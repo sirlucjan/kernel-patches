@@ -9,7 +9,7 @@
 
 * [UKSM](https://github.com/dolohow/uksm)
 
-* [PDS-mq](https://bitbucket.org/alfredchen/linux-gc/downloads)
+* [PDS-mq](https://github.com/cchalpha/PDS-mq))
 
 * [random fixes from pfkernel](https://github.com/pfactum/pf-kernel)
 
