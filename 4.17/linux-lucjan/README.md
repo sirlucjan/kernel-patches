@@ -9,12 +9,12 @@
 
 * [UKSM](https://github.com/dolohow/uksm)
 
-* [PDS-mq](https://github.com/cchalpha/PDS-mq))
+* [PDS-mq](https://github.com/cchalpha/PDS-mq)
 
 * [random fixes from pfkernel](https://github.com/pfactum/pf-kernel)
 
 
-# Hihgest experimental. Prealpha version.
+# Highest experimental.
 # You've been warned.
 
 
