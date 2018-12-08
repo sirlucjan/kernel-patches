@@ -10,7 +10,7 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [linux-bfq](https://github.com/linusw/linux-bfq) 
 
-- [pf-kernel](https://github.com/pfactum/pf-kernel)
+- [pf-kernel](https://github.com/pfactum/pf-kernel) / [pf-kernel](https://gitlab.com/post-factum/pf-kernel)
 
 - [pds](https://gitlab.com/alfredchen/linux-pds)
 
