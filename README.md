@@ -14,5 +14,9 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [linux-pds](https://gitlab.com/alfredchen/linux-pds)
 
+- [zen-kernel](https://github.com/zen-kernel/zen-kernel)
+
+- [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/4.20/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/4.20/ll-patches)
+
 - [MARC](https://marc.info/?l=linux-block&r=1&w=1)
 
