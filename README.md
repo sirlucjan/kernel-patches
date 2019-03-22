@@ -12,7 +12,7 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [pf-kernel](https://github.com/pfactum/pf-kernel) / [pf-kernel](https://gitlab.com/post-factum/pf-kernel)
 
-- [linux-pds](https://gitlab.com/alfredchen/linux-pds)
+- [linux-bmq](https://gitlab.com/alfredchen/linux-bmq)
 
 - [zen-kernel](https://github.com/zen-kernel/zen-kernel)
 
