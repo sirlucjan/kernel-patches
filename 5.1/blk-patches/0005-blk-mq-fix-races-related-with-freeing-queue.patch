@@ -1,0 +1,578 @@
+From 75f8f60765251d166063665bd67f4a5642c0ebf2 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@redhat.com>
+Date: Sat, 13 Apr 2019 11:38:21 +0300
+Subject: [PATCH] blk-mq: fix races related with freeing queue
+
+Since 45a9c9d909b2 ("blk-mq: Fix a use-after-free"), run queue isn't
+allowed during cleanup queue even though queue refcount is held.
+
+This change has caused lots of kernel oops triggered in run queue path,
+turns out it isn't easy to fix them all.
+
+So move freeing of hw queue resources into hctx's release handler, then
+the above issue is fixed. Meantime, this way is safe given freeing hw
+queue resource doesn't require tags.
+
+V3 covers more races.
+
+V5:
+	- refactor blk_mq_alloc_and_init_hctx()
+	- fix race related updating nr_hw_queues by always freeing hctx
+	  after request queue is released
+
+V4:
+	- add patch for fixing potential use-after-free in
+blk_mq_update_nr_hw_queues
+	- fix comment in the last patch
+
+V3:
+	- cancel q->requeue_work in queue's release handler
+	- cancel hctx->run_work in hctx's release handler
+	- add patch 1 for fixing race in plug code path
+	- the last patch is added for avoiding to grab SCSI's refcont
+	in IO path
+
+V2:
+	- moving freeing hw queue resources into hctx's release handler
+
+
+
+Ming Lei (9):
+  blk-mq: grab .q_usage_counter when queuing request from plug code path
+  blk-mq: move cancel of requeue_work into blk_mq_release
+  blk-mq: free hw queue's resource in hctx's release handler
+  blk-mq: move all hctx alloction & initialization into
+    __blk_mq_alloc_and_init_hctx
+  blk-mq: split blk_mq_alloc_and_init_hctx into two parts
+  blk-mq: always free hctx after request queue is freed
+  blk-mq: move cancel of hctx->run_work into blk_mq_hw_sysfs_release
+  block: don't drain in-progress dispatch in blk_cleanup_queue()
+  SCSI: don't hold device refcount in IO path
+
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+---
+ block/blk-core.c        |  23 +----
+ block/blk-mq-sysfs.c    |   8 ++
+ block/blk-mq.c          | 188 ++++++++++++++++++++++++----------------
+ block/blk-mq.h          |   2 +-
+ drivers/scsi/scsi_lib.c |  28 +-----
+ include/linux/blk-mq.h  |   2 +
+ include/linux/blkdev.h  |   7 ++
+ 7 files changed, 132 insertions(+), 126 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 18e78e6bbbd4..e1b8d894afbb 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -233,15 +233,6 @@ void blk_sync_queue(struct request_queue *q)
+ {
+ 	del_timer_sync(&q->timeout);
+ 	cancel_work_sync(&q->timeout_work);
+-
+-	if (queue_is_mq(q)) {
+-		struct blk_mq_hw_ctx *hctx;
+-		int i;
+-
+-		cancel_delayed_work_sync(&q->requeue_work);
+-		queue_for_each_hw_ctx(q, hctx, i)
+-			cancel_delayed_work_sync(&hctx->run_work);
+-	}
+ }
+ EXPORT_SYMBOL(blk_sync_queue);
+ 
+@@ -348,18 +339,6 @@ void blk_cleanup_queue(struct request_queue *q)
+ 
+ 	blk_queue_flag_set(QUEUE_FLAG_DEAD, q);
+ 
+-	/*
+-	 * make sure all in-progress dispatch are completed because
+-	 * blk_freeze_queue() can only complete all requests, and
+-	 * dispatch may still be in-progress since we dispatch requests
+-	 * from more than one contexts.
+-	 *
+-	 * We rely on driver to deal with the race in case that queue
+-	 * initialization isn't done.
+-	 */
+-	if (queue_is_mq(q) && blk_queue_init_done(q))
+-		blk_mq_quiesce_queue(q);
+-
+ 	/* for synchronous bio-based driver finish in-flight integrity i/o */
+ 	blk_flush_integrity();
+ 
+@@ -376,7 +355,7 @@ void blk_cleanup_queue(struct request_queue *q)
+ 	blk_exit_queue(q);
+ 
+ 	if (queue_is_mq(q))
+-		blk_mq_free_queue(q);
++		blk_mq_exit_queue(q);
+ 
+ 	percpu_ref_exit(&q->q_usage_counter);
+ 
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index 3f9c3f4ac44c..25c0d0a6a556 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -10,6 +10,7 @@
+ #include <linux/smp.h>
+ 
+ #include <linux/blk-mq.h>
++#include "blk.h"
+ #include "blk-mq.h"
+ #include "blk-mq-tag.h"
+ 
+@@ -33,6 +34,13 @@ static void blk_mq_hw_sysfs_release(struct kobject *kobj)
+ {
+ 	struct blk_mq_hw_ctx *hctx = container_of(kobj, struct blk_mq_hw_ctx,
+ 						  kobj);
++
++	cancel_delayed_work_sync(&hctx->run_work);
++
++	if (hctx->flags & BLK_MQ_F_BLOCKING)
++		cleanup_srcu_struct(hctx->srcu);
++	blk_free_flush_queue(hctx->fq);
++	sbitmap_free(&hctx->ctx_map);
+ 	free_cpumask_var(hctx->cpumask);
+ 	kfree(hctx->ctxs);
+ 	kfree(hctx);
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 08150ccb95d8..9248add8194e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1727,9 +1727,12 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ 		if (rq->mq_hctx != this_hctx || rq->mq_ctx != this_ctx) {
+ 			if (this_hctx) {
+ 				trace_block_unplug(this_q, depth, !from_schedule);
++
++				percpu_ref_get(&this_q->q_usage_counter);
+ 				blk_mq_sched_insert_requests(this_hctx, this_ctx,
+ 								&rq_list,
+ 								from_schedule);
++				percpu_ref_put(&this_q->q_usage_counter);
+ 			}
+ 
+ 			this_q = rq->q;
+@@ -1748,8 +1751,11 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ 	 */
+ 	if (this_hctx) {
+ 		trace_block_unplug(this_q, depth, !from_schedule);
++
++		percpu_ref_get(&this_q->q_usage_counter);
+ 		blk_mq_sched_insert_requests(this_hctx, this_ctx, &rq_list,
+ 						from_schedule);
++		percpu_ref_put(&this_q->q_usage_counter);
+ 	}
+ }
+ 
+@@ -2258,12 +2264,11 @@ static void blk_mq_exit_hctx(struct request_queue *q,
+ 	if (set->ops->exit_hctx)
+ 		set->ops->exit_hctx(hctx, hctx_idx);
+ 
+-	if (hctx->flags & BLK_MQ_F_BLOCKING)
+-		cleanup_srcu_struct(hctx->srcu);
+-
+ 	blk_mq_remove_cpuhp(hctx);
+-	blk_free_flush_queue(hctx->fq);
+-	sbitmap_free(&hctx->ctx_map);
++
++	spin_lock(&q->dead_hctx_lock);
++	list_add(&hctx->hctx_list, &q->dead_hctx_list);
++	spin_unlock(&q->dead_hctx_lock);
+ }
+ 
+ static void blk_mq_exit_hw_queues(struct request_queue *q,
+@@ -2280,15 +2285,69 @@ static void blk_mq_exit_hw_queues(struct request_queue *q,
+ 	}
+ }
+ 
++static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
++{
++	int hw_ctx_size = sizeof(struct blk_mq_hw_ctx);
++
++	BUILD_BUG_ON(ALIGN(offsetof(struct blk_mq_hw_ctx, srcu),
++			   __alignof__(struct blk_mq_hw_ctx)) !=
++		     sizeof(struct blk_mq_hw_ctx));
++
++	if (tag_set->flags & BLK_MQ_F_BLOCKING)
++		hw_ctx_size += sizeof(struct srcu_struct);
++
++	return hw_ctx_size;
++}
++
+ static int blk_mq_init_hctx(struct request_queue *q,
+-		struct blk_mq_tag_set *set,
+-		struct blk_mq_hw_ctx *hctx, unsigned hctx_idx)
++			    struct blk_mq_tag_set *set,
++			    struct blk_mq_hw_ctx *hctx,
++			    unsigned hctx_idx)
+ {
+-	int node;
++	hctx->queue_num = hctx_idx;
+ 
+-	node = hctx->numa_node;
++	cpuhp_state_add_instance_nocalls(CPUHP_BLK_MQ_DEAD, &hctx->cpuhp_dead);
++
++	hctx->tags = set->tags[hctx_idx];
++
++	if (set->ops->init_hctx &&
++	    set->ops->init_hctx(hctx, set->driver_data, hctx_idx))
++		goto fail;
++
++	if (blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx,
++				hctx->numa_node))
++		goto exit_hctx;
++	return 0;
++ exit_hctx:
++	if (set->ops->exit_hctx)
++		set->ops->exit_hctx(hctx, hctx_idx);
++ fail:
++	return -1;
++}
++
++static struct blk_mq_hw_ctx *
++blk_mq_alloc_hctx(struct request_queue *q,
++		  struct blk_mq_tag_set *set,
++		  unsigned hctx_idx, int node)
++{
++	struct blk_mq_hw_ctx *hctx;
++
++	hctx = kzalloc_node(blk_mq_hw_ctx_size(set),
++			GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
++			node);
++	if (!hctx)
++		goto fail_alloc_hctx;
++
++	if (!zalloc_cpumask_var_node(&hctx->cpumask,
++				GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
++				node))
++		goto free_hctx;
++
++	atomic_set(&hctx->nr_active, 0);
++	hctx->numa_node = node;
+ 	if (node == NUMA_NO_NODE)
+-		node = hctx->numa_node = set->numa_node;
++		hctx->numa_node = set->numa_node;
++	node = hctx->numa_node;
+ 
+ 	INIT_DELAYED_WORK(&hctx->run_work, blk_mq_run_work_fn);
+ 	spin_lock_init(&hctx->lock);
+@@ -2296,10 +2355,6 @@ static int blk_mq_init_hctx(struct request_queue *q,
+ 	hctx->queue = q;
+ 	hctx->flags = set->flags & ~BLK_MQ_F_TAG_SHARED;
+ 
+-	cpuhp_state_add_instance_nocalls(CPUHP_BLK_MQ_DEAD, &hctx->cpuhp_dead);
+-
+-	hctx->tags = set->tags[hctx_idx];
+-
+ 	/*
+ 	 * Allocate space for all possible cpus to avoid allocation at
+ 	 * runtime
+@@ -2312,42 +2367,34 @@ static int blk_mq_init_hctx(struct request_queue *q,
+ 	if (sbitmap_init_node(&hctx->ctx_map, nr_cpu_ids, ilog2(8),
+ 				GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY, node))
+ 		goto free_ctxs;
+-
+ 	hctx->nr_ctx = 0;
+ 
+ 	spin_lock_init(&hctx->dispatch_wait_lock);
+ 	init_waitqueue_func_entry(&hctx->dispatch_wait, blk_mq_dispatch_wake);
+ 	INIT_LIST_HEAD(&hctx->dispatch_wait.entry);
+ 
+-	if (set->ops->init_hctx &&
+-	    set->ops->init_hctx(hctx, set->driver_data, hctx_idx))
+-		goto free_bitmap;
+-
+ 	hctx->fq = blk_alloc_flush_queue(q, hctx->numa_node, set->cmd_size,
+ 			GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY);
+ 	if (!hctx->fq)
+-		goto exit_hctx;
+-
+-	if (blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx, node))
+-		goto free_fq;
++		goto free_bitmap;
+ 
+ 	if (hctx->flags & BLK_MQ_F_BLOCKING)
+ 		init_srcu_struct(hctx->srcu);
++	blk_mq_hctx_kobj_init(hctx);
+ 
+-	return 0;
++	return hctx;
+ 
+- free_fq:
+-	blk_free_flush_queue(hctx->fq);
+- exit_hctx:
+-	if (set->ops->exit_hctx)
+-		set->ops->exit_hctx(hctx, hctx_idx);
+  free_bitmap:
+ 	sbitmap_free(&hctx->ctx_map);
+  free_ctxs:
+ 	kfree(hctx->ctxs);
+  unregister_cpu_notifier:
+ 	blk_mq_remove_cpuhp(hctx);
+-	return -1;
++	free_cpumask_var(hctx->cpumask);
++ free_hctx:
++	kfree(hctx);
++ fail_alloc_hctx:
++	return NULL;
+ }
+ 
+ static void blk_mq_init_cpu_queues(struct request_queue *q,
+@@ -2622,13 +2669,13 @@ static int blk_mq_alloc_ctxs(struct request_queue *q)
+  */
+ void blk_mq_release(struct request_queue *q)
+ {
+-	struct blk_mq_hw_ctx *hctx;
+-	unsigned int i;
++	struct blk_mq_hw_ctx *hctx, *next;
+ 
+-	/* hctx kobj stays in hctx */
+-	queue_for_each_hw_ctx(q, hctx, i) {
+-		if (!hctx)
+-			continue;
++	cancel_delayed_work_sync(&q->requeue_work);
++
++	/* all hctx are in .dead_hctx_list now */
++	list_for_each_entry_safe(hctx, next, &q->dead_hctx_list, hctx_list) {
++		list_del_init(&hctx->hctx_list);
+ 		kobject_put(&hctx->kobj);
+ 	}
+ 
+@@ -2691,51 +2738,38 @@ struct request_queue *blk_mq_init_sq_queue(struct blk_mq_tag_set *set,
+ }
+ EXPORT_SYMBOL(blk_mq_init_sq_queue);
+ 
+-static int blk_mq_hw_ctx_size(struct blk_mq_tag_set *tag_set)
+-{
+-	int hw_ctx_size = sizeof(struct blk_mq_hw_ctx);
+-
+-	BUILD_BUG_ON(ALIGN(offsetof(struct blk_mq_hw_ctx, srcu),
+-			   __alignof__(struct blk_mq_hw_ctx)) !=
+-		     sizeof(struct blk_mq_hw_ctx));
+-
+-	if (tag_set->flags & BLK_MQ_F_BLOCKING)
+-		hw_ctx_size += sizeof(struct srcu_struct);
+-
+-	return hw_ctx_size;
+-}
+-
+ static struct blk_mq_hw_ctx *blk_mq_alloc_and_init_hctx(
+ 		struct blk_mq_tag_set *set, struct request_queue *q,
+ 		int hctx_idx, int node)
+ {
+-	struct blk_mq_hw_ctx *hctx;
++	struct blk_mq_hw_ctx *hctx = NULL, *tmp;
+ 
+-	hctx = kzalloc_node(blk_mq_hw_ctx_size(set),
+-			GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
+-			node);
+-	if (!hctx)
+-		return NULL;
+-
+-	if (!zalloc_cpumask_var_node(&hctx->cpumask,
+-				GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
+-				node)) {
+-		kfree(hctx);
+-		return NULL;
++	/* reuse dead hctx first */
++	spin_lock(&q->dead_hctx_lock);
++	list_for_each_entry(tmp, &q->dead_hctx_list, hctx_list) {
++		if (tmp->numa_node == node) {
++			hctx = tmp;
++			break;
++		}
+ 	}
++	if (hctx)
++		list_del_init(&hctx->hctx_list);
++	spin_unlock(&q->dead_hctx_lock);
+ 
+-	atomic_set(&hctx->nr_active, 0);
+-	hctx->numa_node = node;
+-	hctx->queue_num = hctx_idx;
++	if (!hctx)
++		hctx = blk_mq_alloc_hctx(q, set, hctx_idx, node);
++	if (!hctx)
++		goto fail;
+ 
+-	if (blk_mq_init_hctx(q, set, hctx, hctx_idx)) {
+-		free_cpumask_var(hctx->cpumask);
+-		kfree(hctx);
+-		return NULL;
+-	}
+-	blk_mq_hctx_kobj_init(hctx);
++	if (blk_mq_init_hctx(q, set, hctx, hctx_idx))
++		goto free_hctx;
+ 
+ 	return hctx;
++
++ free_hctx:
++	kobject_put(&hctx->kobj);
++ fail:
++	return NULL;
+ }
+ 
+ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+@@ -2761,10 +2795,8 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+ 
+ 		hctx = blk_mq_alloc_and_init_hctx(set, q, i, node);
+ 		if (hctx) {
+-			if (hctxs[i]) {
++			if (hctxs[i])
+ 				blk_mq_exit_hctx(q, set, hctxs[i], i);
+-				kobject_put(&hctxs[i]->kobj);
+-			}
+ 			hctxs[i] = hctx;
+ 		} else {
+ 			if (hctxs[i])
+@@ -2795,9 +2827,7 @@ static void blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+ 			if (hctx->tags)
+ 				blk_mq_free_map_and_requests(set, j);
+ 			blk_mq_exit_hctx(q, set, hctx, j);
+-			kobject_put(&hctx->kobj);
+ 			hctxs[j] = NULL;
+-
+ 		}
+ 	}
+ 	mutex_unlock(&q->sysfs_lock);
+@@ -2840,6 +2870,9 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ 	if (!q->queue_hw_ctx)
+ 		goto err_sys_init;
+ 
++	INIT_LIST_HEAD(&q->dead_hctx_list);
++	spin_lock_init(&q->dead_hctx_lock);
++
+ 	blk_mq_realloc_hw_ctxs(set, q);
+ 	if (!q->nr_hw_queues)
+ 		goto err_hctxs;
+@@ -2896,7 +2929,8 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ }
+ EXPORT_SYMBOL(blk_mq_init_allocated_queue);
+ 
+-void blk_mq_free_queue(struct request_queue *q)
++/* tags can _not_ be used after returning from blk_mq_exit_queue */
++void blk_mq_exit_queue(struct request_queue *q)
+ {
+ 	struct blk_mq_tag_set	*set = q->tag_set;
+ 
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 423ea88ab6fb..633a5a77ee8b 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -37,7 +37,7 @@ struct blk_mq_ctx {
+ 	struct kobject		kobj;
+ } ____cacheline_aligned_in_smp;
+ 
+-void blk_mq_free_queue(struct request_queue *q);
++void blk_mq_exit_queue(struct request_queue *q);
+ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+ void blk_mq_wake_waiters(struct request_queue *q);
+ bool blk_mq_dispatch_rq_list(struct request_queue *, struct list_head *, bool);
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 07dfc17d4824..403ada254cef 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -141,8 +141,6 @@ scsi_set_blocked(struct scsi_cmnd *cmd, int reason)
+ 
+ static void scsi_mq_requeue_cmd(struct scsi_cmnd *cmd)
+ {
+-	struct scsi_device *sdev = cmd->device;
+-
+ 	if (cmd->request->rq_flags & RQF_DONTPREP) {
+ 		cmd->request->rq_flags &= ~RQF_DONTPREP;
+ 		scsi_mq_uninit_cmd(cmd);
+@@ -150,7 +148,6 @@ static void scsi_mq_requeue_cmd(struct scsi_cmnd *cmd)
+ 		WARN_ON_ONCE(true);
+ 	}
+ 	blk_mq_requeue_request(cmd->request, true);
+-	put_device(&sdev->sdev_gendev);
+ }
+ 
+ /**
+@@ -189,19 +186,7 @@ static void __scsi_queue_insert(struct scsi_cmnd *cmd, int reason, bool unbusy)
+ 	 */
+ 	cmd->result = 0;
+ 
+-	/*
+-	 * Before a SCSI command is dispatched,
+-	 * get_device(&sdev->sdev_gendev) is called and the host,
+-	 * target and device busy counters are increased. Since
+-	 * requeuing a request causes these actions to be repeated and
+-	 * since scsi_device_unbusy() has already been called,
+-	 * put_device(&device->sdev_gendev) must still be called. Call
+-	 * put_device() after blk_mq_requeue_request() to avoid that
+-	 * removal of the SCSI device can start before requeueing has
+-	 * happened.
+-	 */
+ 	blk_mq_requeue_request(cmd->request, true);
+-	put_device(&device->sdev_gendev);
+ }
+ 
+ /*
+@@ -619,7 +604,6 @@ static bool scsi_end_request(struct request *req, blk_status_t error,
+ 		blk_mq_run_hw_queues(q, true);
+ 
+ 	percpu_ref_put(&q->q_usage_counter);
+-	put_device(&sdev->sdev_gendev);
+ 	return false;
+ }
+ 
+@@ -1613,7 +1597,6 @@ static void scsi_mq_put_budget(struct blk_mq_hw_ctx *hctx)
+ 	struct scsi_device *sdev = q->queuedata;
+ 
+ 	atomic_dec(&sdev->device_busy);
+-	put_device(&sdev->sdev_gendev);
+ }
+ 
+ static bool scsi_mq_get_budget(struct blk_mq_hw_ctx *hctx)
+@@ -1621,16 +1604,9 @@ static bool scsi_mq_get_budget(struct blk_mq_hw_ctx *hctx)
+ 	struct request_queue *q = hctx->queue;
+ 	struct scsi_device *sdev = q->queuedata;
+ 
+-	if (!get_device(&sdev->sdev_gendev))
+-		goto out;
+-	if (!scsi_dev_queue_ready(q, sdev))
+-		goto out_put_device;
+-
+-	return true;
++	if (scsi_dev_queue_ready(q, sdev))
++		return true;
+ 
+-out_put_device:
+-	put_device(&sdev->sdev_gendev);
+-out:
+ 	if (atomic_read(&sdev->device_busy) == 0 && !scsi_device_blocked(sdev))
+ 		blk_mq_delay_run_hw_queue(hctx, SCSI_QUEUE_DELAY);
+ 	return false;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 464c9d03cc1a..b4c55a28401b 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -70,6 +70,8 @@ struct blk_mq_hw_ctx {
+ 	struct dentry		*sched_debugfs_dir;
+ #endif
+ 
++	struct list_head	hctx_list;
++
+ 	/* Must be the last member - see also blk_mq_hw_ctx_size(). */
+ 	struct srcu_struct	srcu[0];
+ };
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 8668f798d4fc..3610a25e7377 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -539,6 +539,13 @@ struct request_queue {
+ 
+ 	struct mutex		sysfs_lock;
+ 
++	/*
++	 * for reusing dead hctx instance in case of updating
++	 * nr_hw_queues
++	 */
++	struct list_head	dead_hctx_list;
++	spinlock_t		dead_hctx_lock;
++
+ 	atomic_t		mq_freeze_depth;
+ 
+ #if defined(CONFIG_BLK_DEV_BSG)
+-- 
+2.21.0.777.g83232e3864
+
