@@ -18,6 +18,8 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [zen-kernel](https://github.com/zen-kernel/zen-kernel)
 
+- [clearlinux](https://github.com/clearlinux-pkgs/linux)
+
 - [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.1/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.1/ll-patches)
 
 - [MARC](https://marc.info/?l=linux-block&r=1&w=1)
