@@ -4,6 +4,6 @@
 
 #### Patches for [github/linux-lucjan](https://github.com/sirlucjan/linux-lucjan/) / [gitlab/linux-lucjan](https://gitlab.com/sirlucjan/linux-lucjan/)
 
-# Some patches for BFQ conflict with patches for BFQ-dev.
+###### Some patches for BFQ conflict with patches for BFQ-dev.
 
-# To use lucjan-kernels smoothly apply bfq-reverts before linux-lucjan patch. Otherwise the kernel will not compile.
+###### To use lucjan-kernels smoothly apply bfq-reverts before linux-lucjan patch. Otherwise the kernel will not compile.
