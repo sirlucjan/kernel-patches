@@ -10,7 +10,7 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [linux-bfq](https://github.com/linusw/linux-bfq)
 
-- [bfq-lucjan-dev](https://github.com/sirlucjan/bfq-mq-lucjan/commits/dev-bfq-on-5.2-lucjan)
+- [bfq-lucjan-dev](https://github.com/sirlucjan/bfq-mq-lucjan/)
 
 - [pf-kernel](https://github.com/pfactum/pf-kernel) / [pf-kernel](https://gitlab.com/post-factum/pf-kernel)
 
@@ -26,9 +26,9 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [WireGuard](https://git.zx2c4.com/WireGuard)
 
-- [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.1/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.1/ll-patches)
+- [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.3/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.3/ll-patches)
 
-- [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.1/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.1/ll-branding)
+- [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.3/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.3/ll-branding)
 
 - [MARC](https://marc.info/?l=linux-block&r=1&w=1)
 
