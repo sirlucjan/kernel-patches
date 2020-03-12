@@ -1,5 +1,7 @@
 ## CHANGELOG
 
+5.5-bfq-reverts-ver2-rc2 --> 5.5-bfq-reverts-ver2
+
 5.5-bfq-reverts-ver2-rc2
 
 - add Revert-block-bfq-remove-ifdefs-from-around-gets-puts.patch
