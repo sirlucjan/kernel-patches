@@ -1,5 +1,9 @@
 ## CHANGELOG
 
+5.5-bfq-reverts-ver3-rc1
+
+- add Revert-block-bfq-fix-overwrite-of-bfq_group-pointer-.patch
+
 5.5-bfq-reverts-ver2-rc2 --> 5.5-bfq-reverts-ver2
 
 5.5-bfq-reverts-ver2-rc2
