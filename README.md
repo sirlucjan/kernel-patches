@@ -26,9 +26,9 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [WireGuard](https://git.zx2c4.com/wireguard-linux-compat/)
 
-- [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.5/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.5/ll-patches)
+- [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.6/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.6/ll-patches)
 
-- [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.5/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.5/ll-branding)
+- [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.6/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.6/ll-branding)
 
 - [MARC](https://marc.info/?l=linux-block&r=1&w=1)
 
