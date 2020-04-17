@@ -1,5 +1,7 @@
 ## CHANGELOG
 
+5.6-bfq-reverts-ver1-rc1 --> 5.6-bfq-reverts-ver1
+
 5.6-bfq-reverts-ver1-rc1
 
 - add Revert-block-bfq-move-forward-the-getting-of-an-extr.patch
