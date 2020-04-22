@@ -8,4 +8,4 @@
 
 ###### To use lucjan-kernels smoothly apply bfq-reverts before linux-lucjan patch. Otherwise the kernel will not compile.
 
-* [bfq-reverts](https://github.com/sirlucjan/kernel-patches/tree/master/5.5/bfq-reverts-sep) / [bfq-reverts](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.5/bfq-reverts-sep) - specific patches authored by Piotr Gorski
+* [bfq-reverts](https://github.com/sirlucjan/kernel-patches/tree/master/5.5/bfq-reverts-sep-v4) / [bfq-reverts](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.5/bfq-reverts-sep-v4) - specific patches authored by Piotr Gorski
