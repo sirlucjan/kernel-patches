@@ -1,8 +1,8 @@
 ## BFQ reverts
 
-#### Patches for [github/lucjan-kernels](https://github.com/sirlucjan/lucjan-kernels/) / [gitlab/lucjan-kernels](https://gitlab.com/sirlucjan/lucjan-kernels/)
+#### Patches for [github/lucjan-kernels](https://github.com/sirlucjan/lucjan-kernels) / [gitlab/lucjan-kernels](https://gitlab.com/sirlucjan/lucjan-kernels)
 
-#### Patches for [github/linux-lucjan](https://github.com/sirlucjan/linux-lucjan/) / [gitlab/linux-lucjan](https://gitlab.com/sirlucjan/linux-lucjan/)
+#### Patches for [github/linux-lucjan](https://github.com/sirlucjan/linux-lucjan) / [gitlab/linux-lucjan](https://gitlab.com/sirlucjan/linux-lucjan)
 
 ###### Some patches for BFQ conflict with patches for BFQ-dev.
 
