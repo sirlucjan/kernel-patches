@@ -1,5 +1,7 @@
 ## CHANGELOG
 
+5.6-bfq-reverts-ver2-rc1 --> 5.6-bfq-reverts-ver2
+
 5.6-bfq-reverts-ver2-rc1
 
 - add Revert-block-bfq-invoke-flush_idle_tree-after-repare.patch
