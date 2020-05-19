@@ -1,10 +1,125 @@
-From 4ff327262231d7fd76c16b206c09581bb2027553 Mon Sep 17 00:00:00 2001
-From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Fri, 1 May 2020 16:20:51 +0200
+From 47c94ad19bf5db8aa44e3bf86a43f2262542c52d Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Tue, 4 Feb 2020 18:12:48 -0500
 Subject: [PATCH 1/2] vfs: keep inodes with page cache off the inode shrinker
  LRU
 
-Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+The VFS inode shrinker is currently allowed to reclaim inodes with
+populated page cache. As a result it can drop gigabytes of hot and
+active page cache on the floor without consulting the VM.
+
+The reason for this goes back to highmem: page cache in the highmem
+zones can pin struct inode objects in small lowmem zones and get the
+whole system into trouble. As a result, the inode shrinker zaps the
+page cache to free up the lowmem struct inodes.
+
+Details: https://marc.info/?l=git-commits-head&m=103646757213266&w=2
+
+But the cost of doing this isn't justifiable on the more prevalent
+!CONFIG_HIGHMEM systems nowadays.
+
+Consider for example how the VM would cache a source tree, such as the
+Linux git tree. As large parts of the checked out files and the object
+database are accessed repeatedly, the page cache holding this data
+gets moved to the active list, where it's fully (and indefinitely)
+insulated from one-off cache moving through the inactive list. But due
+to the way users interact with the tree, no ongoing open file
+descriptors into the source tree are maintained, and the inodes end up
+on the shrinker LRU. A larger burst of one-off cache (find, updatedb,
+etc.) can now drive the shrinkers to drop first the dentries and then
+the inodes - inodes that contain the most valuable data currently held
+by the page cache - while there is plenty of one-off cache that could
+be reclaimed instead.
+
+This may have been less of a concern when the VM itself didn't have
+real workingset protection, and one-off cache would push out active
+cache over time anyway. But we've come a long way since, and the inode
+shrinker is now actively in conflict with the VM's caching strategy.
+
+Previous proposals
+
+As this keeps causing problems for people, there have been several
+attempts to address this.
+
+One recent attempt was to make the inode shrinker simply skip over
+inodes that still contain pages: a76cf1a474d7 ("mm: don't reclaim
+inodes with many attached pages").
+
+However, this change had to be reverted in 69056ee6a8a3 ("Revert "mm:
+don't reclaim inodes with many attached pages"") because it caused
+excessive pressure build up on the VFS objects: Inodes that sit on the
+shrinker LRU are attracting reclaim pressure away from the page cache
+and toward the VFS. If we then permanently exempt sizable portions of
+this pool from actually getting reclaimed when looked at, this
+pressure accumulates as deferred work (a mechanism for *temporarily*
+unreclaimable objects) until it causes mayhem in the VFS cache pools.
+
+In the bug quoted in 69056ee6a8a3 in particular, the excessive
+pressure drove the XFS shrinker into dirty objects, where it caused
+synchronous, IO-bound stalls, even as there was plenty of clean page
+cache that should have been reclaimed instead.
+
+Another variant of this problem was recently observed, where the
+kernel violates cgroups' memory.low protection settings and reclaims
+page cache way beyond the configured thresholds. It was followed by a
+proposal of a modified form of the reverted commit above, that
+implements memory.low-sensitive shrinker skipping over populated
+inodes on the LRU [1]. However, this proposal continues to run the
+risk of attracting disproportionate reclaim pressure to a pool of
+still-used inodes, while not addressing the more generic reclaim
+inversion problem outside of a very specific cgroup application.
+
+[1] https://lore.kernel.org/linux-mm/1578499437-1664-1-git-send-email-laoar.shao@gmail.com/
+
+Solution
+
+To fix the reclaim inversion in the shrinker, without reintroducing
+the problems associated with shrinker LRU rotations, this patch keeps
+populated inodes off the LRUs entirely on !CONFIG_HIGHMEM systems.
+
+Currently, inodes are kept off the shrinker LRU as long as they have
+an elevated i_count, indicating an active user. Unfortunately, the
+page cache cannot simply hold an i_count reference, because unlink()
+*should* result in the inode being dropped and its cache invalidated.
+
+Instead, this patch makes iput_final() consult the state of the page
+cache and punt the LRU linking to the VM if the inode is still
+populated; the VM in turn checks the inode state when it depopulates
+the page cache, and adds the inode to the LRU if necessary.
+
+This is not unlike what we do for dirty inodes, which are moved off
+the LRU permanently until writeback completion puts them back on (iff
+still unused). We can reuse the same code -- inode_add_lru() - here.
+
+This is also not unlike page reclaim, where the lower VM layer has to
+negotiate state with the higher VFS layer. Follow existing precedence
+and handle the inversion as much as possible on the VM side:
+
+- introduce an I_PAGES flag that the VM maintains under the i_lock, so
+  that any inode code holding that lock can check the page cache state
+  without having to lock and inspect the struct address_space
+
+- introduce inode_pages_set() and inode_pages_clear() to maintain the
+  inode LRU state from the VM side, then update all cache mutators to
+  use them when populating the first cache entry or clearing the last
+
+With this, the concept of "inodesteal" - where the inode shrinker
+drops page cache - is a thing of the past. The VM is in charge of the
+page cache, the inode shrinker is in charge of freeing struct inode.
+
+Footnotes
+
+- For debuggability, add vmstat counters that track the number of
+  times a new cache entry pulls a previously unused inode off the LRU
+  (pginoderescue), as well as how many times existing cache deferred
+  an LRU addition.
+
+- Fix /proc/sys/vm/drop_caches to drop shadow entries from the page
+  cache. Not doing so has always been a bit strange, but since most
+  people drop cache and metadata cache together, the inode shrinker
+  would have taken care of them before - no more, so do it VM-side.
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
 ---
  fs/block_dev.c                |   2 +-
  fs/dax.c                      |  14 +++++
@@ -23,10 +138,10 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  14 files changed, 209 insertions(+), 35 deletions(-)
 
 diff --git a/fs/block_dev.c b/fs/block_dev.c
-index 93672c3f1..dcf013e52 100644
+index 84fe0162f..8f3db4a19 100644
 --- a/fs/block_dev.c
 +++ b/fs/block_dev.c
-@@ -79,7 +79,7 @@ void kill_bdev(struct block_device *bdev)
+@@ -80,7 +80,7 @@ void kill_bdev(struct block_device *bdev)
  {
  	struct address_space *mapping = bdev->bd_inode->i_mapping;
  
@@ -36,7 +151,7 @@ index 93672c3f1..dcf013e52 100644
  
  	invalidate_bh_lrus();
 diff --git a/fs/dax.c b/fs/dax.c
-index 11b16729b..80f96daab 100644
+index 35da14437..f68b71f81 100644
 --- a/fs/dax.c
 +++ b/fs/dax.c
 @@ -478,9 +478,11 @@ static void *grab_mapping_entry(struct xa_state *xas,
@@ -270,10 +385,10 @@ index 93d9252a0..9127296e4 100644
  
  	WARN_ON(inode->i_state & I_NEW);
 diff --git a/fs/internal.h b/fs/internal.h
-index aa5d45524..2ca77c0af 100644
+index f3f280b95..4a9dc77e8 100644
 --- a/fs/internal.h
 +++ b/fs/internal.h
-@@ -137,7 +137,7 @@ extern int vfs_open(const struct path *, struct file *);
+@@ -139,7 +139,7 @@ extern int vfs_open(const struct path *, struct file *);
   * inode.c
   */
  extern long prune_icache_sb(struct super_block *sb, struct shrink_control *sc);
@@ -283,10 +398,10 @@ index aa5d45524..2ca77c0af 100644
  
  /*
 diff --git a/include/linux/fs.h b/include/linux/fs.h
-index 45cc10cdf..2ad25d242 100644
+index abedbffe2..387d95496 100644
 --- a/include/linux/fs.h
 +++ b/include/linux/fs.h
-@@ -590,6 +590,11 @@ static inline void mapping_allow_writable(struct address_space *mapping)
+@@ -585,6 +585,11 @@ static inline void mapping_allow_writable(struct address_space *mapping)
  	atomic_inc(&mapping->i_mmap_writable);
  }
  
@@ -298,7 +413,7 @@ index 45cc10cdf..2ad25d242 100644
  /*
   * Use sequence counter to get consistent i_size on 32-bit processors.
   */
-@@ -2156,6 +2161,9 @@ static inline void kiocb_clone(struct kiocb *kiocb, struct kiocb *kiocb_src,
+@@ -2151,6 +2156,9 @@ static inline void kiocb_clone(struct kiocb *kiocb, struct kiocb *kiocb_src,
   *
   * I_CREATING		New object's inode in the middle of setting up.
   *
@@ -308,7 +423,7 @@ index 45cc10cdf..2ad25d242 100644
   * Q: What is the difference between I_WILL_FREE and I_FREEING?
   */
  #define I_DIRTY_SYNC		(1 << 0)
-@@ -2178,6 +2186,7 @@ static inline void kiocb_clone(struct kiocb *kiocb, struct kiocb *kiocb_src,
+@@ -2173,6 +2181,7 @@ static inline void kiocb_clone(struct kiocb *kiocb, struct kiocb *kiocb_src,
  #define I_WB_SWITCH		(1 << 13)
  #define I_OVL_INUSE		(1 << 14)
  #define I_CREATING		(1 << 15)
@@ -316,7 +431,7 @@ index 45cc10cdf..2ad25d242 100644
  
  #define I_DIRTY_INODE (I_DIRTY_SYNC | I_DIRTY_DATASYNC)
  #define I_DIRTY (I_DIRTY_INODE | I_DIRTY_PAGES)
-@@ -3105,6 +3114,14 @@ static inline void remove_inode_hash(struct inode *inode)
+@@ -3098,6 +3107,14 @@ static inline void remove_inode_hash(struct inode *inode)
  		__remove_inode_hash(inode);
  }
  
@@ -332,10 +447,10 @@ index 45cc10cdf..2ad25d242 100644
  
  #ifdef CONFIG_BLOCK
 diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
-index a8f7bd8ea..af4f122e3 100644
+index ccb14b6a1..ae4d90bd0 100644
 --- a/include/linux/pagemap.h
 +++ b/include/linux/pagemap.h
-@@ -610,7 +610,7 @@ int add_to_page_cache_locked(struct page *page, struct address_space *mapping,
+@@ -609,7 +609,7 @@ int add_to_page_cache_locked(struct page *page, struct address_space *mapping,
  int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
  				pgoff_t index, gfp_t gfp_mask);
  extern void delete_from_page_cache(struct page *page);
@@ -345,7 +460,7 @@ index a8f7bd8ea..af4f122e3 100644
  void delete_from_page_cache_batch(struct address_space *mapping,
  				  struct pagevec *pvec);
 diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
-index ffef0f279..de362c9cd 100644
+index 47a3441cf..f31026ccf 100644
 --- a/include/linux/vm_event_item.h
 +++ b/include/linux/vm_event_item.h
 @@ -38,7 +38,8 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
@@ -359,7 +474,7 @@ index ffef0f279..de362c9cd 100644
  		PAGEOUTRUN, PGROTATED,
  		DROP_PAGECACHE, DROP_SLAB,
 diff --git a/mm/filemap.c b/mm/filemap.c
-index 23a051a7e..01280fece 100644
+index 178447827..fcc24b3b3 100644
 --- a/mm/filemap.c
 +++ b/mm/filemap.c
 @@ -116,8 +116,8 @@
@@ -494,10 +609,10 @@ index 23a051a7e..01280fece 100644
  error:
  	page->mapping = NULL;
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index 6ecd10451..be8fa26a7 100644
+index 24ad53b4d..29bafc154 100644
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
-@@ -2608,7 +2608,8 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+@@ -2535,7 +2535,8 @@ static void __split_huge_page(struct page *page, struct list_head *list,
  		/* Some pages can be beyond i_size: drop them from page cache */
  		if (head[i].index >= end) {
  			ClearPageDirty(head + i);
@@ -615,7 +730,7 @@ index dd9ebc1da..8fb6c2f76 100644
  
  	pagevec_init(&pvec);
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index a37c87b5a..98f59c5bf 100644
+index 876370565..b46a31b76 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -901,6 +901,7 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
@@ -627,7 +742,7 @@ index a37c87b5a..98f59c5bf 100644
  		freepage = mapping->a_ops->freepage;
  		/*
 @@ -922,9 +923,12 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
- 		if (reclaimed && page_is_file_lru(page) &&
+ 		if (reclaimed && page_is_file_cache(page) &&
  		    !mapping_exiting(mapping) && !dax_mapping(mapping))
  			shadow = workingset_eviction(page, target_memcg);
 -		__delete_from_page_cache(page, shadow);
@@ -641,10 +756,10 @@ index a37c87b5a..98f59c5bf 100644
  			freepage(page);
  	}
 diff --git a/mm/vmstat.c b/mm/vmstat.c
-index 96d21a792..168ad6055 100644
+index 78d53378d..ae802253f 100644
 --- a/mm/vmstat.c
 +++ b/mm/vmstat.c
-@@ -1205,9 +1205,11 @@ const char * const vmstat_text[] = {
+@@ -1203,9 +1203,11 @@ const char * const vmstat_text[] = {
  #ifdef CONFIG_NUMA
  	"zone_reclaim_failed",
  #endif
