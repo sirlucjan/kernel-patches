@@ -18,6 +18,8 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [linux-bmq](https://gitlab.com/alfredchen/linux-bmq)
 
+- [Project C](https://gitlab.com/alfredchen/projectc)
+
 - [zen-kernel](https://github.com/zen-kernel/zen-kernel)
 
 - [clearlinux](https://github.com/clearlinux-pkgs/linux)
