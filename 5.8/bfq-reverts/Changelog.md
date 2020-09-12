@@ -1,5 +1,9 @@
 ## CHANGELOG
 
+5.8-bfq-reverts-ver3-rc1
+
+- add Revert-block-only-call-sched-requeue_request-for-sch.patch
+
 5.8-bfq-reverts-ver2-rc1 --> 5.8-bfq-reverts-ver2
 
 5.8-bfq-reverts-ver2-rc1
