@@ -6,11 +6,11 @@
 
 Here are patches reformatted (with `git format-patch` and/or `git diff`) and rebased from: 
 
-- [Algodev-github/bfq-mq](https://github.com/Algodev-github/bfq-mq/)
+- [Algodev-github/bfq-mq](https://github.com/Algodev-github/bfq-mq)
 
 - [linux-bfq](https://github.com/linusw/linux-bfq)
 
-- [bfq-dev-lucjan](https://github.com/sirlucjan/bfq-mq-lucjan/)
+- [bfq-dev-lucjan](https://github.com/sirlucjan/bfq-mq-lucjan)
 
 - [pf-kernel](https://github.com/pfactum/pf-kernel) / [pf-kernel](https://gitlab.com/post-factum/pf-kernel)
 
@@ -26,11 +26,10 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [AUFS](https://github.com/sfjro/aufs5-standalone)
 
-- [WireGuard](https://git.zx2c4.com/wireguard-linux-compat/)
+- [WireGuard](https://git.zx2c4.com/wireguard-linux-compat)
 
 - [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.8/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.8/ll-patches)
 
 - [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.8/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.8/ll-branding)
 
 - [MARC](https://marc.info/?l=linux-block&r=1&w=1)
-
