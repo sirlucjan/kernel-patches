@@ -10,7 +10,7 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [linux-bfq](https://github.com/linusw/linux-bfq)
 
-- [bfq-lucjan-dev](https://github.com/sirlucjan/bfq-mq-lucjan/)
+- [bfq-dev-lucjan](https://github.com/sirlucjan/bfq-mq-lucjan/)
 
 - [pf-kernel](https://github.com/pfactum/pf-kernel) / [pf-kernel](https://gitlab.com/post-factum/pf-kernel)
 
