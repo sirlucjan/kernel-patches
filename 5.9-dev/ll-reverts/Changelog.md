@@ -1,6 +1,8 @@
 ## CHANGELOG
 
-5.9-llreverts-ver1
+5.9-llreverts-ver1-rc1 --> 5.9-llreverts-ver1
+
+5.9-llreverts-ver1-rc1
 
 - add Revert-block-bfq-fix-use-after-free-in-bfq_idle_slic.patch
 
