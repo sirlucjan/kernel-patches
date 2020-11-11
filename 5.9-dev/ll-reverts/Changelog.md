@@ -1,6 +1,10 @@
 ## CHANGELOG
 
-5.9-llreverts-ver1-rc1 --> 5.9-llreverts-ver1
+5.9-ll-reverts-ver2-rc1
+
+- add Revert-nbd-don-t-update-block-size-after-device-is-s.patch
+
+5.9-ll-reverts-ver1-rc1 --> 5.9-ll-reverts-ver1
 
 5.9-llreverts-ver1-rc1
 
