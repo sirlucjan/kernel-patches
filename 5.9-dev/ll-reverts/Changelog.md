@@ -1,5 +1,13 @@
 ## CHANGELOG
 
+5.9-ll-reverts-ver3-rc1
+
+- add Revert-nvme-fix-incorrect-behavior-when-BLKROSET-is-.patch
+
+- add Revert-nvme-freeze-the-queue-over-lba_shift-updates.patch\
+
+- add Revert-nvme-factor-out-a-nvme_configure_metadata-hel.patch
+
 5.9-ll-reverts-ver2-rc1
 
 - add Revert-nbd-don-t-update-block-size-after-device-is-s.patch
