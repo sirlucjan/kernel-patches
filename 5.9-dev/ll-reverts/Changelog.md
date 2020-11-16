@@ -1,5 +1,11 @@
 ## CHANGELOG
 
+5.9-ll-reverts-ver4-rc1
+
+- add Revert-loop-Fix-occasional-uevent-drop.patch
+
+- add Revert-block-add-a-return-value-to-set_capacity_reva.patch
+
 5.9-ll-reverts-ver3-rc1
 
 - add Revert-nvme-fix-incorrect-behavior-when-BLKROSET-is-.patch
