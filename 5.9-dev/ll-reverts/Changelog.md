@@ -1,5 +1,9 @@
 ## CHANGELOG
 
+5.9-ll-reverts-ver5-rc1
+
+- add Revert-null_blk-Fix-scheduling-in-atomic-with-zoned-.patch
+
 5.9-ll-reverts-ver4-rc1
 
 - add Revert-loop-Fix-occasional-uevent-drop.patch
