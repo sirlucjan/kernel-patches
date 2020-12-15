@@ -8,4 +8,4 @@
 
 ###### To use lucjan-kernels smoothly apply ll-reverts before linux-lucjan patch. Otherwise the kernel will not compile.
 
-* [ll-reverts](https://github.com/sirlucjan/kernel-patches/tree/master/5.10-rc/ll-reverts-sep) / [ll-reverts](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.10-rc/ll-reverts-sep) - specific patches authored by Piotr Gorski
+* [ll-reverts](https://github.com/sirlucjan/kernel-patches/tree/master/5.10-dev/ll-reverts-sep) / [ll-reverts](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.10-dev/ll-reverts-sep) - specific patches authored by Piotr Gorski
