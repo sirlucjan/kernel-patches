@@ -22,6 +22,8 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [zen-kernel](https://github.com/zen-kernel/zen-kernel)
 
+- [xanmod-linux](https://github.com/xanmod/linux)
+
 - [clearlinux](https://github.com/clearlinux-pkgs/linux)
 
 - [AUFS](https://github.com/sfjro/aufs5-standalone)
