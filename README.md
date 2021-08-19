@@ -34,4 +34,4 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.13/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.13/ll-branding)
 
-- [MARC](https://marc.info/?l=linux-block&r=1&w=1)
+- [Linux Kernel Mailing List Archive](https://lkml.org) / [Linux Kernel Mailing List Archive](https://lore.kernel.org/lkml/) / [Linux Kernel Mailing List Archive](https://patchwork.kernel.org)
