@@ -26,6 +26,8 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [clearlinux](https://github.com/clearlinux-pkgs/linux)
 
+- [UKSM](https://github.com/dolohow/uksm)
+
 - [AUFS](https://github.com/sfjro/aufs5-standalone)
 
 - [WireGuard](https://git.zx2c4.com/wireguard-linux-compat)
