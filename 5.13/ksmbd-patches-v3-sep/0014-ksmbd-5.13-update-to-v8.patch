@@ -1,0 +1,604 @@
+From 22073856b47ca4b08a8eefb6f03f5b0e57584178 Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Mon, 23 Aug 2021 12:45:35 +0200
+Subject: [PATCH 14/15] ksmbd-5.13: update to v8
+
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ Documentation/filesystems/cifs/ksmbd.rst |   3 +-
+ MAINTAINERS                              |   1 +
+ fs/ksmbd/Kconfig                         |   1 -
+ fs/ksmbd/smb2pdu.c                       |  55 +++++++-----
+ fs/ksmbd/smb2pdu.h                       |   6 +-
+ fs/ksmbd/smb_common.c                    |  53 ++++++++----
+ fs/ksmbd/smb_common.h                    |   3 +-
+ fs/ksmbd/smbacl.c                        | 106 ++++++++++++++---------
+ fs/ksmbd/transport_rdma.c                |   5 +-
+ fs/ksmbd/vfs.c                           |   9 ++
+ 10 files changed, 151 insertions(+), 91 deletions(-)
+
+diff --git a/Documentation/filesystems/cifs/ksmbd.rst b/Documentation/filesystems/cifs/ksmbd.rst
+index 1e111efec..a1326157d 100644
+--- a/Documentation/filesystems/cifs/ksmbd.rst
++++ b/Documentation/filesystems/cifs/ksmbd.rst
+@@ -84,7 +84,8 @@ SMB3 encryption(CCM, GCM)      Supported. (CCM and GCM128 supported, GCM256 in
+                                progress)
+ SMB direct(RDMA)               Partially Supported. SMB3 Multi-channel is
+                                required to connect to Windows client.
+-SMB3 Multi-channel             In Progress.
++SMB3 Multi-channel             Partially Supported. Planned to implement
++                               replay/retry mechanisms for future.
+ SMB3.1.1 POSIX extension       Supported.
+ ACLs                           Partially Supported. only DACLs available, SACLs
+                                (auditing) is planned for the future. For
+diff --git a/MAINTAINERS b/MAINTAINERS
+index aca846ff1..1a706ad9c 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -9953,6 +9953,7 @@ M:	Steve French <sfrench@samba.org>
+ M:	Hyunchul Lee <hyc.lee@gmail.com>
+ L:	linux-cifs@vger.kernel.org
+ S:	Maintained
++T:	git git://git.samba.org/ksmbd.git
+ F:	fs/ksmbd/
+ 
+ KERNEL UNIT TESTING FRAMEWORK (KUnit)
+diff --git a/fs/ksmbd/Kconfig b/fs/ksmbd/Kconfig
+index e9a5ac01b..b83cbd756 100644
+--- a/fs/ksmbd/Kconfig
++++ b/fs/ksmbd/Kconfig
+@@ -19,7 +19,6 @@ config SMB_SERVER
+ 	select CRYPTO_GCM
+ 	select ASN1
+ 	select OID_REGISTRY
+-	select FS_POSIX_ACL
+ 	default n
+ 	help
+ 	  Choose Y here if you want to allow SMB3 compliant clients
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index 636570ecf..d329ea49f 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -58,18 +58,18 @@ static void __wbuf(struct ksmbd_work *work, void **req, void **rsp)
+  *
+  * Return:      1 if valid session id, otherwise 0
+  */
+-static inline int check_session_id(struct ksmbd_conn *conn, u64 id)
++static inline bool check_session_id(struct ksmbd_conn *conn, u64 id)
+ {
+ 	struct ksmbd_session *sess;
+ 
+ 	if (id == 0 || id == -1)
+-		return 0;
++		return false;
+ 
+ 	sess = ksmbd_session_lookup_all(conn, id);
+ 	if (sess)
+-		return 1;
++		return true;
+ 	pr_err("Invalid user session id: %llu\n", id);
+-	return 0;
++	return false;
+ }
+ 
+ struct channel *lookup_chann_list(struct ksmbd_session *sess, struct ksmbd_conn *conn)
+@@ -85,10 +85,11 @@ struct channel *lookup_chann_list(struct ksmbd_session *sess, struct ksmbd_conn
+ }
+ 
+ /**
+- * smb2_get_ksmbd_tcon() - get tree connection information for a tree id
++ * smb2_get_ksmbd_tcon() - get tree connection information using a tree id.
+  * @work:	smb work
+  *
+- * Return:      matching tree connection on success, otherwise error
++ * Return:	0 if there is a tree connection matched or these are
++ *		skipable commands, otherwise error
+  */
+ int smb2_get_ksmbd_tcon(struct ksmbd_work *work)
+ {
+@@ -105,14 +106,14 @@ int smb2_get_ksmbd_tcon(struct ksmbd_work *work)
+ 
+ 	if (xa_empty(&work->sess->tree_conns)) {
+ 		ksmbd_debug(SMB, "NO tree connected\n");
+-		return -1;
++		return -ENOENT;
+ 	}
+ 
+ 	tree_id = le32_to_cpu(req_hdr->Id.SyncId.TreeId);
+ 	work->tcon = ksmbd_tree_conn_lookup(work->sess, tree_id);
+ 	if (!work->tcon) {
+ 		pr_err("Invalid tid %d\n", tree_id);
+-		return -1;
++		return -EINVAL;
+ 	}
+ 
+ 	return 1;
+@@ -145,45 +146,45 @@ void smb2_set_err_rsp(struct ksmbd_work *work)
+  * is_smb2_neg_cmd() - is it smb2 negotiation command
+  * @work:	smb work containing smb header
+  *
+- * Return:      1 if smb2 negotiation command, otherwise 0
++ * Return:      true if smb2 negotiation command, otherwise false
+  */
+-int is_smb2_neg_cmd(struct ksmbd_work *work)
++bool is_smb2_neg_cmd(struct ksmbd_work *work)
+ {
+ 	struct smb2_hdr *hdr = work->request_buf;
+ 
+ 	/* is it SMB2 header ? */
+ 	if (hdr->ProtocolId != SMB2_PROTO_NUMBER)
+-		return 0;
++		return false;
+ 
+ 	/* make sure it is request not response message */
+ 	if (hdr->Flags & SMB2_FLAGS_SERVER_TO_REDIR)
+-		return 0;
++		return false;
+ 
+ 	if (hdr->Command != SMB2_NEGOTIATE)
+-		return 0;
++		return false;
+ 
+-	return 1;
++	return true;
+ }
+ 
+ /**
+  * is_smb2_rsp() - is it smb2 response
+  * @work:	smb work containing smb response buffer
+  *
+- * Return:      1 if smb2 response, otherwise 0
++ * Return:      true if smb2 response, otherwise false
+  */
+-int is_smb2_rsp(struct ksmbd_work *work)
++bool is_smb2_rsp(struct ksmbd_work *work)
+ {
+ 	struct smb2_hdr *hdr = work->response_buf;
+ 
+ 	/* is it SMB2 header ? */
+ 	if (hdr->ProtocolId != SMB2_PROTO_NUMBER)
+-		return 0;
++		return false;
+ 
+ 	/* make sure it is response not request message */
+ 	if (!(hdr->Flags & SMB2_FLAGS_SERVER_TO_REDIR))
+-		return 0;
++		return false;
+ 
+-	return 1;
++	return true;
+ }
+ 
+ /**
+@@ -2385,11 +2386,14 @@ static void ksmbd_acls_fattr(struct smb_fattr *fattr, struct inode *inode)
+ 	fattr->cf_uid = inode->i_uid;
+ 	fattr->cf_gid = inode->i_gid;
+ 	fattr->cf_mode = inode->i_mode;
++	fattr->cf_acls = NULL;
+ 	fattr->cf_dacls = NULL;
+ 
+-	fattr->cf_acls = get_acl(inode, ACL_TYPE_ACCESS);
+-	if (S_ISDIR(inode->i_mode))
+-		fattr->cf_dacls = get_acl(inode, ACL_TYPE_DEFAULT);
++	if (IS_ENABLED(CONFIG_FS_POSIX_ACL)) {
++		fattr->cf_acls = get_acl(inode, ACL_TYPE_ACCESS);
++		if (S_ISDIR(inode->i_mode))
++			fattr->cf_dacls = get_acl(inode, ACL_TYPE_DEFAULT);
++	}
+ }
+ 
+ /**
+@@ -5857,10 +5861,15 @@ int smb2_set_info(struct ksmbd_work *work)
+ 		break;
+ 	case SMB2_O_INFO_SECURITY:
+ 		ksmbd_debug(SMB, "GOT SMB2_O_INFO_SECURITY\n");
++		if (ksmbd_override_fsids(work)) {
++			rc = -ENOMEM;
++			goto err_out;
++		}
+ 		rc = smb2_set_info_sec(fp,
+ 				       le32_to_cpu(req->AdditionalInformation),
+ 				       req->Buffer,
+ 				       le32_to_cpu(req->BufferLength));
++		ksmbd_revert_fsids(work);
+ 		break;
+ 	default:
+ 		rc = -EOPNOTSUPP;
+@@ -8291,7 +8300,7 @@ int smb3_encrypt_resp(struct ksmbd_work *work)
+ 	return rc;
+ }
+ 
+-int smb3_is_transform_hdr(void *buf)
++bool smb3_is_transform_hdr(void *buf)
+ {
+ 	struct smb2_transform_hdr *trhdr = buf;
+ 
+diff --git a/fs/ksmbd/smb2pdu.h b/fs/ksmbd/smb2pdu.h
+index 89019f672..bcec845b0 100644
+--- a/fs/ksmbd/smb2pdu.h
++++ b/fs/ksmbd/smb2pdu.h
+@@ -1638,8 +1638,8 @@ void init_smb2_max_read_size(unsigned int sz);
+ void init_smb2_max_write_size(unsigned int sz);
+ void init_smb2_max_trans_size(unsigned int sz);
+ 
+-int is_smb2_neg_cmd(struct ksmbd_work *work);
+-int is_smb2_rsp(struct ksmbd_work *work);
++bool is_smb2_neg_cmd(struct ksmbd_work *work);
++bool is_smb2_rsp(struct ksmbd_work *work);
+ 
+ u16 get_smb2_cmd_val(struct ksmbd_work *work);
+ void set_smb2_rsp_status(struct ksmbd_work *work, __le32 err);
+@@ -1664,7 +1664,7 @@ void smb2_send_interim_resp(struct ksmbd_work *work, __le32 status);
+ struct channel *lookup_chann_list(struct ksmbd_session *sess,
+ 				  struct ksmbd_conn *conn);
+ void smb3_preauth_hash_rsp(struct ksmbd_work *work);
+-int smb3_is_transform_hdr(void *buf);
++bool smb3_is_transform_hdr(void *buf);
+ int smb3_decrypt_req(struct ksmbd_work *work);
+ int smb3_encrypt_resp(struct ksmbd_work *work);
+ bool smb3_11_final_sess_setup_resp(struct ksmbd_work *work);
+diff --git a/fs/ksmbd/smb_common.c b/fs/ksmbd/smb_common.c
+index 24c6bb476..b108b918e 100644
+--- a/fs/ksmbd/smb_common.c
++++ b/fs/ksmbd/smb_common.c
+@@ -30,7 +30,7 @@ struct smb_protocol {
+ 	__u16		prot_id;
+ };
+ 
+-static struct smb_protocol smb_protos[] = {
++static struct smb_protocol smb1_protos[] = {
+ 	{
+ 		SMB21_PROT,
+ 		"\2SMB 2.1",
+@@ -43,6 +43,15 @@ static struct smb_protocol smb_protos[] = {
+ 		"SMB2_22",
+ 		SMB2X_PROT_ID
+ 	},
++};
++
++static struct smb_protocol smb2_protos[] = {
++	{
++		SMB21_PROT,
++		"\2SMB 2.1",
++		"SMB2_10",
++		SMB21_PROT_ID
++	},
+ 	{
+ 		SMB30_PROT,
+ 		"\2SMB 3.0",
+@@ -90,14 +99,24 @@ inline int ksmbd_max_protocol(void)
+ 
+ int ksmbd_lookup_protocol_idx(char *str)
+ {
+-	int offt = ARRAY_SIZE(smb_protos) - 1;
++	int offt = ARRAY_SIZE(smb1_protos) - 1;
+ 	int len = strlen(str);
+ 
+ 	while (offt >= 0) {
+-		if (!strncmp(str, smb_protos[offt].prot, len)) {
++		if (!strncmp(str, smb1_protos[offt].prot, len)) {
++			ksmbd_debug(SMB, "selected %s dialect idx = %d\n",
++				    smb1_protos[offt].prot, offt);
++			return smb1_protos[offt].index;
++		}
++		offt--;
++	}
++
++	offt = ARRAY_SIZE(smb2_protos) - 1;
++	while (offt >= 0) {
++		if (!strncmp(str, smb2_protos[offt].prot, len)) {
+ 			ksmbd_debug(SMB, "selected %s dialect idx = %d\n",
+-				    smb_protos[offt].prot, offt);
+-			return smb_protos[offt].index;
++				    smb2_protos[offt].prot, offt);
++			return smb2_protos[offt].index;
+ 		}
+ 		offt--;
+ 	}
+@@ -169,7 +188,7 @@ static int ksmbd_lookup_dialect_by_name(char *cli_dialects, __le16 byte_count)
+ 	int i, seq_num, bcount, next;
+ 	char *dialect;
+ 
+-	for (i = ARRAY_SIZE(smb_protos) - 1; i >= 0; i--) {
++	for (i = ARRAY_SIZE(smb1_protos) - 1; i >= 0; i--) {
+ 		seq_num = 0;
+ 		next = 0;
+ 		dialect = cli_dialects;
+@@ -178,14 +197,14 @@ static int ksmbd_lookup_dialect_by_name(char *cli_dialects, __le16 byte_count)
+ 			dialect = next_dialect(dialect, &next);
+ 			ksmbd_debug(SMB, "client requested dialect %s\n",
+ 				    dialect);
+-			if (!strcmp(dialect, smb_protos[i].name)) {
+-				if (supported_protocol(smb_protos[i].index)) {
++			if (!strcmp(dialect, smb1_protos[i].name)) {
++				if (supported_protocol(smb1_protos[i].index)) {
+ 					ksmbd_debug(SMB,
+ 						    "selected %s dialect\n",
+-						    smb_protos[i].name);
+-					if (smb_protos[i].index == SMB1_PROT)
++						    smb1_protos[i].name);
++					if (smb1_protos[i].index == SMB1_PROT)
+ 						return seq_num;
+-					return smb_protos[i].prot_id;
++					return smb1_protos[i].prot_id;
+ 				}
+ 			}
+ 			seq_num++;
+@@ -201,19 +220,19 @@ int ksmbd_lookup_dialect_by_id(__le16 *cli_dialects, __le16 dialects_count)
+ 	int i;
+ 	int count;
+ 
+-	for (i = ARRAY_SIZE(smb_protos) - 1; i >= 0; i--) {
++	for (i = ARRAY_SIZE(smb2_protos) - 1; i >= 0; i--) {
+ 		count = le16_to_cpu(dialects_count);
+ 		while (--count >= 0) {
+ 			ksmbd_debug(SMB, "client requested dialect 0x%x\n",
+ 				    le16_to_cpu(cli_dialects[count]));
+ 			if (le16_to_cpu(cli_dialects[count]) !=
+-					smb_protos[i].prot_id)
++					smb2_protos[i].prot_id)
+ 				continue;
+ 
+-			if (supported_protocol(smb_protos[i].index)) {
++			if (supported_protocol(smb2_protos[i].index)) {
+ 				ksmbd_debug(SMB, "selected %s dialect\n",
+-					    smb_protos[i].name);
+-				return smb_protos[i].prot_id;
++					    smb2_protos[i].name);
++				return smb2_protos[i].prot_id;
+ 			}
+ 		}
+ 	}
+@@ -221,7 +240,7 @@ int ksmbd_lookup_dialect_by_id(__le16 *cli_dialects, __le16 dialects_count)
+ 	return BAD_PROT_ID;
+ }
+ 
+-int ksmbd_negotiate_smb_dialect(void *buf)
++static int ksmbd_negotiate_smb_dialect(void *buf)
+ {
+ 	__le32 proto;
+ 
+diff --git a/fs/ksmbd/smb_common.h b/fs/ksmbd/smb_common.h
+index b8c350725..eb667d855 100644
+--- a/fs/ksmbd/smb_common.h
++++ b/fs/ksmbd/smb_common.h
+@@ -473,7 +473,7 @@ struct smb_version_ops {
+ 	void (*set_sign_rsp)(struct ksmbd_work *work);
+ 	int (*generate_signingkey)(struct ksmbd_session *sess, struct ksmbd_conn *conn);
+ 	int (*generate_encryptionkey)(struct ksmbd_session *sess);
+-	int (*is_transform_hdr)(void *buf);
++	bool (*is_transform_hdr)(void *buf);
+ 	int (*decrypt_req)(struct ksmbd_work *work);
+ 	int (*encrypt_resp)(struct ksmbd_work *work);
+ };
+@@ -498,7 +498,6 @@ bool ksmbd_smb_request(struct ksmbd_conn *conn);
+ 
+ int ksmbd_lookup_dialect_by_id(__le16 *cli_dialects, __le16 dialects_count);
+ 
+-int ksmbd_negotiate_smb_dialect(void *buf);
+ int ksmbd_init_smb_server(struct ksmbd_work *work);
+ 
+ bool ksmbd_pdu_size_has_room(unsigned int pdu);
+diff --git a/fs/ksmbd/smbacl.c b/fs/ksmbd/smbacl.c
+index fa99d950a..5456e3ad9 100644
+--- a/fs/ksmbd/smbacl.c
++++ b/fs/ksmbd/smbacl.c
+@@ -533,22 +533,29 @@ static void parse_dacl(struct user_namespace *user_ns,
+ 
+ 	if (acl_state.users->n || acl_state.groups->n) {
+ 		acl_state.mask.allow = 0x07;
+-		fattr->cf_acls = posix_acl_alloc(acl_state.users->n +
+-			acl_state.groups->n + 4, GFP_KERNEL);
+-		if (fattr->cf_acls) {
+-			cf_pace = fattr->cf_acls->a_entries;
+-			posix_state_to_acl(&acl_state, cf_pace);
++
++		if (IS_ENABLED(CONFIG_FS_POSIX_ACL)) {
++			fattr->cf_acls =
++				posix_acl_alloc(acl_state.users->n +
++					acl_state.groups->n + 4, GFP_KERNEL);
++			if (fattr->cf_acls) {
++				cf_pace = fattr->cf_acls->a_entries;
++				posix_state_to_acl(&acl_state, cf_pace);
++			}
+ 		}
+ 	}
+ 
+ 	if (default_acl_state.users->n || default_acl_state.groups->n) {
+ 		default_acl_state.mask.allow = 0x07;
+-		fattr->cf_dacls =
+-			posix_acl_alloc(default_acl_state.users->n +
+-			default_acl_state.groups->n + 4, GFP_KERNEL);
+-		if (fattr->cf_dacls) {
+-			cf_pdace = fattr->cf_dacls->a_entries;
+-			posix_state_to_acl(&default_acl_state, cf_pdace);
++
++		if (IS_ENABLED(CONFIG_FS_POSIX_ACL)) {
++			fattr->cf_dacls =
++				posix_acl_alloc(default_acl_state.users->n +
++				default_acl_state.groups->n + 4, GFP_KERNEL);
++			if (fattr->cf_dacls) {
++				cf_pdace = fattr->cf_dacls->a_entries;
++				posix_state_to_acl(&default_acl_state, cf_pdace);
++			}
+ 		}
+ 	}
+ 	free_acl_state(&acl_state);
+@@ -724,7 +731,6 @@ static void set_mode_dacl(struct user_namespace *user_ns,
+ 	ace_size = fill_ace_for_sid(pace, sid, ACCESS_ALLOWED, 0,
+ 				    fattr->cf_mode, 0700);
+ 	pace->sid.sub_auth[pace->sid.num_subauth++] = cpu_to_le32(uid);
+-	pace->access_req |= FILE_DELETE_LE | FILE_DELETE_CHILD_LE;
+ 	pace->size = cpu_to_le16(ace_size + 4);
+ 	size += le16_to_cpu(pace->size);
+ 	pace = (struct smb_ace *)((char *)pndace + size);
+@@ -745,7 +751,6 @@ static void set_mode_dacl(struct user_namespace *user_ns,
+ 		/* creator owner */
+ 		size += fill_ace_for_sid(pace, &creator_owner, ACCESS_ALLOWED,
+ 					 0x0b, fattr->cf_mode, 0700);
+-		pace->access_req |= FILE_DELETE_LE | FILE_DELETE_CHILD_LE;
+ 		pace = (struct smb_ace *)((char *)pndace + size);
+ 
+ 		/* creator group */
+@@ -1221,31 +1226,36 @@ int smb_check_perm_dacl(struct ksmbd_conn *conn, struct path *path,
+ 			granted = GENERIC_ALL_FLAGS;
+ 	}
+ 
+-	posix_acls = get_acl(d_inode(path->dentry), ACL_TYPE_ACCESS);
+-	if (posix_acls && !found) {
+-		unsigned int id = -1;
+-
+-		pa_entry = posix_acls->a_entries;
+-		for (i = 0; i < posix_acls->a_count; i++, pa_entry++) {
+-			if (pa_entry->e_tag == ACL_USER)
+-				id = from_kuid(user_ns,
+-					       pa_entry->e_uid);
+-			else if (pa_entry->e_tag == ACL_GROUP)
+-				id = from_kgid(user_ns,
+-					       pa_entry->e_gid);
+-			else
+-				continue;
+-
+-			if (id == uid) {
+-				mode_to_access_flags(pa_entry->e_perm, 0777, &access_bits);
+-				if (!access_bits)
+-					access_bits = SET_MINIMUM_RIGHTS;
+-				goto check_access_bits;
++	if (IS_ENABLED(CONFIG_FS_POSIX_ACL)) {
++		posix_acls = get_acl(d_inode(path->dentry), ACL_TYPE_ACCESS);
++		if (posix_acls && !found) {
++			unsigned int id = -1;
++
++			pa_entry = posix_acls->a_entries;
++			for (i = 0; i < posix_acls->a_count; i++, pa_entry++) {
++				if (pa_entry->e_tag == ACL_USER)
++					id = from_kuid(user_ns,
++						       pa_entry->e_uid);
++				else if (pa_entry->e_tag == ACL_GROUP)
++					id = from_kgid(user_ns,
++						       pa_entry->e_gid);
++				else
++					continue;
++
++				if (id == uid) {
++					mode_to_access_flags(pa_entry->e_perm,
++							     0777,
++							     &access_bits);
++					if (!access_bits)
++						access_bits =
++							SET_MINIMUM_RIGHTS;
++					goto check_access_bits;
++				}
+ 			}
+ 		}
++		if (posix_acls)
++			posix_acl_release(posix_acls);
+ 	}
+-	if (posix_acls)
+-		posix_acl_release(posix_acls);
+ 
+ 	if (!found) {
+ 		if (others_ace) {
+@@ -1290,6 +1300,7 @@ int set_info_sec(struct ksmbd_conn *conn, struct ksmbd_tree_connect *tcon,
+ 	struct smb_fattr fattr = {{0}};
+ 	struct inode *inode = d_inode(path->dentry);
+ 	struct user_namespace *user_ns = mnt_user_ns(path->mnt);
++	struct iattr newattrs;
+ 
+ 	fattr.cf_uid = INVALID_UID;
+ 	fattr.cf_gid = INVALID_GID;
+@@ -1299,16 +1310,27 @@ int set_info_sec(struct ksmbd_conn *conn, struct ksmbd_tree_connect *tcon,
+ 	if (rc)
+ 		goto out;
+ 
+-	inode->i_mode = (inode->i_mode & ~0777) | (fattr.cf_mode & 0777);
+-	if (!uid_eq(fattr.cf_uid, INVALID_UID))
+-		inode->i_uid = fattr.cf_uid;
+-	if (!gid_eq(fattr.cf_gid, INVALID_GID))
+-		inode->i_gid = fattr.cf_gid;
+-	mark_inode_dirty(inode);
++	newattrs.ia_valid = ATTR_CTIME;
++	if (!uid_eq(fattr.cf_uid, INVALID_UID)) {
++		newattrs.ia_valid |= ATTR_UID;
++		newattrs.ia_uid = fattr.cf_uid;
++	}
++	if (!gid_eq(fattr.cf_gid, INVALID_GID)) {
++		newattrs.ia_valid |= ATTR_GID;
++		newattrs.ia_gid = fattr.cf_gid;
++	}
++	newattrs.ia_valid |= ATTR_MODE;
++	newattrs.ia_mode = (inode->i_mode & ~0777) | (fattr.cf_mode & 0777);
++
++	inode_lock(inode);
++	rc = notify_change(user_ns, path->dentry, &newattrs, NULL);
++	inode_unlock(inode);
++	if (rc)
++		goto out;
+ 
+ 	ksmbd_vfs_remove_acl_xattrs(user_ns, path->dentry);
+ 	/* Update posix acls */
+-	if (fattr.cf_dacls) {
++	if (IS_ENABLED(CONFIG_FS_POSIX_ACL) && fattr.cf_dacls) {
+ 		rc = set_posix_acl(user_ns, inode,
+ 				   ACL_TYPE_ACCESS, fattr.cf_acls);
+ 		if (S_ISDIR(inode->i_mode) && fattr.cf_dacls)
+diff --git a/fs/ksmbd/transport_rdma.c b/fs/ksmbd/transport_rdma.c
+index f2ae6bae8..58f530056 100644
+--- a/fs/ksmbd/transport_rdma.c
++++ b/fs/ksmbd/transport_rdma.c
+@@ -329,7 +329,8 @@ static void smb_direct_disconnect_rdma_work(struct work_struct *work)
+ static void
+ smb_direct_disconnect_rdma_connection(struct smb_direct_transport *t)
+ {
+-	queue_work(smb_direct_wq, &t->disconnect_work);
++	if (t->status == SMB_DIRECT_CS_CONNECTED)
++		queue_work(smb_direct_wq, &t->disconnect_work);
+ }
+ 
+ static void smb_direct_send_immediate_work(struct work_struct *work)
+@@ -1415,7 +1416,7 @@ static void smb_direct_disconnect(struct ksmbd_transport *t)
+ 
+ 	ksmbd_debug(RDMA, "Disconnecting cm_id=%p\n", st->cm_id);
+ 
+-	smb_direct_disconnect_rdma_connection(st);
++	smb_direct_disconnect_rdma_work(&st->disconnect_work);
+ 	wait_event_interruptible(st->wait_status,
+ 				 st->status == SMB_DIRECT_CS_DISCONNECTED);
+ 	free_transport(st);
+diff --git a/fs/ksmbd/vfs.c b/fs/ksmbd/vfs.c
+index 612c52d7a..aee28ee6b 100644
+--- a/fs/ksmbd/vfs.c
++++ b/fs/ksmbd/vfs.c
+@@ -1365,6 +1365,9 @@ static struct xattr_smb_acl *ksmbd_vfs_make_xattr_posix_acl(struct user_namespac
+ 	struct xattr_acl_entry *xa_entry;
+ 	int i;
+ 
++	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL))
++		return NULL;
++
+ 	posix_acls = get_acl(inode, acl_type);
+ 	if (!posix_acls)
+ 		return NULL;
+@@ -1811,6 +1814,9 @@ int ksmbd_vfs_set_init_posix_acl(struct user_namespace *user_ns,
+ 	struct posix_acl *acls;
+ 	int rc;
+ 
++	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL))
++		return -EOPNOTSUPP;
++
+ 	ksmbd_debug(SMB, "Set posix acls\n");
+ 	rc = init_acl_state(&acl_state, 1);
+ 	if (rc)
+@@ -1858,6 +1864,9 @@ int ksmbd_vfs_inherit_posix_acl(struct user_namespace *user_ns,
+ 	struct posix_acl_entry *pace;
+ 	int rc, i;
+ 
++	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL))
++		return -EOPNOTSUPP;
++
+ 	acls = get_acl(parent_inode, ACL_TYPE_DEFAULT);
+ 	if (!acls)
+ 		return -ENOENT;
+-- 
+2.33.0
+
