@@ -4,6 +4,10 @@
 
 #### Patches for [github/linux-lucjan](https://github.com/sirlucjan/linux-lucjan) / [gitlab/linux-lucjan](https://gitlab.com/sirlucjan/linux-lucjan)
 
+###### Patches developed and offered only for the last, stable line (not EOL and not LTS). 
+###### Active support is offered only for this kernel line. 
+###### Any others are not supported anymore, but you can find patchsets for previous versions of kernel.
+
 Here are patches reformatted (with `git format-patch` and/or `git diff`) and rebased from: 
 
 - [Algodev-github/bfq-mq](https://github.com/Algodev-github/bfq-mq)
