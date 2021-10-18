@@ -1,0 +1,169 @@
+From 03cac3a9fc21dd912669e9eb79b92bf46386b853 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Wed, 13 Oct 2021 14:00:35 -0600
+Subject: [PATCH 6/6] block: remove plug based merging
+
+It's expensive to browse the whole plug list for merge opportunities at
+the IOPS rates that modern storage can do. For sequential IO, the one-hit
+cached merge should suffice on fast drives, and for rotational storage the
+IO scheduler will do a more exhaustive lookup based merge anyway.
+
+Just remove the plug based O(N) traversal merging.
+
+With that, there's really no difference between the two plug cases that
+we have. Unify them.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/blk-merge.c | 56 -----------------------------------------------
+ block/blk-mq.c    | 32 +--------------------------
+ block/blk.h       |  2 --
+ 3 files changed, 1 insertion(+), 89 deletions(-)
+
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 4d73dbe..a3c5fe9 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -1018,62 +1018,6 @@ static enum bio_merge_status blk_attempt_bio_merge(struct request_queue *q,
+ 	return BIO_MERGE_FAILED;
+ }
+ 
+-/**
+- * blk_attempt_plug_merge - try to merge with %current's plugged list
+- * @q: request_queue new bio is being queued at
+- * @bio: new bio being queued
+- * @nr_segs: number of segments in @bio
+- * @same_queue_rq: pointer to &struct request that gets filled in when
+- * another request associated with @q is found on the plug list
+- * (optional, may be %NULL)
+- *
+- * Determine whether @bio being queued on @q can be merged with a request
+- * on %current's plugged list.  Returns %true if merge was successful,
+- * otherwise %false.
+- *
+- * Plugging coalesces IOs from the same issuer for the same purpose without
+- * going through @q->queue_lock.  As such it's more of an issuing mechanism
+- * than scheduling, and the request, while may have elvpriv data, is not
+- * added on the elevator at this point.  In addition, we don't have
+- * reliable access to the elevator outside queue lock.  Only check basic
+- * merging parameters without querying the elevator.
+- *
+- * Caller must ensure !blk_queue_nomerges(q) beforehand.
+- */
+-bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+-		unsigned int nr_segs, struct request **same_queue_rq)
+-{
+-	struct blk_plug *plug;
+-	struct request *rq;
+-	struct list_head *plug_list;
+-
+-	plug = blk_mq_plug(q, bio);
+-	if (!plug)
+-		return false;
+-
+-	plug_list = &plug->mq_list;
+-
+-	list_for_each_entry_reverse(rq, plug_list, queuelist) {
+-		if (rq->q == q && same_queue_rq) {
+-			/*
+-			 * Only blk-mq multiple hardware queues case checks the
+-			 * rq in the same queue, there should be only one such
+-			 * rq in a queue
+-			 **/
+-			*same_queue_rq = rq;
+-		}
+-
+-		if (rq->q != q)
+-			continue;
+-
+-		if (blk_attempt_bio_merge(q, rq, bio, nr_segs, false) ==
+-		    BIO_MERGE_OK)
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+ /*
+  * Iterate list of requests and see if we can merge this bio with any
+  * of them.
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 077d4c2..e3ef8e8 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2172,7 +2172,6 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
+ 	};
+ 	struct request *rq;
+ 	struct blk_plug *plug;
+-	struct request *same_queue_rq = NULL;
+ 	unsigned int nr_segs;
+ 	blk_qc_t cookie;
+ 	blk_status_t ret;
+@@ -2184,10 +2183,6 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
+ 	if (!bio_integrity_prep(bio))
+ 		goto queue_exit;
+ 
+-	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+-	    blk_attempt_plug_merge(q, bio, nr_segs, &same_queue_rq))
+-		goto queue_exit;
+-
+ 	if (blk_mq_sched_bio_merge(q, bio, nr_segs))
+ 		goto queue_exit;
+ 
+@@ -2225,9 +2220,7 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
+ 		/* Bypass scheduler for flush requests */
+ 		blk_insert_flush(rq);
+ 		blk_mq_run_hw_queue(data.hctx, true);
+-	} else if (plug && (q->nr_hw_queues == 1 ||
+-		   blk_mq_is_sbitmap_shared(rq->mq_hctx->flags) ||
+-		   q->mq_ops->commit_rqs || !blk_queue_nonrot(q))) {
++	} else if (plug) {
+ 		/*
+ 		 * Use plugging if we have a ->commit_rqs() hook as well, as
+ 		 * we know the driver uses bd->last in a smart fashion.
+@@ -2253,29 +2246,6 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
+ 	} else if (q->elevator) {
+ 		/* Insert the request at the IO scheduler queue */
+ 		blk_mq_sched_insert_request(rq, false, true, true);
+-	} else if (plug && !blk_queue_nomerges(q)) {
+-		/*
+-		 * We do limited plugging. If the bio can be merged, do that.
+-		 * Otherwise the existing request in the plug list will be
+-		 * issued. So the plug list will have one request at most
+-		 * The plug list might get flushed before this. If that happens,
+-		 * the plug list is empty, and same_queue_rq is invalid.
+-		 */
+-		if (list_empty(&plug->mq_list))
+-			same_queue_rq = NULL;
+-		if (same_queue_rq) {
+-			list_del_init(&same_queue_rq->queuelist);
+-			plug->rq_count--;
+-		}
+-		blk_add_rq_to_plug(plug, rq);
+-		trace_block_plug(q);
+-
+-		if (same_queue_rq) {
+-			data.hctx = same_queue_rq->mq_hctx;
+-			trace_block_unplug(q, 1, true);
+-			blk_mq_try_issue_directly(data.hctx, same_queue_rq,
+-					&cookie);
+-		}
+ 	} else if ((q->nr_hw_queues > 1 && is_sync) ||
+ 			!data.hctx->dispatch_busy) {
+ 		/*
+diff --git a/block/blk.h b/block/blk.h
+index 21cfd59..84e8b8d 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -173,8 +173,6 @@ static inline void blk_integrity_del(struct gendisk *disk)
+ unsigned long blk_rq_timeout(unsigned long timeout);
+ void blk_add_timer(struct request *req);
+ 
+-bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+-		unsigned int nr_segs, struct request **same_queue_rq);
+ bool blk_bio_list_merge(struct request_queue *q, struct list_head *list,
+ 			struct bio *bio, unsigned int nr_segs);
+ 
+-- 
+2.33.0.610.gcefe983a32
+
