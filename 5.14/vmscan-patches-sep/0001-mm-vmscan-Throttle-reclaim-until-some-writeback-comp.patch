@@ -1,0 +1,421 @@
+From 34f0c32ad0f85df26e045cca52ca11b40cae57ed Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@techsingularity.net>
+Date: Fri, 22 Oct 2021 15:46:44 +0100
+Subject: [PATCH 1/8] mm/vmscan: Throttle reclaim until some writeback
+ completes if congested
+
+Page reclaim throttles on wait_iff_congested under the following conditions
+
+o kswapd is encountering pages under writeback and marked for immediate
+  reclaim implying that pages are cycling through the LRU faster than
+  pages can be cleaned.
+
+o Direct reclaim will stall if all dirty pages are backed by congested
+  inodes.
+
+wait_iff_congested is almost completely broken with few exceptions. This
+patch adds a new node-based workqueue and tracks the number of throttled
+tasks and pages written back since throttling started. If enough pages
+belonging to the node are written back then the throttled tasks will wake
+early. If not, the throttled tasks sleeps until the timeout expires.
+
+[neilb@suse.de: Uninterruptible sleep and simpler wakeups]
+[hdanton@sina.com: Avoid race when reclaim starts]
+[vbabka@suse.cz: vmstat irq-safe api, clarifications]
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ include/linux/backing-dev.h      |  1 -
+ include/linux/mmzone.h           | 13 +++++
+ include/trace/events/vmscan.h    | 34 +++++++++++++
+ include/trace/events/writeback.h |  7 ---
+ mm/backing-dev.c                 | 48 -------------------
+ mm/filemap.c                     |  1 +
+ mm/internal.h                    | 11 +++++
+ mm/page_alloc.c                  |  5 ++
+ mm/vmscan.c                      | 82 +++++++++++++++++++++++++++-----
+ mm/vmstat.c                      |  1 +
+ 10 files changed, 135 insertions(+), 68 deletions(-)
+
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index 44df4fcef..3ee968904 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -154,7 +154,6 @@ static inline int wb_congested(struct bdi_writeback *wb, int cong_bits)
+ }
+ 
+ long congestion_wait(int sync, long timeout);
+-long wait_iff_congested(int sync, long timeout);
+ 
+ static inline bool mapping_can_writeback(struct address_space *mapping)
+ {
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index fcb535560..c17d32917 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -199,6 +199,7 @@ enum node_stat_item {
+ 	NR_VMSCAN_IMMEDIATE,	/* Prioritise for reclaim when writeback ends */
+ 	NR_DIRTIED,		/* page dirtyings since bootup */
+ 	NR_WRITTEN,		/* page writings since bootup */
++	NR_THROTTLED_WRITTEN,	/* NR_WRITTEN while reclaim throttled */
+ 	NR_KERNEL_MISC_RECLAIMABLE,	/* reclaimable non-slab kernel pages */
+ 	NR_FOLL_PIN_ACQUIRED,	/* via: pin_user_page(), gup flag: FOLL_PIN */
+ 	NR_FOLL_PIN_RELEASED,	/* pages returned via unpin_user_page() */
+@@ -272,6 +273,11 @@ enum lru_list {
+ 	NR_LRU_LISTS
+ };
+ 
++enum vmscan_throttle_state {
++	VMSCAN_THROTTLE_WRITEBACK,
++	NR_VMSCAN_THROTTLE,
++};
++
+ #define for_each_lru(lru) for (lru = 0; lru < NR_LRU_LISTS; lru++)
+ 
+ #define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_ACTIVE_FILE; lru++)
+@@ -834,6 +840,13 @@ typedef struct pglist_data {
+ 	int node_id;
+ 	wait_queue_head_t kswapd_wait;
+ 	wait_queue_head_t pfmemalloc_wait;
++
++	/* workqueues for throttling reclaim for different reasons. */
++	wait_queue_head_t reclaim_wait[NR_VMSCAN_THROTTLE];
++
++	atomic_t nr_writeback_throttled;/* nr of writeback-throttled tasks */
++	unsigned long nr_reclaim_start;	/* nr pages written while throttled
++					 * when throttling started. */
+ 	struct task_struct *kswapd;	/* Protected by
+ 					   mem_hotplug_begin/end() */
+ 	int kswapd_order;
+diff --git a/include/trace/events/vmscan.h b/include/trace/events/vmscan.h
+index 88faf2400..c317f9fe0 100644
+--- a/include/trace/events/vmscan.h
++++ b/include/trace/events/vmscan.h
+@@ -27,6 +27,14 @@
+ 		{RECLAIM_WB_ASYNC,	"RECLAIM_WB_ASYNC"}	\
+ 		) : "RECLAIM_WB_NONE"
+ 
++#define _VMSCAN_THROTTLE_WRITEBACK	(1 << VMSCAN_THROTTLE_WRITEBACK)
++
++#define show_throttle_flags(flags)						\
++	(flags) ? __print_flags(flags, "|",					\
++		{_VMSCAN_THROTTLE_WRITEBACK,	"VMSCAN_THROTTLE_WRITEBACK"}	\
++		) : "VMSCAN_THROTTLE_NONE"
++
++
+ #define trace_reclaim_flags(file) ( \
+ 	(file ? RECLAIM_WB_FILE : RECLAIM_WB_ANON) | \
+ 	(RECLAIM_WB_ASYNC) \
+@@ -454,6 +462,32 @@ DEFINE_EVENT(mm_vmscan_direct_reclaim_end_template, mm_vmscan_node_reclaim_end,
+ 	TP_ARGS(nr_reclaimed)
+ );
+ 
++TRACE_EVENT(mm_vmscan_throttled,
++
++	TP_PROTO(int nid, int usec_timeout, int usec_delayed, int reason),
++
++	TP_ARGS(nid, usec_timeout, usec_delayed, reason),
++
++	TP_STRUCT__entry(
++		__field(int, nid)
++		__field(int, usec_timeout)
++		__field(int, usec_delayed)
++		__field(int, reason)
++	),
++
++	TP_fast_assign(
++		__entry->nid = nid;
++		__entry->usec_timeout = usec_timeout;
++		__entry->usec_delayed = usec_delayed;
++		__entry->reason = 1U << reason;
++	),
++
++	TP_printk("nid=%d usec_timeout=%d usect_delayed=%d reason=%s",
++		__entry->nid,
++		__entry->usec_timeout,
++		__entry->usec_delayed,
++		show_throttle_flags(__entry->reason))
++);
+ #endif /* _TRACE_VMSCAN_H */
+ 
+ /* This part must be outside protection */
+diff --git a/include/trace/events/writeback.h b/include/trace/events/writeback.h
+index 840d1ba84..3bc759b81 100644
+--- a/include/trace/events/writeback.h
++++ b/include/trace/events/writeback.h
+@@ -763,13 +763,6 @@ DEFINE_EVENT(writeback_congest_waited_template, writeback_congestion_wait,
+ 	TP_ARGS(usec_timeout, usec_delayed)
+ );
+ 
+-DEFINE_EVENT(writeback_congest_waited_template, writeback_wait_iff_congested,
+-
+-	TP_PROTO(unsigned int usec_timeout, unsigned int usec_delayed),
+-
+-	TP_ARGS(usec_timeout, usec_delayed)
+-);
+-
+ DECLARE_EVENT_CLASS(writeback_single_inode_template,
+ 
+ 	TP_PROTO(struct inode *inode,
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index f5561ea7d..d08bcfad0 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -1027,51 +1027,3 @@ long congestion_wait(int sync, long timeout)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(congestion_wait);
+-
+-/**
+- * wait_iff_congested - Conditionally wait for a backing_dev to become uncongested or a pgdat to complete writes
+- * @sync: SYNC or ASYNC IO
+- * @timeout: timeout in jiffies
+- *
+- * In the event of a congested backing_dev (any backing_dev) this waits
+- * for up to @timeout jiffies for either a BDI to exit congestion of the
+- * given @sync queue or a write to complete.
+- *
+- * The return value is 0 if the sleep is for the full timeout. Otherwise,
+- * it is the number of jiffies that were still remaining when the function
+- * returned. return_value == timeout implies the function did not sleep.
+- */
+-long wait_iff_congested(int sync, long timeout)
+-{
+-	long ret;
+-	unsigned long start = jiffies;
+-	DEFINE_WAIT(wait);
+-	wait_queue_head_t *wqh = &congestion_wqh[sync];
+-
+-	/*
+-	 * If there is no congestion, yield if necessary instead
+-	 * of sleeping on the congestion queue
+-	 */
+-	if (atomic_read(&nr_wb_congested[sync]) == 0) {
+-		cond_resched();
+-
+-		/* In case we scheduled, work out time remaining */
+-		ret = timeout - (jiffies - start);
+-		if (ret < 0)
+-			ret = 0;
+-
+-		goto out;
+-	}
+-
+-	/* Sleep until uncongested or a write happens */
+-	prepare_to_wait(wqh, &wait, TASK_UNINTERRUPTIBLE);
+-	ret = io_schedule_timeout(timeout);
+-	finish_wait(wqh, &wait);
+-
+-out:
+-	trace_writeback_wait_iff_congested(jiffies_to_usecs(timeout),
+-					jiffies_to_usecs(jiffies - start));
+-
+-	return ret;
+-}
+-EXPORT_SYMBOL(wait_iff_congested);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index d1458ecf2..a8ff9dbb8 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1550,6 +1550,7 @@ void end_page_writeback(struct page *page)
+ 
+ 	smp_mb__after_atomic();
+ 	wake_up_page(page, PG_writeback);
++	acct_reclaim_writeback(page);
+ 	put_page(page);
+ }
+ EXPORT_SYMBOL(end_page_writeback);
+diff --git a/mm/internal.h b/mm/internal.h
+index 31ff935b2..b9205ae64 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -34,6 +34,17 @@
+ 
+ void page_writeback_init(void);
+ 
++void __acct_reclaim_writeback(pg_data_t *pgdat, struct page *page,
++						int nr_throttled);
++static inline void acct_reclaim_writeback(struct page *page)
++{
++	pg_data_t *pgdat = page_pgdat(page);
++	int nr_throttled = atomic_read(&pgdat->nr_writeback_throttled);
++
++	if (nr_throttled)
++		__acct_reclaim_writeback(pgdat, page, nr_throttled);
++}
++
+ vm_fault_t do_swap_page(struct vm_fault *vmf);
+ 
+ void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 7a28f7db7..84b883d35 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7389,6 +7389,8 @@ static void pgdat_init_kcompactd(struct pglist_data *pgdat) {}
+ 
+ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
+ {
++	int i;
++
+ 	pgdat_resize_init(pgdat);
+ 
+ 	pgdat_init_split_queue(pgdat);
+@@ -7397,6 +7399,9 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
+ 	init_waitqueue_head(&pgdat->kswapd_wait);
+ 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
+ 
++	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
++		init_waitqueue_head(&pgdat->reclaim_wait[i]);
++
+ 	pgdat_page_ext_init(pgdat);
+ 	lruvec_init(&pgdat->__lruvec);
+ }
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index f1782b816..c211909cd 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -959,6 +959,64 @@ static void handle_write_error(struct address_space *mapping,
+ 	unlock_page(page);
+ }
+ 
++static void
++reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason,
++							long timeout)
++{
++	wait_queue_head_t *wqh = &pgdat->reclaim_wait[reason];
++	long ret;
++	DEFINE_WAIT(wait);
++
++	/*
++	 * Do not throttle IO workers, kthreads other than kswapd or
++	 * workqueues. They may be required for reclaim to make
++	 * forward progress (e.g. journalling workqueues or kthreads).
++	 */
++	if (!current_is_kswapd() &&
++	    current->flags & (PF_IO_WORKER|PF_KTHREAD))
++		return;
++
++	if (atomic_inc_return(&pgdat->nr_writeback_throttled) == 1) {
++		WRITE_ONCE(pgdat->nr_reclaim_start,
++			node_page_state(pgdat, NR_THROTTLED_WRITTEN));
++	}
++
++	prepare_to_wait(wqh, &wait, TASK_UNINTERRUPTIBLE);
++	ret = schedule_timeout(timeout);
++	finish_wait(wqh, &wait);
++	atomic_dec(&pgdat->nr_writeback_throttled);
++
++	trace_mm_vmscan_throttled(pgdat->node_id, jiffies_to_usecs(timeout),
++				jiffies_to_usecs(timeout - ret),
++				reason);
++}
++
++/*
++ * Account for pages written if tasks are throttled waiting on dirty
++ * pages to clean. If enough pages have been cleaned since throttling
++ * started then wakeup the throttled tasks.
++ */
++void __acct_reclaim_writeback(pg_data_t *pgdat, struct page *page,
++							int nr_throttled)
++{
++	unsigned long nr_written;
++
++	inc_node_page_state(page, NR_THROTTLED_WRITTEN);
++
++	/*
++	 * This is an inaccurate read as the per-cpu deltas may not
++	 * be synchronised. However, given that the system is
++	 * writeback throttled, it is not worth taking the penalty
++	 * of getting an accurate count. At worst, the throttle
++	 * timeout guarantees forward progress.
++	 */
++	nr_written = node_page_state(pgdat, NR_THROTTLED_WRITTEN) -
++		READ_ONCE(pgdat->nr_reclaim_start);
++
++	if (nr_written > SWAP_CLUSTER_MAX * nr_throttled)
++		wake_up(&pgdat->reclaim_wait[VMSCAN_THROTTLE_WRITEBACK]);
++}
++
+ /* possible outcome of pageout() */
+ typedef enum {
+ 	/* failed to write page out, page is locked */
+@@ -1314,9 +1372,8 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 
+ 		/*
+ 		 * The number of dirty pages determines if a node is marked
+-		 * reclaim_congested which affects wait_iff_congested. kswapd
+-		 * will stall and start writing pages if the tail of the LRU
+-		 * is all dirty unqueued pages.
++		 * reclaim_congested. kswapd will stall and start writing
++		 * pages if the tail of the LRU is all dirty unqueued pages.
+ 		 */
+ 		page_check_dirty_writeback(page, &dirty, &writeback);
+ 		if (dirty || writeback)
+@@ -3035,19 +3092,19 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 		 * If kswapd scans pages marked for immediate
+ 		 * reclaim and under writeback (nr_immediate), it
+ 		 * implies that pages are cycling through the LRU
+-		 * faster than they are written so also forcibly stall.
++		 * faster than they are written so forcibly stall
++		 * until some pages complete writeback.
+ 		 */
+ 		if (sc->nr.immediate)
+-			congestion_wait(BLK_RW_ASYNC, HZ/10);
++			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK, HZ/10);
+ 	}
+ 
+ 	/*
+-	 * Tag a node/memcg as congested if all the dirty pages
+-	 * scanned were backed by a congested BDI and
+-	 * wait_iff_congested will stall.
++	 * Tag a node/memcg as congested if all the dirty pages were marked
++	 * for writeback and immediate reclaim (counted in nr.congested).
+ 	 *
+ 	 * Legacy memcg will stall in page writeback so avoid forcibly
+-	 * stalling in wait_iff_congested().
++	 * stalling in reclaim_throttle().
+ 	 */
+ 	if ((current_is_kswapd() ||
+ 	     (cgroup_reclaim(sc) && writeback_throttling_sane(sc))) &&
+@@ -3055,15 +3112,15 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 		set_bit(LRUVEC_CONGESTED, &target_lruvec->flags);
+ 
+ 	/*
+-	 * Stall direct reclaim for IO completions if underlying BDIs
+-	 * and node is congested. Allow kswapd to continue until it
++	 * Stall direct reclaim for IO completions if the lruvec is
++	 * node is congested. Allow kswapd to continue until it
+ 	 * starts encountering unqueued dirty pages or cycling through
+ 	 * the LRU too quickly.
+ 	 */
+ 	if (!current_is_kswapd() && current_may_throttle() &&
+ 	    !sc->hibernation_mode &&
+ 	    test_bit(LRUVEC_CONGESTED, &target_lruvec->flags))
+-		wait_iff_congested(BLK_RW_ASYNC, HZ/10);
++		reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK, HZ/10);
+ 
+ 	if (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
+ 				    sc))
+@@ -4145,6 +4202,7 @@ static int kswapd(void *p)
+ 
+ 	WRITE_ONCE(pgdat->kswapd_order, 0);
+ 	WRITE_ONCE(pgdat->kswapd_highest_zoneidx, MAX_NR_ZONES);
++	atomic_set(&pgdat->nr_writeback_throttled, 0);
+ 	for ( ; ; ) {
+ 		bool ret;
+ 
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index b0534e068..b47803b3e 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1177,6 +1177,7 @@ const char * const vmstat_text[] = {
+ 	"nr_vmscan_immediate_reclaim",
+ 	"nr_dirtied",
+ 	"nr_written",
++	"nr_throttled_written",
+ 	"nr_kernel_misc_reclaimable",
+ 	"nr_foll_pin_acquired",
+ 	"nr_foll_pin_released",
+-- 
+2.33.1.711.g9d530dc002
+
