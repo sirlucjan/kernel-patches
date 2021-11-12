@@ -1,0 +1,187 @@
+From 118c0903cfe4d46e7661950498cd49089387cc1a Mon Sep 17 00:00:00 2001
+From: SeongJae Park <sj@kernel.org>
+Date: Fri, 5 Nov 2021 13:47:23 -0700
+Subject: [PATCH 21/33] mm/damon/schemes: implement time quota
+
+The size quota feature of DAMOS is useful for IO resource-critical
+systems, but not so intuitive for CPU time-critical systems.  Systems
+using zram or zswap-like swap device would be examples.
+
+To provide another intuitive ways for such systems, this implements
+time-based quota for DAMON-based Operation Schemes.  If the quota is
+set, DAMOS tries to use only up to the user-defined quota of CPU time
+within a given time window.
+
+Link: https://lkml.kernel.org/r/20211019150731.16699-5-sj@kernel.org
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Cc: Amit Shah <amit@kernel.org>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: David Woodhouse <dwmw@amazon.com>
+Cc: Greg Thelen <gthelen@google.com>
+Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Leonard Foerster <foersleo@amazon.de>
+Cc: Marco Elver <elver@google.com>
+Cc: Markus Boehme <markubo@amazon.de>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ include/linux/damon.h | 25 +++++++++++++++++++-----
+ mm/damon/core.c       | 45 ++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 60 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/damon.h b/include/linux/damon.h
+index a4d71c77b..8c1ce16fb 100644
+--- a/include/linux/damon.h
++++ b/include/linux/damon.h
+@@ -91,20 +91,35 @@ enum damos_action {
+ 
+ /**
+  * struct damos_quota - Controls the aggressiveness of the given scheme.
++ * @ms:			Maximum milliseconds that the scheme can use.
+  * @sz:			Maximum bytes of memory that the action can be applied.
+  * @reset_interval:	Charge reset interval in milliseconds.
+  *
+  * To avoid consuming too much CPU time or IO resources for applying the
+- * &struct damos->action to large memory, DAMON allows users to set a size
+- * quota.  The quota can be set by writing non-zero values to &sz.  If the size
+- * quota is set, DAMON tries to apply the action only up to &sz bytes within
+- * &reset_interval.
++ * &struct damos->action to large memory, DAMON allows users to set time and/or
++ * size quotas.  The quotas can be set by writing non-zero values to &ms and
++ * &sz, respectively.  If the time quota is set, DAMON tries to use only up to
++ * &ms milliseconds within &reset_interval for applying the action.  If the
++ * size quota is set, DAMON tries to apply the action only up to &sz bytes
++ * within &reset_interval.
++ *
++ * Internally, the time quota is transformed to a size quota using estimated
++ * throughput of the scheme's action.  DAMON then compares it against &sz and
++ * uses smaller one as the effective quota.
+  */
+ struct damos_quota {
++	unsigned long ms;
+ 	unsigned long sz;
+ 	unsigned long reset_interval;
+ 
+-/* private: For charging the quota */
++/* private: */
++	/* For throughput estimation */
++	unsigned long total_charged_sz;
++	unsigned long total_charged_ns;
++
++	unsigned long esz;	/* Effective size quota in bytes */
++
++	/* For charging the quota */
+ 	unsigned long charged_sz;
+ 	unsigned long charged_from;
+ 	struct damon_target *charge_target_from;
+diff --git a/mm/damon/core.c b/mm/damon/core.c
+index 693b75bc3..d1da4bef9 100644
+--- a/mm/damon/core.c
++++ b/mm/damon/core.c
+@@ -107,8 +107,12 @@ struct damos *damon_new_scheme(
+ 	scheme->stat_sz = 0;
+ 	INIT_LIST_HEAD(&scheme->list);
+ 
++	scheme->quota.ms = quota->ms;
+ 	scheme->quota.sz = quota->sz;
+ 	scheme->quota.reset_interval = quota->reset_interval;
++	scheme->quota.total_charged_sz = 0;
++	scheme->quota.total_charged_ns = 0;
++	scheme->quota.esz = 0;
+ 	scheme->quota.charged_sz = 0;
+ 	scheme->quota.charged_from = 0;
+ 	scheme->quota.charge_target_from = NULL;
+@@ -550,9 +554,10 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
+ 	damon_for_each_scheme(s, c) {
+ 		struct damos_quota *quota = &s->quota;
+ 		unsigned long sz = r->ar.end - r->ar.start;
++		struct timespec64 begin, end;
+ 
+ 		/* Check the quota */
+-		if (quota->sz && quota->charged_sz >= quota->sz)
++		if (quota->esz && quota->charged_sz >= quota->esz)
+ 			continue;
+ 
+ 		/* Skip previously charged regions */
+@@ -597,16 +602,21 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
+ 
+ 		/* Apply the scheme */
+ 		if (c->primitive.apply_scheme) {
+-			if (quota->sz && quota->charged_sz + sz > quota->sz) {
+-				sz = ALIGN_DOWN(quota->sz - quota->charged_sz,
++			if (quota->esz &&
++					quota->charged_sz + sz > quota->esz) {
++				sz = ALIGN_DOWN(quota->esz - quota->charged_sz,
+ 						DAMON_MIN_REGION);
+ 				if (!sz)
+ 					goto update_stat;
+ 				damon_split_region_at(c, t, r, sz);
+ 			}
++			ktime_get_coarse_ts64(&begin);
+ 			c->primitive.apply_scheme(c, t, r, s);
++			ktime_get_coarse_ts64(&end);
++			quota->total_charged_ns += timespec64_to_ns(&end) -
++				timespec64_to_ns(&begin);
+ 			quota->charged_sz += sz;
+-			if (quota->sz && quota->charged_sz >= quota->sz) {
++			if (quota->esz && quota->charged_sz >= quota->esz) {
+ 				quota->charge_target_from = t;
+ 				quota->charge_addr_from = r->ar.end + 1;
+ 			}
+@@ -620,6 +630,29 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
+ 	}
+ }
+ 
++/* Shouldn't be called if quota->ms and quota->sz are zero */
++static void damos_set_effective_quota(struct damos_quota *quota)
++{
++	unsigned long throughput;
++	unsigned long esz;
++
++	if (!quota->ms) {
++		quota->esz = quota->sz;
++		return;
++	}
++
++	if (quota->total_charged_ns)
++		throughput = quota->total_charged_sz * 1000000 /
++			quota->total_charged_ns;
++	else
++		throughput = PAGE_SIZE * 1024;
++	esz = throughput * quota->ms;
++
++	if (quota->sz && quota->sz < esz)
++		esz = quota->sz;
++	quota->esz = esz;
++}
++
+ static void kdamond_apply_schemes(struct damon_ctx *c)
+ {
+ 	struct damon_target *t;
+@@ -629,15 +662,17 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
+ 	damon_for_each_scheme(s, c) {
+ 		struct damos_quota *quota = &s->quota;
+ 
+-		if (!quota->sz)
++		if (!quota->ms && !quota->sz)
+ 			continue;
+ 
+ 		/* New charge window starts */
+ 		if (time_after_eq(jiffies, quota->charged_from +
+ 					msecs_to_jiffies(
+ 						quota->reset_interval))) {
++			quota->total_charged_sz += quota->charged_sz;
+ 			quota->charged_from = jiffies;
+ 			quota->charged_sz = 0;
++			damos_set_effective_quota(quota);
+ 		}
+ 	}
+ 
+-- 
+2.33.1.711.g9d530dc002
+
