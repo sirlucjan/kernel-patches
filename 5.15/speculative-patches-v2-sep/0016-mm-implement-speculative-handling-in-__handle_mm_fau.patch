@@ -1,0 +1,148 @@
+From b9373da2b9398da553d9efd19147bea54632b5e7 Mon Sep 17 00:00:00 2001
+From: Michel Lespinasse <michel@lespinasse.org>
+Date: Mon, 1 Nov 2021 10:39:09 -0700
+Subject: [PATCH 16/31] mm: implement speculative handling in
+ __handle_mm_fault().
+
+The speculative path calls speculative_page_walk_begin() before walking
+the page table tree to prevent page table reclamation. The logic is
+otherwise similar to the non-speculative path, but with additional
+restrictions: in the speculative path, we do not handle huge pages or
+wiring new pages tables.
+---
+ include/linux/mm.h |  6 ++++
+ mm/memory.c        | 77 ++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 81 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 918e295b9..5eb913ef6 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -540,6 +540,10 @@ struct vm_fault {
+ 	};
+ 	enum fault_flag flags;		/* FAULT_FLAG_xxx flags
+ 					 * XXX: should really be 'const' */
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	unsigned long seq;
++	pmd_t orig_pmd;
++#endif
+ 	pmd_t *pmd;			/* Pointer to pmd entry matching
+ 					 * the 'address' */
+ 	pud_t *pud;			/* Pointer to pud entry matching
+@@ -547,9 +551,11 @@ struct vm_fault {
+ 					 */
+ 	union {
+ 		pte_t orig_pte;		/* Value of PTE at the time of fault */
++#ifndef CONFIG_SPECULATIVE_PAGE_FAULT
+ 		pmd_t orig_pmd;		/* Value of PMD at the time of fault,
+ 					 * used by PMD fault only.
+ 					 */
++#endif
+ 	};
+ 
+ 	struct page *cow_page;		/* Page handler may use for COW fault */
+diff --git a/mm/memory.c b/mm/memory.c
+index a484cb4b4..fb6f4c698 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4579,7 +4579,7 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
+ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+-		unsigned long address, unsigned int flags)
++		unsigned long address, unsigned int flags, unsigned long seq)
+ {
+ 	struct vm_fault vmf = {
+ 		.vma = vma,
+@@ -4594,6 +4594,79 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 	p4d_t *p4d;
+ 	vm_fault_t ret;
+ 
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	if (flags & FAULT_FLAG_SPECULATIVE) {
++		pgd_t pgdval;
++		p4d_t p4dval;
++		pud_t pudval;
++
++		vmf.seq = seq;
++
++		speculative_page_walk_begin();
++		pgd = pgd_offset(mm, address);
++		pgdval = READ_ONCE(*pgd);
++		if (pgd_none(pgdval) || unlikely(pgd_bad(pgdval)))
++			goto spf_fail;
++
++		p4d = p4d_offset(pgd, address);
++		p4dval = READ_ONCE(*p4d);
++		if (p4d_none(p4dval) || unlikely(p4d_bad(p4dval)))
++			goto spf_fail;
++
++		vmf.pud = pud_offset(p4d, address);
++		pudval = READ_ONCE(*vmf.pud);
++		if (pud_none(pudval) || unlikely(pud_bad(pudval)) ||
++		    unlikely(pud_trans_huge(pudval)) ||
++		    unlikely(pud_devmap(pudval)))
++			goto spf_fail;
++
++		vmf.pmd = pmd_offset(vmf.pud, address);
++		vmf.orig_pmd = READ_ONCE(*vmf.pmd);
++
++		/*
++		 * pmd_none could mean that a hugepage collapse is in
++		 * progress in our back as collapse_huge_page() mark
++		 * it before invalidating the pte (which is done once
++		 * the IPI is catched by all CPU and we have interrupt
++		 * disabled).  For this reason we cannot handle THP in
++		 * a speculative way since we can't safely identify an
++		 * in progress collapse operation done in our back on
++		 * that PMD.
++		 */
++		if (unlikely(pmd_none(vmf.orig_pmd) ||
++			     is_swap_pmd(vmf.orig_pmd) ||
++			     pmd_trans_huge(vmf.orig_pmd) ||
++			     pmd_devmap(vmf.orig_pmd)))
++			goto spf_fail;
++
++		/*
++		 * The above does not allocate/instantiate page-tables because
++		 * doing so would lead to the possibility of instantiating
++		 * page-tables after free_pgtables() -- and consequently
++		 * leaking them.
++		 *
++		 * The result is that we take at least one non-speculative
++		 * fault per PMD in order to instantiate it.
++		 */
++
++		vmf.pte = pte_offset_map(vmf.pmd, address);
++		vmf.orig_pte = READ_ONCE(*vmf.pte);
++		barrier();
++		if (pte_none(vmf.orig_pte)) {
++			pte_unmap(vmf.pte);
++			vmf.pte = NULL;
++		}
++
++		speculative_page_walk_end();
++
++		return handle_pte_fault(&vmf);
++
++	spf_fail:
++		speculative_page_walk_end();
++		return VM_FAULT_RETRY;
++	}
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++
+ 	pgd = pgd_offset(mm, address);
+ 	p4d = p4d_alloc(mm, pgd, address);
+ 	if (!p4d)
+@@ -4813,7 +4886,7 @@ vm_fault_t do_handle_mm_fault(struct vm_area_struct *vma,
+ 	if (unlikely(is_vm_hugetlb_page(vma)))
+ 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
+ 	else
+-		ret = __handle_mm_fault(vma, address, flags);
++		ret = __handle_mm_fault(vma, address, flags, seq);
+ 
+ 	if (flags & FAULT_FLAG_USER) {
+ 		mem_cgroup_exit_user_fault();
+-- 
+2.34.1.75.gabe6bb3905
+
