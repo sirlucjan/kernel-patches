@@ -1,0 +1,289 @@
+From 8cdb217d1447d121875b8a0de502a86b6ce940ac Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Mon, 16 May 2022 15:50:07 +0200
+Subject: [PATCH 05/30] bfq: Fix use-after-free with cgroups
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/bfq-cgroup.c  | 103 ++++++++------------------------------------
+ block/bfq-iosched.c |  54 ++++++++++++-----------
+ block/bfq-iosched.h |   6 +++
+ 3 files changed, 51 insertions(+), 112 deletions(-)
+
+diff --git a/block/bfq-cgroup.c b/block/bfq-cgroup.c
+index 420eda258..1bf1fc0f0 100644
+--- a/block/bfq-cgroup.c
++++ b/block/bfq-cgroup.c
+@@ -680,6 +680,7 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 		bfq_deactivate_bfqq(bfqd, bfqq, false, false);
+ 	else if (entity->on_st_or_in_serv)
+ 		bfq_put_idle_entity(bfq_entity_service_tree(entity), entity);
++	hlist_del(&bfqq->children_node);
+ 	bfqg_and_blkg_put(old_parent);
+ 
+ 	if (entity->parent &&
+@@ -692,6 +693,7 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 	entity->sched_data = &bfqg->sched_data;
+ 	/* pin down bfqg and its associated blkg  */
+ 	bfqg_and_blkg_get(bfqg);
++	hlist_add_head(&bfqq->children_node, &bfqg->children);
+ 
+ 	if (bfq_bfqq_busy(bfqq)) {
+ 		if (unlikely(!bfqd->nonrot_with_queueing))
+@@ -824,68 +826,18 @@ void bfq_bic_update_cgroup(struct bfq_io_cq *bic, struct bio *bio)
+ 	rcu_read_unlock();
+ }
+ 
+-/**
+- * bfq_flush_idle_tree - deactivate any entity on the idle tree of @st.
+- * @st: the service tree being flushed.
+- */
+-static void bfq_flush_idle_tree(struct bfq_service_tree *st)
+-{
+-	struct bfq_entity *entity = st->first_idle;
+-
+-	for (; entity ; entity = st->first_idle)
+-		__bfq_deactivate_entity(entity, false);
+-}
+-
+-/**
+- * bfq_reparent_leaf_entity - move leaf entity to the root_group.
+- * @bfqd: the device data structure with the root group.
+- * @entity: the entity to move, if entity is a leaf; or the parent entity
+- *	    of an active leaf entity to move, if entity is not a leaf.
+- */
+-static void bfq_reparent_leaf_entity(struct bfq_data *bfqd,
+-				     struct bfq_entity *entity,
+-				     int ioprio_class)
++static void bfq_reparent_children(struct bfq_data *bfqd, struct bfq_group *bfqg)
+ {
+ 	struct bfq_queue *bfqq;
+-	struct bfq_entity *child_entity = entity;
+-
+-	while (child_entity->my_sched_data) { /* leaf not reached yet */
+-		struct bfq_sched_data *child_sd = child_entity->my_sched_data;
+-		struct bfq_service_tree *child_st = child_sd->service_tree +
+-			ioprio_class;
+-		struct rb_root *child_active = &child_st->active;
+-
+-		child_entity = bfq_entity_of(rb_first(child_active));
+-
+-		if (!child_entity)
+-			child_entity = child_sd->in_service_entity;
+-	}
+-
+-	bfqq = bfq_entity_to_bfqq(child_entity);
+-	bfq_bfqq_move(bfqd, bfqq, bfqd->root_group);
+-}
+-
+-/**
+- * bfq_reparent_active_queues - move to the root group all active queues.
+- * @bfqd: the device data structure with the root group.
+- * @bfqg: the group to move from.
+- * @st: the service tree to start the search from.
+- */
+-static void bfq_reparent_active_queues(struct bfq_data *bfqd,
+-				       struct bfq_group *bfqg,
+-				       struct bfq_service_tree *st,
+-				       int ioprio_class)
+-{
+-	struct rb_root *active = &st->active;
+-	struct bfq_entity *entity;
++	struct hlist_node *next;
++	struct bfq_group *parent;
+ 
+-	while ((entity = bfq_entity_of(rb_first(active))))
+-		bfq_reparent_leaf_entity(bfqd, entity, ioprio_class);
++	parent = bfqg_parent(bfqg);
++	if (!parent)
++		parent = bfqd->root_group;
+ 
+-	if (bfqg->sched_data.in_service_entity)
+-		bfq_reparent_leaf_entity(bfqd,
+-					 bfqg->sched_data.in_service_entity,
+-					 ioprio_class);
++	hlist_for_each_entry_safe(bfqq, next, &bfqg->children, children_node)
++		bfq_bfqq_move(bfqd, bfqq, parent);
+ }
+ 
+ /**
+@@ -911,38 +863,17 @@ static void bfq_pd_offline(struct blkg_policy_data *pd)
+ 		goto put_async_queues;
+ 
+ 	/*
+-	 * Empty all service_trees belonging to this group before
+-	 * deactivating the group itself.
++	 * Reparent all bfqqs under this bfq group. This will also empty all
++	 * service_trees belonging to this group before deactivating the group
++	 * itself.
+ 	 */
++	bfq_reparent_children(bfqd, bfqg);
++
+ 	for (i = 0; i < BFQ_IOPRIO_CLASSES; i++) {
+ 		st = bfqg->sched_data.service_tree + i;
+ 
+-		/*
+-		 * It may happen that some queues are still active
+-		 * (busy) upon group destruction (if the corresponding
+-		 * processes have been forced to terminate). We move
+-		 * all the leaf entities corresponding to these queues
+-		 * to the root_group.
+-		 * Also, it may happen that the group has an entity
+-		 * in service, which is disconnected from the active
+-		 * tree: it must be moved, too.
+-		 * There is no need to put the sync queues, as the
+-		 * scheduler has taken no reference.
+-		 */
+-		bfq_reparent_active_queues(bfqd, bfqg, st, i);
+-
+-		/*
+-		 * The idle tree may still contain bfq_queues
+-		 * belonging to exited task because they never
+-		 * migrated to a different cgroup from the one being
+-		 * destroyed now. In addition, even
+-		 * bfq_reparent_active_queues() may happen to add some
+-		 * entities to the idle tree. It happens if, in some
+-		 * of the calls to bfq_bfqq_move() performed by
+-		 * bfq_reparent_active_queues(), the queue to move is
+-		 * empty and gets expired.
+-		 */
+-		bfq_flush_idle_tree(st);
++		WARN_ON_ONCE(!RB_EMPTY_ROOT(&st->active));
++		WARN_ON_ONCE(!RB_EMPTY_ROOT(&st->idle));
+ 	}
+ 
+ 	__bfq_deactivate_entity(entity, false);
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 518aa00de..bdf67a4d3 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -5300,6 +5300,7 @@ void bfq_put_queue(struct bfq_queue *bfqq)
+ 	if (bfqq->bfqd && bfqq->bfqd->last_completed_rq_bfqq == bfqq)
+ 		bfqq->bfqd->last_completed_rq_bfqq = NULL;
+ 
++	hlist_del(&bfqq->children_node);
+ 	kmem_cache_free(bfq_pool, bfqq);
+ 	bfqg_and_blkg_put(bfqg);
+ }
+@@ -5474,8 +5475,9 @@ static void bfq_check_ioprio_change(struct bfq_io_cq *bic, struct bio *bio)
+ 		bfq_set_next_ioprio_data(bfqq, bic);
+ }
+ 
+-static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+-			  struct bfq_io_cq *bic, pid_t pid, int is_sync)
++static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_group *bfqg,
++			  struct bfq_queue *bfqq, struct bfq_io_cq *bic,
++			  pid_t pid, int is_sync)
+ {
+ 	u64 now_ns = ktime_get_ns();
+ 
+@@ -5484,6 +5486,7 @@ static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 	INIT_HLIST_NODE(&bfqq->burst_list_node);
+ 	INIT_HLIST_NODE(&bfqq->woken_list_node);
+ 	INIT_HLIST_HEAD(&bfqq->woken_list);
++	hlist_add_head(&bfqq->children_node, &bfqg->children);
+ 
+ 	bfqq->ref = 0;
+ 	bfqq->bfqd = bfqd;
+@@ -5737,8 +5740,7 @@ static struct bfq_queue *bfq_get_queue(struct bfq_data *bfqd,
+ 				     bfqd->queue->node);
+ 
+ 	if (bfqq) {
+-		bfq_init_bfqq(bfqd, bfqq, bic, current->pid,
+-			      is_sync);
++		bfq_init_bfqq(bfqd, bfqg, bfqq, bic, current->pid, is_sync);
+ 		bfq_init_entity(&bfqq->entity, bfqg);
+ 		bfq_log_bfqq(bfqd, bfqq, "allocated");
+ 	} else {
+@@ -7023,6 +7025,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
+ 
+ 	hrtimer_cancel(&bfqd->idle_slice_timer);
+ 
++	hlist_del(&bfqd->oom_bfqq.children_node);
+ 	/* release oom-queue reference to root group */
+ 	bfqg_and_blkg_put(bfqd->root_group);
+ 
+@@ -7076,28 +7079,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	q->elevator = eq;
+ 	spin_unlock_irq(&q->queue_lock);
+ 
+-	/*
+-	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
+-	 * Grab a permanent reference to it, so that the normal code flow
+-	 * will not attempt to free it.
+-	 */
+-	bfq_init_bfqq(bfqd, &bfqd->oom_bfqq, NULL, 1, 0);
+-	bfqd->oom_bfqq.ref++;
+-	bfqd->oom_bfqq.new_ioprio = BFQ_DEFAULT_QUEUE_IOPRIO;
+-	bfqd->oom_bfqq.new_ioprio_class = IOPRIO_CLASS_BE;
+-	bfqd->oom_bfqq.entity.new_weight =
+-		bfq_ioprio_to_weight(bfqd->oom_bfqq.new_ioprio);
+-
+-	/* oom_bfqq does not participate to bursts */
+-	bfq_clear_bfqq_just_created(&bfqd->oom_bfqq);
+-
+-	/*
+-	 * Trigger weight initialization, according to ioprio, at the
+-	 * oom_bfqq's first activation. The oom_bfqq's ioprio and ioprio
+-	 * class won't be changed any more.
+-	 */
+-	bfqd->oom_bfqq.entity.prio_changed = 1;
+-
+ 	bfqd->queue = q;
+ 
+ 	INIT_LIST_HEAD(&bfqd->dispatch);
+@@ -7176,6 +7157,27 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 		goto out_free;
+ 	bfq_init_root_group(bfqd->root_group, bfqd);
+ 	bfq_init_entity(&bfqd->oom_bfqq.entity, bfqd->root_group);
++	/*
++	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
++	 * Grab a permanent reference to it, so that the normal code flow
++	 * will not attempt to free it.
++	 */
++	bfq_init_bfqq(bfqd, bfqd->root_group, &bfqd->oom_bfqq, NULL, 1, 0);
++	bfqd->oom_bfqq.ref++;
++	bfqd->oom_bfqq.new_ioprio = BFQ_DEFAULT_QUEUE_IOPRIO;
++	bfqd->oom_bfqq.new_ioprio_class = IOPRIO_CLASS_BE;
++	bfqd->oom_bfqq.entity.new_weight =
++		bfq_ioprio_to_weight(bfqd->oom_bfqq.new_ioprio);
++
++	/* oom_bfqq does not participate to bursts */
++	bfq_clear_bfqq_just_created(&bfqd->oom_bfqq);
++
++	/*
++	 * Trigger weight initialization, according to ioprio, at the
++	 * oom_bfqq's first activation. The oom_bfqq's ioprio and ioprio
++	 * class won't be changed any more.
++	 */
++	bfqd->oom_bfqq.entity.prio_changed = 1;
+ 
+ 	wbt_disable_default(q);
+ 	return 0;
+diff --git a/block/bfq-iosched.h b/block/bfq-iosched.h
+index fd8710c2a..57ce86dab 100644
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -292,6 +292,9 @@ struct bfq_queue {
+ 
+ 	/* node for active/idle bfqq list inside parent bfqd */
+ 	struct list_head bfqq_list;
++	/* Member of parent's bfqg children list */
++	struct hlist_node children_node;
++
+ 
+ 	/* associated @bfq_ttime struct */
+ 	struct bfq_ttime ttime;
+@@ -932,6 +935,9 @@ struct bfq_group {
+ 	struct bfq_entity entity;
+ 	struct bfq_sched_data sched_data;
+ 
++	/* bfq_queues under this entity */
++	struct hlist_head children;
++
+ 	void *bfqd;
+ 
+ 	struct bfq_queue *async_bfqq[2][IOPRIO_NR_LEVELS];
+-- 
+2.36.1.74.g277cf0bc36
+
