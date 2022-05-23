@@ -1,0 +1,103 @@
+From 6e89dffef84a037947f69e8cbc5b5f2860ad8fc4 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Fri, 11 Mar 2022 11:35:31 +0000
+Subject: [PATCH 13/31] btrfs: avoid unnecessary btree search restarts when
+ reading node
+
+When reading a btree node, at read_block_for_search(), if we don't find
+the node's (or leaf) extent buffer in the cache, we will read it from
+disk. Since that requires waiting on IO, we release all upper level nodes
+from our path before reading the target node/leaf, and then return -EAGAIN
+to the caller, which will make the caller restart the while btree search.
+
+However we are causing the restart of btree search even for cases where
+it is not necessary:
+
+1) We have a path with ->skip_locking set to true, typically when doing
+   a search on a commit root, so we are never holding locks on any node;
+
+2) We are doing a read search (the "ins_len" argument passed to
+   btrfs_search_slot() is 0), or we are doing a search to modify an
+   existing key (the "cow" argument passed to btrfs_search_slot() has
+   a value of 1 and "ins_len" is 0), in which case we never hold locks
+   for upper level nodes;
+
+3) We are doing a search to insert or delete a key, in which case we may
+   or may not have upper level nodes locked. That depends on the current
+   minimum write lock levels at btrfs_search_slot(), if we had to split
+   or merge parent nodes, if we had to COW upper level nodes and if
+   we ever visited slot 0 of an upper level node. It's still common to
+   not have upper level nodes locked, but our current node must be at
+   least at level 1, for insertions, or at least at level 2 for deletions.
+   In these cases when we have locks on upper level nodes, they are always
+   write locks.
+
+These cases where we are not holding locks on upper level nodes far
+outweigh the cases where we are holding locks, so it's completely wasteful
+to retry the whole search when we have no upper nodes locked.
+
+So change the logic to not return -EAGAIN, and make the caller retry the
+search, when we don't have the parent node locked - when it's not locked
+it means no other upper level nodes are locked as well.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/ctree.c | 30 +++++++++++++++++++-----------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c
+index 0eecf98d0..839607970 100644
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -1447,19 +1447,22 @@ read_block_for_search(struct btrfs_root *root, struct btrfs_path *p,
+ 		return 0;
+ 	}
+ 
+-	/*
+-	 * reduce lock contention at high levels
+-	 * of the btree by dropping locks before
+-	 * we read.  Don't release the lock on the current
+-	 * level because we need to walk this node to figure
+-	 * out which blocks to read.
+-	 */
+-	btrfs_unlock_up_safe(p, level + 1);
++	if ((level + 1 < BTRFS_MAX_LEVEL) && p->locks[level + 1]) {
++		/*
++		 * Reduce lock contention at high levels of the btree by
++		 * dropping locks before we read.  Don't release the lock
++		 * on the current level because we need to walk this node
++		 * to figure out which blocks to read.
++		 */
++		btrfs_unlock_up_safe(p, level + 1);
++		ret = -EAGAIN;
++	} else {
++		ret = 0;
++	}
+ 
+ 	if (p->reada != READA_NONE)
+ 		reada_for_search(fs_info, p, level, slot, key->objectid);
+ 
+-	ret = -EAGAIN;
+ 	tmp = read_tree_block(fs_info, blocknr, root->root_key.objectid,
+ 			      gen, parent_level - 1, &first_key);
+ 	if (IS_ERR(tmp)) {
+@@ -1474,9 +1477,14 @@ read_block_for_search(struct btrfs_root *root, struct btrfs_path *p,
+ 	 */
+ 	if (!extent_buffer_uptodate(tmp))
+ 		ret = -EIO;
+-	free_extent_buffer(tmp);
+ 
+-	btrfs_release_path(p);
++	if (ret == 0) {
++		*eb_ret = tmp;
++	} else {
++		free_extent_buffer(tmp);
++		btrfs_release_path(p);
++	}
++
+ 	return ret;
+ }
+ 
+-- 
+2.36.1.74.g277cf0bc36
+
