@@ -36,8 +36,8 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [WireGuard](https://git.zx2c4.com/wireguard-linux-compat)
 
-- [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.17/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.17/ll-patches)
+- [LL-patches](https://github.com/sirlucjan/kernel-patches/tree/master/5.18/ll-patches) / [LL-patches](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.18/ll-patches)
 
-- [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.17/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.17/ll-branding)
+- [LL-branding](https://github.com/sirlucjan/kernel-patches/tree/master/5.18/ll-branding) / [LL-branding](https://gitlab.com/sirlucjan/kernel-patches/tree/master/5.18/ll-branding)
 
 - [Linux Kernel Mailing List Archive](https://lkml.org) / [Linux Kernel Mailing List Archive](https://lore.kernel.org/lkml/) / [Linux Kernel Mailing List Archive](https://patchwork.kernel.org)
