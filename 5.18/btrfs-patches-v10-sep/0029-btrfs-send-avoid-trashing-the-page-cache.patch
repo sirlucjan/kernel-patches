@@ -1,0 +1,208 @@
+From c9dc50ae87200276121102fcda4593753add430b Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Tue, 17 May 2022 11:47:30 +0100
+Subject: [PATCH 29/43] btrfs: send: avoid trashing the page cache
+
+A send operation reads extent data using the buffered IO path for getting
+extent data to send in write commands and this is both because it's simple
+and to make use of the generic readahead infrastructure, which results in
+a massive speedup.
+
+However this fills the page cache with data that, most of the time, is
+really only used by the send operation - once the write commands are sent,
+it's not useful to have the data in the page cache anymore. For large
+snapshots, bringing all data into the page cache eventually leads to the
+need to evict other data from the page cache that may be more useful for
+applications (and kernel susbsystems).
+
+Even if extents are shared with the subvolume on which a snapshot is based
+on and the data is currently on the page cache due to being read through
+the subvolume, attempting to read the data through the snapshot will
+always result in bringing a new copy of the data into another location in
+the page cache (there's currently no shared memory for shared extents).
+
+So make send evict the data it has read before if when it first opened
+the inode, its mapping had no pages currently loaded: when
+inode->i_mapping->nr_pages has a value of 0. Do this instead of deciding
+based on the return value of filemap_range_has_page() before reading an
+extent because the generic readahead mechanism may read pages beyond the
+range we request (and it very often does it), which means a call to
+filemap_range_has_page() will return true due to the readahead that was
+triggered when processing a previous extent - we don't have a simple way
+to distinguish this case from the case where the data was brought into
+the page cache through someone else. So checking for the mapping number
+of pages being 0 when we first open the inode is simple, cheap and it
+generally accomplishes the goal of not trashing the page cache - the
+only exception is if part of data was previously loaded into the page
+cache through the snapshot by some other process, in that case we end
+up not evicting any data send brings into the page cache, just like
+before this change - but that however is not the common case.
+
+Example scenario, on a box with 32G of RAM:
+
+  $ btrfs subvolume create /mnt/sv1
+  $ xfs_io -f -c "pwrite 0 4G" /mnt/sv1/file1
+
+  $ btrfs subvolume snapshot -r /mnt/sv1 /mnt/snap1
+
+  $ free -m
+                 total        used        free      shared  buff/cache   available
+  Mem:           31937         186       26866           0        4883       31297
+  Swap:           8188           0        8188
+
+  # After this we get less 4G of free memory.
+  $ btrfs send /mnt/snap1 >/dev/null
+
+  $ free -m
+                 total        used        free      shared  buff/cache   available
+  Mem:           31937         186       22814           0        8935       31297
+  Swap:           8188           0        8188
+
+The same, obviously, applies to an incremental send.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/send.c | 85 +++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 82 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index 19fae92e3..2d6684c21 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -138,6 +138,8 @@ struct send_ctx {
+ 	 */
+ 	struct inode *cur_inode;
+ 	struct file_ra_state ra;
++	u64 page_cache_clear_start;
++	bool clean_page_cache;
+ 
+ 	/*
+ 	 * We process inodes by their increasing order, so if before an
+@@ -5217,6 +5219,7 @@ static int send_extent_data(struct send_ctx *sctx,
+ 			    const u64 offset,
+ 			    const u64 len)
+ {
++	const u64 end = offset + len;
+ 	u64 read_size = max_send_read_size(sctx);
+ 	u64 sent = 0;
+ 
+@@ -5235,6 +5238,28 @@ static int send_extent_data(struct send_ctx *sctx,
+ 		}
+ 		memset(&sctx->ra, 0, sizeof(struct file_ra_state));
+ 		file_ra_state_init(&sctx->ra, sctx->cur_inode->i_mapping);
++
++		/*
++		 * It's very likely there are no pages from this inode in the page
++		 * cache, so after reading extents and sending their data, we clean
++		 * the page cache to avoid trashing the page cache (adding pressure
++		 * to the page cache and forcing eviction of other data more useful
++		 * for applications).
++		 *
++		 * We decide if we should clean the page cache simply by checking
++		 * if the inode's mapping nrpages is 0 when we first open it, and
++		 * not by using something like filemap_range_has_page() before
++		 * reading an extent because when we ask the readahead code to
++		 * read a given file range, it may (and almost always does) read
++		 * pages from beyond that range (see the documentation for
++		 * page_cache_sync_readahead()), so it would not be reliable,
++		 * because after reading the first extent future calls to
++		 * filemap_range_has_page() would return true because the readahead
++		 * on the previous extent resulted in reading pages of the current
++		 * extent as well.
++		 */
++		sctx->clean_page_cache = (sctx->cur_inode->i_mapping->nrpages == 0);
++		sctx->page_cache_clear_start = round_down(offset, PAGE_SIZE);
+ 	}
+ 
+ 	while (sent < len) {
+@@ -5246,6 +5271,37 @@ static int send_extent_data(struct send_ctx *sctx,
+ 			return ret;
+ 		sent += size;
+ 	}
++
++	if (sctx->clean_page_cache && IS_ALIGNED(end, PAGE_SIZE)) {
++		/*
++		 * Always operate only on ranges that are a multiple of the page
++		 * size. This is not only to prevent zeroing parts of a page in
++		 * the case of subpage sector size, but also to guarantee we evict
++		 * pages, as passing a range that is smaller than page size does
++		 * not evict the respective page (only zeroes part of its content).
++		 *
++		 * Always start from the end offset of the last range cleared.
++		 * This is because the readahead code may (and very often does)
++		 * reads pages beyond the range we request for readahead. So if
++		 * we have an extent layout like this:
++		 *
++		 *            [ extent A ] [ extent B ] [ extent C ]
++		 *
++		 * When we ask page_cache_sync_readahead() to read extent A, it
++		 * may also trigger reads for pages of extent B. If we are doing
++		 * an incremental send and extent B has not changed between the
++		 * parent and send snapshots, some or all of its pages may end
++		 * up being read and placed in the page cache. So when truncating
++		 * the page cache we always start from the end offset of the
++		 * previously processed extent up to the end of the current
++		 * extent.
++		 */
++		truncate_inode_pages_range(&sctx->cur_inode->i_data,
++					   sctx->page_cache_clear_start,
++					   end - 1);
++		sctx->page_cache_clear_start = end;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -6281,6 +6337,30 @@ static int btrfs_unlink_all_paths(struct send_ctx *sctx)
+ 	return ret;
+ }
+ 
++static void close_current_inode(struct send_ctx *sctx)
++{
++	u64 i_size;
++
++	if (sctx->cur_inode == NULL)
++		return;
++
++	i_size = i_size_read(sctx->cur_inode);
++
++	/*
++	 * If we are doing an incremental send, we may have extents between the
++	 * last processed extent and the i_size that have not been processed
++	 * because they haven't changed but we may have read some of their pages
++	 * through readahead, see the comments at send_extent_data().
++	 */
++	if (sctx->clean_page_cache && sctx->page_cache_clear_start < i_size)
++		truncate_inode_pages_range(&sctx->cur_inode->i_data,
++					   sctx->page_cache_clear_start,
++					   round_up(i_size, PAGE_SIZE) - 1);
++
++	iput(sctx->cur_inode);
++	sctx->cur_inode = NULL;
++}
++
+ static int changed_inode(struct send_ctx *sctx,
+ 			 enum btrfs_compare_tree_result result)
+ {
+@@ -6291,8 +6371,7 @@ static int changed_inode(struct send_ctx *sctx,
+ 	u64 left_gen = 0;
+ 	u64 right_gen = 0;
+ 
+-	iput(sctx->cur_inode);
+-	sctx->cur_inode = NULL;
++	close_current_inode(sctx);
+ 
+ 	sctx->cur_ino = key->objectid;
+ 	sctx->cur_inode_new_gen = 0;
+@@ -7780,7 +7859,7 @@ long btrfs_ioctl_send(struct inode *inode, struct btrfs_ioctl_send_args *arg)
+ 
+ 		name_cache_free(sctx);
+ 
+-		iput(sctx->cur_inode);
++		close_current_inode(sctx);
+ 
+ 		kfree(sctx);
+ 	}
+-- 
+2.37.0.rc0.15.g3b9a5a33c2
+
