@@ -16,7 +16,7 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [bfq-dev-lucjan](https://github.com/sirlucjan/bfq-mq-lucjan)
 
-- [pf-kernel](https://github.com/pfactum/pf-kernel) / [pf-kernel](https://gitlab.com/post-factum/pf-kernel)
+- [pf-kernel](https://codeberg.org/pf-kernel/linux)
 
 - [linux-pds](https://gitlab.com/alfredchen/linux-pds)
 
