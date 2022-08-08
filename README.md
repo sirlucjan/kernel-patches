@@ -1,8 +1,7 @@
 ## PATCHES
 
-#### Patches for [github/lucjan-kernels](https://github.com/sirlucjan/lucjan-kernels) / [gitlab/lucjan-kernels](https://gitlab.com/sirlucjan/lucjan-kernels)
+#### Patches for [CachyOS Kernels](https://github.com/CachyOS/linux-cachyos)
 
-#### Patches for [github/linux-lucjan](https://github.com/sirlucjan/linux-lucjan) / [gitlab/linux-lucjan](https://gitlab.com/sirlucjan/linux-lucjan)
 
 ###### Patches developed and offered only for the last, stable line (not EOL and not LTS). 
 ###### Active support is offered only for this kernel line. 
