@@ -1,0 +1,1014 @@
+From 554c04e53802244a0bceeca183ef67d829c9a8b2 Mon Sep 17 00:00:00 2001
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Date: Sat, 11 Jun 2022 04:21:32 +0100
+Subject: [PATCH 1/5] squashfs: extend "page actor" to handle missing pages
+
+Patch series "Squashfs: handle missing pages decompressing into page
+cache".
+
+This patchset enables Squashfs to handle missing pages when directly
+decompressing datablocks into the page cache.
+
+Previously if the full set of pages needed was not available, Squashfs
+would have to fall back to using an intermediate buffer (the older
+method), which is slower, involving a memcopy, and it introduces
+contention on a shared buffer.
+
+The first patch extends the "page actor" code to handle missing pages.
+
+The second patch updates Squashfs_readpage_block() to use the new
+functionality, and removes the code that falls back to using an
+intermediate buffer.
+
+This patchset is independent of the readahead work, and it is standalone.
+It can be merged on its own.
+
+But the readahead patch for efficiency also needs this patch-set.
+
+This patch (of 2):
+
+This patch extends the "page actor" code to handle missing pages.
+
+Previously if the full set of pages needed to decompress a Squashfs
+datablock was unavailable, this would cause decompression to fail on the
+missing pages.
+
+In this case direct decompression into the page cache could not be
+achieved and the code would fall back to using the older intermediate
+buffer method.
+
+With this patch, direct decompression into the page cache can be achieved
+with missing pages.
+
+For "multi-shot" decompressors (zlib, xz, zstd), the page actor will
+allocate a temporary buffer which is passed to the decompressor, and then
+freed by the page actor.
+
+For "single shot" decompressors (lz4, lzo) which decompress into a
+contiguous "bounce buffer", and which is then copied into the page cache,
+it would be pointless to allocate a temporary buffer, memcpy into it, and
+then free it.  For these decompressors -ENOMEM is returned, which
+signifies that the memcpy for that page should be skipped.
+
+This also happens if the data block is uncompressed.
+
+Link: https://lkml.kernel.org/r/20220611032133.5743-1-phillip@squashfs.org.uk
+Link: https://lkml.kernel.org/r/20220611032133.5743-2-phillip@squashfs.org.uk
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Hsin-Yi Wang <hsinyi@chromium.org>
+Cc: Xiongwei Song <Xiongwei.Song@windriver.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ fs/squashfs/block.c        | 10 ++++---
+ fs/squashfs/decompressor.h |  1 +
+ fs/squashfs/file_direct.c  | 21 ++++++++-------
+ fs/squashfs/lz4_wrapper.c  |  7 +++--
+ fs/squashfs/lzo_wrapper.c  |  7 +++--
+ fs/squashfs/page_actor.c   | 55 ++++++++++++++++++++++++++++++++------
+ fs/squashfs/page_actor.h   | 21 ++++++++++++---
+ fs/squashfs/xz_wrapper.c   | 11 +++++++-
+ fs/squashfs/zlib_wrapper.c | 12 ++++++++-
+ fs/squashfs/zstd_wrapper.c | 12 ++++++++-
+ 10 files changed, 126 insertions(+), 31 deletions(-)
+
+diff --git a/fs/squashfs/block.c b/fs/squashfs/block.c
+index 8879d052f..833aca923 100644
+--- a/fs/squashfs/block.c
++++ b/fs/squashfs/block.c
+@@ -34,12 +34,15 @@ static int copy_bio_to_actor(struct bio *bio,
+ 			     struct squashfs_page_actor *actor,
+ 			     int offset, int req_length)
+ {
+-	void *actor_addr = squashfs_first_page(actor);
++	void *actor_addr;
+ 	struct bvec_iter_all iter_all = {};
+ 	struct bio_vec *bvec = bvec_init_iter_all(&iter_all);
+ 	int copied_bytes = 0;
+ 	int actor_offset = 0;
+ 
++	squashfs_actor_nobuff(actor);
++	actor_addr = squashfs_first_page(actor);
++
+ 	if (WARN_ON_ONCE(!bio_next_segment(bio, &iter_all)))
+ 		return 0;
+ 
+@@ -49,8 +52,9 @@ static int copy_bio_to_actor(struct bio *bio,
+ 
+ 		bytes_to_copy = min_t(int, bytes_to_copy,
+ 				      req_length - copied_bytes);
+-		memcpy(actor_addr + actor_offset, bvec_virt(bvec) + offset,
+-		       bytes_to_copy);
++		if (!IS_ERR(actor_addr))
++			memcpy(actor_addr + actor_offset, bvec_virt(bvec) +
++					offset, bytes_to_copy);
+ 
+ 		actor_offset += bytes_to_copy;
+ 		copied_bytes += bytes_to_copy;
+diff --git a/fs/squashfs/decompressor.h b/fs/squashfs/decompressor.h
+index 1b9ccfd0a..19ab60834 100644
+--- a/fs/squashfs/decompressor.h
++++ b/fs/squashfs/decompressor.h
+@@ -20,6 +20,7 @@ struct squashfs_decompressor {
+ 		struct bio *, int, int, struct squashfs_page_actor *);
+ 	int	id;
+ 	char	*name;
++	int	alloc_buffer;
+ 	int	supported;
+ };
+ 
+diff --git a/fs/squashfs/file_direct.c b/fs/squashfs/file_direct.c
+index a4894cc59..5af5802f5 100644
+--- a/fs/squashfs/file_direct.c
++++ b/fs/squashfs/file_direct.c
+@@ -47,14 +47,6 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 	if (page == NULL)
+ 		return res;
+ 
+-	/*
+-	 * Create a "page actor" which will kmap and kunmap the
+-	 * page cache pages appropriately within the decompressor
+-	 */
+-	actor = squashfs_page_actor_init_special(page, pages, 0);
+-	if (actor == NULL)
+-		goto out;
+-
+ 	/* Try to grab all the pages covered by the Squashfs block */
+ 	for (missing_pages = 0, i = 0, n = start_index; i < pages; i++, n++) {
+ 		page[i] = (n == target_page->index) ? target_page :
+@@ -89,8 +81,19 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Create a "page actor" which will kmap and kunmap the
++	 * page cache pages appropriately within the decompressor
++	 */
++	actor = squashfs_page_actor_init_special(msblk, page, pages, 0);
++	if (actor == NULL)
++		goto out;
++
+ 	/* Decompress directly into the page cache buffers */
+ 	res = squashfs_read_data(inode->i_sb, block, bsize, NULL, actor);
++
++	kfree(actor);
++
+ 	if (res < 0)
+ 		goto mark_errored;
+ 
+@@ -116,7 +119,6 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 			put_page(page[i]);
+ 	}
+ 
+-	kfree(actor);
+ 	kfree(page);
+ 
+ 	return 0;
+@@ -135,7 +137,6 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 	}
+ 
+ out:
+-	kfree(actor);
+ 	kfree(page);
+ 	return res;
+ }
+diff --git a/fs/squashfs/lz4_wrapper.c b/fs/squashfs/lz4_wrapper.c
+index b685b6238..49797729f 100644
+--- a/fs/squashfs/lz4_wrapper.c
++++ b/fs/squashfs/lz4_wrapper.c
+@@ -119,10 +119,12 @@ static int lz4_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 	buff = stream->output;
+ 	while (data) {
+ 		if (bytes <= PAGE_SIZE) {
+-			memcpy(data, buff, bytes);
++			if (!IS_ERR(data))
++				memcpy(data, buff, bytes);
+ 			break;
+ 		}
+-		memcpy(data, buff, PAGE_SIZE);
++		if (!IS_ERR(data))
++			memcpy(data, buff, PAGE_SIZE);
+ 		buff += PAGE_SIZE;
+ 		bytes -= PAGE_SIZE;
+ 		data = squashfs_next_page(output);
+@@ -139,5 +141,6 @@ const struct squashfs_decompressor squashfs_lz4_comp_ops = {
+ 	.decompress = lz4_uncompress,
+ 	.id = LZ4_COMPRESSION,
+ 	.name = "lz4",
++	.alloc_buffer = 0,
+ 	.supported = 1
+ };
+diff --git a/fs/squashfs/lzo_wrapper.c b/fs/squashfs/lzo_wrapper.c
+index cb510a631..d216aeefa 100644
+--- a/fs/squashfs/lzo_wrapper.c
++++ b/fs/squashfs/lzo_wrapper.c
+@@ -93,10 +93,12 @@ static int lzo_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 	buff = stream->output;
+ 	while (data) {
+ 		if (bytes <= PAGE_SIZE) {
+-			memcpy(data, buff, bytes);
++			if (!IS_ERR(data))
++				memcpy(data, buff, bytes);
+ 			break;
+ 		} else {
+-			memcpy(data, buff, PAGE_SIZE);
++			if (!IS_ERR(data))
++				memcpy(data, buff, PAGE_SIZE);
+ 			buff += PAGE_SIZE;
+ 			bytes -= PAGE_SIZE;
+ 			data = squashfs_next_page(output);
+@@ -116,5 +118,6 @@ const struct squashfs_decompressor squashfs_lzo_comp_ops = {
+ 	.decompress = lzo_uncompress,
+ 	.id = LZO_COMPRESSION,
+ 	.name = "lzo",
++	.alloc_buffer = 0,
+ 	.supported = 1
+ };
+diff --git a/fs/squashfs/page_actor.c b/fs/squashfs/page_actor.c
+index 520d323a9..b23b780d8 100644
+--- a/fs/squashfs/page_actor.c
++++ b/fs/squashfs/page_actor.c
+@@ -7,6 +7,8 @@
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+ #include <linux/pagemap.h>
++#include "squashfs_fs_sb.h"
++#include "decompressor.h"
+ #include "page_actor.h"
+ 
+ /*
+@@ -57,29 +59,62 @@ struct squashfs_page_actor *squashfs_page_actor_init(void **buffer,
+ }
+ 
+ /* Implementation of page_actor for decompressing directly into page cache. */
++static void *handle_next_page(struct squashfs_page_actor *actor)
++{
++	int max_pages = (actor->length + PAGE_SIZE - 1) >> PAGE_SHIFT;
++
++	if (actor->returned_pages == max_pages)
++		return NULL;
++
++	if ((actor->next_page == actor->pages) ||
++			(actor->next_index != actor->page[actor->next_page]->index)) {
++		if (actor->alloc_buffer) {
++			void *tmp_buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
++
++			if (tmp_buffer) {
++				actor->tmp_buffer = tmp_buffer;
++				actor->next_index++;
++				actor->returned_pages++;
++				return tmp_buffer;
++			}
++		}
++
++		actor->next_index++;
++		actor->returned_pages++;
++		return ERR_PTR(-ENOMEM);
++	}
++
++	actor->next_index++;
++	actor->returned_pages++;
++	return actor->pageaddr = kmap_local_page(actor->page[actor->next_page++]);
++}
++
+ static void *direct_first_page(struct squashfs_page_actor *actor)
+ {
+-	actor->next_page = 1;
+-	return actor->pageaddr = kmap_atomic(actor->page[0]);
++	return handle_next_page(actor);
+ }
+ 
+ static void *direct_next_page(struct squashfs_page_actor *actor)
+ {
+ 	if (actor->pageaddr)
+-		kunmap_atomic(actor->pageaddr);
++		kunmap_local(actor->pageaddr);
++
++	kfree(actor->tmp_buffer);
++	actor->pageaddr = actor->tmp_buffer = NULL;
+ 
+-	return actor->pageaddr = actor->next_page == actor->pages ? NULL :
+-		kmap_atomic(actor->page[actor->next_page++]);
++	return handle_next_page(actor);
+ }
+ 
+ static void direct_finish_page(struct squashfs_page_actor *actor)
+ {
+ 	if (actor->pageaddr)
+-		kunmap_atomic(actor->pageaddr);
++		kunmap_local(actor->pageaddr);
++
++	kfree(actor->tmp_buffer);
+ }
+ 
+-struct squashfs_page_actor *squashfs_page_actor_init_special(struct page **page,
+-	int pages, int length)
++struct squashfs_page_actor *squashfs_page_actor_init_special(struct squashfs_sb_info *msblk,
++	struct page **page, int pages, int length)
+ {
+ 	struct squashfs_page_actor *actor = kmalloc(sizeof(*actor), GFP_KERNEL);
+ 
+@@ -90,7 +125,11 @@ struct squashfs_page_actor *squashfs_page_actor_init_special(struct page **page,
+ 	actor->page = page;
+ 	actor->pages = pages;
+ 	actor->next_page = 0;
++	actor->returned_pages = 0;
++	actor->next_index = page[0]->index & ~((1 << (msblk->block_log - PAGE_SHIFT)) - 1);
+ 	actor->pageaddr = NULL;
++	actor->tmp_buffer = NULL;
++	actor->alloc_buffer = msblk->decompressor->alloc_buffer;
+ 	actor->squashfs_first_page = direct_first_page;
+ 	actor->squashfs_next_page = direct_next_page;
+ 	actor->squashfs_finish_page = direct_finish_page;
+diff --git a/fs/squashfs/page_actor.h b/fs/squashfs/page_actor.h
+index 2e3073ace..37523c542 100644
+--- a/fs/squashfs/page_actor.h
++++ b/fs/squashfs/page_actor.h
+@@ -45,6 +45,11 @@ static inline void squashfs_finish_page(struct squashfs_page_actor *actor)
+ {
+ 	/* empty */
+ }
++
++static inline void squashfs_actor_nobuff(struct squashfs_page_actor *actor)
++{
++	/* empty */
++}
+ #else
+ struct squashfs_page_actor {
+ 	union {
+@@ -52,17 +57,23 @@ struct squashfs_page_actor {
+ 		struct page	**page;
+ 	};
+ 	void	*pageaddr;
++	void	*tmp_buffer;
+ 	void    *(*squashfs_first_page)(struct squashfs_page_actor *);
+ 	void    *(*squashfs_next_page)(struct squashfs_page_actor *);
+ 	void    (*squashfs_finish_page)(struct squashfs_page_actor *);
+ 	int	pages;
+ 	int	length;
+ 	int	next_page;
++	int	alloc_buffer;
++	int	returned_pages;
++	pgoff_t	next_index;
+ };
+ 
+-extern struct squashfs_page_actor *squashfs_page_actor_init(void **, int, int);
+-extern struct squashfs_page_actor *squashfs_page_actor_init_special(struct page
+-							 **, int, int);
++extern struct squashfs_page_actor *squashfs_page_actor_init(void **buffer,
++				int pages, int length);
++extern struct squashfs_page_actor *squashfs_page_actor_init_special(
++				struct squashfs_sb_info *msblk,
++				struct page **page, int pages, int length);
+ static inline void *squashfs_first_page(struct squashfs_page_actor *actor)
+ {
+ 	return actor->squashfs_first_page(actor);
+@@ -75,5 +86,9 @@ static inline void squashfs_finish_page(struct squashfs_page_actor *actor)
+ {
+ 	actor->squashfs_finish_page(actor);
+ }
++static inline void squashfs_actor_nobuff(struct squashfs_page_actor *actor)
++{
++	actor->alloc_buffer = 0;
++}
+ #endif
+ #endif
+diff --git a/fs/squashfs/xz_wrapper.c b/fs/squashfs/xz_wrapper.c
+index 68f6d09bb..6c49481a2 100644
+--- a/fs/squashfs/xz_wrapper.c
++++ b/fs/squashfs/xz_wrapper.c
+@@ -131,6 +131,10 @@ static int squashfs_xz_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 	stream->buf.out_pos = 0;
+ 	stream->buf.out_size = PAGE_SIZE;
+ 	stream->buf.out = squashfs_first_page(output);
++	if (IS_ERR(stream->buf.out)) {
++		error = PTR_ERR(stream->buf.out);
++		goto finish;
++	}
+ 
+ 	for (;;) {
+ 		enum xz_ret xz_err;
+@@ -156,7 +160,10 @@ static int squashfs_xz_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 
+ 		if (stream->buf.out_pos == stream->buf.out_size) {
+ 			stream->buf.out = squashfs_next_page(output);
+-			if (stream->buf.out != NULL) {
++			if (IS_ERR(stream->buf.out)) {
++				error = PTR_ERR(stream->buf.out);
++				break;
++			} else if (stream->buf.out != NULL) {
+ 				stream->buf.out_pos = 0;
+ 				total += PAGE_SIZE;
+ 			}
+@@ -171,6 +178,7 @@ static int squashfs_xz_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 		}
+ 	}
+ 
++finish:
+ 	squashfs_finish_page(output);
+ 
+ 	return error ? error : total + stream->buf.out_pos;
+@@ -183,5 +191,6 @@ const struct squashfs_decompressor squashfs_xz_comp_ops = {
+ 	.decompress = squashfs_xz_uncompress,
+ 	.id = XZ_COMPRESSION,
+ 	.name = "xz",
++	.alloc_buffer = 1,
+ 	.supported = 1
+ };
+diff --git a/fs/squashfs/zlib_wrapper.c b/fs/squashfs/zlib_wrapper.c
+index a20e90421..cbb7afe7b 100644
+--- a/fs/squashfs/zlib_wrapper.c
++++ b/fs/squashfs/zlib_wrapper.c
+@@ -62,6 +62,11 @@ static int zlib_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 	stream->next_out = squashfs_first_page(output);
+ 	stream->avail_in = 0;
+ 
++	if (IS_ERR(stream->next_out)) {
++		error = PTR_ERR(stream->next_out);
++		goto finish;
++	}
++
+ 	for (;;) {
+ 		int zlib_err;
+ 
+@@ -85,7 +90,10 @@ static int zlib_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 
+ 		if (stream->avail_out == 0) {
+ 			stream->next_out = squashfs_next_page(output);
+-			if (stream->next_out != NULL)
++			if (IS_ERR(stream->next_out)) {
++				error = PTR_ERR(stream->next_out);
++				break;
++			} else if (stream->next_out != NULL)
+ 				stream->avail_out = PAGE_SIZE;
+ 		}
+ 
+@@ -107,6 +115,7 @@ static int zlib_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 		}
+ 	}
+ 
++finish:
+ 	squashfs_finish_page(output);
+ 
+ 	if (!error)
+@@ -122,6 +131,7 @@ const struct squashfs_decompressor squashfs_zlib_comp_ops = {
+ 	.decompress = zlib_uncompress,
+ 	.id = ZLIB_COMPRESSION,
+ 	.name = "zlib",
++	.alloc_buffer = 1,
+ 	.supported = 1
+ };
+ 
+diff --git a/fs/squashfs/zstd_wrapper.c b/fs/squashfs/zstd_wrapper.c
+index c40445dbf..0e407c4d8 100644
+--- a/fs/squashfs/zstd_wrapper.c
++++ b/fs/squashfs/zstd_wrapper.c
+@@ -80,6 +80,10 @@ static int zstd_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 
+ 	out_buf.size = PAGE_SIZE;
+ 	out_buf.dst = squashfs_first_page(output);
++	if (IS_ERR(out_buf.dst)) {
++		error = PTR_ERR(out_buf.dst);
++		goto finish;
++	}
+ 
+ 	for (;;) {
+ 		size_t zstd_err;
+@@ -104,7 +108,10 @@ static int zstd_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 
+ 		if (out_buf.pos == out_buf.size) {
+ 			out_buf.dst = squashfs_next_page(output);
+-			if (out_buf.dst == NULL) {
++			if (IS_ERR(out_buf.dst)) {
++				error = PTR_ERR(out_buf.dst);
++				break;
++			} else if (out_buf.dst == NULL) {
+ 				/* Shouldn't run out of pages
+ 				 * before stream is done.
+ 				 */
+@@ -129,6 +136,8 @@ static int zstd_uncompress(struct squashfs_sb_info *msblk, void *strm,
+ 		}
+ 	}
+ 
++finish:
++
+ 	squashfs_finish_page(output);
+ 
+ 	return error ? error : total_out;
+@@ -140,5 +149,6 @@ const struct squashfs_decompressor squashfs_zstd_comp_ops = {
+ 	.decompress = zstd_uncompress,
+ 	.id = ZSTD_COMPRESSION,
+ 	.name = "zstd",
++	.alloc_buffer = 1,
+ 	.supported = 1
+ };
+-- 
+2.37.1.377.g679aad9e82
+
+
+From 15787260178b9e4dc2c977c57fe14ee152ff13b5 Mon Sep 17 00:00:00 2001
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Date: Sat, 11 Jun 2022 04:21:33 +0100
+Subject: [PATCH 2/5] squashfs: don't use intermediate buffer if pages missing
+
+Now that the "page actor" can handle missing pages, we don't have to fall
+back to using an intermediate buffer in Squashfs_readpage_block() if all
+the pages necessary can't be obtained.
+
+Link: https://lkml.kernel.org/r/20220611032133.5743-3-phillip@squashfs.org.uk
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+Cc: Hsin-Yi Wang <hsinyi@chromium.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Xiongwei Song <Xiongwei.Song@windriver.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ fs/squashfs/file_direct.c | 75 +++++++--------------------------------
+ 1 file changed, 12 insertions(+), 63 deletions(-)
+
+diff --git a/fs/squashfs/file_direct.c b/fs/squashfs/file_direct.c
+index 5af5802f5..be4b12d31 100644
+--- a/fs/squashfs/file_direct.c
++++ b/fs/squashfs/file_direct.c
+@@ -18,9 +18,6 @@
+ #include "squashfs.h"
+ #include "page_actor.h"
+ 
+-static int squashfs_read_cache(struct page *target_page, u64 block, int bsize,
+-	int pages, struct page **page, int bytes);
+-
+ /* Read separately compressed datablock directly into page cache */
+ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 	int expected)
+@@ -33,7 +30,7 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 	int mask = (1 << (msblk->block_log - PAGE_SHIFT)) - 1;
+ 	int start_index = target_page->index & ~mask;
+ 	int end_index = start_index | mask;
+-	int i, n, pages, missing_pages, bytes, res = -ENOMEM;
++	int i, n, pages, bytes, res = -ENOMEM;
+ 	struct page **page;
+ 	struct squashfs_page_actor *actor;
+ 	void *pageaddr;
+@@ -48,44 +45,29 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 		return res;
+ 
+ 	/* Try to grab all the pages covered by the Squashfs block */
+-	for (missing_pages = 0, i = 0, n = start_index; i < pages; i++, n++) {
++	for (i = 0, n = start_index; n <= end_index; n++) {
+ 		page[i] = (n == target_page->index) ? target_page :
+ 			grab_cache_page_nowait(target_page->mapping, n);
+ 
+-		if (page[i] == NULL) {
+-			missing_pages++;
++		if (page[i] == NULL)
+ 			continue;
+-		}
+ 
+ 		if (PageUptodate(page[i])) {
+ 			unlock_page(page[i]);
+ 			put_page(page[i]);
+-			page[i] = NULL;
+-			missing_pages++;
++			continue;
+ 		}
+-	}
+-
+-	if (missing_pages) {
+-		/*
+-		 * Couldn't get one or more pages, this page has either
+-		 * been VM reclaimed, but others are still in the page cache
+-		 * and uptodate, or we're racing with another thread in
+-		 * squashfs_readpage also trying to grab them.  Fall back to
+-		 * using an intermediate buffer.
+-		 */
+-		res = squashfs_read_cache(target_page, block, bsize, pages,
+-							page, expected);
+-		if (res < 0)
+-			goto mark_errored;
+ 
+-		goto out;
++		i++;
+ 	}
+ 
++	pages = i;
++
+ 	/*
+ 	 * Create a "page actor" which will kmap and kunmap the
+ 	 * page cache pages appropriately within the decompressor
+ 	 */
+-	actor = squashfs_page_actor_init_special(msblk, page, pages, 0);
++	actor = squashfs_page_actor_init_special(msblk, page, pages, expected);
+ 	if (actor == NULL)
+ 		goto out;
+ 
+@@ -102,12 +84,12 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 		goto mark_errored;
+ 	}
+ 
+-	/* Last page may have trailing bytes not filled */
++	/* Last page (if present) may have trailing bytes not filled */
+ 	bytes = res % PAGE_SIZE;
+-	if (bytes) {
+-		pageaddr = kmap_atomic(page[pages - 1]);
++	if (page[pages - 1]->index == end_index && bytes) {
++		pageaddr = kmap_local_page(page[pages - 1]);
+ 		memset(pageaddr + bytes, 0, PAGE_SIZE - bytes);
+-		kunmap_atomic(pageaddr);
++		kunmap_local(pageaddr);
+ 	}
+ 
+ 	/* Mark pages as uptodate, unlock and release */
+@@ -140,36 +122,3 @@ int squashfs_readpage_block(struct page *target_page, u64 block, int bsize,
+ 	kfree(page);
+ 	return res;
+ }
+-
+-
+-static int squashfs_read_cache(struct page *target_page, u64 block, int bsize,
+-	int pages, struct page **page, int bytes)
+-{
+-	struct inode *i = target_page->mapping->host;
+-	struct squashfs_cache_entry *buffer = squashfs_get_datablock(i->i_sb,
+-						 block, bsize);
+-	int res = buffer->error, n, offset = 0;
+-
+-	if (res) {
+-		ERROR("Unable to read page, block %llx, size %x\n", block,
+-			bsize);
+-		goto out;
+-	}
+-
+-	for (n = 0; n < pages && bytes > 0; n++,
+-			bytes -= PAGE_SIZE, offset += PAGE_SIZE) {
+-		int avail = min_t(int, bytes, PAGE_SIZE);
+-
+-		if (page[n] == NULL)
+-			continue;
+-
+-		squashfs_fill_page(page[n], buffer, offset, avail);
+-		unlock_page(page[n]);
+-		if (page[n] != target_page)
+-			put_page(page[n]);
+-	}
+-
+-out:
+-	squashfs_cache_put(buffer);
+-	return res;
+-}
+-- 
+2.37.1.377.g679aad9e82
+
+
+From 45a715e5731d37516a5f7094e7f83df4951a0b80 Mon Sep 17 00:00:00 2001
+From: Hsin-Yi Wang <hsinyi@chromium.org>
+Date: Mon, 13 Jun 2022 16:28:00 +0800
+Subject: [PATCH 3/5] Revert "squashfs: provide backing_dev_info in order to
+ disable read-ahead"
+
+Patch series "Implement readahead for squashfs", v6.
+
+Commit 9eec1d897139("squashfs: provide backing_dev_info in order to
+disable read-ahead") mitigates the performance drop issue for squashfs by
+closing readahead for it.
+
+This patch (of 3):
+
+This reverts commit 9eec1d897139e5 ("squashfs: provide backing_dev_info in
+order to disable read-ahead").
+
+Revert closing the readahead to squashfs since the readahead callback
+for squashfs is implemented.
+
+Link: https://lkml.kernel.org/r/20220613082802.1301238-1-hsinyi@chromium.org
+Link: https://lkml.kernel.org/r/20220613082802.1301238-2-hsinyi@chromium.org
+Suggested-by: Xiongwei Song <Xiongwei.Song@windriver.com>
+Signed-off-by: Hsin-Yi Wang <hsinyi@chromium.org>
+Cc: Phillip Lougher <phillip@squashfs.org.uk>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+Cc: Zheng Liang <zhengliang6@huawei.com>
+Cc: Zhang Yi <yi.zhang@huawei.com>
+Cc: Hou Tao <houtao1@huawei.com>
+Cc: Miao Xie <miaoxie@huawei.com>
+Cc: kernel test robot <lkp@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ fs/squashfs/super.c | 33 ---------------------------------
+ 1 file changed, 33 deletions(-)
+
+diff --git a/fs/squashfs/super.c b/fs/squashfs/super.c
+index 6d594ba2e..32565dafa 100644
+--- a/fs/squashfs/super.c
++++ b/fs/squashfs/super.c
+@@ -29,7 +29,6 @@
+ #include <linux/module.h>
+ #include <linux/magic.h>
+ #include <linux/xattr.h>
+-#include <linux/backing-dev.h>
+ 
+ #include "squashfs_fs.h"
+ #include "squashfs_fs_sb.h"
+@@ -113,24 +112,6 @@ static const struct squashfs_decompressor *supported_squashfs_filesystem(
+ 	return decompressor;
+ }
+ 
+-static int squashfs_bdi_init(struct super_block *sb)
+-{
+-	int err;
+-	unsigned int major = MAJOR(sb->s_dev);
+-	unsigned int minor = MINOR(sb->s_dev);
+-
+-	bdi_put(sb->s_bdi);
+-	sb->s_bdi = &noop_backing_dev_info;
+-
+-	err = super_setup_bdi_name(sb, "squashfs_%u_%u", major, minor);
+-	if (err)
+-		return err;
+-
+-	sb->s_bdi->ra_pages = 0;
+-	sb->s_bdi->io_pages = 0;
+-
+-	return 0;
+-}
+ 
+ static int squashfs_fill_super(struct super_block *sb, struct fs_context *fc)
+ {
+@@ -146,20 +127,6 @@ static int squashfs_fill_super(struct super_block *sb, struct fs_context *fc)
+ 
+ 	TRACE("Entered squashfs_fill_superblock\n");
+ 
+-	/*
+-	 * squashfs provides 'backing_dev_info' in order to disable read-ahead. For
+-	 * squashfs, I/O is not deferred, it is done immediately in read_folio,
+-	 * which means the user would always have to wait their own I/O. So the effect
+-	 * of readahead is very weak for squashfs. squashfs_bdi_init will set
+-	 * sb->s_bdi->ra_pages and sb->s_bdi->io_pages to 0 and close readahead for
+-	 * squashfs.
+-	 */
+-	err = squashfs_bdi_init(sb);
+-	if (err) {
+-		errorf(fc, "squashfs init bdi failed");
+-		return err;
+-	}
+-
+ 	sb->s_fs_info = kzalloc(sizeof(*msblk), GFP_KERNEL);
+ 	if (sb->s_fs_info == NULL) {
+ 		ERROR("Failed to allocate squashfs_sb_info\n");
+-- 
+2.37.1.377.g679aad9e82
+
+
+From 84a09ff1f43e8f577dbb94895c26ed6cbe6f882c Mon Sep 17 00:00:00 2001
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Date: Mon, 13 Jun 2022 16:28:01 +0800
+Subject: [PATCH 4/5] squashfs: always build "file direct" version of page
+ actor
+
+Squashfs_readahead uses the "file direct" version of the page
+actor, and so build it unconditionally.
+
+Link: https://lkml.kernel.org/r/20220613082802.1301238-3-hsinyi@chromium.org
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+Signed-off-by: Hsin-Yi Wang <hsinyi@chromium.org>
+Cc: Hou Tao <houtao1@huawei.com>
+Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miao Xie <miaoxie@huawei.com>
+Cc: Xiongwei Song <Xiongwei.Song@windriver.com>
+Cc: Zhang Yi <yi.zhang@huawei.com>
+Cc: Zheng Liang <zhengliang6@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ fs/squashfs/Makefile     |  4 ++--
+ fs/squashfs/page_actor.h | 46 ----------------------------------------
+ 2 files changed, 2 insertions(+), 48 deletions(-)
+
+diff --git a/fs/squashfs/Makefile b/fs/squashfs/Makefile
+index 7bd9b8b85..477c89a51 100644
+--- a/fs/squashfs/Makefile
++++ b/fs/squashfs/Makefile
+@@ -5,9 +5,9 @@
+ 
+ obj-$(CONFIG_SQUASHFS) += squashfs.o
+ squashfs-y += block.o cache.o dir.o export.o file.o fragment.o id.o inode.o
+-squashfs-y += namei.o super.o symlink.o decompressor.o
++squashfs-y += namei.o super.o symlink.o decompressor.o page_actor.o
+ squashfs-$(CONFIG_SQUASHFS_FILE_CACHE) += file_cache.o
+-squashfs-$(CONFIG_SQUASHFS_FILE_DIRECT) += file_direct.o page_actor.o
++squashfs-$(CONFIG_SQUASHFS_FILE_DIRECT) += file_direct.o
+ squashfs-$(CONFIG_SQUASHFS_DECOMP_SINGLE) += decompressor_single.o
+ squashfs-$(CONFIG_SQUASHFS_DECOMP_MULTI) += decompressor_multi.o
+ squashfs-$(CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU) += decompressor_multi_percpu.o
+diff --git a/fs/squashfs/page_actor.h b/fs/squashfs/page_actor.h
+index 37523c542..24841d28b 100644
+--- a/fs/squashfs/page_actor.h
++++ b/fs/squashfs/page_actor.h
+@@ -6,51 +6,6 @@
+  * Phillip Lougher <phillip@squashfs.org.uk>
+  */
+ 
+-#ifndef CONFIG_SQUASHFS_FILE_DIRECT
+-struct squashfs_page_actor {
+-	void	**page;
+-	int	pages;
+-	int	length;
+-	int	next_page;
+-};
+-
+-static inline struct squashfs_page_actor *squashfs_page_actor_init(void **page,
+-	int pages, int length)
+-{
+-	struct squashfs_page_actor *actor = kmalloc(sizeof(*actor), GFP_KERNEL);
+-
+-	if (actor == NULL)
+-		return NULL;
+-
+-	actor->length = length ? : pages * PAGE_SIZE;
+-	actor->page = page;
+-	actor->pages = pages;
+-	actor->next_page = 0;
+-	return actor;
+-}
+-
+-static inline void *squashfs_first_page(struct squashfs_page_actor *actor)
+-{
+-	actor->next_page = 1;
+-	return actor->page[0];
+-}
+-
+-static inline void *squashfs_next_page(struct squashfs_page_actor *actor)
+-{
+-	return actor->next_page == actor->pages ? NULL :
+-		actor->page[actor->next_page++];
+-}
+-
+-static inline void squashfs_finish_page(struct squashfs_page_actor *actor)
+-{
+-	/* empty */
+-}
+-
+-static inline void squashfs_actor_nobuff(struct squashfs_page_actor *actor)
+-{
+-	/* empty */
+-}
+-#else
+ struct squashfs_page_actor {
+ 	union {
+ 		void		**buffer;
+@@ -91,4 +46,3 @@ static inline void squashfs_actor_nobuff(struct squashfs_page_actor *actor)
+ 	actor->alloc_buffer = 0;
+ }
+ #endif
+-#endif
+-- 
+2.37.1.377.g679aad9e82
+
+
+From b94e7aeaf6f4b1384043d6452192bbddc9636cb0 Mon Sep 17 00:00:00 2001
+From: Hsin-Yi Wang <hsinyi@chromium.org>
+Date: Mon, 13 Jun 2022 16:28:02 +0800
+Subject: [PATCH 5/5] squashfs: implement readahead
+
+Implement readahead callback for squashfs.  It will read datablocks which
+cover pages in readahead request.  For a few cases it will not mark page
+as uptodate, including:
+
+- file end is 0.
+- zero filled blocks.
+- current batch of pages isn't in the same datablock.
+- decompressor error.
+
+Otherwise pages will be marked as uptodate.  The unhandled pages will be
+updated by readpage later.
+
+Link: https://lkml.kernel.org/r/20220613082802.1301238-4-hsinyi@chromium.org
+Suggested-by: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Hsin-Yi Wang <hsinyi@chromium.org>
+Reported-by: Matthew Wilcox <willy@infradead.org>
+Reported-by: Phillip Lougher <phillip@squashfs.org.uk>
+Reported-by: Xiongwei Song <Xiongwei.Song@windriver.com>
+Reported-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Hou Tao <houtao1@huawei.com>
+Cc: kernel test robot <lkp@intel.com>
+Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+Cc: Miao Xie <miaoxie@huawei.com>
+Cc: Zhang Yi <yi.zhang@huawei.com>
+Cc: Zheng Liang <zhengliang6@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ fs/squashfs/file.c | 92 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/fs/squashfs/file.c b/fs/squashfs/file.c
+index a8e495d8e..128ebe9ad 100644
+--- a/fs/squashfs/file.c
++++ b/fs/squashfs/file.c
+@@ -39,6 +39,7 @@
+ #include "squashfs_fs_sb.h"
+ #include "squashfs_fs_i.h"
+ #include "squashfs.h"
++#include "page_actor.h"
+ 
+ /*
+  * Locate cache slot in range [offset, index] for specified inode.  If
+@@ -495,7 +496,96 @@ static int squashfs_read_folio(struct file *file, struct folio *folio)
+ 	return 0;
+ }
+ 
++static void squashfs_readahead(struct readahead_control *ractl)
++{
++	struct inode *inode = ractl->mapping->host;
++	struct squashfs_sb_info *msblk = inode->i_sb->s_fs_info;
++	size_t mask = (1UL << msblk->block_log) - 1;
++	unsigned short shift = msblk->block_log - PAGE_SHIFT;
++	loff_t start = readahead_pos(ractl) & ~mask;
++	size_t len = readahead_length(ractl) + readahead_pos(ractl) - start;
++	struct squashfs_page_actor *actor;
++	unsigned int nr_pages = 0;
++	struct page **pages;
++	int i, file_end = i_size_read(inode) >> msblk->block_log;
++	unsigned int max_pages = 1UL << shift;
++
++	readahead_expand(ractl, start, (len | mask) + 1);
++
++	if (file_end == 0)
++		return;
++
++	pages = kmalloc_array(max_pages, sizeof(void *), GFP_KERNEL);
++	if (!pages)
++		return;
++
++	for (;;) {
++		pgoff_t index;
++		int res, bsize;
++		u64 block = 0;
++		unsigned int expected;
++
++		nr_pages = __readahead_batch(ractl, pages, max_pages);
++		if (!nr_pages)
++			break;
++
++		if (readahead_pos(ractl) >= i_size_read(inode))
++			goto skip_pages;
++
++		index = pages[0]->index >> shift;
++		if ((pages[nr_pages - 1]->index >> shift) != index)
++			goto skip_pages;
++
++		expected = index == file_end ?
++			   (i_size_read(inode) & (msblk->block_size - 1)) :
++			    msblk->block_size;
++
++		bsize = read_blocklist(inode, index, &block);
++		if (bsize == 0)
++			goto skip_pages;
++
++		actor = squashfs_page_actor_init_special(msblk, pages, nr_pages,
++							 expected);
++		if (!actor)
++			goto skip_pages;
++
++		res = squashfs_read_data(inode->i_sb, block, bsize, NULL, actor);
++
++		kfree(actor);
++
++		if (res == expected) {
++			int bytes;
++
++			/* Last page (if present) may have trailing bytes not filled */
++			bytes = res % PAGE_SIZE;
++			if (pages[nr_pages - 1]->index == file_end && bytes)
++				memzero_page(pages[nr_pages - 1], bytes,
++					     PAGE_SIZE - bytes);
++
++			for (i = 0; i < nr_pages; i++) {
++				flush_dcache_page(pages[i]);
++				SetPageUptodate(pages[i]);
++			}
++		}
++
++		for (i = 0; i < nr_pages; i++) {
++			unlock_page(pages[i]);
++			put_page(pages[i]);
++		}
++	}
++
++	kfree(pages);
++	return;
++
++skip_pages:
++	for (i = 0; i < nr_pages; i++) {
++		unlock_page(pages[i]);
++		put_page(pages[i]);
++	}
++	kfree(pages);
++}
+ 
+ const struct address_space_operations squashfs_aops = {
+-	.read_folio = squashfs_read_folio
++	.read_folio = squashfs_read_folio,
++	.readahead = squashfs_readahead
+ };
+-- 
+2.37.1.377.g679aad9e82
+
