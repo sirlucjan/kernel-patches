@@ -1,0 +1,210 @@
+From 3d03595031aa0b1994f1f2564a25946930799ef4 Mon Sep 17 00:00:00 2001
+From: Alexander Potapenko <glider@google.com>
+Date: Mon, 5 Sep 2022 14:24:30 +0200
+Subject: [PATCH 22/48] dma: kmsan: unpoison DMA mappings
+
+KMSAN doesn't know about DMA memory writes performed by devices.
+We unpoison such memory when it's mapped to avoid false positive
+reports.
+
+Signed-off-by: Alexander Potapenko <glider@google.com>
+---
+ include/linux/kmsan.h | 41 ++++++++++++++++++++++++++++++
+ kernel/dma/mapping.c  | 10 +++++---
+ mm/kmsan/hooks.c      | 59 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 107 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/kmsan.h b/include/linux/kmsan.h
+index e00de976e..dac296da4 100644
+--- a/include/linux/kmsan.h
++++ b/include/linux/kmsan.h
+@@ -9,6 +9,7 @@
+ #ifndef _LINUX_KMSAN_H
+ #define _LINUX_KMSAN_H
+ 
++#include <linux/dma-direction.h>
+ #include <linux/gfp.h>
+ #include <linux/kmsan-checks.h>
+ #include <linux/types.h>
+@@ -16,6 +17,7 @@
+ struct page;
+ struct kmem_cache;
+ struct task_struct;
++struct scatterlist;
+ 
+ #ifdef CONFIG_KMSAN
+ 
+@@ -172,6 +174,35 @@ void kmsan_ioremap_page_range(unsigned long addr, unsigned long end,
+  */
+ void kmsan_iounmap_page_range(unsigned long start, unsigned long end);
+ 
++/**
++ * kmsan_handle_dma() - Handle a DMA data transfer.
++ * @page:   first page of the buffer.
++ * @offset: offset of the buffer within the first page.
++ * @size:   buffer size.
++ * @dir:    one of possible dma_data_direction values.
++ *
++ * Depending on @direction, KMSAN:
++ * * checks the buffer, if it is copied to device;
++ * * initializes the buffer, if it is copied from device;
++ * * does both, if this is a DMA_BIDIRECTIONAL transfer.
++ */
++void kmsan_handle_dma(struct page *page, size_t offset, size_t size,
++		      enum dma_data_direction dir);
++
++/**
++ * kmsan_handle_dma_sg() - Handle a DMA transfer using scatterlist.
++ * @sg:    scatterlist holding DMA buffers.
++ * @nents: number of scatterlist entries.
++ * @dir:   one of possible dma_data_direction values.
++ *
++ * Depending on @direction, KMSAN:
++ * * checks the buffers in the scatterlist, if they are copied to device;
++ * * initializes the buffers, if they are copied from device;
++ * * does both, if this is a DMA_BIDIRECTIONAL transfer.
++ */
++void kmsan_handle_dma_sg(struct scatterlist *sg, int nents,
++			 enum dma_data_direction dir);
++
+ #else
+ 
+ static inline void kmsan_init_shadow(void)
+@@ -254,6 +285,16 @@ static inline void kmsan_iounmap_page_range(unsigned long start,
+ {
+ }
+ 
++static inline void kmsan_handle_dma(struct page *page, size_t offset,
++				    size_t size, enum dma_data_direction dir)
++{
++}
++
++static inline void kmsan_handle_dma_sg(struct scatterlist *sg, int nents,
++				       enum dma_data_direction dir)
++{
++}
++
+ #endif
+ 
+ #endif /* _LINUX_KMSAN_H */
+diff --git a/kernel/dma/mapping.c b/kernel/dma/mapping.c
+index 27f272381..33437d620 100644
+--- a/kernel/dma/mapping.c
++++ b/kernel/dma/mapping.c
+@@ -10,6 +10,7 @@
+ #include <linux/dma-map-ops.h>
+ #include <linux/export.h>
+ #include <linux/gfp.h>
++#include <linux/kmsan.h>
+ #include <linux/of_device.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+@@ -156,6 +157,7 @@ dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page,
+ 		addr = dma_direct_map_page(dev, page, offset, size, dir, attrs);
+ 	else
+ 		addr = ops->map_page(dev, page, offset, size, dir, attrs);
++	kmsan_handle_dma(page, offset, size, dir);
+ 	debug_dma_map_page(dev, page, offset, size, dir, addr, attrs);
+ 
+ 	return addr;
+@@ -194,11 +196,13 @@ static int __dma_map_sg_attrs(struct device *dev, struct scatterlist *sg,
+ 	else
+ 		ents = ops->map_sg(dev, sg, nents, dir, attrs);
+ 
+-	if (ents > 0)
++	if (ents > 0) {
++		kmsan_handle_dma_sg(sg, nents, dir);
+ 		debug_dma_map_sg(dev, sg, nents, ents, dir, attrs);
+-	else if (WARN_ON_ONCE(ents != -EINVAL && ents != -ENOMEM &&
+-			      ents != -EIO && ents != -EREMOTEIO))
++	} else if (WARN_ON_ONCE(ents != -EINVAL && ents != -ENOMEM &&
++				ents != -EIO && ents != -EREMOTEIO)) {
+ 		return -EIO;
++	}
+ 
+ 	return ents;
+ }
+diff --git a/mm/kmsan/hooks.c b/mm/kmsan/hooks.c
+index 5c0eb25d9..563c09443 100644
+--- a/mm/kmsan/hooks.c
++++ b/mm/kmsan/hooks.c
+@@ -10,10 +10,12 @@
+  */
+ 
+ #include <linux/cacheflush.h>
++#include <linux/dma-direction.h>
+ #include <linux/gfp.h>
+ #include <linux/kmsan.h>
+ #include <linux/mm.h>
+ #include <linux/mm_types.h>
++#include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ 
+@@ -243,6 +245,63 @@ void kmsan_copy_to_user(void __user *to, const void *from, size_t to_copy,
+ }
+ EXPORT_SYMBOL(kmsan_copy_to_user);
+ 
++static void kmsan_handle_dma_page(const void *addr, size_t size,
++				  enum dma_data_direction dir)
++{
++	switch (dir) {
++	case DMA_BIDIRECTIONAL:
++		kmsan_internal_check_memory((void *)addr, size, /*user_addr*/ 0,
++					    REASON_ANY);
++		kmsan_internal_unpoison_memory((void *)addr, size,
++					       /*checked*/ false);
++		break;
++	case DMA_TO_DEVICE:
++		kmsan_internal_check_memory((void *)addr, size, /*user_addr*/ 0,
++					    REASON_ANY);
++		break;
++	case DMA_FROM_DEVICE:
++		kmsan_internal_unpoison_memory((void *)addr, size,
++					       /*checked*/ false);
++		break;
++	case DMA_NONE:
++		break;
++	}
++}
++
++/* Helper function to handle DMA data transfers. */
++void kmsan_handle_dma(struct page *page, size_t offset, size_t size,
++		      enum dma_data_direction dir)
++{
++	u64 page_offset, to_go, addr;
++
++	if (PageHighMem(page))
++		return;
++	addr = (u64)page_address(page) + offset;
++	/*
++	 * The kernel may occasionally give us adjacent DMA pages not belonging
++	 * to the same allocation. Process them separately to avoid triggering
++	 * internal KMSAN checks.
++	 */
++	while (size > 0) {
++		page_offset = addr % PAGE_SIZE;
++		to_go = min(PAGE_SIZE - page_offset, (u64)size);
++		kmsan_handle_dma_page((void *)addr, to_go, dir);
++		addr += to_go;
++		size -= to_go;
++	}
++}
++
++void kmsan_handle_dma_sg(struct scatterlist *sg, int nents,
++			 enum dma_data_direction dir)
++{
++	struct scatterlist *item;
++	int i;
++
++	for_each_sg(sg, item, nents, i)
++		kmsan_handle_dma(sg_page(item), item->offset, item->length,
++				 dir);
++}
++
+ /* Functions from kmsan-checks.h follow. */
+ void kmsan_poison_memory(const void *address, size_t size, gfp_t flags)
+ {
+-- 
+2.37.3.485.gbe1a02a17e
+
