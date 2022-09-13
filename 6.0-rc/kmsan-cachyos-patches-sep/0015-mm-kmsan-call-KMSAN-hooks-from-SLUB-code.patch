@@ -1,0 +1,277 @@
+From e288c9473a29cae1721f0da576602bddc7c88b38 Mon Sep 17 00:00:00 2001
+From: Alexander Potapenko <glider@google.com>
+Date: Mon, 5 Sep 2022 14:24:23 +0200
+Subject: [PATCH 15/44] mm: kmsan: call KMSAN hooks from SLUB code
+
+In order to report uninitialized memory coming from heap allocations
+KMSAN has to poison them unless they're created with __GFP_ZERO.
+
+It's handy that we need KMSAN hooks in the places where
+init_on_alloc/init_on_free initialization is performed.
+
+In addition, we apply __no_kmsan_checks to get_freepointer_safe() to
+suppress reports when accessing freelist pointers that reside in freed
+objects.
+
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Reviewed-by: Marco Elver <elver@google.com>
+---
+ include/linux/kmsan.h | 57 ++++++++++++++++++++++++++++++++
+ mm/kmsan/hooks.c      | 76 +++++++++++++++++++++++++++++++++++++++++++
+ mm/slab.h             |  1 +
+ mm/slub.c             | 17 ++++++++++
+ 4 files changed, 151 insertions(+)
+
+diff --git a/include/linux/kmsan.h b/include/linux/kmsan.h
+index b36bf3db8..5c4e00790 100644
+--- a/include/linux/kmsan.h
++++ b/include/linux/kmsan.h
+@@ -14,6 +14,7 @@
+ #include <linux/types.h>
+ 
+ struct page;
++struct kmem_cache;
+ 
+ #ifdef CONFIG_KMSAN
+ 
+@@ -48,6 +49,44 @@ void kmsan_free_page(struct page *page, unsigned int order);
+  */
+ void kmsan_copy_page_meta(struct page *dst, struct page *src);
+ 
++/**
++ * kmsan_slab_alloc() - Notify KMSAN about a slab allocation.
++ * @s:      slab cache the object belongs to.
++ * @object: object pointer.
++ * @flags:  GFP flags passed to the allocator.
++ *
++ * Depending on cache flags and GFP flags, KMSAN sets up the metadata of the
++ * newly created object, marking it as initialized or uninitialized.
++ */
++void kmsan_slab_alloc(struct kmem_cache *s, void *object, gfp_t flags);
++
++/**
++ * kmsan_slab_free() - Notify KMSAN about a slab deallocation.
++ * @s:      slab cache the object belongs to.
++ * @object: object pointer.
++ *
++ * KMSAN marks the freed object as uninitialized.
++ */
++void kmsan_slab_free(struct kmem_cache *s, void *object);
++
++/**
++ * kmsan_kmalloc_large() - Notify KMSAN about a large slab allocation.
++ * @ptr:   object pointer.
++ * @size:  object size.
++ * @flags: GFP flags passed to the allocator.
++ *
++ * Similar to kmsan_slab_alloc(), but for large allocations.
++ */
++void kmsan_kmalloc_large(const void *ptr, size_t size, gfp_t flags);
++
++/**
++ * kmsan_kfree_large() - Notify KMSAN about a large slab deallocation.
++ * @ptr: object pointer.
++ *
++ * Similar to kmsan_slab_free(), but for large allocations.
++ */
++void kmsan_kfree_large(const void *ptr);
++
+ /**
+  * kmsan_map_kernel_range_noflush() - Notify KMSAN about a vmap.
+  * @start:	start of vmapped range.
+@@ -114,6 +153,24 @@ static inline void kmsan_copy_page_meta(struct page *dst, struct page *src)
+ {
+ }
+ 
++static inline void kmsan_slab_alloc(struct kmem_cache *s, void *object,
++				    gfp_t flags)
++{
++}
++
++static inline void kmsan_slab_free(struct kmem_cache *s, void *object)
++{
++}
++
++static inline void kmsan_kmalloc_large(const void *ptr, size_t size,
++				       gfp_t flags)
++{
++}
++
++static inline void kmsan_kfree_large(const void *ptr)
++{
++}
++
+ static inline void kmsan_vmap_pages_range_noflush(unsigned long start,
+ 						  unsigned long end,
+ 						  pgprot_t prot,
+diff --git a/mm/kmsan/hooks.c b/mm/kmsan/hooks.c
+index 040111bb9..000703c56 100644
+--- a/mm/kmsan/hooks.c
++++ b/mm/kmsan/hooks.c
+@@ -27,6 +27,82 @@
+  * skipping effects of functions like memset() inside instrumented code.
+  */
+ 
++void kmsan_slab_alloc(struct kmem_cache *s, void *object, gfp_t flags)
++{
++	if (unlikely(object == NULL))
++		return;
++	if (!kmsan_enabled || kmsan_in_runtime())
++		return;
++	/*
++	 * There's a ctor or this is an RCU cache - do nothing. The memory
++	 * status hasn't changed since last use.
++	 */
++	if (s->ctor || (s->flags & SLAB_TYPESAFE_BY_RCU))
++		return;
++
++	kmsan_enter_runtime();
++	if (flags & __GFP_ZERO)
++		kmsan_internal_unpoison_memory(object, s->object_size,
++					       KMSAN_POISON_CHECK);
++	else
++		kmsan_internal_poison_memory(object, s->object_size, flags,
++					     KMSAN_POISON_CHECK);
++	kmsan_leave_runtime();
++}
++
++void kmsan_slab_free(struct kmem_cache *s, void *object)
++{
++	if (!kmsan_enabled || kmsan_in_runtime())
++		return;
++
++	/* RCU slabs could be legally used after free within the RCU period */
++	if (unlikely(s->flags & (SLAB_TYPESAFE_BY_RCU | SLAB_POISON)))
++		return;
++	/*
++	 * If there's a constructor, freed memory must remain in the same state
++	 * until the next allocation. We cannot save its state to detect
++	 * use-after-free bugs, instead we just keep it unpoisoned.
++	 */
++	if (s->ctor)
++		return;
++	kmsan_enter_runtime();
++	kmsan_internal_poison_memory(object, s->object_size, GFP_KERNEL,
++				     KMSAN_POISON_CHECK | KMSAN_POISON_FREE);
++	kmsan_leave_runtime();
++}
++
++void kmsan_kmalloc_large(const void *ptr, size_t size, gfp_t flags)
++{
++	if (unlikely(ptr == NULL))
++		return;
++	if (!kmsan_enabled || kmsan_in_runtime())
++		return;
++	kmsan_enter_runtime();
++	if (flags & __GFP_ZERO)
++		kmsan_internal_unpoison_memory((void *)ptr, size,
++					       /*checked*/ true);
++	else
++		kmsan_internal_poison_memory((void *)ptr, size, flags,
++					     KMSAN_POISON_CHECK);
++	kmsan_leave_runtime();
++}
++
++void kmsan_kfree_large(const void *ptr)
++{
++	struct page *page;
++
++	if (!kmsan_enabled || kmsan_in_runtime())
++		return;
++	kmsan_enter_runtime();
++	page = virt_to_head_page((void *)ptr);
++	KMSAN_WARN_ON(ptr != page_address(page));
++	kmsan_internal_poison_memory((void *)ptr,
++				     PAGE_SIZE << compound_order(page),
++				     GFP_KERNEL,
++				     KMSAN_POISON_CHECK | KMSAN_POISON_FREE);
++	kmsan_leave_runtime();
++}
++
+ static unsigned long vmalloc_shadow(unsigned long addr)
+ {
+ 	return (unsigned long)kmsan_get_metadata((void *)addr,
+diff --git a/mm/slab.h b/mm/slab.h
+index 4ec82bec1..9d0afd298 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -729,6 +729,7 @@ static inline void slab_post_alloc_hook(struct kmem_cache *s,
+ 			memset(p[i], 0, s->object_size);
+ 		kmemleak_alloc_recursive(p[i], s->object_size, 1,
+ 					 s->flags, flags);
++		kmsan_slab_alloc(s, p[i], flags);
+ 	}
+ 
+ 	memcg_slab_post_alloc_hook(s, objcg, flags, size, p);
+diff --git a/mm/slub.c b/mm/slub.c
+index 862dbd9af..2c323d83d 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -22,6 +22,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ #include <linux/kasan.h>
++#include <linux/kmsan.h>
+ #include <linux/cpu.h>
+ #include <linux/cpuset.h>
+ #include <linux/mempolicy.h>
+@@ -359,6 +360,17 @@ static void prefetch_freepointer(const struct kmem_cache *s, void *object)
+ 	prefetchw(object + s->offset);
+ }
+ 
++/*
++ * When running under KMSAN, get_freepointer_safe() may return an uninitialized
++ * pointer value in the case the current thread loses the race for the next
++ * memory chunk in the freelist. In that case this_cpu_cmpxchg_double() in
++ * slab_alloc_node() will fail, so the uninitialized value won't be used, but
++ * KMSAN will still check all arguments of cmpxchg because of imperfect
++ * handling of inline assembly.
++ * To work around this problem, we apply __no_kmsan_checks to ensure that
++ * get_freepointer_safe() returns initialized memory.
++ */
++__no_kmsan_checks
+ static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
+ {
+ 	unsigned long freepointer_addr;
+@@ -1709,6 +1721,7 @@ static inline void *kmalloc_large_node_hook(void *ptr, size_t size, gfp_t flags)
+ 	ptr = kasan_kmalloc_large(ptr, size, flags);
+ 	/* As ptr might get tagged, call kmemleak hook after KASAN. */
+ 	kmemleak_alloc(ptr, size, 1, flags);
++	kmsan_kmalloc_large(ptr, size, flags);
+ 	return ptr;
+ }
+ 
+@@ -1716,12 +1729,14 @@ static __always_inline void kfree_hook(void *x)
+ {
+ 	kmemleak_free(x);
+ 	kasan_kfree_large(x);
++	kmsan_kfree_large(x);
+ }
+ 
+ static __always_inline bool slab_free_hook(struct kmem_cache *s,
+ 						void *x, bool init)
+ {
+ 	kmemleak_free_recursive(x, s->flags);
++	kmsan_slab_free(s, x);
+ 
+ 	debug_check_no_locks_freed(x, s->object_size);
+ 
+@@ -5915,6 +5930,7 @@ static char *create_unique_id(struct kmem_cache *s)
+ 	p += sprintf(p, "%07u", s->size);
+ 
+ 	BUG_ON(p > name + ID_STR_LENGTH - 1);
++	kmsan_unpoison_memory(name, p - name);
+ 	return name;
+ }
+ 
+@@ -6016,6 +6032,7 @@ static int sysfs_slab_alias(struct kmem_cache *s, const char *name)
+ 	al->name = name;
+ 	al->next = alias_list;
+ 	alias_list = al;
++	kmsan_unpoison_memory(al, sizeof(*al));
+ 	return 0;
+ }
+ 
+-- 
+2.37.3.485.gbe1a02a17e
+
