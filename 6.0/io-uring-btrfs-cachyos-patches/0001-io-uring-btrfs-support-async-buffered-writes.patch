@@ -1,0 +1,917 @@
+From c24e01ab439f07080a2329d03fa49b6df31549fa Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 7 Oct 2022 20:15:58 +0200
+Subject: [PATCH] io-uring/btrfs: support async buffered writes
+
+This patch series adds support for async buffered writes when using both
+btrfs and io-uring. Currently io-uring only supports buffered writes (for btrfs)
+in the slow path, by processing them in the io workers. With this patch series
+it is now possible to support buffered writes in the fast path. To be able to use
+the fast path, the required pages must be in the page cache, the required locks
+in btrfs can be granted immediately and no additional blocks need to be read
+form disk.
+
+This patch series makes use of the changes that have been introduced by a
+previous patch series: "io-uring/xfs: support async buffered writes"
+
+Performance results:
+  For fio the following results have been obtained with a queue depth of
+  1 and 4k block size (runtime 600 secs):
+
+                 sequential writes:
+                 without patch           with patch      libaio     psync
+  iops:              55k                    134k          117K       148K
+  bw:               221MB/s                 538MB/s       469MB/s    592MB/s
+  clat:           15286ns                    82ns         994ns     6340ns
+
+For an io depth of 1, the new patch improves throughput by over two times
+(compared to the exiting behavior, where buffered writes are processed by an
+io-worker process) and also the latency is considerably reduced. To achieve the
+same or better performance with the exisiting code an io depth of 4 is required.
+Increasing the iodepth further does not lead to improvements.
+
+BTRFS changes:
+ -Add option for NOWAIT IOCB's to tell that searches do not wait on locks. This
+  adds the nowait option to btrfs_path.
+
+ -For NOWAIT buffered writes on PREALLOC or NOCOW extents tell can_nocow_extent()
+  that we don't want to wait on any locks or metadata IO.
+
+ -Support no_flush reservations for nowait buffered writes.
+
+ -Add btrfs_try_lock_ordered_range() function.
+
+ -Add nowait flag to btrfs_check_nocow_lock() to use it in write code path.
+
+ -Add nowait parameter to prepare_pages() function.
+
+ -Plumb nowait through the write code path.
+
+ -Enable nowait buffered writes.
+
+Testing:
+  This patch has been tested with xfstests, fsx, fio. xfstests shows no new
+  diffs compared to running without the patch series.
+
+Changes:
+
+V2:
+ - Replace EWOULDBLOCK with EAGAIN. In Version 1 it was not used consistently
+ - Export function balance_dirty_pages_ratelimited_flags()
+ - Add asserts/warnings for search functions when nowait is set, but we don't
+   expect that they are invoked with nowait set.
+
+Josef Bacik (5):
+  btrfs: implement a nowait option for tree searches
+  btrfs: make can_nocow_extent nowait compatible
+  btrfs: add the ability to use NO_FLUSH for data reservations
+  btrfs: add btrfs_try_lock_ordered_range
+  btrfs: make btrfs_check_nocow_lock nowait compatible
+
+Stefan Roesch (7):
+  mm: export balance_dirty_pages_ratelimited_flags()
+  btrfs: make prepare_pages nowait compatible
+  btrfs: make lock_and_cleanup_extent_if_need nowait compatible
+  btrfs: btrfs: plumb NOWAIT through the write path
+  btrfs: make balance_dirty_pages nowait compatible
+  btrfs: add assert to search functions
+  btrfs: enable nowait async buffered writes
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ fs/btrfs/block-group.c    |   2 +-
+ fs/btrfs/ctree.c          |  48 ++++++++++++++-
+ fs/btrfs/ctree.h          |   8 ++-
+ fs/btrfs/delalloc-space.c |  13 +++-
+ fs/btrfs/delalloc-space.h |   3 +-
+ fs/btrfs/extent-tree.c    |   5 ++
+ fs/btrfs/file-item.c      |   4 +-
+ fs/btrfs/file.c           | 124 ++++++++++++++++++++++++++++----------
+ fs/btrfs/inode.c          |  22 ++++---
+ fs/btrfs/locking.c        |  23 +++++++
+ fs/btrfs/locking.h        |   1 +
+ fs/btrfs/ordered-data.c   |  28 +++++++++
+ fs/btrfs/ordered-data.h   |   1 +
+ fs/btrfs/relocation.c     |   2 +-
+ fs/btrfs/scrub.c          |   4 +-
+ fs/btrfs/space-info.c     |   3 +-
+ fs/btrfs/tree-log.c       |   6 +-
+ mm/page-writeback.c       |   1 +
+ 18 files changed, 239 insertions(+), 59 deletions(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index e0375ba9d..9df51245b 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -2869,7 +2869,7 @@ static int cache_save_setup(struct btrfs_block_group *block_group,
+ 	cache_size *= fs_info->sectorsize;
+ 
+ 	ret = btrfs_check_data_free_space(BTRFS_I(inode), &data_reserved, 0,
+-					  cache_size);
++					  cache_size, false);
+ 	if (ret)
+ 		goto out_put;
+ 
+diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c
+index ebfa35fe1..9caf0f87c 100644
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -1447,6 +1447,11 @@ read_block_for_search(struct btrfs_root *root, struct btrfs_path *p,
+ 			return 0;
+ 		}
+ 
++		if (p->nowait) {
++			free_extent_buffer(tmp);
++			return -EAGAIN;
++		}
++
+ 		if (unlock_up)
+ 			btrfs_unlock_up_safe(p, level + 1);
+ 
+@@ -1467,6 +1472,8 @@ read_block_for_search(struct btrfs_root *root, struct btrfs_path *p,
+ 			ret = -EAGAIN;
+ 
+ 		goto out;
++	} else if (p->nowait) {
++		return -EAGAIN;
+ 	}
+ 
+ 	if (unlock_up) {
+@@ -1634,7 +1641,13 @@ static struct extent_buffer *btrfs_search_slot_get_root(struct btrfs_root *root,
+ 		 * We don't know the level of the root node until we actually
+ 		 * have it read locked
+ 		 */
+-		b = btrfs_read_lock_root_node(root);
++		if (p->nowait) {
++			b = btrfs_try_read_lock_root_node(root);
++			if (IS_ERR(b))
++				return b;
++		} else {
++			b = btrfs_read_lock_root_node(root);
++		}
+ 		level = btrfs_header_level(b);
+ 		if (level > write_lock_level)
+ 			goto out;
+@@ -1910,6 +1923,13 @@ int btrfs_search_slot(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+ 	WARN_ON(p->nodes[0] != NULL);
+ 	BUG_ON(!cow && ins_len);
+ 
++	/*
++	 * For now only allow nowait for read only operations.  There's no
++	 * strict reason why we can't, we just only need it for reads so I'm
++	 * only implementing it for reads right now.
++	 */
++	ASSERT(!p->nowait || !cow);
++
+ 	if (ins_len < 0) {
+ 		lowest_unlock = 2;
+ 
+@@ -1936,7 +1956,12 @@ int btrfs_search_slot(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+ 
+ 	if (p->need_commit_sem) {
+ 		ASSERT(p->search_commit_root);
+-		down_read(&fs_info->commit_root_sem);
++		if (p->nowait) {
++			if (!down_read_trylock(&fs_info->commit_root_sem))
++				return -EAGAIN;
++		} else {
++			down_read(&fs_info->commit_root_sem);
++		}
+ 	}
+ 
+ again:
+@@ -2082,7 +2107,15 @@ int btrfs_search_slot(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+ 				btrfs_tree_lock(b);
+ 				p->locks[level] = BTRFS_WRITE_LOCK;
+ 			} else {
+-				btrfs_tree_read_lock(b);
++				if (p->nowait) {
++					if (!btrfs_try_tree_read_lock(b)) {
++						free_extent_buffer(b);
++						ret = -EAGAIN;
++						goto done;
++					}
++				} else {
++					btrfs_tree_read_lock(b);
++				}
+ 				p->locks[level] = BTRFS_READ_LOCK;
+ 			}
+ 			p->nodes[level] = b;
+@@ -2132,6 +2165,9 @@ int btrfs_search_old_slot(struct btrfs_root *root, const struct btrfs_key *key,
+ 	lowest_level = p->lowest_level;
+ 	WARN_ON(p->nodes[0] != NULL);
+ 
++	if (WARN_ON_ONCE(p->nowait == 1))
++		return -EINVAL;
++
+ 	if (p->search_commit_root) {
+ 		BUG_ON(time_seq);
+ 		return btrfs_search_slot(NULL, root, key, p, 0, 0);
+@@ -4432,6 +4468,9 @@ int btrfs_search_forward(struct btrfs_root *root, struct btrfs_key *min_key,
+ 	int ret = 1;
+ 	int keep_locks = path->keep_locks;
+ 
++	if (WARN_ON_ONCE(path->nowait == 1))
++		return -EINVAL;
++
+ 	path->keep_locks = 1;
+ again:
+ 	cur = btrfs_read_lock_root_node(root);
+@@ -4612,6 +4651,9 @@ int btrfs_next_old_leaf(struct btrfs_root *root, struct btrfs_path *path,
+ 	int ret;
+ 	int i;
+ 
++	if (WARN_ON_ONCE(path->nowait == 1))
++		return -EINVAL;
++
+ 	nritems = btrfs_header_nritems(path->nodes[0]);
+ 	if (nritems == 0)
+ 		return 1;
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index df8c99c99..eb25d007e 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -443,6 +443,7 @@ struct btrfs_path {
+ 	 * header (ie. sizeof(struct btrfs_item) is not included).
+ 	 */
+ 	unsigned int search_for_extension:1;
++	unsigned int nowait:1;
+ };
+ #define BTRFS_MAX_EXTENT_ITEM_SIZE(r) ((BTRFS_LEAF_DATA_SIZE(r->fs_info) >> 4) - \
+ 					sizeof(struct btrfs_item))
+@@ -3273,7 +3274,8 @@ int btrfs_csum_file_blocks(struct btrfs_trans_handle *trans,
+ blk_status_t btrfs_csum_one_bio(struct btrfs_inode *inode, struct bio *bio,
+ 				u64 offset, bool one_ordered);
+ int btrfs_lookup_csums_range(struct btrfs_root *root, u64 start, u64 end,
+-			     struct list_head *list, int search_commit);
++			     struct list_head *list, int search_commit,
++			     bool nowait);
+ void btrfs_extent_item_to_extent_map(struct btrfs_inode *inode,
+ 				     const struct btrfs_path *path,
+ 				     struct btrfs_file_extent_item *fi,
+@@ -3303,7 +3305,7 @@ struct extent_map *btrfs_get_extent_fiemap(struct btrfs_inode *inode,
+ 					   u64 start, u64 len);
+ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
+ 			      u64 *orig_start, u64 *orig_block_len,
+-			      u64 *ram_bytes, bool strict);
++			      u64 *ram_bytes, bool nowait, bool strict);
+ 
+ void __btrfs_del_delalloc_inode(struct btrfs_root *root,
+ 				struct btrfs_inode *inode);
+@@ -3478,7 +3480,7 @@ int btrfs_dirty_pages(struct btrfs_inode *inode, struct page **pages,
+ 		      struct extent_state **cached, bool noreserve);
+ int btrfs_fdatawrite_range(struct inode *inode, loff_t start, loff_t end);
+ int btrfs_check_nocow_lock(struct btrfs_inode *inode, loff_t pos,
+-			   size_t *write_bytes);
++			   size_t *write_bytes, bool nowait);
+ void btrfs_check_nocow_unlock(struct btrfs_inode *inode);
+ 
+ /* tree-defrag.c */
+diff --git a/fs/btrfs/delalloc-space.c b/fs/btrfs/delalloc-space.c
+index 1e8f17ff8..118b2e20b 100644
+--- a/fs/btrfs/delalloc-space.c
++++ b/fs/btrfs/delalloc-space.c
+@@ -127,9 +127,11 @@ int btrfs_alloc_data_chunk_ondemand(struct btrfs_inode *inode, u64 bytes)
+ }
+ 
+ int btrfs_check_data_free_space(struct btrfs_inode *inode,
+-			struct extent_changeset **reserved, u64 start, u64 len)
++				struct extent_changeset **reserved, u64 start,
++				u64 len, bool noflush)
+ {
+ 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	enum btrfs_reserve_flush_enum flush = BTRFS_RESERVE_FLUSH_DATA;
+ 	int ret;
+ 
+ 	/* align the range */
+@@ -137,7 +139,12 @@ int btrfs_check_data_free_space(struct btrfs_inode *inode,
+ 	      round_down(start, fs_info->sectorsize);
+ 	start = round_down(start, fs_info->sectorsize);
+ 
+-	ret = btrfs_alloc_data_chunk_ondemand(inode, len);
++	if (noflush)
++		flush = BTRFS_RESERVE_NO_FLUSH;
++	else if (btrfs_is_free_space_inode(inode))
++		flush = BTRFS_RESERVE_FLUSH_FREE_SPACE_INODE;
++
++	ret = btrfs_reserve_data_bytes(fs_info, len, flush);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -454,7 +461,7 @@ int btrfs_delalloc_reserve_space(struct btrfs_inode *inode,
+ {
+ 	int ret;
+ 
+-	ret = btrfs_check_data_free_space(inode, reserved, start, len);
++	ret = btrfs_check_data_free_space(inode, reserved, start, len, false);
+ 	if (ret < 0)
+ 		return ret;
+ 	ret = btrfs_delalloc_reserve_metadata(inode, len, len, false);
+diff --git a/fs/btrfs/delalloc-space.h b/fs/btrfs/delalloc-space.h
+index 28bf5c3ef..e07d46043 100644
+--- a/fs/btrfs/delalloc-space.h
++++ b/fs/btrfs/delalloc-space.h
+@@ -7,7 +7,8 @@ struct extent_changeset;
+ 
+ int btrfs_alloc_data_chunk_ondemand(struct btrfs_inode *inode, u64 bytes);
+ int btrfs_check_data_free_space(struct btrfs_inode *inode,
+-			struct extent_changeset **reserved, u64 start, u64 len);
++			struct extent_changeset **reserved, u64 start, u64 len,
++			bool noflush);
+ void btrfs_free_reserved_data_space(struct btrfs_inode *inode,
+ 			struct extent_changeset *reserved, u64 start, u64 len);
+ void btrfs_delalloc_release_space(struct btrfs_inode *inode,
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 6914cd802..583ddae3c 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -2220,6 +2220,11 @@ static noinline int check_delayed_ref(struct btrfs_root *root,
+ 	}
+ 
+ 	if (!mutex_trylock(&head->mutex)) {
++		if (path->nowait) {
++			spin_unlock(&delayed_refs->lock);
++			return -EAGAIN;
++		}
++
+ 		refcount_inc(&head->refs);
+ 		spin_unlock(&delayed_refs->lock);
+ 
+diff --git a/fs/btrfs/file-item.c b/fs/btrfs/file-item.c
+index c828f971a..fcc6ce861 100644
+--- a/fs/btrfs/file-item.c
++++ b/fs/btrfs/file-item.c
+@@ -503,7 +503,8 @@ blk_status_t btrfs_lookup_bio_sums(struct inode *inode, struct bio *bio, u8 *dst
+ }
+ 
+ int btrfs_lookup_csums_range(struct btrfs_root *root, u64 start, u64 end,
+-			     struct list_head *list, int search_commit)
++			     struct list_head *list, int search_commit,
++			     bool nowait)
+ {
+ 	struct btrfs_fs_info *fs_info = root->fs_info;
+ 	struct btrfs_key key;
+@@ -525,6 +526,7 @@ int btrfs_lookup_csums_range(struct btrfs_root *root, u64 start, u64 end,
+ 	if (!path)
+ 		return -ENOMEM;
+ 
++	path->nowait = nowait;
+ 	if (search_commit) {
+ 		path->skip_locking = 1;
+ 		path->reada = READA_FORWARD;
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 5a3f6e0d9..887497fd5 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1339,26 +1339,55 @@ static int prepare_uptodate_page(struct inode *inode,
+ 	return 0;
+ }
+ 
++static int get_prepare_fgp_flags(bool nowait)
++{
++	int fgp_flags;
++
++	fgp_flags = FGP_LOCK|FGP_ACCESSED|FGP_CREAT;
++	if (nowait)
++		fgp_flags |= FGP_NOWAIT;
++
++	return fgp_flags;
++}
++
++static gfp_t get_prepare_gfp_flags(struct inode *inode, bool nowait)
++{
++	gfp_t gfp;
++
++	gfp = btrfs_alloc_write_mask(inode->i_mapping);
++	if (nowait) {
++		gfp &= ~__GFP_DIRECT_RECLAIM;
++		gfp |= GFP_NOWAIT;
++	}
++
++	return gfp;
++}
++
+ /*
+  * this just gets pages into the page cache and locks them down.
+  */
+ static noinline int prepare_pages(struct inode *inode, struct page **pages,
+ 				  size_t num_pages, loff_t pos,
+-				  size_t write_bytes, bool force_uptodate)
++				  size_t write_bytes, bool force_uptodate,
++				  bool nowait)
+ {
+ 	int i;
+ 	unsigned long index = pos >> PAGE_SHIFT;
+-	gfp_t mask = btrfs_alloc_write_mask(inode->i_mapping);
++	gfp_t mask = get_prepare_gfp_flags(inode, nowait);
++	int fgp_flags = get_prepare_fgp_flags(nowait);
+ 	int err = 0;
+ 	int faili;
+ 
+ 	for (i = 0; i < num_pages; i++) {
+ again:
+-		pages[i] = find_or_create_page(inode->i_mapping, index + i,
+-					       mask | __GFP_WRITE);
++		pages[i] = pagecache_get_page(inode->i_mapping, index + i,
++					fgp_flags, mask | __GFP_WRITE);
+ 		if (!pages[i]) {
+ 			faili = i - 1;
+-			err = -ENOMEM;
++			if (nowait)
++				err = -EAGAIN;
++			else
++				err = -ENOMEM;
+ 			goto fail;
+ 		}
+ 
+@@ -1376,7 +1405,7 @@ static noinline int prepare_pages(struct inode *inode, struct page **pages,
+ 						    pos + write_bytes, false);
+ 		if (err) {
+ 			put_page(pages[i]);
+-			if (err == -EAGAIN) {
++			if (!nowait && err == -EAGAIN) {
+ 				err = 0;
+ 				goto again;
+ 			}
+@@ -1411,7 +1440,7 @@ static noinline int
+ lock_and_cleanup_extent_if_need(struct btrfs_inode *inode, struct page **pages,
+ 				size_t num_pages, loff_t pos,
+ 				size_t write_bytes,
+-				u64 *lockstart, u64 *lockend,
++				u64 *lockstart, u64 *lockend, bool nowait,
+ 				struct extent_state **cached_state)
+ {
+ 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+@@ -1426,8 +1455,20 @@ lock_and_cleanup_extent_if_need(struct btrfs_inode *inode, struct page **pages,
+ 	if (start_pos < inode->vfs_inode.i_size) {
+ 		struct btrfs_ordered_extent *ordered;
+ 
+-		lock_extent_bits(&inode->io_tree, start_pos, last_pos,
++		if (nowait) {
++			if (!try_lock_extent(&inode->io_tree, start_pos, last_pos)) {
++				for (i = 0; i < num_pages; i++) {
++					unlock_page(pages[i]);
++					put_page(pages[i]);
++				}
++
++				return -EAGAIN;
++			}
++		} else {
++			lock_extent_bits(&inode->io_tree, start_pos, last_pos,
+ 				cached_state);
++		}
++
+ 		ordered = btrfs_lookup_ordered_range(inode, start_pos,
+ 						     last_pos - start_pos + 1);
+ 		if (ordered &&
+@@ -1481,7 +1522,7 @@ lock_and_cleanup_extent_if_need(struct btrfs_inode *inode, struct page **pages,
+  * NOTE: Callers need to call btrfs_check_nocow_unlock() if we return > 0.
+  */
+ int btrfs_check_nocow_lock(struct btrfs_inode *inode, loff_t pos,
+-			   size_t *write_bytes)
++			   size_t *write_bytes, bool nowait)
+ {
+ 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+ 	struct btrfs_root *root = inode->root;
+@@ -1500,16 +1541,21 @@ int btrfs_check_nocow_lock(struct btrfs_inode *inode, loff_t pos,
+ 			   fs_info->sectorsize) - 1;
+ 	num_bytes = lockend - lockstart + 1;
+ 
+-	btrfs_lock_and_flush_ordered_range(inode, lockstart, lockend, NULL);
++	if (nowait) {
++		if (!btrfs_try_lock_ordered_range(inode, lockstart, lockend)) {
++			btrfs_drew_write_unlock(&root->snapshot_lock);
++			return -EAGAIN;
++		}
++	} else {
++		btrfs_lock_and_flush_ordered_range(inode, lockstart, lockend, NULL);
++	}
+ 	ret = can_nocow_extent(&inode->vfs_inode, lockstart, &num_bytes,
+-			NULL, NULL, NULL, false);
+-	if (ret <= 0) {
+-		ret = 0;
++			NULL, NULL, NULL, nowait, false);
++	if (ret <= 0)
+ 		btrfs_drew_write_unlock(&root->snapshot_lock);
+-	} else {
++	else
+ 		*write_bytes = min_t(size_t, *write_bytes ,
+ 				     num_bytes - pos + lockstart);
+-	}
+ 	unlock_extent(&inode->io_tree, lockstart, lockend);
+ 
+ 	return ret;
+@@ -1607,8 +1653,10 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
+ 	bool force_page_uptodate = false;
+ 	loff_t old_isize = i_size_read(inode);
+ 	unsigned int ilock_flags = 0;
++	bool nowait = iocb->ki_flags & IOCB_NOWAIT;
++	unsigned int bdp_flags = nowait ? BDP_ASYNC : 0;
+ 
+-	if (iocb->ki_flags & IOCB_NOWAIT)
++	if (nowait)
+ 		ilock_flags |= BTRFS_ILOCK_TRY;
+ 
+ 	ret = btrfs_inode_lock(inode, ilock_flags);
+@@ -1664,18 +1712,29 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
+ 		extent_changeset_release(data_reserved);
+ 		ret = btrfs_check_data_free_space(BTRFS_I(inode),
+ 						  &data_reserved, pos,
+-						  write_bytes);
++						  write_bytes, nowait);
+ 		if (ret < 0) {
++			int tmp;
++
++			if (nowait && (ret == -ENOSPC || ret == -EAGAIN)) {
++				ret = -EAGAIN;
++				break;
++			}
++
+ 			/*
+ 			 * If we don't have to COW at the offset, reserve
+ 			 * metadata only. write_bytes may get smaller than
+ 			 * requested here.
+ 			 */
+-			if (btrfs_check_nocow_lock(BTRFS_I(inode), pos,
+-						   &write_bytes) > 0)
+-				only_release_metadata = true;
+-			else
++			tmp = btrfs_check_nocow_lock(BTRFS_I(inode), pos,
++						     &write_bytes, nowait);
++			if (tmp < 0)
++				ret = tmp;
++			if (tmp > 0)
++				ret = 0;
++			if (ret)
+ 				break;
++			only_release_metadata = true;
+ 		}
+ 
+ 		num_pages = DIV_ROUND_UP(write_bytes + offset, PAGE_SIZE);
+@@ -1685,7 +1744,7 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
+ 		WARN_ON(reserve_bytes == 0);
+ 		ret = btrfs_delalloc_reserve_metadata(BTRFS_I(inode),
+ 						      reserve_bytes,
+-						      reserve_bytes, false);
++						      reserve_bytes, nowait);
+ 		if (ret) {
+ 			if (!only_release_metadata)
+ 				btrfs_free_reserved_data_space(BTRFS_I(inode),
+@@ -1698,6 +1757,10 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
+ 
+ 		release_bytes = reserve_bytes;
+ again:
++		ret = balance_dirty_pages_ratelimited_flags(inode->i_mapping, bdp_flags);
++		if (unlikely(ret))
++			break;
++
+ 		/*
+ 		 * This is going to setup the pages array with the number of
+ 		 * pages we want, so we don't really need to worry about the
+@@ -1705,7 +1768,7 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
+ 		 */
+ 		ret = prepare_pages(inode, pages, num_pages,
+ 				    pos, write_bytes,
+-				    force_page_uptodate);
++				    force_page_uptodate, false);
+ 		if (ret) {
+ 			btrfs_delalloc_release_extents(BTRFS_I(inode),
+ 						       reserve_bytes);
+@@ -1715,10 +1778,11 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
+ 		extents_locked = lock_and_cleanup_extent_if_need(
+ 				BTRFS_I(inode), pages,
+ 				num_pages, pos, write_bytes, &lockstart,
+-				&lockend, &cached_state);
++				&lockend, nowait, &cached_state);
+ 		if (extents_locked < 0) {
+-			if (extents_locked == -EAGAIN)
++			if (!nowait && extents_locked == -EAGAIN)
+ 				goto again;
++
+ 			btrfs_delalloc_release_extents(BTRFS_I(inode),
+ 						       reserve_bytes);
+ 			ret = extents_locked;
+@@ -1801,8 +1865,6 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
+ 
+ 		cond_resched();
+ 
+-		balance_dirty_pages_ratelimited(inode->i_mapping);
+-
+ 		pos += copied;
+ 		num_written += copied;
+ 	}
+@@ -2045,13 +2107,13 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+ 	if (BTRFS_FS_ERROR(inode->root->fs_info))
+ 		return -EROFS;
+ 
+-	if ((iocb->ki_flags & IOCB_NOWAIT) && !(iocb->ki_flags & IOCB_DIRECT))
+-		return -EOPNOTSUPP;
+-
+ 	if (sync)
+ 		atomic_inc(&inode->sync_writers);
+ 
+ 	if (encoded) {
++		if (iocb->ki_flags & IOCB_NOWAIT)
++			return -EOPNOTSUPP;
++
+ 		num_written = btrfs_encoded_write(iocb, from, encoded);
+ 		num_sync = encoded->len;
+ 	} else if (iocb->ki_flags & IOCB_DIRECT) {
+@@ -3693,7 +3755,7 @@ static int btrfs_file_open(struct inode *inode, struct file *filp)
+ {
+ 	int ret;
+ 
+-	filp->f_mode |= FMODE_NOWAIT | FMODE_BUF_RASYNC;
++	filp->f_mode |= FMODE_NOWAIT | FMODE_BUF_RASYNC | FMODE_BUF_WASYNC;
+ 
+ 	ret = fsverity_file_open(inode, filp);
+ 	if (ret)
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 137221086..4ff07b47d 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -1666,7 +1666,7 @@ static noinline int run_delalloc_zoned(struct btrfs_inode *inode,
+ }
+ 
+ static noinline int csum_exist_in_range(struct btrfs_fs_info *fs_info,
+-					u64 bytenr, u64 num_bytes)
++					u64 bytenr, u64 num_bytes, bool nowait)
+ {
+ 	struct btrfs_root *csum_root = btrfs_csum_root(fs_info, bytenr);
+ 	struct btrfs_ordered_sum *sums;
+@@ -1674,7 +1674,8 @@ static noinline int csum_exist_in_range(struct btrfs_fs_info *fs_info,
+ 	LIST_HEAD(list);
+ 
+ 	ret = btrfs_lookup_csums_range(csum_root, bytenr,
+-				       bytenr + num_bytes - 1, &list, 0);
++				       bytenr + num_bytes - 1, &list, 0,
++				       nowait);
+ 	if (ret == 0 && list_empty(&list))
+ 		return 0;
+ 
+@@ -1800,6 +1801,7 @@ static int can_nocow_file_extent(struct btrfs_path *path,
+ 	u8 extent_type;
+ 	int can_nocow = 0;
+ 	int ret = 0;
++	bool nowait = path->nowait;
+ 
+ 	fi = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_file_extent_item);
+ 	extent_type = btrfs_file_extent_type(leaf, fi);
+@@ -1876,7 +1878,8 @@ static int can_nocow_file_extent(struct btrfs_path *path,
+ 	 * Force COW if csums exist in the range. This ensures that csums for a
+ 	 * given extent are either valid or do not exist.
+ 	 */
+-	ret = csum_exist_in_range(root->fs_info, args->disk_bytenr, args->num_bytes);
++	ret = csum_exist_in_range(root->fs_info, args->disk_bytenr, args->num_bytes,
++				  nowait);
+ 	WARN_ON_ONCE(ret > 0 && is_freespace_inode);
+ 	if (ret != 0)
+ 		goto out;
+@@ -4878,9 +4881,9 @@ int btrfs_truncate_block(struct btrfs_inode *inode, loff_t from, loff_t len,
+ 	block_end = block_start + blocksize - 1;
+ 
+ 	ret = btrfs_check_data_free_space(inode, &data_reserved, block_start,
+-					  blocksize);
++					  blocksize, false);
+ 	if (ret < 0) {
+-		if (btrfs_check_nocow_lock(inode, block_start, &write_bytes) > 0) {
++		if (btrfs_check_nocow_lock(inode, block_start, &write_bytes, false) > 0) {
+ 			/* For nocow case, no need to reserve data space */
+ 			only_release_metadata = true;
+ 		} else {
+@@ -7292,7 +7295,7 @@ static bool btrfs_extent_readonly(struct btrfs_fs_info *fs_info, u64 bytenr)
+  */
+ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
+ 			      u64 *orig_start, u64 *orig_block_len,
+-			      u64 *ram_bytes, bool strict)
++			      u64 *ram_bytes, bool nowait, bool strict)
+ {
+ 	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
+ 	struct can_nocow_file_extent_args nocow_args = { 0 };
+@@ -7308,6 +7311,7 @@ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
+ 	path = btrfs_alloc_path();
+ 	if (!path)
+ 		return -ENOMEM;
++	path->nowait = nowait;
+ 
+ 	ret = btrfs_lookup_file_extent(NULL, root, path,
+ 			btrfs_ino(BTRFS_I(inode)), offset, 0);
+@@ -7577,7 +7581,7 @@ static int btrfs_get_blocks_direct_write(struct extent_map **map,
+ 		block_start = em->block_start + (start - em->start);
+ 
+ 		if (can_nocow_extent(inode, start, &len, &orig_start,
+-				     &orig_block_len, &ram_bytes, false) == 1) {
++				     &orig_block_len, &ram_bytes, false, false) == 1) {
+ 			bg = btrfs_inc_nocow_writers(fs_info, block_start);
+ 			if (bg)
+ 				can_nocow = true;
+@@ -7762,7 +7766,7 @@ static int btrfs_dio_iomap_begin(struct inode *inode, loff_t start,
+ 	if (write && !(flags & IOMAP_NOWAIT)) {
+ 		ret = btrfs_check_data_free_space(BTRFS_I(inode),
+ 						  &dio_data->data_reserved,
+-						  start, data_alloc_len);
++						  start, data_alloc_len, false);
+ 		if (!ret)
+ 			dio_data->data_space_reserved = true;
+ 		else if (ret && !(BTRFS_I(inode)->flags &
+@@ -11242,7 +11246,7 @@ static int btrfs_swap_activate(struct swap_info_struct *sis, struct file *file,
+ 		free_extent_map(em);
+ 		em = NULL;
+ 
+-		ret = can_nocow_extent(inode, start, &len, NULL, NULL, NULL, true);
++		ret = can_nocow_extent(inode, start, &len, NULL, NULL, NULL, false, true);
+ 		if (ret < 0) {
+ 			goto out;
+ 		} else if (ret) {
+diff --git a/fs/btrfs/locking.c b/fs/btrfs/locking.c
+index 9063072b3..d6c88922d 100644
+--- a/fs/btrfs/locking.c
++++ b/fs/btrfs/locking.c
+@@ -285,6 +285,29 @@ struct extent_buffer *btrfs_read_lock_root_node(struct btrfs_root *root)
+ 	return eb;
+ }
+ 
++/*
++ * Loop around taking references on and locking the root node of the tree in
++ * nowait mode until we end up with a lock on the root node or returning to
++ * avoid blocking.
++ *
++ * Return: root extent buffer with read lock held or -EWOULDBLOCK.
++ */
++struct extent_buffer *btrfs_try_read_lock_root_node(struct btrfs_root *root)
++{
++	struct extent_buffer *eb;
++
++	while (1) {
++		eb = btrfs_root_node(root);
++		if (!btrfs_try_tree_read_lock(eb))
++			return ERR_PTR(-EAGAIN);
++		if (eb == root->node)
++			break;
++		btrfs_tree_read_unlock(eb);
++		free_extent_buffer(eb);
++	}
++	return eb;
++}
++
+ /*
+  * DREW locks
+  * ==========
+diff --git a/fs/btrfs/locking.h b/fs/btrfs/locking.h
+index ab268be09..490c7a79e 100644
+--- a/fs/btrfs/locking.h
++++ b/fs/btrfs/locking.h
+@@ -94,6 +94,7 @@ int btrfs_try_tree_read_lock(struct extent_buffer *eb);
+ int btrfs_try_tree_write_lock(struct extent_buffer *eb);
+ struct extent_buffer *btrfs_lock_root_node(struct btrfs_root *root);
+ struct extent_buffer *btrfs_read_lock_root_node(struct btrfs_root *root);
++struct extent_buffer *btrfs_try_read_lock_root_node(struct btrfs_root *root);
+ 
+ #ifdef CONFIG_BTRFS_DEBUG
+ static inline void btrfs_assert_tree_write_locked(struct extent_buffer *eb)
+diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+index 1952ac852..3cdfdcedb 100644
+--- a/fs/btrfs/ordered-data.c
++++ b/fs/btrfs/ordered-data.c
+@@ -1041,6 +1041,34 @@ void btrfs_lock_and_flush_ordered_range(struct btrfs_inode *inode, u64 start,
+ 	}
+ }
+ 
++/*
++ * btrfs_try_lock_ordered_range - lock the passed range and ensure all pending
++ * ordered extents in it are run to completion in nowait mode.
++ *
++ * @inode:        Inode whose ordered tree is to be searched
++ * @start:        Beginning of range to flush
++ * @end:          Last byte of range to lock
++ *
++ * This function returns 1 if btrfs_lock_ordered_range does not return any
++ * extents, otherwise 0.
++ */
++int btrfs_try_lock_ordered_range(struct btrfs_inode *inode, u64 start, u64 end)
++{
++	struct btrfs_ordered_extent *ordered;
++
++	if (!try_lock_extent(&inode->io_tree, start, end))
++		return 0;
++
++	ordered = btrfs_lookup_ordered_range(inode, start, end - start + 1);
++	if (!ordered)
++		return 1;
++
++	btrfs_put_ordered_extent(ordered);
++	unlock_extent(&inode->io_tree, start, end);
++	return 0;
++}
++
++
+ static int clone_ordered_extent(struct btrfs_ordered_extent *ordered, u64 pos,
+ 				u64 len)
+ {
+diff --git a/fs/btrfs/ordered-data.h b/fs/btrfs/ordered-data.h
+index 87792f85e..ec27ebf0a 100644
+--- a/fs/btrfs/ordered-data.h
++++ b/fs/btrfs/ordered-data.h
+@@ -218,6 +218,7 @@ void btrfs_wait_ordered_roots(struct btrfs_fs_info *fs_info, u64 nr,
+ void btrfs_lock_and_flush_ordered_range(struct btrfs_inode *inode, u64 start,
+ 					u64 end,
+ 					struct extent_state **cached_state);
++int btrfs_try_lock_ordered_range(struct btrfs_inode *inode, u64 start, u64 end);
+ int btrfs_split_ordered_extent(struct btrfs_ordered_extent *ordered, u64 pre,
+ 			       u64 post);
+ int __init ordered_data_init(void);
+diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+index 45c02aba2..dfc3f6c04 100644
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -4339,7 +4339,7 @@ int btrfs_reloc_clone_csums(struct btrfs_inode *inode, u64 file_pos, u64 len)
+ 	disk_bytenr = file_pos + inode->index_cnt;
+ 	csum_root = btrfs_csum_root(fs_info, disk_bytenr);
+ 	ret = btrfs_lookup_csums_range(csum_root, disk_bytenr,
+-				       disk_bytenr + len - 1, &list, 0);
++				       disk_bytenr + len - 1, &list, 0, false);
+ 	if (ret)
+ 		goto out;
+ 
+diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+index 3afe5fa50..1cb3eed8b 100644
+--- a/fs/btrfs/scrub.c
++++ b/fs/btrfs/scrub.c
+@@ -3077,7 +3077,7 @@ static int scrub_raid56_data_stripe_for_parity(struct scrub_ctx *sctx,
+ 
+ 		ret = btrfs_lookup_csums_range(csum_root, extent_start,
+ 					       extent_start + extent_size - 1,
+-					       &sctx->csum_list, 1);
++					       &sctx->csum_list, 1, false);
+ 		if (ret) {
+ 			scrub_parity_mark_sectors_error(sparity, extent_start,
+ 							extent_size);
+@@ -3303,7 +3303,7 @@ static int scrub_simple_mirror(struct scrub_ctx *sctx,
+ 		if (extent_flags & BTRFS_EXTENT_FLAG_DATA) {
+ 			ret = btrfs_lookup_csums_range(csum_root, cur_logical,
+ 					cur_logical + scrub_len - 1,
+-					&sctx->csum_list, 1);
++					&sctx->csum_list, 1, false);
+ 			if (ret)
+ 				break;
+ 		}
+diff --git a/fs/btrfs/space-info.c b/fs/btrfs/space-info.c
+index 435559ba9..a9d4bd374 100644
+--- a/fs/btrfs/space-info.c
++++ b/fs/btrfs/space-info.c
+@@ -1737,7 +1737,8 @@ int btrfs_reserve_data_bytes(struct btrfs_fs_info *fs_info, u64 bytes,
+ 	int ret;
+ 
+ 	ASSERT(flush == BTRFS_RESERVE_FLUSH_DATA ||
+-	       flush == BTRFS_RESERVE_FLUSH_FREE_SPACE_INODE);
++	       flush == BTRFS_RESERVE_FLUSH_FREE_SPACE_INODE ||
++	       flush == BTRFS_RESERVE_NO_FLUSH);
+ 	ASSERT(!current->journal_info || flush != BTRFS_RESERVE_FLUSH_DATA);
+ 
+ 	ret = __reserve_bytes(fs_info, data_sinfo, bytes, flush);
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 9205c4a5c..8af30dab2 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -801,7 +801,7 @@ static noinline int replay_one_extent(struct btrfs_trans_handle *trans,
+ 
+ 			ret = btrfs_lookup_csums_range(root->log_root,
+ 						csum_start, csum_end - 1,
+-						&ordered_sums, 0);
++						&ordered_sums, 0, false);
+ 			if (ret)
+ 				goto out;
+ 			/*
+@@ -4513,7 +4513,7 @@ static noinline int copy_items(struct btrfs_trans_handle *trans,
+ 		disk_bytenr += extent_offset;
+ 		ret = btrfs_lookup_csums_range(csum_root, disk_bytenr,
+ 					       disk_bytenr + extent_num_bytes - 1,
+-					       &ordered_sums, 0);
++					       &ordered_sums, 0, false);
+ 		if (ret)
+ 			goto out;
+ 
+@@ -4709,7 +4709,7 @@ static int log_extent_csums(struct btrfs_trans_handle *trans,
+ 	ret = btrfs_lookup_csums_range(csum_root,
+ 				       em->block_start + csum_offset,
+ 				       em->block_start + csum_offset +
+-				       csum_len - 1, &ordered_sums, 0);
++				       csum_len - 1, &ordered_sums, 0, false);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index 032a7bf8d..7e9d8d857 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -1933,6 +1933,7 @@ int balance_dirty_pages_ratelimited_flags(struct address_space *mapping,
+ 	wb_put(wb);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(balance_dirty_pages_ratelimited_flags);
+ 
+ /**
+  * balance_dirty_pages_ratelimited - balance dirty memory state.
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
