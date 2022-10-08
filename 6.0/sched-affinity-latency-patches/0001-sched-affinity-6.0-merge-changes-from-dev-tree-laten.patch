@@ -1,0 +1,1384 @@
+From c42e48ced5bb2b0e4f6204f11a1fa4f3c57e532b Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Sat, 8 Oct 2022 16:44:39 +0200
+Subject: [PATCH] sched/affinity-6.0: merge changes from dev tree + latency
+ nice support
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ Documentation/admin-guide/cgroup-v2.rst |   8 +
+ include/linux/sched.h                   |   5 +
+ include/uapi/linux/sched.h              |   4 +-
+ include/uapi/linux/sched/types.h        |  19 ++
+ init/init_task.c                        |   1 +
+ kernel/sched/core.c                     | 335 ++++++++++++++++++------
+ kernel/sched/deadline.c                 |   7 +-
+ kernel/sched/debug.c                    |   1 +
+ kernel/sched/fair.c                     | 189 ++++++++++++-
+ kernel/sched/sched.h                    |  59 ++++-
+ tools/include/uapi/linux/sched.h        |   4 +-
+ 11 files changed, 533 insertions(+), 99 deletions(-)
+
+diff --git a/Documentation/admin-guide/cgroup-v2.rst b/Documentation/admin-guide/cgroup-v2.rst
+index be4a77baf..d8ae7e411 100644
+--- a/Documentation/admin-guide/cgroup-v2.rst
++++ b/Documentation/admin-guide/cgroup-v2.rst
+@@ -1095,6 +1095,14 @@ All time durations are in microseconds.
+         values similar to the sched_setattr(2). This maximum utilization
+         value is used to clamp the task specific maximum utilization clamp.
+ 
++  cpu.latency.nice
++	A read-write single value file which exists on non-root
++	cgroups.  The default is "0".
++
++	The nice value is in the range [-20, 19].
++
++	This interface file allows reading and setting latency using the
++	same values used by sched_setattr(2).
+ 
+ 
+ Memory
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e7b2f8a5c..0d744f73c 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -538,6 +538,8 @@ struct sched_entity {
+ 	/* For load-balancing: */
+ 	struct load_weight		load;
+ 	struct rb_node			run_node;
++	struct rb_node			latency_node;
++	unsigned int			on_latency;
+ 	struct list_head		group_node;
+ 	unsigned int			on_rq;
+ 
+@@ -558,6 +560,8 @@ struct sched_entity {
+ 	/* cached value of my_q->h_nr_running */
+ 	unsigned long			runnable_weight;
+ #endif
++	/* preemption offset in ns */
++	long				latency_offset;
+ 
+ #ifdef CONFIG_SMP
+ 	/*
+@@ -774,6 +778,7 @@ struct task_struct {
+ 	int				static_prio;
+ 	int				normal_prio;
+ 	unsigned int			rt_priority;
++	int				latency_prio;
+ 
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 3bac0a8ce..b2e932c25 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -132,6 +132,7 @@ struct clone_args {
+ #define SCHED_FLAG_KEEP_PARAMS		0x10
+ #define SCHED_FLAG_UTIL_CLAMP_MIN	0x20
+ #define SCHED_FLAG_UTIL_CLAMP_MAX	0x40
++#define SCHED_FLAG_LATENCY_NICE		0x80
+ 
+ #define SCHED_FLAG_KEEP_ALL	(SCHED_FLAG_KEEP_POLICY | \
+ 				 SCHED_FLAG_KEEP_PARAMS)
+@@ -143,6 +144,7 @@ struct clone_args {
+ 			 SCHED_FLAG_RECLAIM		| \
+ 			 SCHED_FLAG_DL_OVERRUN		| \
+ 			 SCHED_FLAG_KEEP_ALL		| \
+-			 SCHED_FLAG_UTIL_CLAMP)
++			 SCHED_FLAG_UTIL_CLAMP		| \
++			 SCHED_FLAG_LATENCY_NICE)
+ 
+ #endif /* _UAPI_LINUX_SCHED_H */
+diff --git a/include/uapi/linux/sched/types.h b/include/uapi/linux/sched/types.h
+index f2c4589d4..db1e8199e 100644
+--- a/include/uapi/linux/sched/types.h
++++ b/include/uapi/linux/sched/types.h
+@@ -10,6 +10,7 @@ struct sched_param {
+ 
+ #define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
+ #define SCHED_ATTR_SIZE_VER1	56	/* add: util_{min,max} */
++#define SCHED_ATTR_SIZE_VER2	60	/* add: latency_nice */
+ 
+ /*
+  * Extended scheduling parameters data structure.
+@@ -98,6 +99,22 @@ struct sched_param {
+  * scheduled on a CPU with no more capacity than the specified value.
+  *
+  * A task utilization boundary can be reset by setting the attribute to -1.
++ *
++ * Latency Tolerance Attributes
++ * ===========================
++ *
++ * A subset of sched_attr attributes allows to specify the relative latency
++ * requirements of a task with respect to the other tasks running/queued in the
++ * system.
++ *
++ * @ sched_latency_nice	task's latency_nice value
++ *
++ * The latency_nice of a task can have any value in a range of
++ * [MIN_LATENCY_NICE..MAX_LATENCY_NICE].
++ *
++ * A task with latency_nice with the value of LATENCY_NICE_MIN can be
++ * taken for a task requiring a lower latency as opposed to the task with
++ * higher latency_nice.
+  */
+ struct sched_attr {
+ 	__u32 size;
+@@ -120,6 +137,8 @@ struct sched_attr {
+ 	__u32 sched_util_min;
+ 	__u32 sched_util_max;
+ 
++	/* latency requirement hints */
++	__s32 sched_latency_nice;
+ };
+ 
+ #endif /* _UAPI_LINUX_SCHED_TYPES_H */
+diff --git a/init/init_task.c b/init/init_task.c
+index ff6c4b9bf..b8ddf403b 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -78,6 +78,7 @@ struct task_struct init_task
+ 	.prio		= MAX_PRIO - 20,
+ 	.static_prio	= MAX_PRIO - 20,
+ 	.normal_prio	= MAX_PRIO - 20,
++	.latency_prio	= NICE_WIDTH - 20,
+ 	.policy		= SCHED_NORMAL,
+ 	.cpus_ptr	= &init_task.cpus_mask,
+ 	.user_cpus_ptr	= NULL,
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ee28253c9..87fe3ef5d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1289,6 +1289,16 @@ static void set_load_weight(struct task_struct *p, bool update_load)
+ 	}
+ }
+ 
++static void set_latency_offset(struct task_struct *p)
++{
++	long weight = sched_latency_to_weight[p->latency_prio];
++	s64 offset;
++
++	offset = sysctl_sched_latency * weight;
++	offset = div_s64(offset, NICE_LATENCY_WEIGHT_MAX);
++	p->se.latency_offset = (long)offset;
++}
++
+ #ifdef CONFIG_UCLAMP_TASK
+ /*
+  * Serializes updates of utilization clamp values
+@@ -2195,14 +2205,18 @@ void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
+ #ifdef CONFIG_SMP
+ 
+ static void
+-__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
++__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx);
+ 
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+-				  const struct cpumask *new_mask,
+-				  u32 flags);
++				  struct affinity_context *ctx);
+ 
+ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+ {
++	struct affinity_context ac = {
++		.new_mask  = cpumask_of(rq->cpu),
++		.flags     = SCA_MIGRATE_DISABLE,
++	};
++
+ 	if (likely(!p->migration_disabled))
+ 		return;
+ 
+@@ -2212,7 +2226,7 @@ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+ 	/*
+ 	 * Violates locking rules! see comment in __do_set_cpus_allowed().
+ 	 */
+-	__do_set_cpus_allowed(p, cpumask_of(rq->cpu), SCA_MIGRATE_DISABLE);
++	__do_set_cpus_allowed(p, &ac);
+ }
+ 
+ void migrate_disable(void)
+@@ -2234,6 +2248,10 @@ EXPORT_SYMBOL_GPL(migrate_disable);
+ void migrate_enable(void)
+ {
+ 	struct task_struct *p = current;
++	struct affinity_context ac = {
++		.new_mask  = &p->cpus_mask,
++		.flags     = SCA_MIGRATE_ENABLE,
++	};
+ 
+ 	if (p->migration_disabled > 1) {
+ 		p->migration_disabled--;
+@@ -2249,7 +2267,7 @@ void migrate_enable(void)
+ 	 */
+ 	preempt_disable();
+ 	if (p->cpus_ptr != &p->cpus_mask)
+-		__set_cpus_allowed_ptr(p, &p->cpus_mask, SCA_MIGRATE_ENABLE);
++		__set_cpus_allowed_ptr(p, &ac);
+ 	/*
+ 	 * Mustn't clear migration_disabled() until cpus_ptr points back at the
+ 	 * regular cpus_mask, otherwise things that race (eg.
+@@ -2529,19 +2547,25 @@ int push_cpu_stop(void *arg)
+  * sched_class::set_cpus_allowed must do the below, but is not required to
+  * actually call this function.
+  */
+-void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
++void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx)
+ {
+-	if (flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
+-		p->cpus_ptr = new_mask;
++	if (ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
++		p->cpus_ptr = ctx->new_mask;
+ 		return;
+ 	}
+ 
+-	cpumask_copy(&p->cpus_mask, new_mask);
+-	p->nr_cpus_allowed = cpumask_weight(new_mask);
++	cpumask_copy(&p->cpus_mask, ctx->new_mask);
++	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
++
++	/*
++	 * Swap in a new user_cpus_ptr if SCA_USER flag set
++	 */
++	if (ctx->flags & SCA_USER)
++		swap(p->user_cpus_ptr, ctx->user_mask);
+ }
+ 
+ static void
+-__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
++__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
+ {
+ 	struct rq *rq = task_rq(p);
+ 	bool queued, running;
+@@ -2558,7 +2582,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+ 	 *
+ 	 * XXX do further audits, this smells like something putrid.
+ 	 */
+-	if (flags & SCA_MIGRATE_DISABLE)
++	if (ctx->flags & SCA_MIGRATE_DISABLE)
+ 		SCHED_WARN_ON(!p->on_cpu);
+ 	else
+ 		lockdep_assert_held(&p->pi_lock);
+@@ -2577,7 +2601,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+ 	if (running)
+ 		put_prev_task(rq, p);
+ 
+-	p->sched_class->set_cpus_allowed(p, new_mask, flags);
++	p->sched_class->set_cpus_allowed(p, ctx);
+ 
+ 	if (queued)
+ 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
+@@ -2585,14 +2609,27 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+ 		set_next_task(rq, p);
+ }
+ 
++/*
++ * Used for kthread_bind() and select_fallback_rq(), in both cases the user
++ * affinity (if any) should be destroyed too.
++ */
+ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+ {
+-	__do_set_cpus_allowed(p, new_mask, 0);
++	struct affinity_context ac = {
++		.new_mask  = new_mask,
++		.user_mask = NULL,
++		.flags     = SCA_USER,	/* clear the user requested mask */
++	};
++
++	__do_set_cpus_allowed(p, &ac);
++	kfree(ac.user_mask);
+ }
+ 
+ int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
+ 		      int node)
+ {
++	unsigned long flags;
++
+ 	if (!src->user_cpus_ptr)
+ 		return 0;
+ 
+@@ -2600,7 +2637,10 @@ int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
+ 	if (!dst->user_cpus_ptr)
+ 		return -ENOMEM;
+ 
++	/* Use pi_lock to protect content of user_cpus_ptr */
++	raw_spin_lock_irqsave(&src->pi_lock, flags);
+ 	cpumask_copy(dst->user_cpus_ptr, src->user_cpus_ptr);
++	raw_spin_unlock_irqrestore(&src->pi_lock, flags);
+ 	return 0;
+ }
+ 
+@@ -2696,6 +2736,8 @@ void release_user_cpus_ptr(struct task_struct *p)
+  */
+ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
+ 			    int dest_cpu, unsigned int flags)
++	__releases(rq->lock)
++	__releases(p->pi_lock)
+ {
+ 	struct set_affinity_pending my_pending = { }, *pending = NULL;
+ 	bool stop_pending, complete = false;
+@@ -2838,8 +2880,7 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
+  * Called with both p->pi_lock and rq->lock held; drops both before returning.
+  */
+ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+-					 const struct cpumask *new_mask,
+-					 u32 flags,
++					 struct affinity_context *ctx,
+ 					 struct rq *rq,
+ 					 struct rq_flags *rf)
+ 	__releases(rq->lock)
+@@ -2848,7 +2889,6 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	const struct cpumask *cpu_allowed_mask = task_cpu_possible_mask(p);
+ 	const struct cpumask *cpu_valid_mask = cpu_active_mask;
+ 	bool kthread = p->flags & PF_KTHREAD;
+-	struct cpumask *user_mask = NULL;
+ 	unsigned int dest_cpu;
+ 	int ret = 0;
+ 
+@@ -2868,7 +2908,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 		cpu_valid_mask = cpu_online_mask;
+ 	}
+ 
+-	if (!kthread && !cpumask_subset(new_mask, cpu_allowed_mask)) {
++	if (!kthread && !cpumask_subset(ctx->new_mask, cpu_allowed_mask)) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+@@ -2877,18 +2917,18 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	 * Must re-check here, to close a race against __kthread_bind(),
+ 	 * sched_setaffinity() is not guaranteed to observe the flag.
+ 	 */
+-	if ((flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
++	if ((ctx->flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
+-	if (!(flags & SCA_MIGRATE_ENABLE)) {
+-		if (cpumask_equal(&p->cpus_mask, new_mask))
++	if (!(ctx->flags & SCA_MIGRATE_ENABLE)) {
++		if (cpumask_equal(&p->cpus_mask, ctx->new_mask))
+ 			goto out;
+ 
+ 		if (WARN_ON_ONCE(p == current &&
+ 				 is_migration_disabled(p) &&
+-				 !cpumask_test_cpu(task_cpu(p), new_mask))) {
++				 !cpumask_test_cpu(task_cpu(p), ctx->new_mask))) {
+ 			ret = -EBUSY;
+ 			goto out;
+ 		}
+@@ -2899,22 +2939,15 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	 * for groups of tasks (ie. cpuset), so that load balancing is not
+ 	 * immediately required to distribute the tasks within their new mask.
+ 	 */
+-	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, new_mask);
++	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, ctx->new_mask);
+ 	if (dest_cpu >= nr_cpu_ids) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
+-	__do_set_cpus_allowed(p, new_mask, flags);
+-
+-	if (flags & SCA_USER)
+-		user_mask = clear_user_cpus_ptr(p);
++	__do_set_cpus_allowed(p, ctx);
+ 
+-	ret = affine_move_task(rq, p, rf, dest_cpu, flags);
+-
+-	kfree(user_mask);
+-
+-	return ret;
++	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
+ 
+ out:
+ 	task_rq_unlock(rq, p, rf);
+@@ -2932,25 +2965,41 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+  * call is not atomic; no spinlocks may be held.
+  */
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+-				  const struct cpumask *new_mask, u32 flags)
++				  struct affinity_context *ctx)
+ {
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 
+ 	rq = task_rq_lock(p, &rf);
+-	return __set_cpus_allowed_ptr_locked(p, new_mask, flags, rq, &rf);
++	/*
++	 * Masking should be skipped if SCA_USER or any of the SCA_MIGRATE_*
++	 * flags are set.
++	 */
++	if (p->user_cpus_ptr &&
++	    !(ctx->flags & (SCA_USER | SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) &&
++	    cpumask_and(rq->scratch_mask, ctx->new_mask, p->user_cpus_ptr))
++		ctx->new_mask = rq->scratch_mask;
++
++	return __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
+ }
+ 
+ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ {
+-	return __set_cpus_allowed_ptr(p, new_mask, 0);
++	struct affinity_context ac = {
++		.new_mask  = new_mask,
++		.flags     = 0,
++	};
++
++	return __set_cpus_allowed_ptr(p, &ac);
+ }
+ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+ 
+ /*
+  * Change a given task's CPU affinity to the intersection of its current
+- * affinity mask and @subset_mask, writing the resulting mask to @new_mask
+- * and pointing @p->user_cpus_ptr to a copy of the old mask.
++ * affinity mask and @subset_mask, writing the resulting mask to @new_mask.
++ * If user_cpus_ptr is defined, use it as the basis for restricting CPU
++ * affinity or use cpu_online_mask instead.
++ *
+  * If the resulting mask is empty, leave the affinity unchanged and return
+  * -EINVAL.
+  */
+@@ -2958,17 +3007,14 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ 				     struct cpumask *new_mask,
+ 				     const struct cpumask *subset_mask)
+ {
+-	struct cpumask *user_mask = NULL;
++	struct affinity_context ac = {
++		.new_mask  = new_mask,
++		.flags     = 0,
++	};
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 	int err;
+ 
+-	if (!p->user_cpus_ptr) {
+-		user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
+-		if (!user_mask)
+-			return -ENOMEM;
+-	}
+-
+ 	rq = task_rq_lock(p, &rf);
+ 
+ 	/*
+@@ -2981,31 +3027,21 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ 		goto err_unlock;
+ 	}
+ 
+-	if (!cpumask_and(new_mask, &p->cpus_mask, subset_mask)) {
++	if (!cpumask_and(new_mask, task_user_cpus(p), subset_mask)) {
+ 		err = -EINVAL;
+ 		goto err_unlock;
+ 	}
+ 
+-	/*
+-	 * We're about to butcher the task affinity, so keep track of what
+-	 * the user asked for in case we're able to restore it later on.
+-	 */
+-	if (user_mask) {
+-		cpumask_copy(user_mask, p->cpus_ptr);
+-		p->user_cpus_ptr = user_mask;
+-	}
+-
+-	return __set_cpus_allowed_ptr_locked(p, new_mask, 0, rq, &rf);
++	return __set_cpus_allowed_ptr_locked(p, &ac, rq, &rf);
+ 
+ err_unlock:
+ 	task_rq_unlock(rq, p, &rf);
+-	kfree(user_mask);
+ 	return err;
+ }
+ 
+ /*
+  * Restrict the CPU affinity of task @p so that it is a subset of
+- * task_cpu_possible_mask() and point @p->user_cpu_ptr to a copy of the
++ * task_cpu_possible_mask() and point @p->user_cpus_ptr to a copy of the
+  * old affinity mask. If the resulting mask is empty, we warn and walk
+  * up the cpuset hierarchy until we find a suitable mask.
+  */
+@@ -3049,34 +3085,29 @@ void force_compatible_cpus_allowed_ptr(struct task_struct *p)
+ }
+ 
+ static int
+-__sched_setaffinity(struct task_struct *p, const struct cpumask *mask);
++__sched_setaffinity(struct task_struct *p, struct affinity_context *ctx);
+ 
+ /*
+  * Restore the affinity of a task @p which was previously restricted by a
+- * call to force_compatible_cpus_allowed_ptr(). This will clear (and free)
+- * @p->user_cpus_ptr.
++ * call to force_compatible_cpus_allowed_ptr().
+  *
+  * It is the caller's responsibility to serialise this with any calls to
+  * force_compatible_cpus_allowed_ptr(@p).
+  */
+ void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
+ {
+-	struct cpumask *user_mask = p->user_cpus_ptr;
+-	unsigned long flags;
++	struct affinity_context ac = {
++		.new_mask  = task_user_cpus(p),
++		.flags     = 0,
++	};
++	int ret;
+ 
+ 	/*
+-	 * Try to restore the old affinity mask. If this fails, then
+-	 * we free the mask explicitly to avoid it being inherited across
+-	 * a subsequent fork().
++	 * Try to restore the old affinity mask with __sched_setaffinity().
++	 * Cpuset masking will be done there too.
+ 	 */
+-	if (!user_mask || !__sched_setaffinity(p, user_mask))
+-		return;
+-
+-	raw_spin_lock_irqsave(&p->pi_lock, flags);
+-	user_mask = clear_user_cpus_ptr(p);
+-	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+-
+-	kfree(user_mask);
++	ret = __sched_setaffinity(p, &ac);
++	WARN_ON_ONCE(ret);
+ }
+ 
+ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+@@ -3554,10 +3585,9 @@ void sched_set_stop_task(int cpu, struct task_struct *stop)
+ #else /* CONFIG_SMP */
+ 
+ static inline int __set_cpus_allowed_ptr(struct task_struct *p,
+-					 const struct cpumask *new_mask,
+-					 u32 flags)
++					 struct affinity_context *ctx)
+ {
+-	return set_cpus_allowed_ptr(p, new_mask);
++	return set_cpus_allowed_ptr(p, ctx->new_mask);
+ }
+ 
+ static inline void migrate_disable_switch(struct rq *rq, struct task_struct *p) { }
+@@ -4564,6 +4594,9 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 		p->prio = p->normal_prio = p->static_prio;
+ 		set_load_weight(p, false);
+ 
++		p->latency_prio = NICE_TO_LATENCY(0);
++		set_latency_offset(p);
++
+ 		/*
+ 		 * We don't need the reset flag anymore after the fork. It has
+ 		 * fulfilled its duty:
+@@ -7322,6 +7355,16 @@ static void __setscheduler_params(struct task_struct *p,
+ 	p->rt_priority = attr->sched_priority;
+ 	p->normal_prio = normal_prio(p);
+ 	set_load_weight(p, true);
++
++}
++
++static void __setscheduler_latency(struct task_struct *p,
++		const struct sched_attr *attr)
++{
++	if (attr->sched_flags & SCHED_FLAG_LATENCY_NICE) {
++		p->latency_prio = NICE_TO_LATENCY(attr->sched_latency_nice);
++		set_latency_offset(p);
++	}
+ }
+ 
+ /*
+@@ -7464,6 +7507,13 @@ static int __sched_setscheduler(struct task_struct *p,
+ 			return retval;
+ 	}
+ 
++	if (attr->sched_flags & SCHED_FLAG_LATENCY_NICE) {
++		if (attr->sched_latency_nice > MAX_LATENCY_NICE)
++			return -EINVAL;
++		if (attr->sched_latency_nice < MIN_LATENCY_NICE)
++			return -EINVAL;
++	}
++
+ 	if (pi)
+ 		cpuset_read_lock();
+ 
+@@ -7498,6 +7548,9 @@ static int __sched_setscheduler(struct task_struct *p,
+ 			goto change;
+ 		if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)
+ 			goto change;
++		if (attr->sched_flags & SCHED_FLAG_LATENCY_NICE &&
++		    attr->sched_latency_nice != LATENCY_TO_NICE(p->latency_prio))
++			goto change;
+ 
+ 		p->sched_reset_on_fork = reset_on_fork;
+ 		retval = 0;
+@@ -7586,6 +7639,7 @@ static int __sched_setscheduler(struct task_struct *p,
+ 		__setscheduler_params(p, attr);
+ 		__setscheduler_prio(p, newprio);
+ 	}
++	__setscheduler_latency(p, attr);
+ 	__setscheduler_uclamp(p, attr);
+ 
+ 	if (queued) {
+@@ -7796,6 +7850,9 @@ static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *a
+ 	    size < SCHED_ATTR_SIZE_VER1)
+ 		return -EINVAL;
+ 
++	if ((attr->sched_flags & SCHED_FLAG_LATENCY_NICE) &&
++	    size < SCHED_ATTR_SIZE_VER2)
++		return -EINVAL;
+ 	/*
+ 	 * XXX: Do we want to be lenient like existing syscalls; or do we want
+ 	 * to be strict and return an error on out-of-bounds values?
+@@ -8033,6 +8090,8 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
+ 	get_params(p, &kattr);
+ 	kattr.sched_flags &= SCHED_FLAG_ALL;
+ 
++	kattr.sched_latency_nice = LATENCY_TO_NICE(p->latency_prio);
++
+ #ifdef CONFIG_UCLAMP_TASK
+ 	/*
+ 	 * This could race with another potential updater, but this is fine
+@@ -8079,7 +8138,7 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
+ #endif
+ 
+ static int
+-__sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
++__sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
+ {
+ 	int retval;
+ 	cpumask_var_t cpus_allowed, new_mask;
+@@ -8093,13 +8152,16 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 	}
+ 
+ 	cpuset_cpus_allowed(p, cpus_allowed);
+-	cpumask_and(new_mask, mask, cpus_allowed);
++	cpumask_and(new_mask, ctx->new_mask, cpus_allowed);
++
++	ctx->new_mask = new_mask;
++	ctx->flags |= SCA_CHECK;
+ 
+ 	retval = dl_task_check_affinity(p, new_mask);
+ 	if (retval)
+ 		goto out_free_new_mask;
+-again:
+-	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK | SCA_USER);
++
++	retval = __set_cpus_allowed_ptr(p, ctx);
+ 	if (retval)
+ 		goto out_free_new_mask;
+ 
+@@ -8110,7 +8172,24 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 		 * Just reset the cpumask to the cpuset's cpus_allowed.
+ 		 */
+ 		cpumask_copy(new_mask, cpus_allowed);
+-		goto again;
++
++		/*
++		 * If SCA_USER is set, a 2nd call to __set_cpus_allowed_ptr()
++		 * will restore the previous user_cpus_ptr value.
++		 *
++		 * In the unlikely event a previous user_cpus_ptr exists,
++		 * we need to further restrict the mask to what is allowed
++		 * by that old user_cpus_ptr.
++		 */
++		if (unlikely((ctx->flags & SCA_USER) && ctx->user_mask)) {
++			bool empty = !cpumask_and(new_mask, new_mask,
++						  ctx->user_mask);
++
++			if (WARN_ON_ONCE(empty))
++				cpumask_copy(new_mask, cpus_allowed);
++		}
++		__set_cpus_allowed_ptr(p, ctx);
++		retval = -EINVAL;
+ 	}
+ 
+ out_free_new_mask:
+@@ -8122,6 +8201,8 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 
+ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ {
++	struct affinity_context ac;
++	struct cpumask *user_mask;
+ 	struct task_struct *p;
+ 	int retval;
+ 
+@@ -8156,7 +8237,21 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ 	if (retval)
+ 		goto out_put_task;
+ 
+-	retval = __sched_setaffinity(p, in_mask);
++	user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
++	if (!user_mask) {
++		retval = -ENOMEM;
++		goto out_put_task;
++	}
++	cpumask_copy(user_mask, in_mask);
++	ac = (struct affinity_context){
++		.new_mask  = in_mask,
++		.user_mask = user_mask,
++		.flags     = SCA_USER,
++	};
++
++	retval = __sched_setaffinity(p, &ac);
++	kfree(ac.user_mask);
++
+ out_put_task:
+ 	put_task_struct(p);
+ 	return retval;
+@@ -8937,6 +9032,12 @@ void show_state_filter(unsigned int state_filter)
+  */
+ void __init init_idle(struct task_struct *idle, int cpu)
+ {
++#ifdef CONFIG_SMP
++	struct affinity_context ac = (struct affinity_context) {
++		.new_mask  = cpumask_of(cpu),
++		.flags     = 0,
++	};
++#endif
+ 	struct rq *rq = cpu_rq(cpu);
+ 	unsigned long flags;
+ 
+@@ -8961,7 +9062,7 @@ void __init init_idle(struct task_struct *idle, int cpu)
+ 	 *
+ 	 * And since this is boot we can forgo the serialization.
+ 	 */
+-	set_cpus_allowed_common(idle, cpumask_of(cpu), 0);
++	set_cpus_allowed_common(idle, &ac);
+ #endif
+ 	/*
+ 	 * We're having a chicken and egg problem, even though we are
+@@ -9759,6 +9860,7 @@ void __init sched_init(void)
+ 
+ 		rq->core_cookie = 0UL;
+ #endif
++		zalloc_cpumask_var_node(&per_cpu(runqueues.scratch_mask, i), GFP_KERNEL, cpu_to_node(i));
+ 	}
+ 
+ 	set_load_weight(&init_task, false);
+@@ -10901,6 +11003,48 @@ static int cpu_idle_write_s64(struct cgroup_subsys_state *css,
+ {
+ 	return sched_group_set_idle(css_tg(css), idle);
+ }
++
++static s64 cpu_latency_nice_read_s64(struct cgroup_subsys_state *css,
++				    struct cftype *cft)
++{
++	int last_delta = INT_MAX;
++	int prio, delta;
++	s64 weight;
++
++	weight = css_tg(css)->latency_offset * NICE_LATENCY_WEIGHT_MAX;
++	weight = div_s64(weight, sysctl_sched_latency);
++
++	/* Find the closest nice value to the current weight */
++	for (prio = 0; prio < ARRAY_SIZE(sched_latency_to_weight); prio++) {
++		delta = abs(sched_latency_to_weight[prio] - weight);
++		if (delta >= last_delta)
++			break;
++		last_delta = delta;
++	}
++
++	return LATENCY_TO_NICE(prio-1);
++}
++
++static int cpu_latency_nice_write_s64(struct cgroup_subsys_state *css,
++				     struct cftype *cft, s64 nice)
++{
++	s64 latency_offset;
++	long weight;
++	int idx;
++
++	if (nice < MIN_LATENCY_NICE || nice > MAX_LATENCY_NICE)
++		return -ERANGE;
++
++	idx = NICE_TO_LATENCY(nice);
++	idx = array_index_nospec(idx, LATENCY_NICE_WIDTH);
++	weight = sched_latency_to_weight[idx];
++
++	latency_offset = sysctl_sched_latency * weight;
++	latency_offset = div_s64(latency_offset, NICE_LATENCY_WEIGHT_MAX);
++
++	return sched_group_set_latency(css_tg(css), latency_offset);
++}
++
+ #endif
+ 
+ static struct cftype cpu_legacy_files[] = {
+@@ -10915,6 +11059,11 @@ static struct cftype cpu_legacy_files[] = {
+ 		.read_s64 = cpu_idle_read_s64,
+ 		.write_s64 = cpu_idle_write_s64,
+ 	},
++	{
++		.name = "latency.nice",
++		.read_s64 = cpu_latency_nice_read_s64,
++		.write_s64 = cpu_latency_nice_write_s64,
++	},
+ #endif
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	{
+@@ -11132,6 +11281,12 @@ static struct cftype cpu_files[] = {
+ 		.read_s64 = cpu_idle_read_s64,
+ 		.write_s64 = cpu_idle_write_s64,
+ 	},
++	{
++		.name = "latency.nice",
++		.flags = CFTYPE_NOT_ON_ROOT,
++		.read_s64 = cpu_latency_nice_read_s64,
++		.write_s64 = cpu_latency_nice_write_s64,
++	},
+ #endif
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	{
+@@ -11228,6 +11383,20 @@ const u32 sched_prio_to_wmult[40] = {
+  /*  15 */ 119304647, 148102320, 186737708, 238609294, 286331153,
+ };
+ 
++/*
++ * latency weight for wakeup preemption
++ */
++const int sched_latency_to_weight[40] = {
++ /* -20 */     -1024,     -973,     -922,      -870,      -819,
++ /* -15 */      -768,     -717,     -666,      -614,      -563,
++ /* -10 */      -512,     -461,     -410,      -358,      -307,
++ /*  -5 */      -256,     -205,     -154,      -102,       -51,
++ /*   0 */         0,       51,      102,       154,       205,
++ /*   5 */       256,      307,      358,       410,       461,
++ /*  10 */       512,      563,      614,       666,       717,
++ /*  15 */       768,      819,      870,       922,       973,
++};
++
+ void call_trace_sched_update_nr_running(struct rq *rq, int count)
+ {
+         trace_sched_update_nr_running_tp(rq, count);
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 0ab79d819..38fa2c3ef 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2486,8 +2486,7 @@ static void task_woken_dl(struct rq *rq, struct task_struct *p)
+ }
+ 
+ static void set_cpus_allowed_dl(struct task_struct *p,
+-				const struct cpumask *new_mask,
+-				u32 flags)
++				struct affinity_context *ctx)
+ {
+ 	struct root_domain *src_rd;
+ 	struct rq *rq;
+@@ -2502,7 +2501,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
+ 	 * update. We already made space for us in the destination
+ 	 * domain (see cpuset_can_attach()).
+ 	 */
+-	if (!cpumask_intersects(src_rd->span, new_mask)) {
++	if (!cpumask_intersects(src_rd->span, ctx->new_mask)) {
+ 		struct dl_bw *src_dl_b;
+ 
+ 		src_dl_b = dl_bw_of(cpu_of(rq));
+@@ -2516,7 +2515,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
+ 		raw_spin_unlock(&src_dl_b->lock);
+ 	}
+ 
+-	set_cpus_allowed_common(p, new_mask, flags);
++	set_cpus_allowed_common(p, ctx);
+ }
+ 
+ /* Assumes rq->lock is held */
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 667876da8..1aa89efad 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -1042,6 +1042,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ #endif
+ 	P(policy);
+ 	P(prio);
++	P(latency_prio);
+ 	if (task_has_dl_policy(p)) {
+ 		P(dl.runtime);
+ 		P(dl.deadline);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 914096c5b..6ef665945 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -664,7 +664,77 @@ struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
+ 
+ 	return __node_2_se(last);
+ }
++#endif
+ 
++/**************************************************************
++ * Scheduling class tree data structure manipulation methods:
++ * for latency
++ */
++
++static inline bool latency_before(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	return (s64)(a->vruntime + a->latency_offset - b->vruntime - b->latency_offset) < 0;
++}
++
++#define __latency_node_2_se(node) \
++	rb_entry((node), struct sched_entity, latency_node)
++
++static inline bool __latency_less(struct rb_node *a, const struct rb_node *b)
++{
++	return latency_before(__latency_node_2_se(a), __latency_node_2_se(b));
++}
++
++/*
++ * Enqueue an entity into the latency rb-tree:
++ */
++static void __enqueue_latency(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
++{
++
++	/* Only latency sensitive entity can be added to the list */
++	if (se->latency_offset >= 0)
++		return;
++
++	if (se->on_latency)
++		return;
++
++	/*
++	 * An execution time less than sysctl_sched_min_granularity means that
++	 * the entity has been preempted by a higher sched class or an entity
++	 * with higher latency constraint.
++	 * Put it back in the list so it gets a chance to run 1st during the
++	 * next slice.
++	 */
++	if (!(flags & ENQUEUE_WAKEUP)) {
++		u64 delta_exec = se->sum_exec_runtime - se->prev_sum_exec_runtime;
++
++		if (delta_exec >= sysctl_sched_min_granularity)
++			return;
++	}
++
++	rb_add_cached(&se->latency_node, &cfs_rq->latency_timeline, __latency_less);
++	se->on_latency = 1;
++}
++
++static void __dequeue_latency(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	if (se->on_latency) {
++		rb_erase_cached(&se->latency_node, &cfs_rq->latency_timeline);
++		se->on_latency = 0;
++	}
++}
++
++static struct sched_entity *__pick_first_latency(struct cfs_rq *cfs_rq)
++{
++	struct rb_node *left = rb_first_cached(&cfs_rq->latency_timeline);
++
++	if (!left)
++		return NULL;
++
++	return __latency_node_2_se(left);
++}
++
++#ifdef CONFIG_SCHED_DEBUG
+ /**************************************************************
+  * Scheduling class statistics methods:
+  */
+@@ -4450,8 +4520,10 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	check_schedstat_required();
+ 	update_stats_enqueue_fair(cfs_rq, se, flags);
+ 	check_spread(cfs_rq, se);
+-	if (!curr)
++	if (!curr) {
+ 		__enqueue_entity(cfs_rq, se);
++		__enqueue_latency(cfs_rq, se, flags);
++	}
+ 	se->on_rq = 1;
+ 
+ 	if (cfs_rq->nr_running == 1) {
+@@ -4531,8 +4603,10 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 
+ 	clear_buddies(cfs_rq, se);
+ 
+-	if (se != cfs_rq->curr)
++	if (se != cfs_rq->curr) {
+ 		__dequeue_entity(cfs_rq, se);
++		__dequeue_latency(cfs_rq, se);
++	}
+ 	se->on_rq = 0;
+ 	account_entity_dequeue(cfs_rq, se);
+ 
+@@ -4563,6 +4637,8 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 		update_idle_cfs_rq_clock_pelt(cfs_rq);
+ }
+ 
++static long wakeup_latency_gran(struct sched_entity *curr, struct sched_entity *se);
++
+ /*
+  * Preempt the current task with a newly woken task if needed:
+  */
+@@ -4595,6 +4671,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 
+ 	se = __pick_first_entity(cfs_rq);
+ 	delta = curr->vruntime - se->vruntime;
++	delta -= wakeup_latency_gran(curr, se);
+ 
+ 	if (delta < 0)
+ 		return;
+@@ -4617,6 +4694,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 		 */
+ 		update_stats_wait_end_fair(cfs_rq, se);
+ 		__dequeue_entity(cfs_rq, se);
++		__dequeue_latency(cfs_rq, se);
+ 		update_load_avg(cfs_rq, se, UPDATE_TG);
+ 	}
+ 
+@@ -4655,7 +4733,7 @@ static struct sched_entity *
+ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ {
+ 	struct sched_entity *left = __pick_first_entity(cfs_rq);
+-	struct sched_entity *se;
++	struct sched_entity *latency, *se;
+ 
+ 	/*
+ 	 * If curr is set we have to see if its left of the leftmost entity
+@@ -4697,6 +4775,12 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 		se = cfs_rq->last;
+ 	}
+ 
++	/* Check for latency sensitive entity waiting for running */
++	latency = __pick_first_latency(cfs_rq);
++	if (latency && (latency != se) &&
++	    wakeup_preempt_entity(latency, se) < 1)
++		se = latency;
++
+ 	return se;
+ }
+ 
+@@ -4720,6 +4804,7 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
+ 		update_stats_wait_start_fair(cfs_rq, prev);
+ 		/* Put 'current' back into the tree. */
+ 		__enqueue_entity(cfs_rq, prev);
++		__enqueue_latency(cfs_rq, prev, 0);
+ 		/* in !on_rq case, update occurred at dequeue */
+ 		update_load_avg(cfs_rq, prev, 0);
+ 	}
+@@ -5721,6 +5806,35 @@ static int sched_idle_cpu(int cpu)
+ }
+ #endif
+ 
++static void set_next_buddy(struct sched_entity *se);
++
++static void check_preempt_from_others(struct cfs_rq *cfs, struct sched_entity *se)
++{
++	struct sched_entity *next;
++
++	if (se->latency_offset >= 0)
++		return;
++
++	if (cfs->nr_running <= 1)
++		return;
++	/*
++	 * When waking from another class, we don't need to check to preempt at
++	 * wakeup and don't set next buddy as a candidate for being picked in
++	 * priority.
++	 * In case of simultaneous wakeup when current is another class, the
++	 * latency sensitive tasks lost opportunity to preempt non sensitive
++	 * tasks which woke up simultaneously.
++	 */
++
++	if (cfs->next)
++		next = cfs->next;
++	else
++		next = __pick_first_entity(cfs);
++
++	if (next && wakeup_preempt_entity(next, se) == 1)
++		set_next_buddy(se);
++}
++
+ /*
+  * The enqueue_task method is called before nr_running is
+  * increased. Here we update the fair scheduling stats and
+@@ -5807,14 +5921,15 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	if (!task_new)
+ 		update_overutilized_status(rq);
+ 
++	if (rq->curr->sched_class != &fair_sched_class)
++		check_preempt_from_others(cfs_rq_of(&p->se), &p->se);
++
+ enqueue_throttle:
+ 	assert_list_leaf_cfs_rq(rq);
+ 
+ 	hrtick_update(rq);
+ }
+ 
+-static void set_next_buddy(struct sched_entity *se);
+-
+ /*
+  * The dequeue_task method is called before nr_running is
+  * decreased. We remove the task from the rbtree and
+@@ -7147,6 +7262,22 @@ balance_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ }
+ #endif /* CONFIG_SMP */
+ 
++static long wakeup_latency_gran(struct sched_entity *curr, struct sched_entity *se)
++{
++	long latency_offset = se->latency_offset;
++
++	/*
++	 * A negative latency offset means that the sched_entity has latency
++	 * requirement that needs to be evaluated versus other entity.
++	 * Otherwise, use the latency weight to evaluate how much scheduling
++	 * delay is acceptable by se.
++	 */
++	if ((se->latency_offset < 0) || (curr->latency_offset < 0))
++		latency_offset -= curr->latency_offset;
++
++	return latency_offset;
++}
++
+ static unsigned long wakeup_gran(struct sched_entity *se)
+ {
+ 	unsigned long gran = sysctl_sched_wakeup_granularity;
+@@ -7186,6 +7317,9 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
+ {
+ 	s64 gran, vdiff = curr->vruntime - se->vruntime;
+ 
++	/* Take into account latency priority */
++	vdiff -= wakeup_latency_gran(curr, se);
++
+ 	if (vdiff <= 0)
+ 		return -1;
+ 
+@@ -11392,6 +11526,10 @@ bool cfs_prio_less(struct task_struct *a, struct task_struct *b, bool in_fi)
+ 	delta = (s64)(sea->vruntime - seb->vruntime) +
+ 		(s64)(cfs_rqb->min_vruntime_fi - cfs_rqa->min_vruntime_fi);
+ 
++	/* Take into account latency prio */
++	delta -= wakeup_latency_gran(sea, seb);
++
++
+ 	return delta > 0;
+ }
+ #else
+@@ -11659,6 +11797,7 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
+ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
++	cfs_rq->latency_timeline = RB_ROOT_CACHED;
+ 	u64_u32_store(cfs_rq->min_vruntime, (u64)(-(1LL << 20)));
+ #ifdef CONFIG_SMP
+ 	raw_spin_lock_init(&cfs_rq->removed.lock);
+@@ -11728,6 +11867,7 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+ 		goto err;
+ 
+ 	tg->shares = NICE_0_LOAD;
++	tg->latency_offset = 0;
+ 
+ 	init_cfs_bandwidth(tg_cfs_bandwidth(tg));
+ 
+@@ -11826,6 +11966,9 @@ void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+ 	}
+ 
+ 	se->my_q = cfs_rq;
++
++	se->latency_offset = tg->latency_offset;
++
+ 	/* guarantee group entities always have weight */
+ 	update_load_set(&se->load, NICE_0_LOAD);
+ 	se->parent = parent;
+@@ -11956,6 +12099,42 @@ int sched_group_set_idle(struct task_group *tg, long idle)
+ 	return 0;
+ }
+ 
++int sched_group_set_latency(struct task_group *tg, s64 latency)
++{
++	int i;
++
++	if (tg == &root_task_group)
++		return -EINVAL;
++
++	if (abs(latency) > sysctl_sched_latency)
++		return -EINVAL;
++
++	mutex_lock(&shares_mutex);
++
++	if (tg->latency_offset == latency) {
++		mutex_unlock(&shares_mutex);
++		return 0;
++	}
++
++	tg->latency_offset = latency;
++
++	for_each_possible_cpu(i) {
++		struct sched_entity *se = tg->se[i];
++		struct rq *rq = cpu_rq(i);
++		struct rq_flags rf;
++
++		rq_lock_irqsave(rq, &rf);
++
++		__dequeue_latency(se->cfs_rq, se);
++		WRITE_ONCE(se->latency_offset, latency);
++
++		rq_unlock_irqrestore(rq, &rf);
++	}
++
++	mutex_unlock(&shares_mutex);
++	return 0;
++}
++
+ #else /* CONFIG_FAIR_GROUP_SCHED */
+ 
+ void free_fair_sched_group(struct task_group *tg) { }
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e26688d38..63b0a62c9 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -125,6 +125,35 @@ extern int sched_rr_timeslice;
+  */
+ #define NS_TO_JIFFIES(TIME)	((unsigned long)(TIME) / (NSEC_PER_SEC / HZ))
+ 
++/*
++ * Latency nice is meant to provide scheduler hints about the relative
++ * latency requirements of a task with respect to other tasks.
++ * Thus a task with latency_nice == 19 can be hinted as the task with no
++ * latency requirements, in contrast to the task with latency_nice == -20
++ * which should be given priority in terms of lower latency.
++ */
++#define MAX_LATENCY_NICE	19
++#define MIN_LATENCY_NICE	-20
++
++#define LATENCY_NICE_WIDTH	\
++	(MAX_LATENCY_NICE - MIN_LATENCY_NICE + 1)
++
++/*
++ * Default tasks should be treated as a task with latency_nice = 0.
++ */
++#define DEFAULT_LATENCY_NICE	0
++#define DEFAULT_LATENCY_PRIO	(DEFAULT_LATENCY_NICE + LATENCY_NICE_WIDTH/2)
++
++/*
++ * Convert user-nice values [ -20 ... 0 ... 19 ]
++ * to static latency [ 0..39 ],
++ * and back.
++ */
++#define NICE_TO_LATENCY(nice)	((nice) + DEFAULT_LATENCY_PRIO)
++#define LATENCY_TO_NICE(prio)	((prio) - DEFAULT_LATENCY_PRIO)
++#define NICE_LATENCY_SHIFT	(SCHED_FIXEDPOINT_SHIFT)
++#define NICE_LATENCY_WEIGHT_MAX	(1L << NICE_LATENCY_SHIFT)
++
+ /*
+  * Increase resolution of nice-level calculations for 64-bit architectures.
+  * The extra resolution improves shares distribution and load balancing of
+@@ -393,6 +422,8 @@ struct task_group {
+ 
+ 	/* A positive value indicates that this is a SCHED_IDLE group. */
+ 	int			idle;
++	/* latency constraint of the group. */
++	int			latency_offset;
+ 
+ #ifdef	CONFIG_SMP
+ 	/*
+@@ -503,6 +534,8 @@ extern int sched_group_set_shares(struct task_group *tg, unsigned long shares);
+ 
+ extern int sched_group_set_idle(struct task_group *tg, long idle);
+ 
++extern int sched_group_set_latency(struct task_group *tg, s64 latency);
++
+ #ifdef CONFIG_SMP
+ extern void set_task_rq_fair(struct sched_entity *se,
+ 			     struct cfs_rq *prev, struct cfs_rq *next);
+@@ -581,6 +614,7 @@ struct cfs_rq {
+ #endif
+ 
+ 	struct rb_root_cached	tasks_timeline;
++	struct rb_root_cached	latency_timeline;
+ 
+ 	/*
+ 	 * 'curr' points to currently running entity on this cfs_rq.
+@@ -1159,6 +1193,9 @@ struct rq {
+ 	unsigned int		core_forceidle_occupation;
+ 	u64			core_forceidle_start;
+ #endif
++
++	/* Scratch cpumask to be temporarily used under rq_lock */
++	cpumask_var_t		scratch_mask;
+ };
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+@@ -1881,6 +1918,13 @@ static inline void dirty_sched_domain_sysctl(int cpu)
+ #endif
+ 
+ extern int sched_update_scaling(void);
++
++static inline const struct cpumask *task_user_cpus(struct task_struct *p)
++{
++	if (!p->user_cpus_ptr)
++		return cpu_possible_mask; /* &init_task.cpus_mask */
++	return p->user_cpus_ptr;
++}
+ #endif /* CONFIG_SMP */
+ 
+ #include "stats.h"
+@@ -2107,6 +2151,7 @@ static_assert(WF_TTWU == SD_BALANCE_WAKE);
+ 
+ extern const int		sched_prio_to_weight[40];
+ extern const u32		sched_prio_to_wmult[40];
++extern const int		sched_latency_to_weight[40];
+ 
+ /*
+  * {de,en}queue flags:
+@@ -2147,6 +2192,12 @@ extern const u32		sched_prio_to_wmult[40];
+ 
+ #define RETRY_TASK		((void *)-1UL)
+ 
++struct affinity_context {
++	const struct cpumask *new_mask;
++	struct cpumask *user_mask;
++	unsigned int flags;
++};
++
+ struct sched_class {
+ 
+ #ifdef CONFIG_UCLAMP_TASK
+@@ -2175,9 +2226,7 @@ struct sched_class {
+ 
+ 	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
+ 
+-	void (*set_cpus_allowed)(struct task_struct *p,
+-				 const struct cpumask *newmask,
+-				 u32 flags);
++	void (*set_cpus_allowed)(struct task_struct *p, struct affinity_context *ctx);
+ 
+ 	void (*rq_online)(struct rq *rq);
+ 	void (*rq_offline)(struct rq *rq);
+@@ -2291,7 +2340,7 @@ extern void update_group_capacity(struct sched_domain *sd, int cpu);
+ 
+ extern void trigger_load_balance(struct rq *rq);
+ 
+-extern void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
++extern void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx);
+ 
+ static inline struct task_struct *get_push_task(struct rq *rq)
+ {
+@@ -2438,8 +2487,8 @@ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
+ extern const_debug unsigned int sysctl_sched_nr_migrate;
+ extern const_debug unsigned int sysctl_sched_migration_cost;
+ 
+-#ifdef CONFIG_SCHED_DEBUG
+ extern unsigned int sysctl_sched_latency;
++#ifdef CONFIG_SCHED_DEBUG
+ extern unsigned int sysctl_sched_min_granularity;
+ extern unsigned int sysctl_sched_idle_min_granularity;
+ extern unsigned int sysctl_sched_wakeup_granularity;
+diff --git a/tools/include/uapi/linux/sched.h b/tools/include/uapi/linux/sched.h
+index 3bac0a8ce..ecc4884bf 100644
+--- a/tools/include/uapi/linux/sched.h
++++ b/tools/include/uapi/linux/sched.h
+@@ -132,6 +132,7 @@ struct clone_args {
+ #define SCHED_FLAG_KEEP_PARAMS		0x10
+ #define SCHED_FLAG_UTIL_CLAMP_MIN	0x20
+ #define SCHED_FLAG_UTIL_CLAMP_MAX	0x40
++#define SCHED_FLAG_LATENCY_NICE		0X80
+ 
+ #define SCHED_FLAG_KEEP_ALL	(SCHED_FLAG_KEEP_POLICY | \
+ 				 SCHED_FLAG_KEEP_PARAMS)
+@@ -143,6 +144,7 @@ struct clone_args {
+ 			 SCHED_FLAG_RECLAIM		| \
+ 			 SCHED_FLAG_DL_OVERRUN		| \
+ 			 SCHED_FLAG_KEEP_ALL		| \
+-			 SCHED_FLAG_UTIL_CLAMP)
++			 SCHED_FLAG_UTIL_CLAMP		| \
++			 SCHED_FLAG_LATENCY_NICE)
+ 
+ #endif /* _UAPI_LINUX_SCHED_H */
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
