@@ -1,0 +1,4352 @@
+From 54cdf8857474ee8a6c230652daee00b275650f08 Mon Sep 17 00:00:00 2001
+From: Tor Vic <torvic9@mailbox.org>
+Date: Mon, 20 Jun 2022 12:40:39 +0200
+Subject: [PATCH 01/39] mm: Change dirty writeback defaults
+
+Use a lower ratio of 5, but a longer period of 10 seconds for dirty writeback.
+---
+ mm/page-writeback.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index 032a7bf8d..e829a5a07 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -70,7 +70,7 @@ static long ratelimit_pages = 32;
+ /*
+  * Start background writeback (via writeback threads) at this percentage
+  */
+-static int dirty_background_ratio = 10;
++static int dirty_background_ratio = 5;
+ 
+ /*
+  * dirty_background_bytes starts at 0 (disabled) so that it is a function of
+@@ -98,7 +98,7 @@ static unsigned long vm_dirty_bytes;
+ /*
+  * The interval between `kupdate'-style writebacks
+  */
+-unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
++unsigned int dirty_writeback_interval = 10 * 100; /* centiseconds */
+ 
+ EXPORT_SYMBOL_GPL(dirty_writeback_interval);
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 13490e033c40e44867c033c9de3f588cdb07d2fa Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Wed, 20 Oct 2021 20:50:11 -0700
+Subject: [PATCH 02/39] ZEN: mm: Lower the non-hugetlbpage pageblock size to
+ reduce scheduling delays
+
+The page allocator processes free pages in groups of pageblocks, where
+the size of a pageblock is typically quite large (1024 pages without
+hugetlbpage support). Pageblocks are processed atomically with the zone
+lock held, which can cause severe scheduling delays on both the CPU
+going through the pageblock and any other CPUs waiting to acquire the
+zone lock. A frequent offender is move_freepages_block(), which is used
+by rmqueue() for page allocation.
+
+As it turns out, there's no requirement for pageblocks to be so large,
+so the pageblock order can simply be reduced to ease the scheduling
+delays and zone lock contention. PAGE_ALLOC_COSTLY_ORDER is used as a
+reasonable setting to ensure non-costly page allocation requests can
+still be serviced without always needing to free up more than one
+pageblock's worth of pages at a time.
+
+This has a noticeable effect on overall system latency when memory
+pressure is elevated. The various mm functions which operate on
+pageblocks no longer appear in the preemptoff tracer, where previously
+they would spend up to 100 ms on a mobile arm64 CPU processing a
+pageblock with preemption disabled and the zone lock held.
+
+Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+---
+ include/linux/pageblock-flags.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/linux/pageblock-flags.h b/include/linux/pageblock-flags.h
+index 83c724805..d2b8741ea 100644
+--- a/include/linux/pageblock-flags.h
++++ b/include/linux/pageblock-flags.h
+@@ -48,7 +48,7 @@ extern unsigned int pageblock_order;
+ #else /* CONFIG_HUGETLB_PAGE */
+ 
+ /* If huge pages are not used, group by MAX_ORDER_NR_PAGES */
+-#define pageblock_order		(MAX_ORDER-1)
++#define pageblock_order		PAGE_ALLOC_COSTLY_ORDER
+ 
+ #endif /* CONFIG_HUGETLB_PAGE */
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From f3d5a769b84185362369e9583270f1a5dc15ca5e Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Tue, 2 Aug 2022 12:28:11 -0400
+Subject: [PATCH 03/39] mm: vmscan: fix extreme overreclaim and swap floods
+
+During proactive reclaim, we sometimes observe severe overreclaim, with
+several thousand times more pages reclaimed than requested.
+
+This trace was obtained from shrink_lruvec() during such an instance:
+
+    prio:0 anon_cost:1141521 file_cost:7767
+    nr_reclaimed:4387406 nr_to_reclaim:1047 (or_factor:4190)
+    nr=[7161123 345 578 1111]
+
+While he reclaimer requested 4M, vmscan reclaimed close to 16G, most of it
+by swapping.  These requests take over a minute, during which the write()
+to memory.reclaim is unkillably stuck inside the kernel.
+
+Digging into the source, this is caused by the proportional reclaim
+bailout logic.  This code tries to resolve a fundamental conflict: to
+reclaim roughly what was requested, while also aging all LRUs fairly and
+in accordance to their size, swappiness, refault rates etc.  The way it
+attempts fairness is that once the reclaim goal has been reached, it stops
+scanning the LRUs with the smaller remaining scan targets, and adjusts the
+remainder of the bigger LRUs according to how much of the smaller LRUs was
+scanned.  It then finishes scanning that remainder regardless of the
+reclaim goal.
+
+This works fine if priority levels are low and the LRU lists are
+comparable in size.  However, in this instance, the cgroup that is
+targeted by proactive reclaim has almost no files left - they've already
+been squeezed out by proactive reclaim earlier - and the remaining anon
+pages are hot.  Anon rotations cause the priority level to drop to 0,
+which results in reclaim targeting all of anon (a lot) and all of file
+(almost nothing).  By the time reclaim decides to bail, it has scanned
+most or all of the file target, and therefor must also scan most or all of
+the enormous anon target.  This target is thousands of times larger than
+the reclaim goal, thus causing the overreclaim.
+
+The bailout code hasn't changed in years, why is this failing now?  The
+most likely explanations are two other recent changes in anon reclaim:
+
+1. Before the series starting with commit 5df741963d52 ("mm: fix LRU
+   balancing effect of new transparent huge pages"), the VM was
+   overall relatively reluctant to swap at all, even if swap was
+   configured. This means the LRU balancing code didn't come into play
+   as often as it does now, and mostly in high pressure situations
+   where pronounced swap activity wouldn't be as surprising.
+
+2. For historic reasons, shrink_lruvec() loops on the scan targets of
+   all LRU lists except the active anon one, meaning it would bail if
+   the only remaining pages to scan were active anon - even if there
+   were a lot of them.
+
+   Before the series starting with commit ccc5dc67340c ("mm/vmscan:
+   make active/inactive ratio as 1:1 for anon lru"), most anon pages
+   would live on the active LRU; the inactive one would contain only a
+   handful of preselected reclaim candidates. After the series, anon
+   gets aged similarly to file, and the inactive list is the default
+   for new anon pages as well, making it often the much bigger list.
+
+   As a result, the VM is now more likely to actually finish large
+   anon targets than before.
+
+Change the code such that only one SWAP_CLUSTER_MAX-sized nudge toward the
+larger LRU lists is made before bailing out on a met reclaim goal.
+
+This fixes the extreme overreclaim problem.
+
+Fairness is more subtle and harder to evaluate.  No obvious misbehavior
+was observed on the test workload, in any case.  Conceptually, fairness
+should primarily be a cumulative effect from regular, lower priority
+scans.  Once the VM is in trouble and needs to escalate scan targets to
+make forward progress, fairness needs to take a backseat.  This is also
+acknowledged by the myriad exceptions in get_scan_count().  This patch
+makes fairness decrease gradually, as it keeps fairness work static over
+increasing priority levels with growing scan targets.  This should make
+more sense - although we may have to re-visit the exact values.
+
+Link: https://lkml.kernel.org/r/20220802162811.39216-1-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Rik van Riel <riel@surriel.com>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ mm/vmscan.c | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 382dbe973..266eb8cfe 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2955,8 +2955,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 	enum lru_list lru;
+ 	unsigned long nr_reclaimed = 0;
+ 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
++	bool proportional_reclaim;
+ 	struct blk_plug plug;
+-	bool scan_adjusted;
+ 
+ 	get_scan_count(lruvec, sc, nr);
+ 
+@@ -2974,8 +2974,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 	 * abort proportional reclaim if either the file or anon lru has already
+ 	 * dropped to zero at the first pass.
+ 	 */
+-	scan_adjusted = (!cgroup_reclaim(sc) && !current_is_kswapd() &&
+-			 sc->priority == DEF_PRIORITY);
++	proportional_reclaim = (!cgroup_reclaim(sc) && !current_is_kswapd() &&
++				sc->priority == DEF_PRIORITY);
+ 
+ 	blk_start_plug(&plug);
+ 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
+@@ -2995,7 +2995,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 
+ 		cond_resched();
+ 
+-		if (nr_reclaimed < nr_to_reclaim || scan_adjusted)
++		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
+ 			continue;
+ 
+ 		/*
+@@ -3046,8 +3046,6 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 		nr_scanned = targets[lru] - nr[lru];
+ 		nr[lru] = targets[lru] * (100 - percentage) / 100;
+ 		nr[lru] -= min(nr[lru], nr_scanned);
+-
+-		scan_adjusted = true;
+ 	}
+ 	blk_finish_plug(&plug);
+ 	sc->nr_reclaimed += nr_reclaimed;
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 9fc9b161c8d07ecad733e889d9e6670d39c85354 Mon Sep 17 00:00:00 2001
+From: Josh Poimboeuf <jpoimboe@kernel.org>
+Date: Thu, 18 Aug 2022 09:26:57 -0700
+Subject: [PATCH 04/39] objtool: Remove "ANNOTATE_NOENDBR on ENDBR" warning
+
+This warning isn't very useful: why would you put ANNOTATE_NOENDBR on
+ENDBR, and if you did, what's the harm?
+
+And thus far it's only found one non-bug, where the
+'__end_entry_SYSENTER_compat' label happens to land on the ENDBR from
+entry_SYSCALL_compat:
+
+  vmlinux.o: warning: objtool: entry_SYSCALL_compat+0x0: ANNOTATE_NOENDBR on ENDBR
+
+.. which is fine.  Just remove the warning.
+
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Josh Poimboeuf <jpoimboe@kernel.org>
+---
+ tools/objtool/check.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index e55fdf952..445741f36 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -2104,9 +2104,6 @@ static int read_noendbr_hints(struct objtool_file *file)
+ 			return -1;
+ 		}
+ 
+-		if (insn->type == INSN_ENDBR)
+-			WARN_FUNC("ANNOTATE_NOENDBR on ENDBR", insn->sec, insn->offset);
+-
+ 		insn->noendbr = 1;
+ 	}
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 5c55673b51b1bd5f00bf71b61704b267d84e79ec Mon Sep 17 00:00:00 2001
+From: Ingo Molnar <mingo@kernel.org>
+Date: Thu, 11 Aug 2022 08:54:52 +0200
+Subject: [PATCH 05/39] sched/all: Change all BUG_ON() instances in the
+ scheduler to WARN_ON_ONCE()
+
+There's no good reason to crash a user's system with a BUG_ON(),
+chances are high that they'll never even see the crash message on
+Xorg, and it won't make it into the syslog either.
+
+By using a WARN_ON_ONCE() we at least give the user a chance to report
+any bugs triggered here - instead of getting silent hangs.
+
+None of these WARN_ON_ONCE()s are supposed to trigger, ever - so we ignore
+cases where a NULL check is done via a BUG_ON() and we let a NULL
+pointer through after a WARN_ON_ONCE().
+
+There's one exception: WARN_ON_ONCE() arguments with side-effects,
+such as locking - in this case we use the return value of the
+WARN_ON_ONCE(), such as in:
+
+ -       BUG_ON(!lock_task_sighand(p, &flags));
+ +       if (WARN_ON_ONCE(!lock_task_sighand(p, &flags)))
+ +               return;
+
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/YvSsKcAXISmshtHo@gmail.com
+---
+ kernel/sched/autogroup.c |  3 ++-
+ kernel/sched/core.c      |  2 +-
+ kernel/sched/cpupri.c    |  2 +-
+ kernel/sched/deadline.c  | 26 +++++++++++++-------------
+ kernel/sched/fair.c      | 10 +++++-----
+ kernel/sched/rt.c        |  2 +-
+ kernel/sched/sched.h     |  6 +++---
+ 7 files changed, 26 insertions(+), 25 deletions(-)
+
+diff --git a/kernel/sched/autogroup.c b/kernel/sched/autogroup.c
+index 4ebaf97f7..991fc9002 100644
+--- a/kernel/sched/autogroup.c
++++ b/kernel/sched/autogroup.c
+@@ -161,7 +161,8 @@ autogroup_move_group(struct task_struct *p, struct autogroup *ag)
+ 	struct task_struct *t;
+ 	unsigned long flags;
+ 
+-	BUG_ON(!lock_task_sighand(p, &flags));
++	if (WARN_ON_ONCE(!lock_task_sighand(p, &flags)))
++		return;
+ 
+ 	prev = p->signal->autogroup;
+ 	if (prev == ag) {
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ee28253c9..813687a5f 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2328,7 +2328,7 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
+ 	rq = cpu_rq(new_cpu);
+ 
+ 	rq_lock(rq, rf);
+-	BUG_ON(task_cpu(p) != new_cpu);
++	WARN_ON_ONCE(task_cpu(p) != new_cpu);
+ 	activate_task(rq, p, 0);
+ 	check_preempt_curr(rq, p, 0);
+ 
+diff --git a/kernel/sched/cpupri.c b/kernel/sched/cpupri.c
+index fa9ce9d83..a286e726e 100644
+--- a/kernel/sched/cpupri.c
++++ b/kernel/sched/cpupri.c
+@@ -147,7 +147,7 @@ int cpupri_find_fitness(struct cpupri *cp, struct task_struct *p,
+ 	int task_pri = convert_prio(p->prio);
+ 	int idx, cpu;
+ 
+-	BUG_ON(task_pri >= CPUPRI_NR_PRIORITIES);
++	WARN_ON_ONCE(task_pri >= CPUPRI_NR_PRIORITIES);
+ 
+ 	for (idx = 0; idx < task_pri; idx++) {
+ 
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 0ab79d819..962b169b0 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -310,7 +310,7 @@ static void dl_change_utilization(struct task_struct *p, u64 new_bw)
+ {
+ 	struct rq *rq;
+ 
+-	BUG_ON(p->dl.flags & SCHED_FLAG_SUGOV);
++	WARN_ON_ONCE(p->dl.flags & SCHED_FLAG_SUGOV);
+ 
+ 	if (task_on_rq_queued(p))
+ 		return;
+@@ -607,7 +607,7 @@ static void enqueue_pushable_dl_task(struct rq *rq, struct task_struct *p)
+ {
+ 	struct rb_node *leftmost;
+ 
+-	BUG_ON(!RB_EMPTY_NODE(&p->pushable_dl_tasks));
++	WARN_ON_ONCE(!RB_EMPTY_NODE(&p->pushable_dl_tasks));
+ 
+ 	leftmost = rb_add_cached(&p->pushable_dl_tasks,
+ 				 &rq->dl.pushable_dl_tasks_root,
+@@ -684,7 +684,7 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
+ 			 * Failed to find any suitable CPU.
+ 			 * The task will never come back!
+ 			 */
+-			BUG_ON(dl_bandwidth_enabled());
++			WARN_ON_ONCE(dl_bandwidth_enabled());
+ 
+ 			/*
+ 			 * If admission control is disabled we
+@@ -830,7 +830,7 @@ static void replenish_dl_entity(struct sched_dl_entity *dl_se)
+ 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
+ 	struct rq *rq = rq_of_dl_rq(dl_rq);
+ 
+-	BUG_ON(pi_of(dl_se)->dl_runtime <= 0);
++	WARN_ON_ONCE(pi_of(dl_se)->dl_runtime <= 0);
+ 
+ 	/*
+ 	 * This could be the case for a !-dl task that is boosted.
+@@ -1616,7 +1616,7 @@ static void __enqueue_dl_entity(struct sched_dl_entity *dl_se)
+ {
+ 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
+ 
+-	BUG_ON(!RB_EMPTY_NODE(&dl_se->rb_node));
++	WARN_ON_ONCE(!RB_EMPTY_NODE(&dl_se->rb_node));
+ 
+ 	rb_add_cached(&dl_se->rb_node, &dl_rq->root, __dl_less);
+ 
+@@ -1640,7 +1640,7 @@ static void __dequeue_dl_entity(struct sched_dl_entity *dl_se)
+ static void
+ enqueue_dl_entity(struct sched_dl_entity *dl_se, int flags)
+ {
+-	BUG_ON(on_dl_rq(dl_se));
++	WARN_ON_ONCE(on_dl_rq(dl_se));
+ 
+ 	update_stats_enqueue_dl(dl_rq_of_se(dl_se), dl_se, flags);
+ 
+@@ -2017,7 +2017,7 @@ static struct task_struct *pick_task_dl(struct rq *rq)
+ 		return NULL;
+ 
+ 	dl_se = pick_next_dl_entity(dl_rq);
+-	BUG_ON(!dl_se);
++	WARN_ON_ONCE(!dl_se);
+ 	p = dl_task_of(dl_se);
+ 
+ 	return p;
+@@ -2277,12 +2277,12 @@ static struct task_struct *pick_next_pushable_dl_task(struct rq *rq)
+ 
+ 	p = __node_2_pdl(rb_first_cached(&rq->dl.pushable_dl_tasks_root));
+ 
+-	BUG_ON(rq->cpu != task_cpu(p));
+-	BUG_ON(task_current(rq, p));
+-	BUG_ON(p->nr_cpus_allowed <= 1);
++	WARN_ON_ONCE(rq->cpu != task_cpu(p));
++	WARN_ON_ONCE(task_current(rq, p));
++	WARN_ON_ONCE(p->nr_cpus_allowed <= 1);
+ 
+-	BUG_ON(!task_on_rq_queued(p));
+-	BUG_ON(!dl_task(p));
++	WARN_ON_ONCE(!task_on_rq_queued(p));
++	WARN_ON_ONCE(!dl_task(p));
+ 
+ 	return p;
+ }
+@@ -2492,7 +2492,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
+ 	struct root_domain *src_rd;
+ 	struct rq *rq;
+ 
+-	BUG_ON(!dl_task(p));
++	WARN_ON_ONCE(!dl_task(p));
+ 
+ 	rq = task_rq(p);
+ 	src_rd = rq->rd;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 914096c5b..28f10dccd 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2600,7 +2600,7 @@ static void task_numa_group(struct task_struct *p, int cpupid, int flags,
+ 	if (!join)
+ 		return;
+ 
+-	BUG_ON(irqs_disabled());
++	WARN_ON_ONCE(irqs_disabled());
+ 	double_lock_irq(&my_grp->lock, &grp->lock);
+ 
+ 	for (i = 0; i < NR_NUMA_HINT_FAULT_STATS * nr_node_ids; i++) {
+@@ -7279,7 +7279,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
+ 		return;
+ 
+ 	find_matching_se(&se, &pse);
+-	BUG_ON(!pse);
++	WARN_ON_ONCE(!pse);
+ 
+ 	cse_is_idle = se_is_idle(se);
+ 	pse_is_idle = se_is_idle(pse);
+@@ -8159,7 +8159,7 @@ static void attach_task(struct rq *rq, struct task_struct *p)
+ {
+ 	lockdep_assert_rq_held(rq);
+ 
+-	BUG_ON(task_rq(p) != rq);
++	WARN_ON_ONCE(task_rq(p) != rq);
+ 	activate_task(rq, p, ENQUEUE_NOCLOCK);
+ 	check_preempt_curr(rq, p, 0);
+ }
+@@ -10134,7 +10134,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 		goto out_balanced;
+ 	}
+ 
+-	BUG_ON(busiest == env.dst_rq);
++	WARN_ON_ONCE(busiest == env.dst_rq);
+ 
+ 	schedstat_add(sd->lb_imbalance[idle], env.imbalance);
+ 
+@@ -10430,7 +10430,7 @@ static int active_load_balance_cpu_stop(void *data)
+ 	 * we need to fix it. Originally reported by
+ 	 * Bjorn Helgaas on a 128-CPU setup.
+ 	 */
+-	BUG_ON(busiest_rq == target_rq);
++	WARN_ON_ONCE(busiest_rq == target_rq);
+ 
+ 	/* Search for an sd spanning us and the target CPU. */
+ 	rcu_read_lock();
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 55f39c8f4..2936fe55c 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -843,7 +843,7 @@ static void __disable_runtime(struct rq *rq)
+ 		 * We cannot be left wanting - that would mean some runtime
+ 		 * leaked out of the system.
+ 		 */
+-		BUG_ON(want);
++		WARN_ON_ONCE(want);
+ balanced:
+ 		/*
+ 		 * Disable all the borrow logic by pretending we have inf
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e26688d38..7a44dceeb 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2709,8 +2709,8 @@ static inline void double_rq_lock(struct rq *rq1, struct rq *rq2)
+ 	__acquires(rq1->lock)
+ 	__acquires(rq2->lock)
+ {
+-	BUG_ON(!irqs_disabled());
+-	BUG_ON(rq1 != rq2);
++	WARN_ON_ONCE(!irqs_disabled());
++	WARN_ON_ONCE(rq1 != rq2);
+ 	raw_spin_rq_lock(rq1);
+ 	__acquire(rq2->lock);	/* Fake it out ;) */
+ 	double_rq_clock_clear_update(rq1, rq2);
+@@ -2726,7 +2726,7 @@ static inline void double_rq_unlock(struct rq *rq1, struct rq *rq2)
+ 	__releases(rq1->lock)
+ 	__releases(rq2->lock)
+ {
+-	BUG_ON(rq1 != rq2);
++	WARN_ON_ONCE(rq1 != rq2);
+ 	raw_spin_rq_unlock(rq1);
+ 	__release(rq2->lock);
+ }
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 0ea01d65f5fe8c36ad28bfc3d013288c0132412f Mon Sep 17 00:00:00 2001
+From: Sandipan Das <sandipan.das@amd.com>
+Date: Thu, 8 Sep 2022 10:33:15 +0530
+Subject: [PATCH 06/39] perf/x86/amd/uncore: Fix memory leak for events array
+
+When a CPU comes online, the per-CPU NB and LLC uncore contexts are
+freed but not the events array within the context structure. This
+causes a memory leak as identified by the kmemleak detector.
+
+  [...]
+  unreferenced object 0xffff8c5944b8e320 (size 32):
+    comm "swapper/0", pid 1, jiffies 4294670387 (age 151.072s)
+    hex dump (first 32 bytes):
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    backtrace:
+      [<000000000759fb79>] amd_uncore_cpu_up_prepare+0xaf/0x230
+      [<00000000ddc9e126>] cpuhp_invoke_callback+0x2cf/0x470
+      [<0000000093e727d4>] cpuhp_issue_call+0x14d/0x170
+      [<0000000045464d54>] __cpuhp_setup_state_cpuslocked+0x11e/0x330
+      [<0000000069f67cbd>] __cpuhp_setup_state+0x6b/0x110
+      [<0000000015365e0f>] amd_uncore_init+0x260/0x321
+      [<00000000089152d2>] do_one_initcall+0x3f/0x1f0
+      [<000000002d0bd18d>] kernel_init_freeable+0x1ca/0x212
+      [<0000000030be8dde>] kernel_init+0x11/0x120
+      [<0000000059709e59>] ret_from_fork+0x22/0x30
+  unreferenced object 0xffff8c5944b8dd40 (size 64):
+    comm "swapper/0", pid 1, jiffies 4294670387 (age 151.072s)
+    hex dump (first 32 bytes):
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    backtrace:
+      [<00000000306efe8b>] amd_uncore_cpu_up_prepare+0x183/0x230
+      [<00000000ddc9e126>] cpuhp_invoke_callback+0x2cf/0x470
+      [<0000000093e727d4>] cpuhp_issue_call+0x14d/0x170
+      [<0000000045464d54>] __cpuhp_setup_state_cpuslocked+0x11e/0x330
+      [<0000000069f67cbd>] __cpuhp_setup_state+0x6b/0x110
+      [<0000000015365e0f>] amd_uncore_init+0x260/0x321
+      [<00000000089152d2>] do_one_initcall+0x3f/0x1f0
+      [<000000002d0bd18d>] kernel_init_freeable+0x1ca/0x212
+      [<0000000030be8dde>] kernel_init+0x11/0x120
+      [<0000000059709e59>] ret_from_fork+0x22/0x30
+  [...]
+
+Fix the problem by freeing the events array before freeing the uncore
+context.
+
+Fixes: 39621c5808f5 ("perf/x86/amd/uncore: Use dynamic events array")
+Reported-by: Ravi Bangoria <ravi.bangoria@amd.com>
+Tested-by: Ravi Bangoria <ravi.bangoria@amd.com>
+Signed-off-by: Sandipan Das <sandipan.das@amd.com>
+---
+ arch/x86/events/amd/uncore.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/x86/events/amd/uncore.c b/arch/x86/events/amd/uncore.c
+index d568afc70..83f15fe41 100644
+--- a/arch/x86/events/amd/uncore.c
++++ b/arch/x86/events/amd/uncore.c
+@@ -553,6 +553,7 @@ static void uncore_clean_online(void)
+ 
+ 	hlist_for_each_entry_safe(uncore, n, &uncore_unused_list, node) {
+ 		hlist_del(&uncore->node);
++		kfree(uncore->events);
+ 		kfree(uncore);
+ 	}
+ }
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 220854fbb13b18d95a7fdeda4237cba70a9c5ae9 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 8 Sep 2022 12:04:50 +0200
+Subject: [PATCH 07/39] x86,retpoline: Be sure to emit INT3 after JMP *%\reg
+
+Both AMD and Intel recommend using INT3 after an indirect JMP. Make sure
+to emit one when rewriting the retpoline JMP irrespective of compiler
+SLS options or even CONFIG_SLS.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Alexei Starovoitov <alexei.starovoitov@gmail.com>
+Link: https://lkml.kernel.org/r/Yxm+QkFPOhrVSH6q@hirez.programming.kicks-ass.net
+---
+ arch/x86/kernel/alternative.c | 9 +++++++++
+ arch/x86/net/bpf_jit_comp.c   | 4 +++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 4f3204364..5cadcea03 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -453,6 +453,15 @@ static int patch_retpoline(void *addr, struct insn *insn, u8 *bytes)
+ 		return ret;
+ 	i += ret;
+ 
++	/*
++	 * The compiler is supposed to EMIT an INT3 after every unconditional
++	 * JMP instruction due to AMD BTC. However, if the compiler is too old
++	 * or SLS isn't enabled, we still need an INT3 after indirect JMPs
++	 * even on Intel.
++	 */
++	if (op == JMP32_INSN_OPCODE && i < insn->length)
++		bytes[i++] = INT3_INSN_OPCODE;
++
+ 	for (; i < insn->length;)
+ 		bytes[i++] = BYTES_NOP1;
+ 
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 362562c83..8f109da49 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -419,7 +419,9 @@ static void emit_indirect_jump(u8 **pprog, int reg, u8 *ip)
+ 		OPTIMIZER_HIDE_VAR(reg);
+ 		emit_jump(&prog, &__x86_indirect_thunk_array[reg], ip);
+ 	} else {
+-		EMIT2(0xFF, 0xE0 + reg);
++		EMIT2(0xFF, 0xE0 + reg);	/* jmp *%\reg */
++		if (IS_ENABLED(CONFIG_RETPOLINE) || IS_ENABLED(CONFIG_SLS))
++			EMIT1(0xCC);		/* int3 */
+ 	}
+ 
+ 	*pprog = prog;
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From add1ea4511e2b64b4c68147bcda1b4e6e986c81a Mon Sep 17 00:00:00 2001
+From: Alexey Romanov <avromanov@sberdevices.ru>
+Date: Wed, 24 Aug 2022 14:31:17 +0300
+Subject: [PATCH 08/39] zram: don't retry compress incompressible page
+
+It doesn't make sense for us to retry to compress an uncompressible page
+(comp_len == PAGE_SIZE) in zsmalloc slowpath, because we will be storing
+it uncompressed anyway.  We can avoid wasting time on another compression
+attempt.  It is enough to take lock (zcomp_stream_get) and execute the
+code below.
+
+Link: https://lkml.kernel.org/r/20220824113117.78849-1-avromanov@sberdevices.ru
+Signed-off-by: Alexey Romanov <avromanov@sberdevices.ru>
+Signed-off-by: Dmitry Rokosov <ddrokosov@sberdevices.ru>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Alexey Romanov <avromanov@sberdevices.ru>
+Cc: Dmitry Rokosov <DDRokosov@sberdevices.ru>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Nitin Gupta <ngupta@vflare.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ drivers/block/zram/zram_drv.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 226ea76cc..3bd8d5e27 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1410,9 +1410,19 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 		handle = zs_malloc(zram->mem_pool, comp_len,
+ 				GFP_NOIO | __GFP_HIGHMEM |
+ 				__GFP_MOVABLE);
+-		if (!IS_ERR((void *)handle))
++		if (IS_ERR((void *)handle))
++			return PTR_ERR((void *)handle);
++
++		if (comp_len != PAGE_SIZE)
+ 			goto compress_again;
+-		return PTR_ERR((void *)handle);
++		/*
++		 * If the page is not compressible, you need to acquire the lock and
++		 * execute the code below. The zcomp_stream_get() call is needed to
++		 * disable the cpu hotplug and grab the zstrm buffer back.
++		 * It is necessary that the dereferencing of the zstrm variable below
++		 * occurs correctly.
++		 */
++		zstrm = zcomp_stream_get(zram->comp);
+ 	}
+ 
+ 	alloced_pages = zs_get_total_pages(zram->mem_pool);
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From ac24c5440b5202b2467e17b6e906e7fba9cc596c Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Tue, 20 Sep 2022 19:06:33 +0200
+Subject: [PATCH 09/39] lib/vdso: use "grep -E" instead of "egrep"
+
+The latest version of grep claims the egrep is now obsolete so the build
+now contains warnings that look like:
+	egrep: warning: egrep is obsolescent; using grep -E
+fix this up by moving the vdso Makefile to use "grep -E" instead.
+
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ lib/vdso/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/vdso/Makefile b/lib/vdso/Makefile
+index c415a685d..e814061d6 100644
+--- a/lib/vdso/Makefile
++++ b/lib/vdso/Makefile
+@@ -17,6 +17,6 @@ $(error ARCH_REL_TYPE_ABS is not set)
+ endif
+ 
+ quiet_cmd_vdso_check = VDSOCHK $@
+-      cmd_vdso_check = if $(OBJDUMP) -R $@ | egrep -h "$(ARCH_REL_TYPE_ABS)"; \
++      cmd_vdso_check = if $(OBJDUMP) -R $@ | grep -E -h "$(ARCH_REL_TYPE_ABS)"; \
+ 		       then (echo >&2 "$@: dynamic relocations are not supported"; \
+ 			     rm -f $@; /bin/false); fi
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 10d5c2381f45a81b772e03782cda3526e9841aac Mon Sep 17 00:00:00 2001
+From: Ian Pilcher <arequipeno@gmail.com>
+Date: Mon, 26 Sep 2022 11:25:03 -0500
+Subject: [PATCH 10/39] leds: trigger: Add block device LED trigger
+
+Add "blkdev" LED trigger to blink LEDs in response to block device
+activity.
+
+Add LEDS_TRIGGER_BLKDEV (tristate) config option to control building of
+the trigger.
+
+Signed-off-by: Ian Pilcher <arequipeno@gmail.com>
+---
+ drivers/leds/trigger/Kconfig          |    9 +
+ drivers/leds/trigger/Makefile         |    1 +
+ drivers/leds/trigger/ledtrig-blkdev.c | 1220 +++++++++++++++++++++++++
+ 3 files changed, 1230 insertions(+)
+ create mode 100644 drivers/leds/trigger/ledtrig-blkdev.c
+
+diff --git a/drivers/leds/trigger/Kconfig b/drivers/leds/trigger/Kconfig
+index dc6816d36..bda249068 100644
+--- a/drivers/leds/trigger/Kconfig
++++ b/drivers/leds/trigger/Kconfig
+@@ -154,4 +154,13 @@ config LEDS_TRIGGER_TTY
+ 
+ 	  When build as a module this driver will be called ledtrig-tty.
+ 
++config LEDS_TRIGGER_BLKDEV
++	tristate "LED Trigger for block devices"
++	depends on BLOCK
++	help
++	  The blkdev LED trigger allows LEDs to be controlled by block device
++	  activity (reads and writes).
++
++	  See Documentation/leds/ledtrig-blkdev.rst.
++
+ endif # LEDS_TRIGGERS
+diff --git a/drivers/leds/trigger/Makefile b/drivers/leds/trigger/Makefile
+index 25c4db97c..d53bab5d9 100644
+--- a/drivers/leds/trigger/Makefile
++++ b/drivers/leds/trigger/Makefile
+@@ -16,3 +16,4 @@ obj-$(CONFIG_LEDS_TRIGGER_NETDEV)	+= ledtrig-netdev.o
+ obj-$(CONFIG_LEDS_TRIGGER_PATTERN)	+= ledtrig-pattern.o
+ obj-$(CONFIG_LEDS_TRIGGER_AUDIO)	+= ledtrig-audio.o
+ obj-$(CONFIG_LEDS_TRIGGER_TTY)		+= ledtrig-tty.o
++obj-$(CONFIG_LEDS_TRIGGER_BLKDEV)	+= ledtrig-blkdev.o
+diff --git a/drivers/leds/trigger/ledtrig-blkdev.c b/drivers/leds/trigger/ledtrig-blkdev.c
+new file mode 100644
+index 000000000..8614e308f
+--- /dev/null
++++ b/drivers/leds/trigger/ledtrig-blkdev.c
+@@ -0,0 +1,1220 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++/*
++ *	Block device LED trigger
++ *
++ *	Copyright 2021-2022 Ian Pilcher <arequipeno@gmail.com>
++ */
++
++#include <linux/blkdev.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/part_stat.h>
++#include <linux/xarray.h>
++
++/**
++ * DOC: Overview
++ *
++ * The ``blkdev`` LED trigger works by periodically checking the activity
++ * counters of block devices that have been linked to one or more LEDs and
++ * blinking those LED(s) if the correct type of activity has occurred.  The
++ * periodic check is scheduled with the Linux kernel's deferred work facility.
++ *
++ * Trigger-specific data about block devices and LEDs is stored in two data
++ * structures --- &struct blkdev_trig_bdev (a "BTB") and &struct blkdev_trig_led
++ * (a "BTL").  Each structure contains a &struct xarray that holds links to any
++ * linked devices of the other type.  I.e. &blkdev_trig_bdev.linked_btls
++ * contains links to all BTLs whose LEDs have been linked to the BTB's block
++ * device, and &blkdev_trig_led.linked_btbs contains links to all BTBs whose
++ * block devices have been linked to the BTL's LED.  Thus, a block device can
++ * be linked to more than one LED, and an LED can be linked to more than one
++ * block device.
++ */
++
++/* Default, minimum & maximum blink duration (milliseconds) */
++#define BLKDEV_TRIG_BLINK_DEF	75
++#define BLKDEV_TRIG_BLINK_MIN	10
++#define BLKDEV_TRIG_BLINK_MAX	86400000  /* 24 hours */
++
++/* Default, minimum & maximum activity check interval (milliseconds) */
++#define BLKDEV_TRIG_CHECK_DEF	100
++#define BLKDEV_TRIG_CHECK_MIN	25
++#define BLKDEV_TRIG_CHECK_MAX	86400000  /* 24 hours */
++
++/*
++ * If blkdev_trig_check() can't lock the mutex, how long to wait before trying
++ * again (milliseconds)
++ */
++#define BLKDEV_TRIG_CHECK_RETRY	5
++
++/* Mode argument for calls to blkdev_get_by_path() and blkdev_put() */
++#define BLKDEV_TRIG_FMODE	0
++
++/**
++ * struct blkdev_trig_bdev - Trigger-specific data about a block device.
++ * @last_checked:	Time (in jiffies) at which the trigger last checked this
++ *			block device for activity.
++ * @last_activity:	Time (in jiffies) at which the trigger last detected
++ *			activity of each type.
++ * @ios:		Activity counter values for each type, corresponding to
++ *			the timestamps in &last_activity.
++ * @index:		&xarray index, so the BTB can be included in one or more
++ *			&blkdev_trig_led.linked_btbs.
++ * @bdev:		The block device.
++ * @linked_btls:	The BTLs that represent the LEDs linked to the BTB's
++ *			block device.
++ *
++ * Every block device linked to at least one LED gets a "BTB."  A BTB is created
++ * when a block device that is not currently linked to any LEDs is linked to an
++ * LED.
++ *
++ * A BTB is freed when one of the following occurs:
++ *
++ * * The number of LEDs linked to the block device becomes zero, because it has
++ *   been unlinked from its last LED using the trigger's &sysfs interface.
++ *
++ * * The number of LEDs linked to the block device becomes zero, because the
++ *   last LED to which it was linked has been disassociated from the trigger
++ *   (which happens automatically if the LED device is removed from the system).
++ *
++ * * The BTB's block device is removed from the system.  To accomodate this
++ *   scenario, BTB's are created as device resources, so that the release
++ *   function will be called by the driver core when the device is removed.
++ */
++struct blkdev_trig_bdev {
++	unsigned long		last_checked;
++	unsigned long		last_activity[NR_STAT_GROUPS];
++	unsigned long		ios[NR_STAT_GROUPS];
++	unsigned long		index;
++	struct block_device	*bdev;
++	struct xarray		linked_btls;
++};
++
++/**
++ * struct blkdev_trig_led - Trigger-specific data about an LED.
++ * @last_checked:	Time (in jiffies) at which the trigger last checked the
++ *			the block devices linked to this LED for activity.
++ * @index:		&xarray index, so the BTL can be included in one or more
++ *			&blkdev_trig_bdev.linked_btls.
++ * @mode:		Bitmask for types of block device activity that will
++ *			cause this LED to blink --- reads, writes, discards,
++ *			etc.
++ * @led:		The LED device.
++ * @blink_msec:		Duration of a blink (milliseconds).
++ * @check_jiffies:	Frequency with which block devices linked to this LED
++ *			should be checked for activity (jiffies).
++ * @linked_btbs:	The BTBs that represent the block devices linked to the
++ *			BTL's LED.
++ * @all_btls_node:	The BTL's node in the module's list of all BTLs.
++ *
++ * Every LED associated with the block device trigger gets a "BTL."  A BTL is
++ * created when the trigger is "activated" on an LED (usually by writing
++ * ``blkdev`` to the LED's &sysfs &trigger attribute).  A BTL is freed wnen its
++ * LED is disassociated from the trigger, either through the trigger's &sysfs
++ * interface or because the LED device is removed from the system.
++ */
++struct blkdev_trig_led {
++	unsigned long		last_checked;
++	unsigned long		index;
++	unsigned long		mode;  /* must be ulong for atomic bit ops */
++	struct led_classdev	*led;
++	unsigned int		blink_msec;
++	unsigned int		check_jiffies;
++	struct xarray		linked_btbs;
++	struct hlist_node	all_btls_node;
++};
++
++/* Protects everything except atomic LED attributes */
++static DEFINE_MUTEX(blkdev_trig_mutex);
++
++/* BTB device resource release function */
++static void blkdev_trig_btb_release(struct device *dev, void *res);
++
++/* Index for next BTB or BTL */
++static unsigned long blkdev_trig_next_index;
++
++/* All LEDs associated with the trigger */
++static HLIST_HEAD(blkdev_trig_all_btls);
++
++/* Delayed work to periodically check for activity & blink LEDs */
++static void blkdev_trig_check(struct work_struct *work);
++static DECLARE_DELAYED_WORK(blkdev_trig_work, blkdev_trig_check);
++
++/* When is the delayed work scheduled to run next (jiffies) */
++static unsigned long blkdev_trig_next_check;
++
++/* Total number of BTB-to-BTL links */
++static unsigned int blkdev_trig_link_count;
++
++/* Empty sysfs attribute list for next 2 declarations */
++static struct attribute *blkdev_trig_attrs_empty[] = { NULL };
++
++/* linked_leds sysfs directory for block devs linked to 1 or more LEDs */
++static const struct attribute_group blkdev_trig_linked_leds = {
++	.name	= "linked_leds",
++	.attrs	= blkdev_trig_attrs_empty,
++};
++
++/* linked_devices sysfs directory for each LED associated with the trigger */
++static const struct attribute_group blkdev_trig_linked_devs = {
++	.name	= "linked_devices",
++	.attrs	= blkdev_trig_attrs_empty,
++};
++
++
++/*
++ *
++ *	Delayed work to check for activity & blink LEDs
++ *
++ */
++
++/**
++ * blkdev_trig_blink() - Blink an LED, if the correct type of activity has
++ *	occurred on the block device.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ * Return:	&true if the LED is blinked, &false if not.
++ */
++static bool blkdev_trig_blink(const struct blkdev_trig_led *btl,
++			      const struct blkdev_trig_bdev *btb)
++{
++	unsigned long mode, mask, delay_on, delay_off;
++	enum stat_group i;
++
++	mode = READ_ONCE(btl->mode);
++
++	for (i = STAT_READ, mask = 1; i <= STAT_FLUSH; ++i, mask <<= 1) {
++
++		if (!(mode & mask))
++			continue;
++
++		if (time_before_eq(btb->last_activity[i], btl->last_checked))
++			continue;
++
++		delay_on = READ_ONCE(btl->blink_msec);
++		delay_off = 1;	/* 0 leaves LED turned on */
++
++		led_blink_set_oneshot(btl->led, &delay_on, &delay_off, 0);
++		return true;
++	}
++
++	return false;
++}
++
++/**
++ * blkdev_trig_update_btb() - Update a BTB's activity counters and timestamps.
++ * @btb:	The BTB
++ * @now:	Timestamp (in jiffies)
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_update_btb(struct blkdev_trig_bdev *btb,
++				   unsigned long now)
++{
++	unsigned long new_ios;
++	enum stat_group i;
++
++	for (i = STAT_READ; i <= STAT_FLUSH; ++i) {
++
++		new_ios = part_stat_read(btb->bdev, ios[i]);
++
++		if (new_ios != btb->ios[i]) {
++			btb->ios[i] = new_ios;
++			btb->last_activity[i] = now;
++		}
++	}
++
++	btb->last_checked = now;
++}
++
++/**
++ * blkdev_trig_check() - Check linked devices for activity and blink LEDs.
++ * @work:	Delayed work (&blkdev_trig_work)
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ */
++static void blkdev_trig_check(struct work_struct *work)
++{
++	struct blkdev_trig_led *btl;
++	struct blkdev_trig_bdev *btb;
++	unsigned long index, delay, now, led_check, led_delay;
++	bool blinked;
++
++	if (!mutex_trylock(&blkdev_trig_mutex)) {
++		delay = msecs_to_jiffies(BLKDEV_TRIG_CHECK_RETRY);
++		goto exit_reschedule;
++	}
++
++	now = jiffies;
++	delay = ULONG_MAX;
++
++	hlist_for_each_entry (btl, &blkdev_trig_all_btls, all_btls_node) {
++
++		led_check = btl->last_checked + btl->check_jiffies;
++
++		if (time_before_eq(led_check, now)) {
++
++			blinked = false;
++
++			xa_for_each (&btl->linked_btbs, index, btb) {
++
++				if (btb->last_checked != now)
++					blkdev_trig_update_btb(btb, now);
++				if (!blinked)
++					blinked = blkdev_trig_blink(btl, btb);
++			}
++
++			btl->last_checked = now;
++			led_delay = btl->check_jiffies;
++
++		} else {
++			led_delay = led_check - now;
++		}
++
++		if (led_delay < delay)
++			delay = led_delay;
++	}
++
++	mutex_unlock(&blkdev_trig_mutex);
++
++exit_reschedule:
++	WARN_ON_ONCE(delay == ULONG_MAX);
++	WARN_ON_ONCE(!schedule_delayed_work(&blkdev_trig_work, delay));
++}
++
++/**
++ * blkdev_trig_sched_led() - Set the schedule of the delayed work when a new
++ *	LED is added to the schedule.
++ * @btl:	The BTL that represents the LED
++ *
++ * Called when the number of block devices to which an LED is linked becomes
++ * non-zero.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_sched_led(const struct blkdev_trig_led *btl)
++{
++	unsigned long delay = READ_ONCE(btl->check_jiffies);
++	unsigned long check_by = jiffies + delay;
++
++	/*
++	 * If no other LED-to-block device links exist, simply schedule the
++	 * delayed work according to this LED's check_interval attribute
++	 * (check_jiffies).
++	 */
++	if (blkdev_trig_link_count == 0) {
++		WARN_ON(!schedule_delayed_work(&blkdev_trig_work, delay));
++		blkdev_trig_next_check = check_by;
++		return;
++	}
++
++	/*
++	 * If the next check is already scheduled to occur soon enough to
++	 * accomodate this LED's check_interval, the schedule doesn't need
++	 * to be changed.
++	 */
++	if (time_after_eq(check_by, blkdev_trig_next_check))
++		return;
++
++	/*
++	 * Modify the schedule, so that the delayed work runs soon enough for
++	 * this LED.
++	 */
++	WARN_ON(!mod_delayed_work(system_wq, &blkdev_trig_work, delay));
++	blkdev_trig_next_check = check_by;
++}
++
++
++/*
++ *
++ *	Linking and unlinking LEDs and block devices
++ *
++ */
++
++/**
++ * blkdev_trig_link() - Link a block device to an LED.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ * Return:	&0 on success, negative &errno on error.
++ */
++static int blkdev_trig_link(struct blkdev_trig_led *btl,
++			    struct blkdev_trig_bdev *btb)
++{
++	bool led_first_link;
++	int err;
++
++	led_first_link = xa_empty(&btl->linked_btbs);
++
++	err = xa_insert(&btb->linked_btls, btl->index, btl, GFP_KERNEL);
++	if (err)
++		return err;
++
++	err = xa_insert(&btl->linked_btbs, btb->index, btb, GFP_KERNEL);
++	if (err)
++		goto error_erase_btl;
++
++	/* Create /sys/class/block/<bdev>/linked_leds/<led> symlink */
++	err = sysfs_add_link_to_group(bdev_kobj(btb->bdev),
++				      blkdev_trig_linked_leds.name,
++				      &btl->led->dev->kobj, btl->led->name);
++	if (err)
++		goto error_erase_btb;
++
++	/* Create /sys/class/leds/<led>/linked_devices/<bdev> symlink */
++	err = sysfs_add_link_to_group(&btl->led->dev->kobj,
++				      blkdev_trig_linked_devs.name,
++				      bdev_kobj(btb->bdev),
++				      dev_name(&btb->bdev->bd_device));
++	if (err)
++		goto error_remove_symlink;
++
++	/*
++	 * If this is the first block device linked to this LED, the delayed
++	 * work schedule may need to be changed.
++	 */
++	if (led_first_link)
++		blkdev_trig_sched_led(btl);
++
++	++blkdev_trig_link_count;
++
++	return 0;
++
++error_remove_symlink:
++	sysfs_remove_link_from_group(bdev_kobj(btb->bdev),
++				     blkdev_trig_linked_leds.name,
++				     btl->led->name);
++error_erase_btb:
++	xa_erase(&btl->linked_btbs, btb->index);
++error_erase_btl:
++	xa_erase(&btb->linked_btls, btl->index);
++	return err;
++}
++
++/**
++ * blkdev_trig_put_btb() - Remove and free a BTB, if it is no longer needed.
++ * @btb:	The BTB
++ *
++ * Does nothing if the BTB (block device) is still linked to at least one LED.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_put_btb(struct blkdev_trig_bdev *btb)
++{
++	struct block_device *bdev = btb->bdev;
++	int err;
++
++	if (xa_empty(&btb->linked_btls)) {
++
++		sysfs_remove_group(bdev_kobj(bdev), &blkdev_trig_linked_leds);
++		err = devres_destroy(&bdev->bd_device, blkdev_trig_btb_release,
++				     NULL, NULL);
++		WARN_ON(err);
++	}
++}
++
++/**
++ * _blkdev_trig_unlink_always() - Perform the unconditionally required steps of
++ *	unlinking a block device from an LED.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * When a block device is unlinked from an LED, certain steps must be performed
++ * only if the block device is **not** being released.  This function performs
++ * those steps that are **always** required, whether or not the block device is
++ * being released.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void _blkdev_trig_unlink_always(struct blkdev_trig_led *btl,
++				       struct blkdev_trig_bdev *btb)
++{
++	--blkdev_trig_link_count;
++
++	if (blkdev_trig_link_count == 0)
++		WARN_ON(!cancel_delayed_work_sync(&blkdev_trig_work));
++
++	xa_erase(&btb->linked_btls, btl->index);
++	xa_erase(&btl->linked_btbs, btb->index);
++
++	/* Remove /sys/class/leds/<led>/linked_devices/<bdev> symlink */
++	sysfs_remove_link_from_group(&btl->led->dev->kobj,
++				     blkdev_trig_linked_devs.name,
++				     dev_name(&btb->bdev->bd_device));
++}
++
++/**
++ * blkdev_trig_unlink_norelease() - Unlink an LED from a block device that is
++ *	**not** being released.
++ * @btl:	The BTL that represents the LED.
++ * @btb:	The BTB that represents the block device.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_unlink_norelease(struct blkdev_trig_led *btl,
++					 struct blkdev_trig_bdev *btb)
++{
++	_blkdev_trig_unlink_always(btl, btb);
++
++	/* Remove /sys/class/block/<bdev>/linked_leds/<led> symlink */
++	sysfs_remove_link_from_group(bdev_kobj(btb->bdev),
++				     blkdev_trig_linked_leds.name,
++				     btl->led->name);
++
++	blkdev_trig_put_btb(btb);
++}
++
++/**
++ * blkdev_trig_unlink_release() - Unlink an LED from a block device that is
++ *	being released.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_unlink_release(struct blkdev_trig_led *btl,
++				       struct blkdev_trig_bdev *btb)
++{
++	_blkdev_trig_unlink_always(btl, btb);
++
++	/*
++	 * If the BTB is being released, the driver core has already removed the
++	 * device's attribute groups, and the BTB will be freed automatically,
++	 * so there's nothing else to do.
++	 */
++}
++
++
++/*
++ *
++ *	BTB creation
++ *
++ */
++
++/**
++ * blkdev_trig_btb_release() - BTB device resource release function.
++ * @dev:	The block device
++ * @res:	The BTB
++ *
++ * Called by the driver core when a block device with a BTB is removed.
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ */
++static void blkdev_trig_btb_release(struct device *dev, void *res)
++{
++	struct blkdev_trig_bdev *btb = res;
++	struct blkdev_trig_led *btl;
++	unsigned long index;
++
++	mutex_lock(&blkdev_trig_mutex);
++
++	xa_for_each (&btb->linked_btls, index, btl)
++		blkdev_trig_unlink_release(btl, btb);
++
++	mutex_unlock(&blkdev_trig_mutex);
++}
++
++/**
++ * blkdev_trig_get_bdev() - Get a block device by path.
++ * @path:	The value written to an LED's &link_dev_by_path or
++ *		&unlink_dev_by_path attribute, which should be the path to a
++ *		special file that represents a block device
++ * @len:	The number of characters in &path (not including its
++ *		terminating null)
++ *
++ * The caller must call blkdev_put() when finished with the device.
++ *
++ * Context:	Process context.
++ * Return:	The block device, or an error pointer.
++ */
++static struct block_device *blkdev_trig_get_bdev(const char *path, size_t len)
++{
++	struct block_device *bdev;
++	char *buf;
++
++	buf = kmemdup(path, len + 1, GFP_KERNEL);  /* +1 to include null */
++	if (buf == NULL)
++		return ERR_PTR(-ENOMEM);
++
++	bdev = blkdev_get_by_path(strim(buf), BLKDEV_TRIG_FMODE, THIS_MODULE);
++	kfree(buf);
++	return bdev;
++}
++
++/**
++ * blkdev_trig_get_btb() - Find or create the BTB for a block device.
++ * @path:	The value written to an LED's &link_dev_by_path attribute,
++ *		which should be the path to a special file that represents a
++ *		block device
++ * @len:	The number of characters in &path
++ *
++ * If a new BTB is created, because the block device was not previously linked
++ * to any LEDs, the block device's &linked_leds &sysfs directory is created.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ * Return:	Pointer to the BTB, error pointer on error.
++ */
++static struct blkdev_trig_bdev *blkdev_trig_get_btb(const char *path,
++						    size_t len)
++{
++	struct block_device *bdev;
++	struct blkdev_trig_bdev *btb;
++	int err;
++
++	bdev = blkdev_trig_get_bdev(path, len);
++	if (IS_ERR(bdev))
++		return ERR_CAST(bdev);
++
++	btb = devres_find(&bdev->bd_device, blkdev_trig_btb_release,
++			  NULL, NULL);
++	if (btb != NULL) {
++		err = 0;
++		goto exit_put_bdev;
++	}
++
++	if (blkdev_trig_next_index == ULONG_MAX) {
++		err = -EOVERFLOW;
++		goto exit_put_bdev;
++	}
++
++	btb = devres_alloc(blkdev_trig_btb_release, sizeof(*btb), GFP_KERNEL);
++	if (btb == NULL) {
++		err = -ENOMEM;
++		goto exit_put_bdev;
++	}
++
++	err = sysfs_create_group(bdev_kobj(bdev), &blkdev_trig_linked_leds);
++	if (err)
++		goto exit_free_btb;
++
++	btb->index = blkdev_trig_next_index++;
++	btb->bdev = bdev;
++	xa_init(&btb->linked_btls);
++
++	/* Populate BTB activity counters */
++	blkdev_trig_update_btb(btb, jiffies);
++
++	devres_add(&bdev->bd_device, btb);
++
++exit_free_btb:
++	if (err)
++		devres_free(btb);
++exit_put_bdev:
++	blkdev_put(bdev, BLKDEV_TRIG_FMODE);
++	return err ? ERR_PTR(err) : btb;
++}
++
++
++/*
++ *
++ *	Activating and deactivating the trigger on an LED
++ *
++ */
++
++/**
++ * blkdev_trig_activate() - Called by the LEDs subsystem when an LED is
++ *	associated with the trigger.
++ * @led:	The LED
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&0 on success, negative &errno on error.
++ */
++static int blkdev_trig_activate(struct led_classdev *led)
++{
++	struct blkdev_trig_led *btl;
++	int err;
++
++	btl = kzalloc(sizeof(*btl), GFP_KERNEL);
++	if (btl == NULL)
++		return -ENOMEM;
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		goto exit_free;
++
++	if (blkdev_trig_next_index == ULONG_MAX) {
++		err = -EOVERFLOW;
++		goto exit_unlock;
++	}
++
++	btl->index = blkdev_trig_next_index++;
++	btl->last_checked = jiffies;
++	btl->mode = -1;  /* set all bits */
++	btl->led = led;
++	btl->blink_msec = BLKDEV_TRIG_BLINK_DEF;
++	btl->check_jiffies = msecs_to_jiffies(BLKDEV_TRIG_CHECK_DEF);
++	xa_init(&btl->linked_btbs);
++
++	hlist_add_head(&btl->all_btls_node, &blkdev_trig_all_btls);
++	led_set_trigger_data(led, btl);
++
++exit_unlock:
++	mutex_unlock(&blkdev_trig_mutex);
++exit_free:
++	if (err)
++		kfree(btl);
++	return err;
++}
++
++/**
++ * blkdev_trig_deactivate() - Called by the the LEDs subsystem when an LED is
++ *	disassociated from the trigger.
++ * @led:	The LED
++ *
++ * The LEDs subsystem also calls this function when an LED associated with the
++ * trigger is removed or when the trigger is unregistered (if the module is
++ * unloaded).
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ */
++static void blkdev_trig_deactivate(struct led_classdev *led)
++{
++	struct blkdev_trig_led *btl = led_get_trigger_data(led);
++	struct blkdev_trig_bdev *btb;
++	unsigned long index;
++
++	mutex_lock(&blkdev_trig_mutex);
++
++	xa_for_each (&btl->linked_btbs, index, btb)
++		blkdev_trig_unlink_norelease(btl, btb);
++
++	hlist_del(&btl->all_btls_node);
++	kfree(btl);
++
++	mutex_unlock(&blkdev_trig_mutex);
++}
++
++
++/*
++ *
++ *	Link-related attribute store functions
++ *
++ */
++
++/**
++ * link_dev_by_path_store() - &link_dev_by_path device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &link_dev_by_path attribute (&dev_attr_link_dev_by_path)
++ * @buf:	The value written to the attribute, which should be the path to
++ *		a special file that represents a block device to be linked to
++ *		the LED (e.g. ``/dev/sda``)
++ * @count:	The number of characters in &buf
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t link_dev_by_path_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	struct blkdev_trig_bdev *btb;
++	int err;
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		return err;
++
++	btb = blkdev_trig_get_btb(buf, count);
++	if (IS_ERR(btb)) {
++		err = PTR_ERR(btb);
++		goto exit_unlock;
++	}
++
++	if (xa_load(&btb->linked_btls, btl->index) != NULL) {
++		err = -EEXIST;
++		goto exit_put_btb;
++	}
++
++	err = blkdev_trig_link(btl, btb);
++
++exit_put_btb:
++	if (err)
++		blkdev_trig_put_btb(btb);
++exit_unlock:
++	mutex_unlock(&blkdev_trig_mutex);
++	return err ? : count;
++}
++
++/**
++ * unlink_dev_by_path_store() - &unlink_dev_by_path device attribute store
++ *	function.
++ * @dev:	The LED device
++ * @attr:	The &unlink_dev_by_path attribute (&dev_attr_unlink_dev_by_path)
++ * @buf:	The value written to the attribute, which should be the path to
++ *		a special file that represents a block device to be unlinked
++ *		from the LED (e.g. ``/dev/sda``)
++ * @count:	The number of characters in &buf
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t unlink_dev_by_path_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	struct block_device *bdev;
++	struct blkdev_trig_bdev *btb;
++	int err;
++
++	bdev = blkdev_trig_get_bdev(buf, count);
++	if (IS_ERR(bdev))
++		return PTR_ERR(bdev);
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		goto exit_put_bdev;
++
++	btb = devres_find(&bdev->bd_device, blkdev_trig_btb_release,
++			  NULL, NULL);
++	if (btb == NULL) {
++		err = -EUNATCH;  /* bdev isn't linked to any LED */
++		goto exit_unlock;
++	}
++
++	if (xa_load(&btb->linked_btls, btl->index) == NULL) {
++		err = -EUNATCH;  /* bdev isn't linked to this LED */
++		goto exit_unlock;
++	}
++
++	blkdev_trig_unlink_norelease(btl, btb);
++
++exit_unlock:
++	mutex_unlock(&blkdev_trig_mutex);
++exit_put_bdev:
++	blkdev_put(bdev, BLKDEV_TRIG_FMODE);
++	return err ? : count;
++}
++
++/**
++ * unlink_dev_by_name_store() - &unlink_dev_by_name device attribute store
++ *	function.
++ * @dev:	The LED device
++ * @attr:	The &unlink_dev_by_name attribute (&dev_attr_unlink_dev_by_name)
++ * @buf:	The value written to the attribute, which should be the kernel
++ *		name of a block device to be unlinked from the LED (e.g.
++ *		``sda``)
++ * @count:	The number of characters in &buf
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t unlink_dev_by_name_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	struct blkdev_trig_bdev *btb;
++	unsigned long index;
++	int err;
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		return err;
++
++	err = -EUNATCH;
++
++	xa_for_each (&btl->linked_btbs, index, btb) {
++
++		if (sysfs_streq(dev_name(&btb->bdev->bd_device), buf)) {
++			blkdev_trig_unlink_norelease(btl, btb);
++			err = 0;
++			break;
++		}
++	}
++
++	mutex_unlock(&blkdev_trig_mutex);
++	return err ? : count;
++}
++
++
++/*
++ *
++ *	Atomic attribute show & store functions
++ *
++ */
++
++/**
++ * blink_time_show() - &blink_time device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_time attribute (&dev_attr_blink_time)
++ * @buf:	Output buffer
++ *
++ * Writes the value of &blkdev_trig_led.blink_msec to &buf.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_time_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	const struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++
++	return sprintf(buf, "%u\n", READ_ONCE(btl->blink_msec));
++}
++
++/**
++ * blink_time_store() - &blink_time device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_time attribute (&dev_attr_blink_time)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets &blkdev_trig_led.blink_msec to the value in &buf.
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_time_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	unsigned int value;
++	int err;
++
++	err = kstrtouint(buf, 0, &value);
++	if (err)
++		return err;
++
++	if (value < BLKDEV_TRIG_BLINK_MIN || value > BLKDEV_TRIG_BLINK_MAX)
++		return -ERANGE;
++
++	WRITE_ONCE(btl->blink_msec, value);
++	return count;
++}
++
++/**
++ * check_interval_show() - &check_interval device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &check_interval attribute (&dev_attr_check_interval)
++ * @buf:	Output buffer
++ *
++ * Writes the value of &blkdev_trig_led.check_jiffies (converted to
++ * milliseconds) to &buf.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t check_interval_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++
++	return sprintf(buf, "%u\n",
++		       jiffies_to_msecs(READ_ONCE(btl->check_jiffies)));
++}
++
++/**
++ * check_interval_store() - &check_interval device attribute store function
++ * @dev:	The LED device
++ * @attr:	The &check_interval attribute (&dev_attr_check_interval)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets &blkdev_trig_led.check_jiffies to the value in &buf (after converting
++ * from milliseconds).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t check_interval_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct blkdev_trig_led *led = led_trigger_get_drvdata(dev);
++	unsigned int value;
++	int err;
++
++	err = kstrtouint(buf, 0, &value);
++	if (err)
++		return err;
++
++	if (value < BLKDEV_TRIG_CHECK_MIN || value > BLKDEV_TRIG_CHECK_MAX)
++		return -ERANGE;
++
++	WRITE_ONCE(led->check_jiffies, msecs_to_jiffies(value));
++
++	return count;
++}
++
++/**
++ * blkdev_trig_mode_show() - Helper for boolean attribute show functions.
++ * @led:	The LED
++ * @buf:	Output buffer
++ * @bit:	Which bit to show
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static int blkdev_trig_mode_show(const struct blkdev_trig_led *led, char *buf,
++				 enum stat_group bit)
++{
++	return sprintf(buf, READ_ONCE(led->mode) & (1 << bit) ? "Y\n" : "N\n");
++}
++
++/**
++ * blkdev_trig_mode_store() - Helper for boolean attribute store functions.
++ * @led:	The LED
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ * @bit:	Which bit to set
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static int blkdev_trig_mode_store(struct blkdev_trig_led *led,
++				  const char *buf, size_t count,
++				  enum stat_group bit)
++{
++	bool set;
++	int err;
++
++	err = kstrtobool(buf, &set);
++	if (err)
++		return err;
++
++	if (set)
++		set_bit(bit, &led->mode);
++	else
++		clear_bit(bit, &led->mode);
++
++	return count;
++}
++
++/**
++ * blink_on_read_show() - &blink_on_read device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_read attribute (&dev_attr_blink_on_read)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending on whether the &STAT_READ bit in
++ * &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_read_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_READ);
++}
++
++/**
++ * blink_on_read_store() - &blink_on_read device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_read attribute (&dev_attr_blink_on_read)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_READ bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_read_store(struct device *dev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_READ);
++}
++
++/**
++ * blink_on_write_show() - &blink_on_write device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_write attribute (&dev_attr_blink_on_write)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending on whether the &STAT_WRITE bit in
++ * in &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_write_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_WRITE);
++}
++
++/**
++ * blink_on_write_store() - &blink_on_write device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_write attribute (&dev_attr_blink_on_write)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_WRITE bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_write_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_WRITE);
++}
++
++/**
++ * blink_on_flush_show() - &blink_on_flush device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_flush attribute (&dev_attr_blink_on_flush)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending whether the &STAT_FLUSH bit in
++ * &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_flush_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_FLUSH);
++}
++
++/**
++ * blink_on_flush_store() - &blink_on_flush device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_flush attribute (&dev_attr_blink_on_flush)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_FLUSH bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_flush_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_FLUSH);
++}
++
++/**
++ * blink_on_discard_show() - &blink_on_discard device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_discard attribute (&dev_attr_blink_on_discard)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending on whether the &STAT_DISCARD bit in
++ * &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_discard_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_DISCARD);
++}
++
++/**
++ * blink_on_discard_store() - &blink_on_discard device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_discard attribute (&dev_attr_blink_on_discard)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_DISCARD bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_discard_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_DISCARD);
++}
++
++/* Device attributes */
++static DEVICE_ATTR_WO(link_dev_by_path);
++static DEVICE_ATTR_WO(unlink_dev_by_path);
++static DEVICE_ATTR_WO(unlink_dev_by_name);
++static DEVICE_ATTR_RW(blink_time);
++static DEVICE_ATTR_RW(check_interval);
++static DEVICE_ATTR_RW(blink_on_read);
++static DEVICE_ATTR_RW(blink_on_write);
++static DEVICE_ATTR_RW(blink_on_flush);
++static DEVICE_ATTR_RW(blink_on_discard);
++
++/* Device attributes in LED directory (/sys/class/leds/<led>/...) */
++static struct attribute *blkdev_trig_attrs[] = {
++	&dev_attr_link_dev_by_path.attr,
++	&dev_attr_unlink_dev_by_path.attr,
++	&dev_attr_unlink_dev_by_name.attr,
++	&dev_attr_blink_time.attr,
++	&dev_attr_check_interval.attr,
++	&dev_attr_blink_on_read.attr,
++	&dev_attr_blink_on_write.attr,
++	&dev_attr_blink_on_flush.attr,
++	&dev_attr_blink_on_discard.attr,
++	NULL
++};
++
++/* Unnamed attribute group == no subdirectory */
++static const struct attribute_group blkdev_trig_attr_group = {
++	.attrs	= blkdev_trig_attrs,
++};
++
++/* Attribute groups for the trigger */
++static const struct attribute_group *blkdev_trig_attr_groups[] = {
++	&blkdev_trig_attr_group,   /* /sys/class/leds/<led>/... */
++	&blkdev_trig_linked_devs,  /* /sys/class/leds/<led>/linked_devices/ */
++	NULL
++};
++
++/* Trigger registration data */
++static struct led_trigger blkdev_trig_trigger = {
++	.name		= "blkdev",
++	.activate	= blkdev_trig_activate,
++	.deactivate	= blkdev_trig_deactivate,
++	.groups		= blkdev_trig_attr_groups,
++};
++
++/**
++ * blkdev_trig_init() - Block device LED trigger initialization.
++ *
++ * Registers the ``blkdev`` LED trigger.
++ *
++ * Return:	&0 on success, negative &errno on failure.
++ */
++static int __init blkdev_trig_init(void)
++{
++	return led_trigger_register(&blkdev_trig_trigger);
++}
++module_init(blkdev_trig_init);
++
++/**
++ * blkdev_trig_exit() - Block device LED trigger module exit.
++ *
++ * Unregisters the ``blkdev`` LED trigger.
++ */
++static void __exit blkdev_trig_exit(void)
++{
++	led_trigger_unregister(&blkdev_trig_trigger);
++}
++module_exit(blkdev_trig_exit);
++
++MODULE_DESCRIPTION("Block device LED trigger");
++MODULE_AUTHOR("Ian Pilcher <arequipeno@gmail.com>");
++MODULE_LICENSE("GPL v2");
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 5c7b5263813d8be83ee190001bfe18f6f522d967 Mon Sep 17 00:00:00 2001
+From: Ian Pilcher <arequipeno@gmail.com>
+Date: Mon, 26 Sep 2022 11:25:02 -0500
+Subject: [PATCH 11/39] docs: Add block device (blkdev) LED trigger
+ documentation
+
+Add Documentation/ABI/testing/sysfs-class-led-trigger-blkdev to
+document:
+
+  * /sys/class/leds/<led>/blink_time
+  * /sys/class/leds/<led>/check_interval
+  * /sys/class/leds/<led>/blink_on_{read,write,discard,flush}
+  * /sys/class/leds/<led>/link_dev_by_path
+  * /sys/class/leds/<led>/unlink_dev_by_path
+  * /sys/class/leds/<led>/unlink_dev_by_name
+  * /sys/class/leds/<led>/linked_devices
+
+Add /sys/block/<disk>/linked_leds to
+Documentation/ABI/stable/sysfs-block.
+
+Add overview in Documentation/leds/ledtrig-blkdev.rst.
+
+Signed-off-by: Ian Pilcher <arequipeno@gmail.com>
+---
+ Documentation/ABI/stable/sysfs-block          |  10 ++
+ .../testing/sysfs-class-led-trigger-blkdev    |  78 +++++++++
+ Documentation/leds/index.rst                  |   1 +
+ Documentation/leds/ledtrig-blkdev.rst         | 158 ++++++++++++++++++
+ 4 files changed, 247 insertions(+)
+ create mode 100644 Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
+ create mode 100644 Documentation/leds/ledtrig-blkdev.rst
+
+diff --git a/Documentation/ABI/stable/sysfs-block b/Documentation/ABI/stable/sysfs-block
+index cd14ecb3c..853cb2601 100644
+--- a/Documentation/ABI/stable/sysfs-block
++++ b/Documentation/ABI/stable/sysfs-block
+@@ -101,6 +101,16 @@ Description:
+ 		devices that support receiving integrity metadata.
+ 
+ 
++What:		/sys/block/<disk>/linked_leds
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Directory that contains symbolic links to all LEDs that
++		are associated with (linked to) this block device by the
++		blkdev LED trigger.  Only present when at least one LED
++		is linked.  (See Documentation/leds/ledtrig-blkdev.rst.)
++
++
+ What:		/sys/block/<disk>/<partition>/alignment_offset
+ Date:		April 2009
+ Contact:	Martin K. Petersen <martin.petersen@oracle.com>
+diff --git a/Documentation/ABI/testing/sysfs-class-led-trigger-blkdev b/Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
+new file mode 100644
+index 000000000..45275eb0b
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
+@@ -0,0 +1,78 @@
++What:		/sys/class/leds/<led>/blink_time
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Time (in milliseconds) that the LED will be on during a single
++		"blink".
++
++What:		/sys/class/leds/<led>/check_interval
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Interval (in milliseconds) between checks of the block devices
++		linked to this LED.  The LED will be blinked if the correct type
++		of activity (see blink_on_{read,write,discard,flush} attributes)
++		has occurred on any of the linked devices since the previous
++		check.
++
++What:		/sys/class/leds/<led>/blink_on_read
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to read activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/blink_on_write
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to write activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/blink_on_discard
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to discard activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/blink_on_flush
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gamil.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to cache flush activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/link_dev_by_path
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Associate a block device with this LED by writing the path to
++		the device special file (e.g. /dev/sda) to this attribute.
++		Symbolic links are followed.
++
++What:		/sys/class/leds/<led>/unlink_dev_by_path
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Remove the association between this LED and a block device by
++		writing the path to the device special file (e.g. /dev/sda) to
++		this attribute.  Symbolic links are followed.
++
++What:		/sys/class/leds/<led>/unlink_dev_by_name
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Remove the association between this LED and a block device by
++		writing the kernel name of the device (e.g. sda) to this
++		attribute.
++
++What:		/sys/class/leds/<led>/linked_devices
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Directory containing links to all block devices that are
++		associated with this LED.  (Note that the names of the
++		symbolic links in this directory are *kernel* names, which
++		may not match the device special file paths written to
++		link_device and unlink_device.)
+diff --git a/Documentation/leds/index.rst b/Documentation/leds/index.rst
+index e5d63b940..e3c24e468 100644
+--- a/Documentation/leds/index.rst
++++ b/Documentation/leds/index.rst
+@@ -10,6 +10,7 @@ LEDs
+    leds-class
+    leds-class-flash
+    leds-class-multicolor
++   ledtrig-blkdev
+    ledtrig-oneshot
+    ledtrig-transient
+    ledtrig-usbport
+diff --git a/Documentation/leds/ledtrig-blkdev.rst b/Documentation/leds/ledtrig-blkdev.rst
+new file mode 100644
+index 000000000..9ff5b99de
+--- /dev/null
++++ b/Documentation/leds/ledtrig-blkdev.rst
+@@ -0,0 +1,158 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=================================
++Block Device (blkdev) LED Trigger
++=================================
++
++Available when ``CONFIG_LEDS_TRIGGER_BLKDEV=y`` or
++``CONFIG_LEDS_TRIGGER_BLKDEV=m``.
++
++See also:
++
++* ``Documentation/ABI/testing/sysfs-class-led-trigger-blkdev``
++* ``Documentation/ABI/stable/sysfs-block`` (``/sys/block/<disk>/linked_leds``)
++
++Overview
++========
++
++.. note::
++	The examples below use ``<LED>`` to refer to the name of a
++	system-specific LED.  If no suitable LED is available on a test
++	system (in a virtual machine, for example), it is possible to
++	use a userspace LED.  (See ``Documentation/leds/uleds.rst``.)
++
++Verify that the ``blkdev`` LED trigger is available::
++
++	# grep blkdev /sys/class/leds/<LED>/trigger
++	... rfkill-none blkdev
++
++(If the previous command produces no output, you may need to load the trigger
++module - ``modprobe ledtrig_blkdev``.  If the module is not available, check
++the value of ``CONFIG_LEDS_TRIGGER_BLKDEV`` in your kernel configuration.)
++
++Associate the LED with the ``blkdev`` LED trigger::
++
++	# echo blkdev > /sys/class/leds/<LED>/trigger
++
++	# cat /sys/class/leds/<LED>/trigger
++	... rfkill-none [blkdev]
++
++Note that several new device attributes are available in the
++``/sys/class/leds/<LED>`` directory.
++
++* ``link_dev_by_path``, ``unlink_dev_by_path``, and ``unlink_dev_by_name`` are
++  used to manage the set of block devices associated with this LED.  The LED
++  will blink when activity occurs on any of its linked devices.
++
++* ``blink_on_read``, ``blink_on_write``, ``blink_on_discard``, and
++  ``blink_on_flush`` are boolean values that determine whether the LED will
++  blink when a particular type of activity is detected on one of its linked
++  block devices.
++
++* ``blink_time`` is the duration (in milliseconds) of each blink of this LED.
++  (The minimum value is 10 milliseconds.)
++
++* ``check_interval`` is the frequency (in milliseconds) with which block devices
++  linked to this LED will be checked for activity and the LED blinked (if the
++  correct type of activity has occurred).
++
++* The ``linked_devices`` directory will contain a symbolic link to every device
++  that is associated with this LED.
++
++Link a block device to the LED::
++
++	# echo /dev/sda > /sys/class/leds/<LED>/link_dev_by_path
++
++	# ls /sys/class/leds/<LED>/linked_devices
++	sda
++
++(The value written to ``link_dev_by_path`` must be the path of the device
++special file, such as ``/dev/sda``, that represents the block device - or the
++path of a symbolic link to such a device special file.)
++
++Activity on the device will now cause the LED to blink.  The duration of each
++blink (in milliseconds) can be adjusted by setting
++``/sys/class/leds/<LED>/blink_time``.  (But see **check_interval and
++blink_time** below.)
++
++Associate a second device with the LED::
++
++	# echo /dev/sdb > /sys/class/leds/<LED>/link_dev_by_path
++
++	# ls /sys/class/leds/<LED>/linked_devices
++	sda  sdb
++
++When a block device is linked to one or more LEDs, the LEDs are linked from
++the device's ``linked_leds`` directory::
++
++	# ls /sys/class/block/sd{a,b}/linked_leds
++	/sys/class/block/sda/linked_leds:
++	<LED>
++
++	/sys/class/block/sdb/linked_leds:
++	<LED>
++
++(The ``linked_leds`` directory only exists when the block device is linked to
++at least one LED.)
++
++``check_interval`` and ``blink_time``
++=====================================
++
++* By default, linked block devices are checked for activity every 100
++  milliseconds.  This frequency can be changed for an LED via the
++  ``/sys/class/leds/<led>/check_interval`` attribute.  (The minimum value is 25
++  milliseconds.)
++
++* All block devices associated with an LED are checked for activity every
++  ``check_interval`` milliseconds, and a blink is triggered if the correct type
++  of activity (as determined by the LED's ``blink_on_*`` attributes) is
++  detected.  The duration of an LED's blink is determined by its ``blink_time``
++  attribute.  Thus (when the correct type of activity is detected), the LED will
++  be on for ``blink_time`` milliseconds and off for
++  ``check_interval - blink_time`` milliseconds.
++
++* The LED subsystem ignores new blink requests for an LED that is already in
++  in the process of blinking, so setting a ``blink_time`` greater than or equal
++  to ``check_interval`` will cause some blinks to be missed.
++
++* Because of processing times, scheduling latencies, etc., avoiding missed
++  blinks actually requires a difference of at least a few milliseconds between
++  the ``blink_time`` and ``check_interval``.  The required difference is likely
++  to vary from system to system.  As a  reference, a Thecus N5550 NAS requires a
++  difference of 7 milliseconds (e.g. ``check_interval == 100``,
++  ``blink_time == 93``).
++
++* The default values (``check_interval == 100``, ``blink_time == 75``) cause the
++  LED associated with a continuously active device to blink rapidly.  For a more
++  "always on" effect, increase the ``blink_time`` (but not too much; see the
++  previous bullet).
++
++Other Notes
++===========
++
++* Many (possibly all) types of block devices work with this trigger, including:
++
++  * SCSI (including SATA and USB) hard disk drives and SSDs
++  * SCSI (including SATA and USB) optical drives
++  * NVMe SSDs
++  * SD cards
++  * loopback block devices (``/dev/loop*``)
++  * device mapper devices, such as LVM logical volumes
++  * MD RAID devices
++  * zRAM compressed RAM-disks
++  * partitions on block devices that support them
++
++* The names of the symbolic links in ``/sys/class/leds/<LED>/linked_devices``
++  are **kernel** names, which may not match the paths used for
++  ``link_dev_by_path`` and ``unlink_dev_by_path``.  This is most likely when a
++  symbolic link is used to refer to the device (as is common with logical
++  volumes), but it can be true for any device, because nothing prevents the
++  creation of device special files with arbitrary names (e.g.
++  ``sudo mknod /foo b 8 0``).
++
++  Kernel names can be used to unlink block devices from LEDs by writing them to
++  the LED's ``unlink_dev_by_name`` attribute.
++
++* The ``blkdev`` LED trigger supports many-to-many device/LED associations.
++  A device can be associated with multiple LEDs, and an LED can be associated
++  with multiple devices.
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 2f5df94ca937683b77d2de2d6a7e78577a24f74e Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 3 Aug 2022 20:15:04 +0800
+Subject: [PATCH 12/39] sbitmap: fix possible io hung due to lost wakeup
+
+There are two problems can lead to lost wakeup:
+
+1) invalid wakeup on the wrong waitqueue:
+
+For example, 2 * wake_batch tags are put, while only wake_batch threads
+are woken:
+
+__sbq_wake_up
+ atomic_cmpxchg -> reset wait_cnt
+			__sbq_wake_up -> decrease wait_cnt
+			...
+			__sbq_wake_up -> wait_cnt is decreased to 0 again
+			 atomic_cmpxchg
+			 sbq_index_atomic_inc -> increase wake_index
+			 wake_up_nr -> wake up and waitqueue might be empty
+ sbq_index_atomic_inc -> increase again, one waitqueue is skipped
+ wake_up_nr -> invalid wake up because old wakequeue might be empty
+
+To fix the problem, increasing 'wake_index' before resetting 'wait_cnt'.
+
+2) 'wait_cnt' can be decreased while waitqueue is empty
+
+As pointed out by Jan Kara, following race is possible:
+
+CPU1				CPU2
+__sbq_wake_up			 __sbq_wake_up
+ sbq_wake_ptr()			 sbq_wake_ptr() -> the same
+ wait_cnt = atomic_dec_return()
+ /* decreased to 0 */
+ sbq_index_atomic_inc()
+ /* move to next waitqueue */
+ atomic_set()
+ /* reset wait_cnt */
+ wake_up_nr()
+ /* wake up on the old waitqueue */
+				 wait_cnt = atomic_dec_return()
+				 /*
+				  * decrease wait_cnt in the old
+				  * waitqueue, while it can be
+				  * empty.
+				  */
+
+Fix the problem by waking up before updating 'wake_index' and
+'wait_cnt'.
+
+With this patch, noted that 'wait_cnt' is still decreased in the old
+empty waitqueue, however, the wakeup is redirected to a active waitqueue,
+and the extra decrement on the old empty waitqueue is not handled.
+
+Fixes: 88459642cba4 ("blk-mq: abstract tag allocation out into sbitmap library")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+---
+ lib/sbitmap.c | 55 ++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 33 insertions(+), 22 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 29eb04842..1f3114787 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -611,32 +611,43 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 		return false;
+ 
+ 	wait_cnt = atomic_dec_return(&ws->wait_cnt);
+-	if (wait_cnt <= 0) {
+-		int ret;
++	/*
++	 * For concurrent callers of this, callers should call this function
++	 * again to wakeup a new batch on a different 'ws'.
++	 */
++	if (wait_cnt < 0 || !waitqueue_active(&ws->wait))
++		return true;
+ 
+-		wake_batch = READ_ONCE(sbq->wake_batch);
++	if (wait_cnt > 0)
++		return false;
+ 
+-		/*
+-		 * Pairs with the memory barrier in sbitmap_queue_resize() to
+-		 * ensure that we see the batch size update before the wait
+-		 * count is reset.
+-		 */
+-		smp_mb__before_atomic();
++	wake_batch = READ_ONCE(sbq->wake_batch);
+ 
+-		/*
+-		 * For concurrent callers of this, the one that failed the
+-		 * atomic_cmpxhcg() race should call this function again
+-		 * to wakeup a new batch on a different 'ws'.
+-		 */
+-		ret = atomic_cmpxchg(&ws->wait_cnt, wait_cnt, wake_batch);
+-		if (ret == wait_cnt) {
+-			sbq_index_atomic_inc(&sbq->wake_index);
+-			wake_up_nr(&ws->wait, wake_batch);
+-			return false;
+-		}
++	/*
++	 * Wake up first in case that concurrent callers decrease wait_cnt
++	 * while waitqueue is empty.
++	 */
++	wake_up_nr(&ws->wait, wake_batch);
+ 
+-		return true;
+-	}
++	/*
++	 * Pairs with the memory barrier in sbitmap_queue_resize() to
++	 * ensure that we see the batch size update before the wait
++	 * count is reset.
++	 *
++	 * Also pairs with the implicit barrier between decrementing wait_cnt
++	 * and checking for waitqueue_active() to make sure waitqueue_active()
++	 * sees result of the wakeup if atomic_dec_return() has seen the result
++	 * of atomic_set().
++	 */
++	smp_mb__before_atomic();
++
++	/*
++	 * Increase wake_index before updating wait_cnt, otherwise concurrent
++	 * callers can see valid wait_cnt in old waitqueue, which can cause
++	 * invalid wakeup on the old waitqueue.
++	 */
++	sbq_index_atomic_inc(&sbq->wake_index);
++	atomic_set(&ws->wait_cnt, wake_batch);
+ 
+ 	return false;
+ }
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From ed96d1711c1cc76d0159390f8eac303ec6e4655d Mon Sep 17 00:00:00 2001
+From: Liu Song <liusong@linux.alibaba.com>
+Date: Fri, 26 Aug 2022 11:14:13 +0800
+Subject: [PATCH 13/39] sbitmap: remove unnecessary code in
+ __sbitmap_queue_get_batch
+
+If "nr + nr_tags <= map_depth", then the value of nr_tags will not be
+greater than map_depth, so no additional comparison is required.
+
+Signed-off-by: Liu Song <liusong@linux.alibaba.com>
+Link: https://lore.kernel.org/r/1661483653-27326-1-git-send-email-liusong@linux.alibaba.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ lib/sbitmap.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 1f3114787..a39b1a877 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -533,10 +533,9 @@ unsigned long __sbitmap_queue_get_batch(struct sbitmap_queue *sbq, int nr_tags,
+ 		nr = find_first_zero_bit(&map->word, map_depth);
+ 		if (nr + nr_tags <= map_depth) {
+ 			atomic_long_t *ptr = (atomic_long_t *) &map->word;
+-			int map_tags = min_t(int, nr_tags, map_depth);
+ 			unsigned long val, ret;
+ 
+-			get_mask = ((1UL << map_tags) - 1) << nr;
++			get_mask = ((1UL << nr_tags) - 1) << nr;
+ 			do {
+ 				val = READ_ONCE(map->word);
+ 				if ((val & ~get_mask) != val)
+@@ -547,7 +546,7 @@ unsigned long __sbitmap_queue_get_batch(struct sbitmap_queue *sbq, int nr_tags,
+ 			if (get_mask) {
+ 				*offset = nr + (index << sb->shift);
+ 				update_alloc_hint_after_get(sb, depth, hint,
+-							*offset + map_tags - 1);
++							*offset + nr_tags - 1);
+ 				return get_mask;
+ 			}
+ 		}
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 7c4e0c95082f3162e36572a2b1f2d641d0eaecfd Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Thu, 8 Sep 2022 15:09:37 +0200
+Subject: [PATCH 14/39] sbitmap: Avoid leaving waitqueue in invalid state in
+ __sbq_wake_up()
+
+When __sbq_wake_up() decrements wait_cnt to 0 but races with someone
+else waking the waiter on the waitqueue (so the waitqueue becomes
+empty), it exits without reseting wait_cnt to wake_batch number. Once
+wait_cnt is 0, nobody will ever reset the wait_cnt or wake the new
+waiters resulting in possible deadlocks or busyloops. Fix the problem by
+making sure we reset wait_cnt even if we didn't wake up anybody in the
+end.
+
+Fixes: 040b83fcecfb ("sbitmap: fix possible io hung due to lost wakeup")
+Reported-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Jan Kara <jack@suse.cz>
+---
+ lib/sbitmap.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index a39b1a877..47cd8fb89 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -604,6 +604,7 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 	struct sbq_wait_state *ws;
+ 	unsigned int wake_batch;
+ 	int wait_cnt;
++	bool ret;
+ 
+ 	ws = sbq_wake_ptr(sbq);
+ 	if (!ws)
+@@ -614,12 +615,23 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 	 * For concurrent callers of this, callers should call this function
+ 	 * again to wakeup a new batch on a different 'ws'.
+ 	 */
+-	if (wait_cnt < 0 || !waitqueue_active(&ws->wait))
++	if (wait_cnt < 0)
+ 		return true;
+ 
++	/*
++	 * If we decremented queue without waiters, retry to avoid lost
++	 * wakeups.
++	 */
+ 	if (wait_cnt > 0)
+-		return false;
++		return !waitqueue_active(&ws->wait);
+ 
++	/*
++	 * When wait_cnt == 0, we have to be particularly careful as we are
++	 * responsible to reset wait_cnt regardless whether we've actually
++	 * woken up anybody. But in case we didn't wakeup anybody, we still
++	 * need to retry.
++	 */
++	ret = !waitqueue_active(&ws->wait);
+ 	wake_batch = READ_ONCE(sbq->wake_batch);
+ 
+ 	/*
+@@ -648,7 +660,7 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 	sbq_index_atomic_inc(&sbq->wake_index);
+ 	atomic_set(&ws->wait_cnt, wake_batch);
+ 
+-	return false;
++	return ret;
+ }
+ 
+ void sbitmap_queue_wake_up(struct sbitmap_queue *sbq)
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From aba77c239e116e3fc7f4d6732d23c3a2b76586a9 Mon Sep 17 00:00:00 2001
+From: Uros Bizjak <ubizjak@gmail.com>
+Date: Thu, 8 Sep 2022 17:12:00 +0200
+Subject: [PATCH 15/39] sbitmap: Use atomic_long_try_cmpxchg in
+ __sbitmap_queue_get_batch
+
+Use atomic_long_try_cmpxchg instead of
+atomic_long_cmpxchg (*ptr, old, new) == old in __sbitmap_queue_get_batch.
+x86 CMPXCHG instruction returns success in ZF flag, so this change
+saves a compare after cmpxchg (and related move instruction in front
+of cmpxchg).
+
+Also, atomic_long_cmpxchg implicitly assigns old *ptr value to "old"
+when cmpxchg fails, enabling further code simplifications, e.g.
+an extra memory read can be avoided in the loop.
+
+No functional change intended.
+
+Cc: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Uros Bizjak <ubizjak@gmail.com>
+Link: https://lore.kernel.org/r/20220908151200.9993-1-ubizjak@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ lib/sbitmap.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 47cd8fb89..cbfd2e677 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -533,16 +533,16 @@ unsigned long __sbitmap_queue_get_batch(struct sbitmap_queue *sbq, int nr_tags,
+ 		nr = find_first_zero_bit(&map->word, map_depth);
+ 		if (nr + nr_tags <= map_depth) {
+ 			atomic_long_t *ptr = (atomic_long_t *) &map->word;
+-			unsigned long val, ret;
++			unsigned long val;
+ 
+ 			get_mask = ((1UL << nr_tags) - 1) << nr;
++			val = READ_ONCE(map->word);
+ 			do {
+-				val = READ_ONCE(map->word);
+ 				if ((val & ~get_mask) != val)
+ 					goto next;
+-				ret = atomic_long_cmpxchg(ptr, val, get_mask | val);
+-			} while (ret != val);
+-			get_mask = (get_mask & ~ret) >> nr;
++			} while (!atomic_long_try_cmpxchg(ptr, &val,
++							  get_mask | val));
++			get_mask = (get_mask & ~val) >> nr;
+ 			if (get_mask) {
+ 				*offset = nr + (index << sb->shift);
+ 				update_alloc_hint_after_get(sb, depth, hint,
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 748ff6e5f9663f6339bea20a00585c595ae6ffd3 Mon Sep 17 00:00:00 2001
+From: Keith Busch <kbusch@kernel.org>
+Date: Fri, 9 Sep 2022 11:40:22 -0700
+Subject: [PATCH 16/39] sbitmap: fix batched wait_cnt accounting
+
+Batched completions can clear multiple bits, but we're only decrementing
+the wait_cnt by one each time. This can cause waiters to never be woken,
+stalling IO. Use the batched count instead.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=215679
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+---
+ block/blk-mq-tag.c      |  2 +-
+ include/linux/sbitmap.h |  3 ++-
+ lib/sbitmap.c           | 37 +++++++++++++++++++++++--------------
+ 3 files changed, 26 insertions(+), 16 deletions(-)
+
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 8e3b36d1c..9eb968e14 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -196,7 +196,7 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ 		 * other allocations on previous queue won't be starved.
+ 		 */
+ 		if (bt != bt_prev)
+-			sbitmap_queue_wake_up(bt_prev);
++			sbitmap_queue_wake_up(bt_prev, 1);
+ 
+ 		ws = bt_wait_ptr(bt, data->hctx);
+ 	} while (1);
+diff --git a/include/linux/sbitmap.h b/include/linux/sbitmap.h
+index 8f5a86e21..4d2d5205a 100644
+--- a/include/linux/sbitmap.h
++++ b/include/linux/sbitmap.h
+@@ -575,8 +575,9 @@ void sbitmap_queue_wake_all(struct sbitmap_queue *sbq);
+  * sbitmap_queue_wake_up() - Wake up some of waiters in one waitqueue
+  * on a &struct sbitmap_queue.
+  * @sbq: Bitmap queue to wake up.
++ * @nr: Number of bits cleared.
+  */
+-void sbitmap_queue_wake_up(struct sbitmap_queue *sbq);
++void sbitmap_queue_wake_up(struct sbitmap_queue *sbq, int nr);
+ 
+ /**
+  * sbitmap_queue_show() - Dump &struct sbitmap_queue information to a &struct
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index cbfd2e677..624fa7f11 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -599,24 +599,31 @@ static struct sbq_wait_state *sbq_wake_ptr(struct sbitmap_queue *sbq)
+ 	return NULL;
+ }
+ 
+-static bool __sbq_wake_up(struct sbitmap_queue *sbq)
++static bool __sbq_wake_up(struct sbitmap_queue *sbq, int *nr)
+ {
+ 	struct sbq_wait_state *ws;
+ 	unsigned int wake_batch;
+-	int wait_cnt;
++	int wait_cnt, cur, sub;
+ 	bool ret;
+ 
++	if (*nr <= 0)
++		return false;
++
+ 	ws = sbq_wake_ptr(sbq);
+ 	if (!ws)
+ 		return false;
+ 
+-	wait_cnt = atomic_dec_return(&ws->wait_cnt);
+-	/*
+-	 * For concurrent callers of this, callers should call this function
+-	 * again to wakeup a new batch on a different 'ws'.
+-	 */
+-	if (wait_cnt < 0)
+-		return true;
++	cur = atomic_read(&ws->wait_cnt);
++	do {
++		/*
++		 * For concurrent callers of this, callers should call this
++		 * function again to wakeup a new batch on a different 'ws'.
++		 */
++		if (cur == 0)
++			return true;
++		sub = min(*nr, cur);
++		wait_cnt = cur - sub;
++	} while (!atomic_try_cmpxchg(&ws->wait_cnt, &cur, wait_cnt));
+ 
+ 	/*
+ 	 * If we decremented queue without waiters, retry to avoid lost
+@@ -625,6 +632,8 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 	if (wait_cnt > 0)
+ 		return !waitqueue_active(&ws->wait);
+ 
++	*nr -= sub;
++
+ 	/*
+ 	 * When wait_cnt == 0, we have to be particularly careful as we are
+ 	 * responsible to reset wait_cnt regardless whether we've actually
+@@ -660,12 +669,12 @@ static bool __sbq_wake_up(struct sbitmap_queue *sbq)
+ 	sbq_index_atomic_inc(&sbq->wake_index);
+ 	atomic_set(&ws->wait_cnt, wake_batch);
+ 
+-	return ret;
++	return ret || *nr;
+ }
+ 
+-void sbitmap_queue_wake_up(struct sbitmap_queue *sbq)
++void sbitmap_queue_wake_up(struct sbitmap_queue *sbq, int nr)
+ {
+-	while (__sbq_wake_up(sbq))
++	while (__sbq_wake_up(sbq, &nr))
+ 		;
+ }
+ EXPORT_SYMBOL_GPL(sbitmap_queue_wake_up);
+@@ -705,7 +714,7 @@ void sbitmap_queue_clear_batch(struct sbitmap_queue *sbq, int offset,
+ 		atomic_long_andnot(mask, (atomic_long_t *) addr);
+ 
+ 	smp_mb__after_atomic();
+-	sbitmap_queue_wake_up(sbq);
++	sbitmap_queue_wake_up(sbq, nr_tags);
+ 	sbitmap_update_cpu_hint(&sbq->sb, raw_smp_processor_id(),
+ 					tags[nr_tags - 1] - offset);
+ }
+@@ -733,7 +742,7 @@ void sbitmap_queue_clear(struct sbitmap_queue *sbq, unsigned int nr,
+ 	 * waiter. See the comment on waitqueue_active().
+ 	 */
+ 	smp_mb__after_atomic();
+-	sbitmap_queue_wake_up(sbq);
++	sbitmap_queue_wake_up(sbq, 1);
+ 	sbitmap_update_cpu_hint(&sbq->sb, cpu, nr);
+ }
+ EXPORT_SYMBOL_GPL(sbitmap_queue_clear);
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 0a6d12c2f72ddd965f4ce46480a31e4b1c98c8d3 Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Tue, 27 Sep 2022 21:07:46 -0700
+Subject: [PATCH 17/39] sbitmap: fix lockup while swapping
+
+Commit 4acb83417cad ("sbitmap: fix batched wait_cnt accounting")
+is a big improvement: without it, I had to revert to before commit
+040b83fcecfb ("sbitmap: fix possible io hung due to lost wakeup")
+to avoid the high system time and freezes which that had introduced.
+
+Now okay on the NVME laptop, but 4acb83417cad is a disaster for heavy
+swapping (kernel builds in low memory) on another: soon locking up in
+sbitmap_queue_wake_up() (into which __sbq_wake_up() is inlined), cycling
+around with waitqueue_active() but wait_cnt 0 .  Here is a backtrace,
+showing the common pattern of outer sbitmap_queue_wake_up() interrupted
+before setting wait_cnt 0 back to wake_batch (in some cases other CPUs
+are idle, in other cases they're spinning for a lock in dd_bio_merge()):
+
+sbitmap_queue_wake_up < sbitmap_queue_clear < blk_mq_put_tag <
+__blk_mq_free_request < blk_mq_free_request < __blk_mq_end_request <
+scsi_end_request < scsi_io_completion < scsi_finish_command <
+scsi_complete < blk_complete_reqs < blk_done_softirq < __do_softirq <
+__irq_exit_rcu < irq_exit_rcu < common_interrupt < asm_common_interrupt <
+_raw_spin_unlock_irqrestore < __wake_up_common_lock < __wake_up <
+sbitmap_queue_wake_up < sbitmap_queue_clear < blk_mq_put_tag <
+__blk_mq_free_request < blk_mq_free_request < dd_bio_merge <
+blk_mq_sched_bio_merge < blk_mq_attempt_bio_merge < blk_mq_submit_bio <
+__submit_bio < submit_bio_noacct_nocheck < submit_bio_noacct <
+submit_bio < __swap_writepage < swap_writepage < pageout <
+shrink_folio_list < evict_folios < lru_gen_shrink_lruvec <
+shrink_lruvec < shrink_node < do_try_to_free_pages < try_to_free_pages <
+__alloc_pages_slowpath < __alloc_pages < folio_alloc < vma_alloc_folio <
+do_anonymous_page < __handle_mm_fault < handle_mm_fault <
+do_user_addr_fault < exc_page_fault < asm_exc_page_fault
+
+See how the process-context sbitmap_queue_wake_up() has been interrupted,
+after bringing wait_cnt down to 0 (and in this example, after doing its
+wakeups), before advancing wake_index and refilling wake_cnt: an
+interrupt-context sbitmap_queue_wake_up() of the same sbq gets stuck.
+
+I have almost no grasp of all the possible sbitmap races, and their
+consequences: but __sbq_wake_up() can do nothing useful while wait_cnt 0,
+so it is better if sbq_wake_ptr() skips on to the next ws in that case:
+which fixes the lockup and shows no adverse consequence for me.
+
+Signed-off-by: Hugh Dickins <hughd@google.com>
+---
+ lib/sbitmap.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 624fa7f11..a8108a962 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -587,7 +587,7 @@ static struct sbq_wait_state *sbq_wake_ptr(struct sbitmap_queue *sbq)
+ 	for (i = 0; i < SBQ_WAIT_QUEUES; i++) {
+ 		struct sbq_wait_state *ws = &sbq->ws[wake_index];
+ 
+-		if (waitqueue_active(&ws->wait)) {
++		if (waitqueue_active(&ws->wait) && atomic_read(&ws->wait_cnt)) {
+ 			if (wake_index != atomic_read(&sbq->wake_index))
+ 				atomic_set(&sbq->wake_index, wake_index);
+ 			return ws;
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From b3f769b0c06d3a98328d48a94be64fa6a26ebf08 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Fri, 30 Sep 2022 07:54:40 +1000
+Subject: [PATCH 18/39] memcg: calling reclaim_high(GFP_KERNEL) in GFP_NOFS
+ context deadlocks
+
+This should be more obvious, but gfpflags_allow_blocking() is not
+the same thing as a GFP_KERNEL reclaim contexts. The former checks
+GFP_DIRECT_RECLAIM which tells us if direct reclaim is allowed. The
+latter (GFP_KERNEL) allows blocking on anything, including
+filesystem and IO structures during reclaim.
+
+However, we do lots of memory allocation from various filesystems we
+are under GFP_NOFS contexts, including page cache folios. Hence if
+direct reclaim in GFP_NOFS context waits on filesystem progress
+(e.g. waits on folio writeback) then memory reclaim can deadlock.
+
+e.g. page cache allocation (which is GFP_NOFS context) gets stuck
+waiting on page writeback like so:
+
+[   75.943494] task:test_write      state:D stack:12560 pid: 3728 ppid:  3613 flags:0x00004002
+[   75.944788] Call Trace:
+[   75.945183]  <TASK>
+[   75.945543]  __schedule+0x2f9/0xa30
+[   75.946118]  ? __mod_memcg_lruvec_state+0x41/0x90
+[   75.946895]  schedule+0x5a/0xc0
+[   75.947397]  io_schedule+0x42/0x70
+[   75.947992]  folio_wait_bit_common+0x159/0x3d0
+[   75.948732]  ? dio_warn_stale_pagecache.part.0+0x50/0x50
+[   75.949505]  folio_wait_writeback+0x28/0x80
+[   75.950163]  shrink_page_list+0x96e/0xc30
+[   75.950843]  shrink_lruvec+0x558/0xb80
+[   75.951440]  shrink_node+0x2c6/0x700
+[   75.952059]  do_try_to_free_pages+0xd5/0x570
+[   75.952771]  try_to_free_mem_cgroup_pages+0x105/0x220
+[   75.953548]  reclaim_high.constprop.0+0xa3/0xf0
+[   75.954209]  mem_cgroup_handle_over_high+0x8f/0x280
+[   75.955025]  ? kmem_cache_alloc_lru+0x1c6/0x3f0
+[   75.955781]  try_charge_memcg+0x6c3/0x820
+[   75.956436]  ? __mem_cgroup_threshold+0x16/0x150
+[   75.957204]  charge_memcg+0x76/0xf0
+[   75.957810]  __mem_cgroup_charge+0x29/0x80
+[   75.958464]  __filemap_add_folio+0x225/0x590
+[   75.959112]  ? scan_shadow_nodes+0x30/0x30
+[   75.959794]  filemap_add_folio+0x37/0xa0
+[   75.960432]  __filemap_get_folio+0x1fd/0x340
+[   75.961141]  ? xas_load+0x5/0xa0
+[   75.961712]  iomap_write_begin+0x103/0x6a0
+[   75.962390]  ? filemap_dirty_folio+0x5c/0x80
+[   75.963106]  ? iomap_write_end+0xa2/0x2b0
+[   75.963744]  iomap_file_buffered_write+0x17c/0x380
+[   75.964546]  xfs_file_buffered_write+0xb1/0x2e0
+[   75.965286]  ? xfs_file_buffered_write+0x2b2/0x2e0
+[   75.966097]  vfs_write+0x2ca/0x3d0
+[   75.966702]  __x64_sys_pwrite64+0x8c/0xc0
+[   75.967349]  do_syscall_64+0x35/0x80
+
+At this point, the system has 58 pending XFS IO completions that are
+stuck waiting for workqueue progress:
+
+[ 1664.460579] workqueue xfs-conv/dm-0: flags=0x4c
+[ 1664.461332]   pwq 48: cpus=24 node=3 flags=0x0 nice=0 active=58/256 refcnt=59
+[ 1664.461335]     pending: xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io, xfs_end_io
+
+and nothing is making progress. The reason progress is not being
+made is not clear from what I can gather from the steaming corpse,
+but it is clear that the memcg reclaim code should not be blocking
+on filesystem related objects in GFP_NOFS allocation contexts.
+
+We have the reclaim context parameters right there when we call
+mem_cgroup_handle_over_high(), so pass them down the stack so memcg
+reclaim doesn't cause deadlocks. This makes the reclaim deadlocks in
+the test I've been running go away.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+---
+ include/linux/memcontrol.h       | 4 ++--
+ include/linux/resume_user_mode.h | 2 +-
+ mm/memcontrol.c                  | 6 +++---
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 567f12323..5e4b5830b 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -919,7 +919,7 @@ unsigned long mem_cgroup_get_zone_lru_size(struct lruvec *lruvec,
+ 	return READ_ONCE(mz->lru_zone_size[zone_idx][lru]);
+ }
+ 
+-void mem_cgroup_handle_over_high(void);
++void mem_cgroup_handle_over_high(gfp_t gfp_mask);
+ 
+ unsigned long mem_cgroup_get_max(struct mem_cgroup *memcg);
+ 
+@@ -1433,7 +1433,7 @@ static inline void folio_memcg_unlock(struct folio *folio)
+ {
+ }
+ 
+-static inline void mem_cgroup_handle_over_high(void)
++static inline void mem_cgroup_handle_over_high(gfp_t gfp_mask)
+ {
+ }
+ 
+diff --git a/include/linux/resume_user_mode.h b/include/linux/resume_user_mode.h
+index 285189454..f8f3e958e 100644
+--- a/include/linux/resume_user_mode.h
++++ b/include/linux/resume_user_mode.h
+@@ -55,7 +55,7 @@ static inline void resume_user_mode_work(struct pt_regs *regs)
+ 	}
+ #endif
+ 
+-	mem_cgroup_handle_over_high();
++	mem_cgroup_handle_over_high(GFP_KERNEL);
+ 	blkcg_maybe_throttle_current();
+ 
+ 	rseq_handle_notify_resume(NULL, regs);
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index b69979c9c..09fbebff9 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2491,7 +2491,7 @@ static unsigned long calculate_high_delay(struct mem_cgroup *memcg,
+  * Scheduled by try_charge() to be executed from the userland return path
+  * and reclaims memory over the high limit.
+  */
+-void mem_cgroup_handle_over_high(void)
++void mem_cgroup_handle_over_high(gfp_t gfp_mask)
+ {
+ 	unsigned long penalty_jiffies;
+ 	unsigned long pflags;
+@@ -2519,7 +2519,7 @@ void mem_cgroup_handle_over_high(void)
+ 	 */
+ 	nr_reclaimed = reclaim_high(memcg,
+ 				    in_retry ? SWAP_CLUSTER_MAX : nr_pages,
+-				    GFP_KERNEL);
++				    gfp_mask);
+ 
+ 	/*
+ 	 * memory.high is breached and reclaim is unable to keep up. Throttle
+@@ -2755,7 +2755,7 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	if (current->memcg_nr_pages_over_high > MEMCG_CHARGE_BATCH &&
+ 	    !(current->flags & PF_MEMALLOC) &&
+ 	    gfpflags_allow_blocking(gfp_mask)) {
+-		mem_cgroup_handle_over_high();
++		mem_cgroup_handle_over_high(gfp_mask);
+ 	}
+ 	return 0;
+ }
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From c931cf327d602a27ca26828c54bca6b159a07c78 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 30 Sep 2022 11:19:01 +0800
+Subject: [PATCH 19/39] elevator: remove redundant code in
+ elv_unregister_queue()
+
+"elevator_queue *e" is already declared and initialized in the beginning
+of elv_unregister_queue().
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Eric Biggers <ebiggers@google.com>
+---
+ block/elevator.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index bd71f0fc4..20e70fd3f 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -524,8 +524,6 @@ void elv_unregister_queue(struct request_queue *q)
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+ 	if (e && e->registered) {
+-		struct elevator_queue *e = q->elevator;
+-
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 12d9429907010d8baba22799c8617f7416d9fcbe Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 30 Sep 2022 11:19:02 +0800
+Subject: [PATCH 20/39] blk-wbt: remove unnecessary check in
+ wbt_enable_default()
+
+If CONFIG_BLK_WBT_MQ is disabled, wbt_init() won't do anything.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ block/blk-wbt.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c293e08b3..c5a8c1002 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -651,7 +651,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q) && IS_ENABLED(CONFIG_BLK_WBT_MQ))
++	if (queue_is_mq(q))
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From aa3aaefa5c3d464d79007b3bdabbe249adc95a26 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 30 Sep 2022 11:19:03 +0800
+Subject: [PATCH 21/39] blk-wbt: make enable_state more accurate
+
+Currently, if user disable wbt through sysfs, 'enable_state' will be
+'WBT_STATE_ON_MANUAL', which will be confusing. Add a new state
+'WBT_STATE_OFF_MANUAL' to cover that case.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ block/blk-wbt.c |  7 ++++++-
+ block/blk-wbt.h | 12 +++++++-----
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c5a8c1002..4680691a9 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -435,8 +435,13 @@ void wbt_set_min_lat(struct request_queue *q, u64 val)
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+ 	if (!rqos)
+ 		return;
++
+ 	RQWB(rqos)->min_lat_nsec = val;
+-	RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
++	if (val)
++		RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
++	else
++		RQWB(rqos)->enable_state = WBT_STATE_OFF_MANUAL;
++
+ 	wbt_update_limits(RQWB(rqos));
+ }
+ 
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index 7e44eccc6..7fe98638f 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -28,13 +28,15 @@ enum {
+ };
+ 
+ /*
+- * Enable states. Either off, or on by default (done at init time),
+- * or on through manual setup in sysfs.
++ * If current state is WBT_STATE_ON/OFF_DEFAULT, it can be covered to any other
++ * state, if current state is WBT_STATE_ON/OFF_MANUAL, it can only be covered
++ * to WBT_STATE_OFF/ON_MANUAL.
+  */
+ enum {
+-	WBT_STATE_ON_DEFAULT	= 1,
+-	WBT_STATE_ON_MANUAL	= 2,
+-	WBT_STATE_OFF_DEFAULT
++	WBT_STATE_ON_DEFAULT	= 1,	/* on by default */
++	WBT_STATE_ON_MANUAL	= 2,	/* on manually by sysfs */
++	WBT_STATE_OFF_DEFAULT	= 3,	/* off by default */
++	WBT_STATE_OFF_MANUAL	= 4,	/* off manually by sysfs */
+ };
+ 
+ struct rq_wb {
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From e887625a02fc4e4a2f905c768f543855da5399a3 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 30 Sep 2022 11:19:04 +0800
+Subject: [PATCH 22/39] blk-wbt: don't show valid wbt_lat_usec in sysfs while
+ wbt is disabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, if wbt is initialized and then disabled by
+wbt_disable_default(), sysfs will still show valid wbt_lat_usec, which
+will confuse users that wbt is still enabled.
+
+This patch shows wbt_lat_usec as zero if it's disabled.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reported-and-tested-by: Holger Hoffstätte <holger@applied-asynchrony.com>
+---
+ block/blk-sysfs.c | 6 +++++-
+ block/blk-wbt.c   | 8 ++++++++
+ block/blk-wbt.h   | 5 +++++
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index e1f009aba..1df3e22e1 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -467,10 +467,14 @@ static ssize_t queue_io_timeout_store(struct request_queue *q, const char *page,
+ 
+ static ssize_t queue_wb_lat_show(struct request_queue *q, char *page)
+ {
++	u64 lat;
++
+ 	if (!wbt_rq_qos(q))
+ 		return -EINVAL;
+ 
+-	return sprintf(page, "%llu\n", div_u64(wbt_get_min_lat(q), 1000));
++	lat = wbt_disabled(q) ? 0 : div_u64(wbt_get_min_lat(q), 1000);
++
++	return sprintf(page, "%llu\n", lat);
+ }
+ 
+ static ssize_t queue_wb_lat_store(struct request_queue *q, const char *page,
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 4680691a9..07ed0b0ae 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -422,6 +422,14 @@ static void wbt_update_limits(struct rq_wb *rwb)
+ 	rwb_wake_all(rwb);
+ }
+ 
++bool wbt_disabled(struct request_queue *q)
++{
++	struct rq_qos *rqos = wbt_rq_qos(q);
++
++	return !rqos || RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT ||
++	       RQWB(rqos)->enable_state == WBT_STATE_OFF_MANUAL;
++}
++
+ u64 wbt_get_min_lat(struct request_queue *q)
+ {
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index 7fe98638f..e3ea6e7e2 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -96,6 +96,7 @@ void wbt_enable_default(struct request_queue *);
+ 
+ u64 wbt_get_min_lat(struct request_queue *q);
+ void wbt_set_min_lat(struct request_queue *q, u64 val);
++bool wbt_disabled(struct request_queue *);
+ 
+ void wbt_set_write_cache(struct request_queue *, bool);
+ 
+@@ -127,6 +128,10 @@ static inline u64 wbt_default_latency_nsec(struct request_queue *q)
+ {
+ 	return 0;
+ }
++static inline bool wbt_disabled(struct request_queue *q)
++{
++	return true;
++}
+ 
+ #endif /* CONFIG_BLK_WBT */
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From a95ee8c23d88d1d2cefd223420f5e285ac017c9a Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 30 Sep 2022 11:19:05 +0800
+Subject: [PATCH 23/39] elevator: add new field flags in struct elevator_queue
+
+There are only one flag to indicate that elevator is registered currently,
+prepare to add a flag to disable wbt if default elevator is bfq.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ block/elevator.c | 6 ++----
+ block/elevator.h | 4 +++-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index 20e70fd3f..9e12706e8 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -512,7 +512,7 @@ int elv_register_queue(struct request_queue *q, bool uevent)
+ 		if (uevent)
+ 			kobject_uevent(&e->kobj, KOBJ_ADD);
+ 
+-		e->registered = 1;
++		set_bit(ELEVATOR_FLAG_REGISTERED, &e->flags);
+ 	}
+ 	return error;
+ }
+@@ -523,11 +523,9 @@ void elv_unregister_queue(struct request_queue *q)
+ 
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+-	if (e && e->registered) {
++	if (e && test_and_clear_bit(ELEVATOR_FLAG_REGISTERED, &e->flags)) {
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
+-
+-		e->registered = 0;
+ 	}
+ }
+ 
+diff --git a/block/elevator.h b/block/elevator.h
+index 3f0593b3b..ed574bf3e 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -100,10 +100,12 @@ struct elevator_queue
+ 	void *elevator_data;
+ 	struct kobject kobj;
+ 	struct mutex sysfs_lock;
+-	unsigned int registered:1;
++	unsigned long flags;
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
++#define ELEVATOR_FLAG_REGISTERED 0
++
+ /*
+  * block elevator interface
+  */
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 904e305145020ed4659021d919f0ae2057ecaadc Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 30 Sep 2022 11:19:06 +0800
+Subject: [PATCH 24/39] blk-wbt: don't enable throttling if default elevator is
+ bfq
+
+Commit b5dc5d4d1f4f ("block,bfq: Disable writeback throttling") tries to
+disable wbt for bfq, it's done by calling wbt_disable_default() in
+bfq_init_queue(). However, wbt is still enabled if default elevator is
+bfq:
+
+device_add_disk
+ elevator_init_mq
+  bfq_init_queue
+   wbt_disable_default -> done nothing
+
+ blk_register_queue
+  wbt_enable_default -> wbt is enabled
+
+Fix the problem by adding a new flag ELEVATOR_FLAG_DISBALE_WBT, bfq
+will set the flag in bfq_init_queue, and following wbt_enable_default()
+won't enable wbt while the flag is set.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ block/bfq-iosched.c |  2 ++
+ block/blk-wbt.c     | 11 ++++++++---
+ block/elevator.h    |  3 ++-
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index c740b41fe..889ea5264 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -7047,6 +7047,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
+ #endif
+ 
+ 	blk_stat_disable_accounting(bfqd->queue);
++	clear_bit(ELEVATOR_FLAG_DISABLE_WBT, &e->flags);
+ 	wbt_enable_default(bfqd->queue);
+ 
+ 	kfree(bfqd);
+@@ -7192,6 +7193,7 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	/* We dispatch from request queue wide instead of hw queue */
+ 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+ 
++	set_bit(ELEVATOR_FLAG_DISABLE_WBT, &eq->flags);
+ 	wbt_disable_default(q);
+ 	blk_stat_enable_accounting(q);
+ 
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 07ed0b0ae..68a774d7a 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -27,6 +27,7 @@
+ 
+ #include "blk-wbt.h"
+ #include "blk-rq-qos.h"
++#include "elevator.h"
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/wbt.h>
+@@ -651,11 +652,15 @@ void wbt_set_write_cache(struct request_queue *q, bool write_cache_on)
+  */
+ void wbt_enable_default(struct request_queue *q)
+ {
+-	struct rq_qos *rqos = wbt_rq_qos(q);
++	struct rq_qos *rqos;
++	bool disable_flag = q->elevator &&
++		    test_bit(ELEVATOR_FLAG_DISABLE_WBT, &q->elevator->flags);
+ 
+ 	/* Throttling already enabled? */
++	rqos = wbt_rq_qos(q);
+ 	if (rqos) {
+-		if (RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
++		if (!disable_flag &&
++		    RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
+ 			RQWB(rqos)->enable_state = WBT_STATE_ON_DEFAULT;
+ 		return;
+ 	}
+@@ -664,7 +669,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q))
++	if (queue_is_mq(q) && !disable_flag)
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+diff --git a/block/elevator.h b/block/elevator.h
+index ed574bf3e..753824712 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -104,7 +104,8 @@ struct elevator_queue
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
+-#define ELEVATOR_FLAG_REGISTERED 0
++#define ELEVATOR_FLAG_REGISTERED	0
++#define ELEVATOR_FLAG_DISABLE_WBT	1
+ 
+ /*
+  * block elevator interface
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 52ffb9d74764d4765c15cbf20919403997f72358 Mon Sep 17 00:00:00 2001
+From: Nathan Chancellor <nathan@kernel.org>
+Date: Thu, 29 Sep 2022 08:20:10 -0700
+Subject: [PATCH 25/39] x86/Kconfig: Drop check for -mabi=ms for
+ CONFIG_EFI_STUB
+
+A recent change in LLVM made CONFIG_EFI_STUB unselectable because it no
+longer pretends to support -mabi=ms, breaking the dependency in
+Kconfig. Lack of CONFIG_EFI_STUB can prevent kernels from booting via
+EFI in certain circumstances.
+
+This check was added by
+
+  8f24f8c2fc82 ("efi/libstub: Annotate firmware routines as __efiapi")
+
+to ensure that __attribute__((ms_abi)) was available, as -mabi=ms is
+not actually used in any cflags.
+
+According to the GCC documentation, this attribute has been supported
+since GCC 4.4.7. The kernel currently requires GCC 5.1 so this check is
+not necessary; even when that change landed in 5.6, the kernel required
+GCC 4.9 so it was unnecessary then as well.
+
+Clang supports __attribute__((ms_abi)) for all versions that are
+supported for building the kernel so no additional check is needed.
+Remove the 'depends on' line altogether to allow CONFIG_EFI_STUB to be
+selected when CONFIG_EFI is enabled, regardless of compiler.
+
+Fixes: 8f24f8c2fc82 ("efi/libstub: Annotate firmware routines as __efiapi")
+Signed-off-by: Nathan Chancellor <nathan@kernel.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Nick Desaulniers <ndesaulniers@google.com>
+Acked-by: Ard Biesheuvel <ardb@kernel.org>
+Cc: stable@vger.kernel.org
+Link: https://github.com/llvm/llvm-project/commit/d1ad006a8f64bdc17f618deffa9e7c91d82c444d
+---
+ arch/x86/Kconfig | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 159c025eb..4728d3f5d 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1961,7 +1961,6 @@ config EFI
+ config EFI_STUB
+ 	bool "EFI stub support"
+ 	depends on EFI
+-	depends on $(cc-option,-mabi=ms) || X86_32
+ 	select RELOCATABLE
+ 	help
+ 	  This kernel feature allows a bzImage to be loaded directly
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 3c454e3f303cd218004b70cd09c6439a19552a8d Mon Sep 17 00:00:00 2001
+From: Borislav Petkov <bp@suse.de>
+Date: Wed, 5 Oct 2022 12:00:08 +0200
+Subject: [PATCH 26/39] x86/microcode/AMD: Apply the patch early on every
+ logical thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, the patch application logic checks whether the revision
+needs to be applied on each logical CPU (SMT thread). Therefore, on SMT
+designs where the microcode engine is shared between the two threads,
+the application happens only on one of them as that is enough to update
+the shared microcode engine.
+
+However, there are microcode patches which do per-thread modification,
+see Link tag below.
+
+Therefore, drop the revision check and try applying on each thread. This
+is what the BIOS does too so this method is very much tested.
+
+Btw, change only the early paths. On the late loading paths, there's no
+point in doing per-thread modification because if is it some case like
+in the bugzilla below - removing a CPUID flag - the kernel cannot go and
+un-use features it has detected are there early. For that, one should
+use early loading anyway.
+
+  [ bp: Fixes does not contain the oldest commit which did check for
+    equality but that is good enough. ]
+
+Fixes: 8801b3fcb574 ("x86/microcode/AMD: Rework container parsing")
+Reported-by:  Čtefan Talpalaru <stefantalpalaru@yahoo.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Tested-by:  Čtefan Talpalaru <stefantalpalaru@yahoo.com>
+Cc: <stable@vger.kernel.org>
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216211
+---
+ arch/x86/kernel/cpu/microcode/amd.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/microcode/amd.c b/arch/x86/kernel/cpu/microcode/amd.c
+index 615bc6efa..728692763 100644
+--- a/arch/x86/kernel/cpu/microcode/amd.c
++++ b/arch/x86/kernel/cpu/microcode/amd.c
+@@ -440,7 +440,13 @@ apply_microcode_early_amd(u32 cpuid_1_eax, void *ucode, size_t size, bool save_p
+ 		return ret;
+ 
+ 	native_rdmsr(MSR_AMD64_PATCH_LEVEL, rev, dummy);
+-	if (rev >= mc->hdr.patch_id)
++
++	/*
++	 * Allow application of the same revision to pick up SMT-specific
++	 * changes even if the revision of the other SMT thread is already
++	 * up-to-date.
++	 */
++	if (rev > mc->hdr.patch_id)
+ 		return ret;
+ 
+ 	if (!__apply_microcode_amd(mc)) {
+@@ -528,8 +534,12 @@ void load_ucode_amd_ap(unsigned int cpuid_1_eax)
+ 
+ 	native_rdmsr(MSR_AMD64_PATCH_LEVEL, rev, dummy);
+ 
+-	/* Check whether we have saved a new patch already: */
+-	if (*new_rev && rev < mc->hdr.patch_id) {
++	/*
++	 * Check whether a new patch has been saved already. Also, allow application of
++	 * the same revision in order to pick up SMT-thread-specific configuration even
++	 * if the sibling SMT thread already has an up-to-date revision.
++	 */
++	if (*new_rev && rev <= mc->hdr.patch_id) {
+ 		if (!__apply_microcode_amd(mc)) {
+ 			*new_rev = mc->hdr.patch_id;
+ 			return;
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 90ffe803fcef91f2a3f060e157d7b019a78e7382 Mon Sep 17 00:00:00 2001
+From: Babu Moger <babu.moger@amd.com>
+Date: Tue, 27 Sep 2022 15:16:29 -0500
+Subject: [PATCH 27/39] x86/resctrl: Fix min_cbm_bits for AMD
+
+AMD systems support zero CBM (capacity bit mask) for cache allocation.
+That is reflected in rdt_init_res_defs_amd() by:
+
+  r->cache.arch_has_empty_bitmaps = true;
+
+However given the unified code in cbm_validate(), checking for:
+
+  val == 0 && !arch_has_empty_bitmaps
+
+is not enough because of another check in cbm_validate():
+
+  if ((zero_bit - first_bit) < r->cache.min_cbm_bits)
+
+The default value of r->cache.min_cbm_bits = 1.
+
+Leading to:
+
+  $ cd /sys/fs/resctrl
+  $ mkdir foo
+  $ cd foo
+  $ echo L3:0=0 > schemata
+    -bash: echo: write error: Invalid argument
+  $ cat /sys/fs/resctrl/info/last_cmd_status
+    Need at least 1 bits in the mask
+
+Initialize the min_cbm_bits to 0 for AMD. Also, remove the default
+setting of min_cbm_bits and initialize it separately.
+
+After the fix:
+
+  $ cd /sys/fs/resctrl
+  $ mkdir foo
+  $ cd foo
+  $ echo L3:0=0 > schemata
+  $ cat /sys/fs/resctrl/info/last_cmd_status
+    ok
+
+Fixes: 316e7f901f5a ("x86/resctrl: Add struct rdt_cache::arch_has_{sparse, empty}_bitmaps")
+Co-developed-by: Stephane Eranian <eranian@google.com>
+Signed-off-by: Stephane Eranian <eranian@google.com>
+Signed-off-by: Babu Moger <babu.moger@amd.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: James Morse <james.morse@arm.com>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Reviewed-by: Fenghua Yu <fenghua.yu@intel.com>
+Cc: <stable@vger.kernel.org>
+Link: https://lore.kernel.org/lkml/20220517001234.3137157-1-eranian@google.com
+---
+ arch/x86/kernel/cpu/resctrl/core.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/resctrl/core.c b/arch/x86/kernel/cpu/resctrl/core.c
+index bb1c3f5f6..a5c51a14f 100644
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@ -66,9 +66,6 @@ struct rdt_hw_resource rdt_resources_all[] = {
+ 			.rid			= RDT_RESOURCE_L3,
+ 			.name			= "L3",
+ 			.cache_level		= 3,
+-			.cache = {
+-				.min_cbm_bits	= 1,
+-			},
+ 			.domains		= domain_init(RDT_RESOURCE_L3),
+ 			.parse_ctrlval		= parse_cbm,
+ 			.format_str		= "%d=%0*x",
+@@ -83,9 +80,6 @@ struct rdt_hw_resource rdt_resources_all[] = {
+ 			.rid			= RDT_RESOURCE_L2,
+ 			.name			= "L2",
+ 			.cache_level		= 2,
+-			.cache = {
+-				.min_cbm_bits	= 1,
+-			},
+ 			.domains		= domain_init(RDT_RESOURCE_L2),
+ 			.parse_ctrlval		= parse_cbm,
+ 			.format_str		= "%d=%0*x",
+@@ -877,6 +871,7 @@ static __init void rdt_init_res_defs_intel(void)
+ 			r->cache.arch_has_sparse_bitmaps = false;
+ 			r->cache.arch_has_empty_bitmaps = false;
+ 			r->cache.arch_has_per_cpu_cfg = false;
++			r->cache.min_cbm_bits = 1;
+ 		} else if (r->rid == RDT_RESOURCE_MBA) {
+ 			hw_res->msr_base = MSR_IA32_MBA_THRTL_BASE;
+ 			hw_res->msr_update = mba_wrmsr_intel;
+@@ -897,6 +892,7 @@ static __init void rdt_init_res_defs_amd(void)
+ 			r->cache.arch_has_sparse_bitmaps = true;
+ 			r->cache.arch_has_empty_bitmaps = true;
+ 			r->cache.arch_has_per_cpu_cfg = true;
++			r->cache.min_cbm_bits = 0;
+ 		} else if (r->rid == RDT_RESOURCE_MBA) {
+ 			hw_res->msr_base = MSR_IA32_MBA_BW_BASE;
+ 			hw_res->msr_update = mba_wrmsr_amd;
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From a53d3fa91da6ecaadc437e20d6fdad6006e7b2e7 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 20 Oct 2022 18:46:46 +0200
+Subject: [PATCH 28/39] Revert "blk-wbt: don't enable throttling if default
+ elevator is bfq"
+
+This reverts commit 1d02a85fec87b1c79cc6c7d5a67b28547ea4c3b6.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/bfq-iosched.c |  2 --
+ block/blk-wbt.c     | 11 +++--------
+ block/elevator.h    |  3 +--
+ 3 files changed, 4 insertions(+), 12 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 889ea5264..c740b41fe 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -7047,7 +7047,6 @@ static void bfq_exit_queue(struct elevator_queue *e)
+ #endif
+ 
+ 	blk_stat_disable_accounting(bfqd->queue);
+-	clear_bit(ELEVATOR_FLAG_DISABLE_WBT, &e->flags);
+ 	wbt_enable_default(bfqd->queue);
+ 
+ 	kfree(bfqd);
+@@ -7193,7 +7192,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	/* We dispatch from request queue wide instead of hw queue */
+ 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+ 
+-	set_bit(ELEVATOR_FLAG_DISABLE_WBT, &eq->flags);
+ 	wbt_disable_default(q);
+ 	blk_stat_enable_accounting(q);
+ 
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 68a774d7a..07ed0b0ae 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -27,7 +27,6 @@
+ 
+ #include "blk-wbt.h"
+ #include "blk-rq-qos.h"
+-#include "elevator.h"
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/wbt.h>
+@@ -652,15 +651,11 @@ void wbt_set_write_cache(struct request_queue *q, bool write_cache_on)
+  */
+ void wbt_enable_default(struct request_queue *q)
+ {
+-	struct rq_qos *rqos;
+-	bool disable_flag = q->elevator &&
+-		    test_bit(ELEVATOR_FLAG_DISABLE_WBT, &q->elevator->flags);
++	struct rq_qos *rqos = wbt_rq_qos(q);
+ 
+ 	/* Throttling already enabled? */
+-	rqos = wbt_rq_qos(q);
+ 	if (rqos) {
+-		if (!disable_flag &&
+-		    RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
++		if (RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
+ 			RQWB(rqos)->enable_state = WBT_STATE_ON_DEFAULT;
+ 		return;
+ 	}
+@@ -669,7 +664,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q) && !disable_flag)
++	if (queue_is_mq(q))
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+diff --git a/block/elevator.h b/block/elevator.h
+index 753824712..ed574bf3e 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -104,8 +104,7 @@ struct elevator_queue
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
+-#define ELEVATOR_FLAG_REGISTERED	0
+-#define ELEVATOR_FLAG_DISABLE_WBT	1
++#define ELEVATOR_FLAG_REGISTERED 0
+ 
+ /*
+  * block elevator interface
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From d27f0c369f5f78298862c550c6c966de8677f334 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 20 Oct 2022 18:46:47 +0200
+Subject: [PATCH 29/39] Revert "elevator: add new field flags in struct
+ elevator_queue"
+
+This reverts commit 804721046d109737bf0e07af7637dc5f8ed20702.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/elevator.c | 6 ++++--
+ block/elevator.h | 4 +---
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index 9e12706e8..20e70fd3f 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -512,7 +512,7 @@ int elv_register_queue(struct request_queue *q, bool uevent)
+ 		if (uevent)
+ 			kobject_uevent(&e->kobj, KOBJ_ADD);
+ 
+-		set_bit(ELEVATOR_FLAG_REGISTERED, &e->flags);
++		e->registered = 1;
+ 	}
+ 	return error;
+ }
+@@ -523,9 +523,11 @@ void elv_unregister_queue(struct request_queue *q)
+ 
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+-	if (e && test_and_clear_bit(ELEVATOR_FLAG_REGISTERED, &e->flags)) {
++	if (e && e->registered) {
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
++
++		e->registered = 0;
+ 	}
+ }
+ 
+diff --git a/block/elevator.h b/block/elevator.h
+index ed574bf3e..3f0593b3b 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -100,12 +100,10 @@ struct elevator_queue
+ 	void *elevator_data;
+ 	struct kobject kobj;
+ 	struct mutex sysfs_lock;
+-	unsigned long flags;
++	unsigned int registered:1;
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
+-#define ELEVATOR_FLAG_REGISTERED 0
+-
+ /*
+  * block elevator interface
+  */
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 58e3777dfed71a720e233f0dfe1160334d05a287 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 20 Oct 2022 18:46:48 +0200
+Subject: [PATCH 30/39] Revert "blk-wbt: don't show valid wbt_lat_usec in sysfs
+ while wbt is disabled"
+
+This reverts commit 9c349c31cd2985dcc940eaf8d6925f0100437ef2.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/blk-sysfs.c | 6 +-----
+ block/blk-wbt.c   | 8 --------
+ block/blk-wbt.h   | 5 -----
+ 3 files changed, 1 insertion(+), 18 deletions(-)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 1df3e22e1..e1f009aba 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -467,14 +467,10 @@ static ssize_t queue_io_timeout_store(struct request_queue *q, const char *page,
+ 
+ static ssize_t queue_wb_lat_show(struct request_queue *q, char *page)
+ {
+-	u64 lat;
+-
+ 	if (!wbt_rq_qos(q))
+ 		return -EINVAL;
+ 
+-	lat = wbt_disabled(q) ? 0 : div_u64(wbt_get_min_lat(q), 1000);
+-
+-	return sprintf(page, "%llu\n", lat);
++	return sprintf(page, "%llu\n", div_u64(wbt_get_min_lat(q), 1000));
+ }
+ 
+ static ssize_t queue_wb_lat_store(struct request_queue *q, const char *page,
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 07ed0b0ae..4680691a9 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -422,14 +422,6 @@ static void wbt_update_limits(struct rq_wb *rwb)
+ 	rwb_wake_all(rwb);
+ }
+ 
+-bool wbt_disabled(struct request_queue *q)
+-{
+-	struct rq_qos *rqos = wbt_rq_qos(q);
+-
+-	return !rqos || RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT ||
+-	       RQWB(rqos)->enable_state == WBT_STATE_OFF_MANUAL;
+-}
+-
+ u64 wbt_get_min_lat(struct request_queue *q)
+ {
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index e3ea6e7e2..7fe98638f 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -96,7 +96,6 @@ void wbt_enable_default(struct request_queue *);
+ 
+ u64 wbt_get_min_lat(struct request_queue *q);
+ void wbt_set_min_lat(struct request_queue *q, u64 val);
+-bool wbt_disabled(struct request_queue *);
+ 
+ void wbt_set_write_cache(struct request_queue *, bool);
+ 
+@@ -128,10 +127,6 @@ static inline u64 wbt_default_latency_nsec(struct request_queue *q)
+ {
+ 	return 0;
+ }
+-static inline bool wbt_disabled(struct request_queue *q)
+-{
+-	return true;
+-}
+ 
+ #endif /* CONFIG_BLK_WBT */
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From e474f0257bd8efc5671890ad1db6e119f5b1131c Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 20 Oct 2022 18:46:48 +0200
+Subject: [PATCH 31/39] Revert "blk-wbt: make enable_state more accurate"
+
+This reverts commit 3d608a694b9a1da0988b891f28019949c1e20210.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/blk-wbt.c |  7 +------
+ block/blk-wbt.h | 12 +++++-------
+ 2 files changed, 6 insertions(+), 13 deletions(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 4680691a9..c5a8c1002 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -435,13 +435,8 @@ void wbt_set_min_lat(struct request_queue *q, u64 val)
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+ 	if (!rqos)
+ 		return;
+-
+ 	RQWB(rqos)->min_lat_nsec = val;
+-	if (val)
+-		RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
+-	else
+-		RQWB(rqos)->enable_state = WBT_STATE_OFF_MANUAL;
+-
++	RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
+ 	wbt_update_limits(RQWB(rqos));
+ }
+ 
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index 7fe98638f..7e44eccc6 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -28,15 +28,13 @@ enum {
+ };
+ 
+ /*
+- * If current state is WBT_STATE_ON/OFF_DEFAULT, it can be covered to any other
+- * state, if current state is WBT_STATE_ON/OFF_MANUAL, it can only be covered
+- * to WBT_STATE_OFF/ON_MANUAL.
++ * Enable states. Either off, or on by default (done at init time),
++ * or on through manual setup in sysfs.
+  */
+ enum {
+-	WBT_STATE_ON_DEFAULT	= 1,	/* on by default */
+-	WBT_STATE_ON_MANUAL	= 2,	/* on manually by sysfs */
+-	WBT_STATE_OFF_DEFAULT	= 3,	/* off by default */
+-	WBT_STATE_OFF_MANUAL	= 4,	/* off manually by sysfs */
++	WBT_STATE_ON_DEFAULT	= 1,
++	WBT_STATE_ON_MANUAL	= 2,
++	WBT_STATE_OFF_DEFAULT
+ };
+ 
+ struct rq_wb {
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 75835daf43671793d73f76b3349464ff20782656 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 20 Oct 2022 18:46:49 +0200
+Subject: [PATCH 32/39] Revert "blk-wbt: remove unnecessary check in
+ wbt_enable_default()"
+
+This reverts commit afb96bd9624b0859516b0056ad81b301b15cfd0c.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/blk-wbt.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c5a8c1002..c293e08b3 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -651,7 +651,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q))
++	if (queue_is_mq(q) && IS_ENABLED(CONFIG_BLK_WBT_MQ))
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From cec912dabb0c933c7d047e27c73f7a42b0b93f01 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 20 Oct 2022 18:46:50 +0200
+Subject: [PATCH 33/39] Revert "elevator: remove redundant code in
+ elv_unregister_queue()"
+
+This reverts commit c47677f1afa495e13029d26fa81b69a91918c8cb.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/elevator.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index 20e70fd3f..bd71f0fc4 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -524,6 +524,8 @@ void elv_unregister_queue(struct request_queue *q)
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+ 	if (e && e->registered) {
++		struct elevator_queue *e = q->elevator;
++
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From f13f1989e97c62c7a01b612c36462ee13dd831c9 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:13 +0800
+Subject: [PATCH 34/39] elevator: remove redundant code in
+ elv_unregister_queue()
+
+"elevator_queue *e" is already declared and initialized in the beginning
+of elv_unregister_queue().
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Eric Biggers <ebiggers@google.com>
+---
+ block/elevator.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index bd71f0fc4..20e70fd3f 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -524,8 +524,6 @@ void elv_unregister_queue(struct request_queue *q)
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+ 	if (e && e->registered) {
+-		struct elevator_queue *e = q->elevator;
+-
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From f61ce87a047c3ab84e28e860d37d4a1a13b49e51 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:14 +0800
+Subject: [PATCH 35/39] blk-wbt: remove unnecessary check in
+ wbt_enable_default()
+
+If CONFIG_BLK_WBT_MQ is disabled, wbt_init() won't do anything.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/blk-wbt.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c293e08b3..c5a8c1002 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -651,7 +651,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q) && IS_ENABLED(CONFIG_BLK_WBT_MQ))
++	if (queue_is_mq(q))
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 72a299e5fa2b007e257e298d44f025d1c0618349 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:15 +0800
+Subject: [PATCH 36/39] blk-wbt: make enable_state more accurate
+
+Currently, if user disable wbt through sysfs, 'enable_state' will be
+'WBT_STATE_ON_MANUAL', which will be confusing. Add a new state
+'WBT_STATE_OFF_MANUAL' to cover that case.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/blk-wbt.c |  7 ++++++-
+ block/blk-wbt.h | 12 +++++++-----
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c5a8c1002..4680691a9 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -435,8 +435,13 @@ void wbt_set_min_lat(struct request_queue *q, u64 val)
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+ 	if (!rqos)
+ 		return;
++
+ 	RQWB(rqos)->min_lat_nsec = val;
+-	RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
++	if (val)
++		RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
++	else
++		RQWB(rqos)->enable_state = WBT_STATE_OFF_MANUAL;
++
+ 	wbt_update_limits(RQWB(rqos));
+ }
+ 
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index 7e44eccc6..7fe98638f 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -28,13 +28,15 @@ enum {
+ };
+ 
+ /*
+- * Enable states. Either off, or on by default (done at init time),
+- * or on through manual setup in sysfs.
++ * If current state is WBT_STATE_ON/OFF_DEFAULT, it can be covered to any other
++ * state, if current state is WBT_STATE_ON/OFF_MANUAL, it can only be covered
++ * to WBT_STATE_OFF/ON_MANUAL.
+  */
+ enum {
+-	WBT_STATE_ON_DEFAULT	= 1,
+-	WBT_STATE_ON_MANUAL	= 2,
+-	WBT_STATE_OFF_DEFAULT
++	WBT_STATE_ON_DEFAULT	= 1,	/* on by default */
++	WBT_STATE_ON_MANUAL	= 2,	/* on manually by sysfs */
++	WBT_STATE_OFF_DEFAULT	= 3,	/* off by default */
++	WBT_STATE_OFF_MANUAL	= 4,	/* off manually by sysfs */
+ };
+ 
+ struct rq_wb {
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 2665097dce79ae0fe81b5a8bb7e5fc7acbb8b0c6 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:16 +0800
+Subject: [PATCH 37/39] blk-wbt: don't show valid wbt_lat_usec in sysfs while
+ wbt is disabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, if wbt is initialized and then disabled by
+wbt_disable_default(), sysfs will still show valid wbt_lat_usec, which
+will confuse users that wbt is still enabled.
+
+This patch shows wbt_lat_usec as zero if it's disabled.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reported-and-tested-by: Holger Hoffstätte <holger@applied-asynchrony.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/blk-sysfs.c | 3 +++
+ block/blk-wbt.c   | 8 ++++++++
+ block/blk-wbt.h   | 5 +++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index e1f009aba..918d7fffb 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -470,6 +470,9 @@ static ssize_t queue_wb_lat_show(struct request_queue *q, char *page)
+ 	if (!wbt_rq_qos(q))
+ 		return -EINVAL;
+ 
++	if (wbt_disabled(q))
++		return sprintf(page, "0\n");
++
+ 	return sprintf(page, "%llu\n", div_u64(wbt_get_min_lat(q), 1000));
+ }
+ 
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 4680691a9..07ed0b0ae 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -422,6 +422,14 @@ static void wbt_update_limits(struct rq_wb *rwb)
+ 	rwb_wake_all(rwb);
+ }
+ 
++bool wbt_disabled(struct request_queue *q)
++{
++	struct rq_qos *rqos = wbt_rq_qos(q);
++
++	return !rqos || RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT ||
++	       RQWB(rqos)->enable_state == WBT_STATE_OFF_MANUAL;
++}
++
+ u64 wbt_get_min_lat(struct request_queue *q)
+ {
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index 7fe98638f..e3ea6e7e2 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -96,6 +96,7 @@ void wbt_enable_default(struct request_queue *);
+ 
+ u64 wbt_get_min_lat(struct request_queue *q);
+ void wbt_set_min_lat(struct request_queue *q, u64 val);
++bool wbt_disabled(struct request_queue *);
+ 
+ void wbt_set_write_cache(struct request_queue *, bool);
+ 
+@@ -127,6 +128,10 @@ static inline u64 wbt_default_latency_nsec(struct request_queue *q)
+ {
+ 	return 0;
+ }
++static inline bool wbt_disabled(struct request_queue *q)
++{
++	return true;
++}
+ 
+ #endif /* CONFIG_BLK_WBT */
+ 
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From a2b0bbc5945baec4cde8473183f0a5517f37a11f Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:17 +0800
+Subject: [PATCH 38/39] elevator: add new field flags in struct elevator_queue
+
+There are only one flag to indicate that elevator is registered currently,
+prepare to add a flag to disable wbt if default elevator is bfq.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/elevator.c | 6 ++----
+ block/elevator.h | 4 +++-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index 20e70fd3f..9e12706e8 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -512,7 +512,7 @@ int elv_register_queue(struct request_queue *q, bool uevent)
+ 		if (uevent)
+ 			kobject_uevent(&e->kobj, KOBJ_ADD);
+ 
+-		e->registered = 1;
++		set_bit(ELEVATOR_FLAG_REGISTERED, &e->flags);
+ 	}
+ 	return error;
+ }
+@@ -523,11 +523,9 @@ void elv_unregister_queue(struct request_queue *q)
+ 
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+-	if (e && e->registered) {
++	if (e && test_and_clear_bit(ELEVATOR_FLAG_REGISTERED, &e->flags)) {
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
+-
+-		e->registered = 0;
+ 	}
+ }
+ 
+diff --git a/block/elevator.h b/block/elevator.h
+index 3f0593b3b..ed574bf3e 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -100,10 +100,12 @@ struct elevator_queue
+ 	void *elevator_data;
+ 	struct kobject kobj;
+ 	struct mutex sysfs_lock;
+-	unsigned int registered:1;
++	unsigned long flags;
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
++#define ELEVATOR_FLAG_REGISTERED 0
++
+ /*
+  * block elevator interface
+  */
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
+
+From 971a2771a797afb595246ab90a410ae2f62eae9e Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:18 +0800
+Subject: [PATCH 39/39] blk-wbt: don't enable throttling if default elevator is
+ bfq
+
+Commit b5dc5d4d1f4f ("block,bfq: Disable writeback throttling") tries to
+disable wbt for bfq, it's done by calling wbt_disable_default() in
+bfq_init_queue(). However, wbt is still enabled if default elevator is
+bfq:
+
+device_add_disk
+ elevator_init_mq
+  bfq_init_queue
+   wbt_disable_default -> done nothing
+
+ blk_register_queue
+  wbt_enable_default -> wbt is enabled
+
+Fix the problem by adding a new flag ELEVATOR_FLAG_DISBALE_WBT, bfq
+will set the flag in bfq_init_queue, and following wbt_enable_default()
+won't enable wbt while the flag is set.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/bfq-iosched.c |  2 ++
+ block/blk-wbt.c     | 11 ++++++++---
+ block/elevator.h    |  3 ++-
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index c740b41fe..889ea5264 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -7047,6 +7047,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
+ #endif
+ 
+ 	blk_stat_disable_accounting(bfqd->queue);
++	clear_bit(ELEVATOR_FLAG_DISABLE_WBT, &e->flags);
+ 	wbt_enable_default(bfqd->queue);
+ 
+ 	kfree(bfqd);
+@@ -7192,6 +7193,7 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	/* We dispatch from request queue wide instead of hw queue */
+ 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+ 
++	set_bit(ELEVATOR_FLAG_DISABLE_WBT, &eq->flags);
+ 	wbt_disable_default(q);
+ 	blk_stat_enable_accounting(q);
+ 
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 07ed0b0ae..68a774d7a 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -27,6 +27,7 @@
+ 
+ #include "blk-wbt.h"
+ #include "blk-rq-qos.h"
++#include "elevator.h"
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/wbt.h>
+@@ -651,11 +652,15 @@ void wbt_set_write_cache(struct request_queue *q, bool write_cache_on)
+  */
+ void wbt_enable_default(struct request_queue *q)
+ {
+-	struct rq_qos *rqos = wbt_rq_qos(q);
++	struct rq_qos *rqos;
++	bool disable_flag = q->elevator &&
++		    test_bit(ELEVATOR_FLAG_DISABLE_WBT, &q->elevator->flags);
+ 
+ 	/* Throttling already enabled? */
++	rqos = wbt_rq_qos(q);
+ 	if (rqos) {
+-		if (RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
++		if (!disable_flag &&
++		    RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
+ 			RQWB(rqos)->enable_state = WBT_STATE_ON_DEFAULT;
+ 		return;
+ 	}
+@@ -664,7 +669,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q))
++	if (queue_is_mq(q) && !disable_flag)
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+diff --git a/block/elevator.h b/block/elevator.h
+index ed574bf3e..753824712 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -104,7 +104,8 @@ struct elevator_queue
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
+-#define ELEVATOR_FLAG_REGISTERED 0
++#define ELEVATOR_FLAG_REGISTERED	0
++#define ELEVATOR_FLAG_DISABLE_WBT	1
+ 
+ /*
+  * block elevator interface
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
