@@ -1,0 +1,242 @@
+From 464b629d5e8bbc2f357b97d69721267aeb97240d Mon Sep 17 00:00:00 2001
+From: John Ogness <john.ogness@linutronix.de>
+Date: Mon, 7 Nov 2022 15:22:02 +0106
+Subject: [PATCH 04/40] printk: Prepare for SRCU console list protection
+
+Provide an NMI-safe SRCU protected variant to walk the console list.
+
+Note that all console fields are now set before adding the console
+to the list to avoid the console becoming visible by SCRU readers
+before being fully initialized.
+
+This is a preparatory change for a new console infrastructure which
+operates independent of the console BKL.
+
+Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: John Ogness <john.ogness@linutronix.de>
+Acked-by: Miguel Ojeda <ojeda@kernel.org>
+Reviewed-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ .clang-format           |  1 +
+ include/linux/console.h | 28 ++++++++++++-
+ kernel/printk/printk.c  | 87 ++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 100 insertions(+), 16 deletions(-)
+
+diff --git a/.clang-format b/.clang-format
+index 1247d54f9..04a675b56 100644
+--- a/.clang-format
++++ b/.clang-format
+@@ -222,6 +222,7 @@ ForEachMacros:
+   - 'for_each_component_dais'
+   - 'for_each_component_dais_safe'
+   - 'for_each_console'
++  - 'for_each_console_srcu'
+   - 'for_each_cpu'
+   - 'for_each_cpu_and'
+   - 'for_each_cpu_not'
+diff --git a/include/linux/console.h b/include/linux/console.h
+index 7b5f21f9e..f4f0c9523 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -15,7 +15,7 @@
+ #define _LINUX_CONSOLE_H_ 1
+ 
+ #include <linux/atomic.h>
+-#include <linux/list.h>
++#include <linux/rculist.h>
+ #include <linux/types.h>
+ 
+ struct vc_data;
+@@ -158,8 +158,34 @@ struct console {
+ 	struct hlist_node node;
+ };
+ 
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++extern bool console_srcu_read_lock_is_held(void);
++#else
++static inline bool console_srcu_read_lock_is_held(void)
++{
++	return 1;
++}
++#endif
++
++extern int console_srcu_read_lock(void);
++extern void console_srcu_read_unlock(int cookie);
++
+ extern struct hlist_head console_list;
+ 
++/**
++ * for_each_console_srcu() - Iterator over registered consoles
++ * @con:	struct console pointer used as loop cursor
++ *
++ * Although SRCU guarantees the console list will be consistent, the
++ * struct console fields may be updated by other CPUs while iterating.
++ *
++ * Requires console_srcu_read_lock to be held. Can be invoked from
++ * any context.
++ */
++#define for_each_console_srcu(con)					\
++	hlist_for_each_entry_srcu(con, &console_list, node,		\
++				  console_srcu_read_lock_is_held())
++
+ /*
+  * for_each_console() allows you to iterate on each console
+  */
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index e6f0832e7..173f46a29 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -85,6 +85,7 @@ EXPORT_SYMBOL(oops_in_progress);
+ static DEFINE_SEMAPHORE(console_sem);
+ HLIST_HEAD(console_list);
+ EXPORT_SYMBOL_GPL(console_list);
++DEFINE_STATIC_SRCU(console_srcu);
+ 
+ /*
+  * System may need to suppress printk message under certain
+@@ -104,6 +105,13 @@ static struct lockdep_map console_lock_dep_map = {
+ };
+ #endif
+ 
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++bool console_srcu_read_lock_is_held(void)
++{
++	return srcu_read_lock_held(&console_srcu);
++}
++#endif
++
+ enum devkmsg_log_bits {
+ 	__DEVKMSG_LOG_BIT_ON = 0,
+ 	__DEVKMSG_LOG_BIT_OFF,
+@@ -219,6 +227,32 @@ int devkmsg_sysctl_set_loglvl(struct ctl_table *table, int write,
+ }
+ #endif /* CONFIG_PRINTK && CONFIG_SYSCTL */
+ 
++/**
++ * console_srcu_read_lock - Register a new reader for the
++ *	SRCU-protected console list
++ *
++ * Use for_each_console_srcu() to iterate the console list
++ *
++ * Context: Any context.
++ */
++int console_srcu_read_lock(void)
++{
++	return srcu_read_lock_nmisafe(&console_srcu);
++}
++EXPORT_SYMBOL(console_srcu_read_lock);
++
++/**
++ * console_srcu_read_unlock - Unregister an old reader from
++ *	the SRCU-protected console list
++ *
++ * Counterpart to console_srcu_read_lock()
++ */
++void console_srcu_read_unlock(int cookie)
++{
++	srcu_read_unlock_nmisafe(&console_srcu, cookie);
++}
++EXPORT_SYMBOL(console_srcu_read_unlock);
++
+ /*
+  * Helper macros to handle lockdep when locking/unlocking console_sem. We use
+  * macros instead of functions so that _RET_IP_ contains useful information.
+@@ -2989,6 +3023,14 @@ void console_stop(struct console *console)
+ 	console_lock();
+ 	console->flags &= ~CON_ENABLED;
+ 	console_unlock();
++
++	/*
++	 * Ensure that all SRCU list walks have completed. All contexts must
++	 * be able to see that this console is disabled so that (for example)
++	 * the caller can suspend the port without risk of another context
++	 * using the port.
++	 */
++	synchronize_srcu(&console_srcu);
+ }
+ EXPORT_SYMBOL(console_stop);
+ 
+@@ -3179,6 +3221,17 @@ void register_console(struct console *newcon)
+ 		newcon->flags &= ~CON_PRINTBUFFER;
+ 	}
+ 
++	newcon->dropped = 0;
++	if (newcon->flags & CON_PRINTBUFFER) {
++		/* Get a consistent copy of @syslog_seq. */
++		mutex_lock(&syslog_lock);
++		newcon->seq = syslog_seq;
++		mutex_unlock(&syslog_lock);
++	} else {
++		/* Begin with next message. */
++		newcon->seq = prb_next_seq(prb);
++	}
++
+ 	/*
+ 	 * Put this console in the list - keep the
+ 	 * preferred driver at the head of the list.
+@@ -3187,28 +3240,24 @@ void register_console(struct console *newcon)
+ 	if (hlist_empty(&console_list)) {
+ 		/* Ensure CON_CONSDEV is always set for the head. */
+ 		newcon->flags |= CON_CONSDEV;
+-		hlist_add_head(&newcon->node, &console_list);
++		hlist_add_head_rcu(&newcon->node, &console_list);
+ 
+ 	} else if (newcon->flags & CON_CONSDEV) {
+ 		/* Only the new head can have CON_CONSDEV set. */
+ 		console_first()->flags &= ~CON_CONSDEV;
+-		hlist_add_head(&newcon->node, &console_list);
++		hlist_add_head_rcu(&newcon->node, &console_list);
+ 
+ 	} else {
+-		hlist_add_behind(&newcon->node, console_list.first);
+-	}
+-
+-	newcon->dropped = 0;
+-	if (newcon->flags & CON_PRINTBUFFER) {
+-		/* Get a consistent copy of @syslog_seq. */
+-		mutex_lock(&syslog_lock);
+-		newcon->seq = syslog_seq;
+-		mutex_unlock(&syslog_lock);
+-	} else {
+-		/* Begin with next message. */
+-		newcon->seq = prb_next_seq(prb);
++		hlist_add_behind_rcu(&newcon->node, console_list.first);
+ 	}
+ 	console_unlock();
++
++	/*
++	 * No need to synchronize SRCU here! The caller does not rely
++	 * on all contexts being able to see the new console before
++	 * register_console() completes.
++	 */
++
+ 	console_sysfs_notify();
+ 
+ 	/*
+@@ -3254,7 +3303,7 @@ int unregister_console(struct console *console)
+ 		return -ENODEV;
+ 	}
+ 
+-	hlist_del_init(&console->node);
++	hlist_del_init_rcu(&console->node);
+ 
+ 	/*
+ 	 * <HISTORICAL>
+@@ -3269,6 +3318,14 @@ int unregister_console(struct console *console)
+ 		console_first()->flags |= CON_CONSDEV;
+ 
+ 	console_unlock();
++
++	/*
++	 * Ensure that all SRCU list walks have completed. All contexts
++	 * must not be able to see this console in the list so that any
++	 * exit/cleanup routines can be performed safely.
++	 */
++	synchronize_srcu(&console_srcu);
++
+ 	console_sysfs_notify();
+ 
+ 	if (console->exit)
+-- 
+2.38.1.385.g3b08839926
+
