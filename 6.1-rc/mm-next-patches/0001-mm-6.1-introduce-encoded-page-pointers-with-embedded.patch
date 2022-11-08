@@ -1,0 +1,445 @@
+From 128c5c64cb7a428bd13cd0a796749c0f7b70fc71 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Tue, 8 Nov 2022 21:03:12 +0100
+Subject: [PATCH] mm-6.1: introduce 'encoded' page pointers with embedded extra
+ bits
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ arch/s390/include/asm/tlb.h | 21 +++++++++++++++++++--
+ include/asm-generic/tlb.h   | 23 ++++++++++++++++++-----
+ include/linux/mm.h          | 21 +++++++++++++++++++--
+ include/linux/mm_types.h    | 33 ++++++++++++++++++++++++++++++++-
+ include/linux/swap.h        |  2 +-
+ mm/memory.c                 | 23 +++++++++++++++++------
+ mm/mmu_gather.c             | 37 ++++++++++++++++++++++++++++++++++---
+ mm/swap.c                   | 16 ++++++++++++----
+ mm/swap_state.c             | 11 ++++-------
+ 9 files changed, 156 insertions(+), 31 deletions(-)
+
+diff --git a/arch/s390/include/asm/tlb.h b/arch/s390/include/asm/tlb.h
+index 3a5c8fb59..e5903ee2f 100644
+--- a/arch/s390/include/asm/tlb.h
++++ b/arch/s390/include/asm/tlb.h
+@@ -25,7 +25,8 @@
+ void __tlb_remove_table(void *_table);
+ static inline void tlb_flush(struct mmu_gather *tlb);
+ static inline bool __tlb_remove_page_size(struct mmu_gather *tlb,
+-					  struct page *page, int page_size);
++					  struct page *page, int page_size,
++					  unsigned int flags);
+ 
+ #define tlb_flush tlb_flush
+ #define pte_free_tlb pte_free_tlb
+@@ -36,13 +37,24 @@ static inline bool __tlb_remove_page_size(struct mmu_gather *tlb,
+ #include <asm/tlbflush.h>
+ #include <asm-generic/tlb.h>
+ 
++/*
++ * s390 never needs to delay page_remove_rmap, because
++ * the ptep_get_and_clear_full() will have flushed the
++ * TLB across CPUs
++ */
++static inline bool tlb_delay_rmap(struct mmu_gather *tlb)
++{
++	return false;
++}
++
+ /*
+  * Release the page cache reference for a pte removed by
+  * tlb_ptep_clear_flush. In both flush modes the tlb for a page cache page
+  * has already been freed, so just do free_page_and_swap_cache.
+  */
+ static inline bool __tlb_remove_page_size(struct mmu_gather *tlb,
+-					  struct page *page, int page_size)
++					  struct page *page, int page_size,
++					  unsigned int flags)
+ {
+ 	free_page_and_swap_cache(page);
+ 	return false;
+@@ -53,6 +65,11 @@ static inline void tlb_flush(struct mmu_gather *tlb)
+ 	__tlb_flush_mm_lazy(tlb->mm);
+ }
+ 
++static inline void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma)
++{
++	/* Nothing to do, s390 does not delay rmaps */
++}
++
+ /*
+  * pte_free_tlb frees a pte table and clears the CRSTE for the
+  * page table from the tlb.
+diff --git a/include/asm-generic/tlb.h b/include/asm-generic/tlb.h
+index 492dce432..9df513e5a 100644
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@ -242,7 +242,7 @@ struct mmu_gather_batch {
+ 	struct mmu_gather_batch	*next;
+ 	unsigned int		nr;
+ 	unsigned int		max;
+-	struct page		*pages[];
++	struct encoded_page	*encoded_pages[];
+ };
+ 
+ #define MAX_GATHER_BATCH	\
+@@ -257,7 +257,15 @@ struct mmu_gather_batch {
+ #define MAX_GATHER_BATCH_COUNT	(10000UL/MAX_GATHER_BATCH)
+ 
+ extern bool __tlb_remove_page_size(struct mmu_gather *tlb, struct page *page,
+-				   int page_size);
++				   int page_size, unsigned int flags);
++extern void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma);
++
++/*
++ * This both sets 'delayed_rmap', and returns true. It would be an inline
++ * function, except we define it before the 'struct mmu_gather'.
++ */
++#define tlb_delay_rmap(tlb) (((tlb)->delayed_rmap = 1), true)
++
+ #endif
+ 
+ /*
+@@ -290,6 +298,11 @@ struct mmu_gather {
+ 	 */
+ 	unsigned int		freed_tables : 1;
+ 
++	/*
++	 * Do we have pending delayed rmap removals?
++	 */
++	unsigned int		delayed_rmap : 1;
++
+ 	/*
+ 	 * at which levels have we cleared entries?
+ 	 */
+@@ -431,13 +444,13 @@ static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+ static inline void tlb_remove_page_size(struct mmu_gather *tlb,
+ 					struct page *page, int page_size)
+ {
+-	if (__tlb_remove_page_size(tlb, page, page_size))
++	if (__tlb_remove_page_size(tlb, page, page_size, 0))
+ 		tlb_flush_mmu(tlb);
+ }
+ 
+-static inline bool __tlb_remove_page(struct mmu_gather *tlb, struct page *page)
++static inline bool __tlb_remove_page(struct mmu_gather *tlb, struct page *page, unsigned int flags)
+ {
+-	return __tlb_remove_page_size(tlb, page, PAGE_SIZE);
++	return __tlb_remove_page_size(tlb, page, PAGE_SIZE, flags);
+ }
+ 
+ /* tlb_remove_page
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 8bbcccbc5..d9fb5c3e3 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1179,7 +1179,24 @@ static inline void folio_put_refs(struct folio *folio, int refs)
+ 		__folio_put(folio);
+ }
+ 
+-void release_pages(struct page **pages, int nr);
++/**
++ * release_pages - release an array of pages or folios
++ *
++ * This just releases a simple array of multiple pages, and
++ * accepts various different forms of said page array: either
++ * a regular old boring array of pages, an array of folios, or
++ * an array of encoded page pointers.
++ *
++ * The transparent union syntax for this kind of "any of these
++ * argument types" is all kinds of ugly, so look away.
++ */
++typedef union {
++	struct page **pages;
++	struct folio **folios;
++	struct encoded_page **encoded_pages;
++} release_pages_arg __attribute__ ((__transparent_union__));
++
++void release_pages(release_pages_arg, int nr);
+ 
+ /**
+  * folios_put - Decrement the reference count on an array of folios.
+@@ -1195,7 +1212,7 @@ void release_pages(struct page **pages, int nr);
+  */
+ static inline void folios_put(struct folio **folios, unsigned int nr)
+ {
+-	release_pages((struct page **)folios, nr);
++	release_pages(folios, nr);
+ }
+ 
+ static inline void put_page(struct page *page)
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 500e53679..b5cffd250 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -67,7 +67,7 @@ struct mem_cgroup;
+ #ifdef CONFIG_HAVE_ALIGNED_STRUCT_PAGE
+ #define _struct_page_alignment	__aligned(2 * sizeof(unsigned long))
+ #else
+-#define _struct_page_alignment
++#define _struct_page_alignment	__aligned(sizeof(unsigned long))
+ #endif
+ 
+ struct page {
+@@ -241,6 +241,37 @@ struct page {
+ #endif
+ } _struct_page_alignment;
+ 
++/**
++ * struct encoded_page - a nonexistent type marking this pointer
++ *
++ * An 'encoded_page' pointer is a pointer to a regular 'struct page', but
++ * with the low bits of the pointer indicating extra context-dependent
++ * information. Not super-common, but happens in mmu_gather and mlock
++ * handling, and this acts as a type system check on that use.
++ *
++ * We only really have two guaranteed bits in general, although you could
++ * play with 'struct page' alignment (see CONFIG_HAVE_ALIGNED_STRUCT_PAGE)
++ * for more.
++ *
++ * Use the supplied helper functions to endcode/decode the pointer and bits.
++ */
++struct encoded_page;
++#define ENCODE_PAGE_BITS 3ul
++static inline struct encoded_page *encode_page(struct page *page, unsigned long flags)
++{
++	return (struct encoded_page *)(flags | (unsigned long)page);
++}
++
++static inline bool encoded_page_flags(struct encoded_page *page)
++{
++	return ENCODE_PAGE_BITS & (unsigned long)page;
++}
++
++static inline struct page *encoded_page_ptr(struct encoded_page *page)
++{
++	return (struct page *)(~ENCODE_PAGE_BITS & (unsigned long)page);
++}
++
+ /**
+  * struct folio - Represents a contiguous set of bytes.
+  * @flags: Identical to the page flags.
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index a18cf4b7c..40e418e34 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -470,7 +470,7 @@ static inline unsigned long total_swapcache_pages(void)
+ 
+ extern void free_swap_cache(struct page *page);
+ extern void free_page_and_swap_cache(struct page *);
+-extern void free_pages_and_swap_cache(struct page **, int);
++extern void free_pages_and_swap_cache(struct encoded_page **, int);
+ /* linux/mm/swapfile.c */
+ extern atomic_long_t nr_swap_pages;
+ extern long total_swap_pages;
+diff --git a/mm/memory.c b/mm/memory.c
+index f88c351ae..60a0f44f6 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1432,6 +1432,8 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 			break;
+ 
+ 		if (pte_present(ptent)) {
++			unsigned int delay_rmap;
++
+ 			page = vm_normal_page(vma, addr, ptent);
+ 			if (unlikely(!should_zap_page(details, page)))
+ 				continue;
+@@ -1443,20 +1445,26 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 			if (unlikely(!page))
+ 				continue;
+ 
++			delay_rmap = 0;
+ 			if (!PageAnon(page)) {
+ 				if (pte_dirty(ptent)) {
+-					force_flush = 1;
+ 					set_page_dirty(page);
++					if (tlb_delay_rmap(tlb)) {
++						delay_rmap = 1;
++						force_flush = 1;
++					}
+ 				}
+ 				if (pte_young(ptent) &&
+ 				    likely(!(vma->vm_flags & VM_SEQ_READ)))
+ 					mark_page_accessed(page);
+ 			}
+ 			rss[mm_counter(page)]--;
+-			page_remove_rmap(page, vma, false);
+-			if (unlikely(page_mapcount(page) < 0))
+-				print_bad_pte(vma, addr, ptent, page);
+-			if (unlikely(__tlb_remove_page(tlb, page))) {
++			if (!delay_rmap) {
++				page_remove_rmap(page, vma, false);
++				if (unlikely(page_mapcount(page) < 0))
++					print_bad_pte(vma, addr, ptent, page);
++			}
++			if (unlikely(__tlb_remove_page(tlb, page, delay_rmap))) {
+ 				force_flush = 1;
+ 				addr += PAGE_SIZE;
+ 				break;
+@@ -1513,8 +1521,11 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 	arch_leave_lazy_mmu_mode();
+ 
+ 	/* Do the actual TLB flush before dropping ptl */
+-	if (force_flush)
++	if (force_flush) {
+ 		tlb_flush_mmu_tlbonly(tlb);
++		if (tlb->delayed_rmap)
++			tlb_flush_rmaps(tlb, vma);
++	}
+ 	pte_unmap_unlock(start_pte, ptl);
+ 
+ 	/*
+diff --git a/mm/mmu_gather.c b/mm/mmu_gather.c
+index add4244e5..136f5fad4 100644
+--- a/mm/mmu_gather.c
++++ b/mm/mmu_gather.c
+@@ -9,6 +9,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/smp.h>
+ #include <linux/swap.h>
++#include <linux/rmap.h>
+ 
+ #include <asm/pgalloc.h>
+ #include <asm/tlb.h>
+@@ -19,6 +20,10 @@ static bool tlb_next_batch(struct mmu_gather *tlb)
+ {
+ 	struct mmu_gather_batch *batch;
+ 
++	/* No more batching if we have delayed rmaps pending */
++	if (tlb->delayed_rmap)
++		return false;
++
+ 	batch = tlb->active;
+ 	if (batch->next) {
+ 		tlb->active = batch->next;
+@@ -43,12 +48,37 @@ static bool tlb_next_batch(struct mmu_gather *tlb)
+ 	return true;
+ }
+ 
++/**
++ * tlb_flush_rmaps - do pending rmap removals after we have flushed the TLB
++ * @tlb: the current mmu_gather
++ *
++ * Note that because of how tlb_next_batch() above works, we will
++ * never start new batches with pending delayed rmaps, so we only
++ * need to walk through the current active batch.
++ */
++void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma)
++{
++	struct mmu_gather_batch *batch;
++
++	batch = tlb->active;
++	for (int i = 0; i < batch->nr; i++) {
++		struct encoded_page *enc = batch->encoded_pages[i];
++
++		if (encoded_page_flags(enc)) {
++			struct page *page = encoded_page_ptr(enc);
++			page_remove_rmap(page, vma, false);
++		}
++	}
++
++	tlb->delayed_rmap = 0;
++}
++
+ static void tlb_batch_pages_flush(struct mmu_gather *tlb)
+ {
+ 	struct mmu_gather_batch *batch;
+ 
+ 	for (batch = &tlb->local; batch && batch->nr; batch = batch->next) {
+-		struct page **pages = batch->pages;
++		struct encoded_page **pages = batch->encoded_pages;
+ 
+ 		do {
+ 			/*
+@@ -77,7 +107,7 @@ static void tlb_batch_list_free(struct mmu_gather *tlb)
+ 	tlb->local.next = NULL;
+ }
+ 
+-bool __tlb_remove_page_size(struct mmu_gather *tlb, struct page *page, int page_size)
++bool __tlb_remove_page_size(struct mmu_gather *tlb, struct page *page, int page_size, unsigned int flags)
+ {
+ 	struct mmu_gather_batch *batch;
+ 
+@@ -92,7 +122,7 @@ bool __tlb_remove_page_size(struct mmu_gather *tlb, struct page *page, int page_
+ 	 * Add the page and check if we are full. If so
+ 	 * force a flush.
+ 	 */
+-	batch->pages[batch->nr++] = page;
++	batch->encoded_pages[batch->nr++] = encode_page(page, flags);
+ 	if (batch->nr == batch->max) {
+ 		if (!tlb_next_batch(tlb))
+ 			return true;
+@@ -286,6 +316,7 @@ static void __tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
+ 	tlb->active     = &tlb->local;
+ 	tlb->batch_count = 0;
+ #endif
++	tlb->delayed_rmap = 0;
+ 
+ 	tlb_table_init(tlb);
+ #ifdef CONFIG_MMU_GATHER_PAGE_SIZE
+diff --git a/mm/swap.c b/mm/swap.c
+index 955930f41..596ed226d 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -968,22 +968,30 @@ void lru_cache_disable(void)
+ 
+ /**
+  * release_pages - batched put_page()
+- * @pages: array of pages to release
++ * @arg: array of pages to release
+  * @nr: number of pages
+  *
+- * Decrement the reference count on all the pages in @pages.  If it
++ * Decrement the reference count on all the pages in @arg.  If it
+  * fell to zero, remove the page from the LRU and free it.
++ *
++ * Note that the argument can be an array of pages, encoded pages,
++ * or folio pointers. We ignore any encoded bits, and turn any of
++ * them into just a folio that gets free'd.
+  */
+-void release_pages(struct page **pages, int nr)
++void release_pages(release_pages_arg arg, int nr)
+ {
+ 	int i;
++	struct encoded_page **encoded = arg.encoded_pages;
+ 	LIST_HEAD(pages_to_free);
+ 	struct lruvec *lruvec = NULL;
+ 	unsigned long flags = 0;
+ 	unsigned int lock_batch;
+ 
+ 	for (i = 0; i < nr; i++) {
+-		struct folio *folio = page_folio(pages[i]);
++		struct folio *folio;
++
++		/* Turn any of the argument types into a folio */
++		folio = page_folio(encoded_page_ptr(encoded[i]));
+ 
+ 		/*
+ 		 * Make sure the IRQ-safe lock-holding time does not get
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 438d0676c..8bf08c313 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -303,15 +303,12 @@ void free_page_and_swap_cache(struct page *page)
+  * Passed an array of pages, drop them all from swapcache and then release
+  * them.  They are removed from the LRU and freed if this is their last use.
+  */
+-void free_pages_and_swap_cache(struct page **pages, int nr)
++void free_pages_and_swap_cache(struct encoded_page **pages, int nr)
+ {
+-	struct page **pagep = pages;
+-	int i;
+-
+ 	lru_add_drain();
+-	for (i = 0; i < nr; i++)
+-		free_swap_cache(pagep[i]);
+-	release_pages(pagep, nr);
++	for (int i = 0; i < nr; i++)
++		free_swap_cache(encoded_page_ptr(pages[i]));
++	release_pages(pages, nr);
+ }
+ 
+ static inline bool swap_use_vma_readahead(void)
+-- 
+2.38.1.385.g3b08839926
+
