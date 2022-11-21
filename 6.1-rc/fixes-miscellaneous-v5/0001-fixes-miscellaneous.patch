@@ -1,0 +1,2621 @@
+From 828408f750b75866f286f0fdb235eb275239f1d5 Mon Sep 17 00:00:00 2001
+From: Tor Vic <torvic9@mailbox.org>
+Date: Mon, 20 Jun 2022 12:40:39 +0200
+Subject: [PATCH 01/16] mm: Change dirty writeback defaults
+
+Use a lower ratio of 5, but a longer period of 10 seconds for dirty writeback.
+---
+ mm/page-writeback.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index 7e9d8d857..010aedd00 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -70,7 +70,7 @@ static long ratelimit_pages = 32;
+ /*
+  * Start background writeback (via writeback threads) at this percentage
+  */
+-static int dirty_background_ratio = 10;
++static int dirty_background_ratio = 5;
+ 
+ /*
+  * dirty_background_bytes starts at 0 (disabled) so that it is a function of
+@@ -98,7 +98,7 @@ static unsigned long vm_dirty_bytes;
+ /*
+  * The interval between `kupdate'-style writebacks
+  */
+-unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
++unsigned int dirty_writeback_interval = 10 * 100; /* centiseconds */
+ 
+ EXPORT_SYMBOL_GPL(dirty_writeback_interval);
+ 
+-- 
+2.38.1.385.g3b08839926
+
+
+From 9f9e2fb4920ce0d8f8ead7b2ee2934ec9647df5c Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Wed, 20 Oct 2021 20:50:11 -0700
+Subject: [PATCH 02/16] ZEN: mm: Lower the non-hugetlbpage pageblock size to
+ reduce scheduling delays
+
+The page allocator processes free pages in groups of pageblocks, where
+the size of a pageblock is typically quite large (1024 pages without
+hugetlbpage support). Pageblocks are processed atomically with the zone
+lock held, which can cause severe scheduling delays on both the CPU
+going through the pageblock and any other CPUs waiting to acquire the
+zone lock. A frequent offender is move_freepages_block(), which is used
+by rmqueue() for page allocation.
+
+As it turns out, there's no requirement for pageblocks to be so large,
+so the pageblock order can simply be reduced to ease the scheduling
+delays and zone lock contention. PAGE_ALLOC_COSTLY_ORDER is used as a
+reasonable setting to ensure non-costly page allocation requests can
+still be serviced without always needing to free up more than one
+pageblock's worth of pages at a time.
+
+This has a noticeable effect on overall system latency when memory
+pressure is elevated. The various mm functions which operate on
+pageblocks no longer appear in the preemptoff tracer, where previously
+they would spend up to 100 ms on a mobile arm64 CPU processing a
+pageblock with preemption disabled and the zone lock held.
+
+Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+---
+ include/linux/pageblock-flags.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/linux/pageblock-flags.h b/include/linux/pageblock-flags.h
+index 5f1ae07d7..97cda629c 100644
+--- a/include/linux/pageblock-flags.h
++++ b/include/linux/pageblock-flags.h
+@@ -48,7 +48,7 @@ extern unsigned int pageblock_order;
+ #else /* CONFIG_HUGETLB_PAGE */
+ 
+ /* If huge pages are not used, group by MAX_ORDER_NR_PAGES */
+-#define pageblock_order		(MAX_ORDER-1)
++#define pageblock_order		PAGE_ALLOC_COSTLY_ORDER
+ 
+ #endif /* CONFIG_HUGETLB_PAGE */
+ 
+-- 
+2.38.1.385.g3b08839926
+
+
+From 662a3d4412fc52a27380e143cc97016153957dad Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Tue, 2 Aug 2022 12:28:11 -0400
+Subject: [PATCH 03/16] mm: vmscan: fix extreme overreclaim and swap floods
+
+During proactive reclaim, we sometimes observe severe overreclaim, with
+several thousand times more pages reclaimed than requested.
+
+This trace was obtained from shrink_lruvec() during such an instance:
+
+    prio:0 anon_cost:1141521 file_cost:7767
+    nr_reclaimed:4387406 nr_to_reclaim:1047 (or_factor:4190)
+    nr=[7161123 345 578 1111]
+
+While he reclaimer requested 4M, vmscan reclaimed close to 16G, most of it
+by swapping.  These requests take over a minute, during which the write()
+to memory.reclaim is unkillably stuck inside the kernel.
+
+Digging into the source, this is caused by the proportional reclaim
+bailout logic.  This code tries to resolve a fundamental conflict: to
+reclaim roughly what was requested, while also aging all LRUs fairly and
+in accordance to their size, swappiness, refault rates etc.  The way it
+attempts fairness is that once the reclaim goal has been reached, it stops
+scanning the LRUs with the smaller remaining scan targets, and adjusts the
+remainder of the bigger LRUs according to how much of the smaller LRUs was
+scanned.  It then finishes scanning that remainder regardless of the
+reclaim goal.
+
+This works fine if priority levels are low and the LRU lists are
+comparable in size.  However, in this instance, the cgroup that is
+targeted by proactive reclaim has almost no files left - they've already
+been squeezed out by proactive reclaim earlier - and the remaining anon
+pages are hot.  Anon rotations cause the priority level to drop to 0,
+which results in reclaim targeting all of anon (a lot) and all of file
+(almost nothing).  By the time reclaim decides to bail, it has scanned
+most or all of the file target, and therefor must also scan most or all of
+the enormous anon target.  This target is thousands of times larger than
+the reclaim goal, thus causing the overreclaim.
+
+The bailout code hasn't changed in years, why is this failing now?  The
+most likely explanations are two other recent changes in anon reclaim:
+
+1. Before the series starting with commit 5df741963d52 ("mm: fix LRU
+   balancing effect of new transparent huge pages"), the VM was
+   overall relatively reluctant to swap at all, even if swap was
+   configured. This means the LRU balancing code didn't come into play
+   as often as it does now, and mostly in high pressure situations
+   where pronounced swap activity wouldn't be as surprising.
+
+2. For historic reasons, shrink_lruvec() loops on the scan targets of
+   all LRU lists except the active anon one, meaning it would bail if
+   the only remaining pages to scan were active anon - even if there
+   were a lot of them.
+
+   Before the series starting with commit ccc5dc67340c ("mm/vmscan:
+   make active/inactive ratio as 1:1 for anon lru"), most anon pages
+   would live on the active LRU; the inactive one would contain only a
+   handful of preselected reclaim candidates. After the series, anon
+   gets aged similarly to file, and the inactive list is the default
+   for new anon pages as well, making it often the much bigger list.
+
+   As a result, the VM is now more likely to actually finish large
+   anon targets than before.
+
+Change the code such that only one SWAP_CLUSTER_MAX-sized nudge toward the
+larger LRU lists is made before bailing out on a met reclaim goal.
+
+This fixes the extreme overreclaim problem.
+
+Fairness is more subtle and harder to evaluate.  No obvious misbehavior
+was observed on the test workload, in any case.  Conceptually, fairness
+should primarily be a cumulative effect from regular, lower priority
+scans.  Once the VM is in trouble and needs to escalate scan targets to
+make forward progress, fairness needs to take a backseat.  This is also
+acknowledged by the myriad exceptions in get_scan_count().  This patch
+makes fairness decrease gradually, as it keeps fairness work static over
+increasing priority levels with growing scan targets.  This should make
+more sense - although we may have to re-visit the exact values.
+
+Link: https://lkml.kernel.org/r/20220802162811.39216-1-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Rik van Riel <riel@surriel.com>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ mm/vmscan.c | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 04d8b88e5..0317d4cf4 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -5844,8 +5844,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 	enum lru_list lru;
+ 	unsigned long nr_reclaimed = 0;
+ 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
++	bool proportional_reclaim;
+ 	struct blk_plug plug;
+-	bool scan_adjusted;
+ 
+ 	if (lru_gen_enabled()) {
+ 		lru_gen_shrink_lruvec(lruvec, sc);
+@@ -5868,8 +5868,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 	 * abort proportional reclaim if either the file or anon lru has already
+ 	 * dropped to zero at the first pass.
+ 	 */
+-	scan_adjusted = (!cgroup_reclaim(sc) && !current_is_kswapd() &&
+-			 sc->priority == DEF_PRIORITY);
++	proportional_reclaim = (!cgroup_reclaim(sc) && !current_is_kswapd() &&
++				sc->priority == DEF_PRIORITY);
+ 
+ 	blk_start_plug(&plug);
+ 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
+@@ -5889,7 +5889,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 
+ 		cond_resched();
+ 
+-		if (nr_reclaimed < nr_to_reclaim || scan_adjusted)
++		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
+ 			continue;
+ 
+ 		/*
+@@ -5940,8 +5940,6 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 		nr_scanned = targets[lru] - nr[lru];
+ 		nr[lru] = targets[lru] * (100 - percentage) / 100;
+ 		nr[lru] -= min(nr[lru], nr_scanned);
+-
+-		scan_adjusted = true;
+ 	}
+ 	blk_finish_plug(&plug);
+ 	sc->nr_reclaimed += nr_reclaimed;
+-- 
+2.38.1.385.g3b08839926
+
+
+From 8f933136ba3d370dfb10fec094d246afe2931871 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Tue, 20 Sep 2022 19:06:33 +0200
+Subject: [PATCH 04/16] lib/vdso: use "grep -E" instead of "egrep"
+
+The latest version of grep claims the egrep is now obsolete so the build
+now contains warnings that look like:
+	egrep: warning: egrep is obsolescent; using grep -E
+fix this up by moving the vdso Makefile to use "grep -E" instead.
+
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ lib/vdso/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/vdso/Makefile b/lib/vdso/Makefile
+index c415a685d..e814061d6 100644
+--- a/lib/vdso/Makefile
++++ b/lib/vdso/Makefile
+@@ -17,6 +17,6 @@ $(error ARCH_REL_TYPE_ABS is not set)
+ endif
+ 
+ quiet_cmd_vdso_check = VDSOCHK $@
+-      cmd_vdso_check = if $(OBJDUMP) -R $@ | egrep -h "$(ARCH_REL_TYPE_ABS)"; \
++      cmd_vdso_check = if $(OBJDUMP) -R $@ | grep -E -h "$(ARCH_REL_TYPE_ABS)"; \
+ 		       then (echo >&2 "$@: dynamic relocations are not supported"; \
+ 			     rm -f $@; /bin/false); fi
+-- 
+2.38.1.385.g3b08839926
+
+
+From 0264ed1de0120800f767505b8f2b0f92777ab413 Mon Sep 17 00:00:00 2001
+From: Ian Pilcher <arequipeno@gmail.com>
+Date: Mon, 26 Sep 2022 11:25:03 -0500
+Subject: [PATCH 05/16] leds: trigger: Add block device LED trigger
+
+Add "blkdev" LED trigger to blink LEDs in response to block device
+activity.
+
+Add LEDS_TRIGGER_BLKDEV (tristate) config option to control building of
+the trigger.
+
+Signed-off-by: Ian Pilcher <arequipeno@gmail.com>
+---
+ drivers/leds/trigger/Kconfig          |    9 +
+ drivers/leds/trigger/Makefile         |    1 +
+ drivers/leds/trigger/ledtrig-blkdev.c | 1220 +++++++++++++++++++++++++
+ 3 files changed, 1230 insertions(+)
+ create mode 100644 drivers/leds/trigger/ledtrig-blkdev.c
+
+diff --git a/drivers/leds/trigger/Kconfig b/drivers/leds/trigger/Kconfig
+index dc6816d36..bda249068 100644
+--- a/drivers/leds/trigger/Kconfig
++++ b/drivers/leds/trigger/Kconfig
+@@ -154,4 +154,13 @@ config LEDS_TRIGGER_TTY
+ 
+ 	  When build as a module this driver will be called ledtrig-tty.
+ 
++config LEDS_TRIGGER_BLKDEV
++	tristate "LED Trigger for block devices"
++	depends on BLOCK
++	help
++	  The blkdev LED trigger allows LEDs to be controlled by block device
++	  activity (reads and writes).
++
++	  See Documentation/leds/ledtrig-blkdev.rst.
++
+ endif # LEDS_TRIGGERS
+diff --git a/drivers/leds/trigger/Makefile b/drivers/leds/trigger/Makefile
+index 25c4db97c..d53bab5d9 100644
+--- a/drivers/leds/trigger/Makefile
++++ b/drivers/leds/trigger/Makefile
+@@ -16,3 +16,4 @@ obj-$(CONFIG_LEDS_TRIGGER_NETDEV)	+= ledtrig-netdev.o
+ obj-$(CONFIG_LEDS_TRIGGER_PATTERN)	+= ledtrig-pattern.o
+ obj-$(CONFIG_LEDS_TRIGGER_AUDIO)	+= ledtrig-audio.o
+ obj-$(CONFIG_LEDS_TRIGGER_TTY)		+= ledtrig-tty.o
++obj-$(CONFIG_LEDS_TRIGGER_BLKDEV)	+= ledtrig-blkdev.o
+diff --git a/drivers/leds/trigger/ledtrig-blkdev.c b/drivers/leds/trigger/ledtrig-blkdev.c
+new file mode 100644
+index 000000000..8614e308f
+--- /dev/null
++++ b/drivers/leds/trigger/ledtrig-blkdev.c
+@@ -0,0 +1,1220 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++/*
++ *	Block device LED trigger
++ *
++ *	Copyright 2021-2022 Ian Pilcher <arequipeno@gmail.com>
++ */
++
++#include <linux/blkdev.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/part_stat.h>
++#include <linux/xarray.h>
++
++/**
++ * DOC: Overview
++ *
++ * The ``blkdev`` LED trigger works by periodically checking the activity
++ * counters of block devices that have been linked to one or more LEDs and
++ * blinking those LED(s) if the correct type of activity has occurred.  The
++ * periodic check is scheduled with the Linux kernel's deferred work facility.
++ *
++ * Trigger-specific data about block devices and LEDs is stored in two data
++ * structures --- &struct blkdev_trig_bdev (a "BTB") and &struct blkdev_trig_led
++ * (a "BTL").  Each structure contains a &struct xarray that holds links to any
++ * linked devices of the other type.  I.e. &blkdev_trig_bdev.linked_btls
++ * contains links to all BTLs whose LEDs have been linked to the BTB's block
++ * device, and &blkdev_trig_led.linked_btbs contains links to all BTBs whose
++ * block devices have been linked to the BTL's LED.  Thus, a block device can
++ * be linked to more than one LED, and an LED can be linked to more than one
++ * block device.
++ */
++
++/* Default, minimum & maximum blink duration (milliseconds) */
++#define BLKDEV_TRIG_BLINK_DEF	75
++#define BLKDEV_TRIG_BLINK_MIN	10
++#define BLKDEV_TRIG_BLINK_MAX	86400000  /* 24 hours */
++
++/* Default, minimum & maximum activity check interval (milliseconds) */
++#define BLKDEV_TRIG_CHECK_DEF	100
++#define BLKDEV_TRIG_CHECK_MIN	25
++#define BLKDEV_TRIG_CHECK_MAX	86400000  /* 24 hours */
++
++/*
++ * If blkdev_trig_check() can't lock the mutex, how long to wait before trying
++ * again (milliseconds)
++ */
++#define BLKDEV_TRIG_CHECK_RETRY	5
++
++/* Mode argument for calls to blkdev_get_by_path() and blkdev_put() */
++#define BLKDEV_TRIG_FMODE	0
++
++/**
++ * struct blkdev_trig_bdev - Trigger-specific data about a block device.
++ * @last_checked:	Time (in jiffies) at which the trigger last checked this
++ *			block device for activity.
++ * @last_activity:	Time (in jiffies) at which the trigger last detected
++ *			activity of each type.
++ * @ios:		Activity counter values for each type, corresponding to
++ *			the timestamps in &last_activity.
++ * @index:		&xarray index, so the BTB can be included in one or more
++ *			&blkdev_trig_led.linked_btbs.
++ * @bdev:		The block device.
++ * @linked_btls:	The BTLs that represent the LEDs linked to the BTB's
++ *			block device.
++ *
++ * Every block device linked to at least one LED gets a "BTB."  A BTB is created
++ * when a block device that is not currently linked to any LEDs is linked to an
++ * LED.
++ *
++ * A BTB is freed when one of the following occurs:
++ *
++ * * The number of LEDs linked to the block device becomes zero, because it has
++ *   been unlinked from its last LED using the trigger's &sysfs interface.
++ *
++ * * The number of LEDs linked to the block device becomes zero, because the
++ *   last LED to which it was linked has been disassociated from the trigger
++ *   (which happens automatically if the LED device is removed from the system).
++ *
++ * * The BTB's block device is removed from the system.  To accomodate this
++ *   scenario, BTB's are created as device resources, so that the release
++ *   function will be called by the driver core when the device is removed.
++ */
++struct blkdev_trig_bdev {
++	unsigned long		last_checked;
++	unsigned long		last_activity[NR_STAT_GROUPS];
++	unsigned long		ios[NR_STAT_GROUPS];
++	unsigned long		index;
++	struct block_device	*bdev;
++	struct xarray		linked_btls;
++};
++
++/**
++ * struct blkdev_trig_led - Trigger-specific data about an LED.
++ * @last_checked:	Time (in jiffies) at which the trigger last checked the
++ *			the block devices linked to this LED for activity.
++ * @index:		&xarray index, so the BTL can be included in one or more
++ *			&blkdev_trig_bdev.linked_btls.
++ * @mode:		Bitmask for types of block device activity that will
++ *			cause this LED to blink --- reads, writes, discards,
++ *			etc.
++ * @led:		The LED device.
++ * @blink_msec:		Duration of a blink (milliseconds).
++ * @check_jiffies:	Frequency with which block devices linked to this LED
++ *			should be checked for activity (jiffies).
++ * @linked_btbs:	The BTBs that represent the block devices linked to the
++ *			BTL's LED.
++ * @all_btls_node:	The BTL's node in the module's list of all BTLs.
++ *
++ * Every LED associated with the block device trigger gets a "BTL."  A BTL is
++ * created when the trigger is "activated" on an LED (usually by writing
++ * ``blkdev`` to the LED's &sysfs &trigger attribute).  A BTL is freed wnen its
++ * LED is disassociated from the trigger, either through the trigger's &sysfs
++ * interface or because the LED device is removed from the system.
++ */
++struct blkdev_trig_led {
++	unsigned long		last_checked;
++	unsigned long		index;
++	unsigned long		mode;  /* must be ulong for atomic bit ops */
++	struct led_classdev	*led;
++	unsigned int		blink_msec;
++	unsigned int		check_jiffies;
++	struct xarray		linked_btbs;
++	struct hlist_node	all_btls_node;
++};
++
++/* Protects everything except atomic LED attributes */
++static DEFINE_MUTEX(blkdev_trig_mutex);
++
++/* BTB device resource release function */
++static void blkdev_trig_btb_release(struct device *dev, void *res);
++
++/* Index for next BTB or BTL */
++static unsigned long blkdev_trig_next_index;
++
++/* All LEDs associated with the trigger */
++static HLIST_HEAD(blkdev_trig_all_btls);
++
++/* Delayed work to periodically check for activity & blink LEDs */
++static void blkdev_trig_check(struct work_struct *work);
++static DECLARE_DELAYED_WORK(blkdev_trig_work, blkdev_trig_check);
++
++/* When is the delayed work scheduled to run next (jiffies) */
++static unsigned long blkdev_trig_next_check;
++
++/* Total number of BTB-to-BTL links */
++static unsigned int blkdev_trig_link_count;
++
++/* Empty sysfs attribute list for next 2 declarations */
++static struct attribute *blkdev_trig_attrs_empty[] = { NULL };
++
++/* linked_leds sysfs directory for block devs linked to 1 or more LEDs */
++static const struct attribute_group blkdev_trig_linked_leds = {
++	.name	= "linked_leds",
++	.attrs	= blkdev_trig_attrs_empty,
++};
++
++/* linked_devices sysfs directory for each LED associated with the trigger */
++static const struct attribute_group blkdev_trig_linked_devs = {
++	.name	= "linked_devices",
++	.attrs	= blkdev_trig_attrs_empty,
++};
++
++
++/*
++ *
++ *	Delayed work to check for activity & blink LEDs
++ *
++ */
++
++/**
++ * blkdev_trig_blink() - Blink an LED, if the correct type of activity has
++ *	occurred on the block device.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ * Return:	&true if the LED is blinked, &false if not.
++ */
++static bool blkdev_trig_blink(const struct blkdev_trig_led *btl,
++			      const struct blkdev_trig_bdev *btb)
++{
++	unsigned long mode, mask, delay_on, delay_off;
++	enum stat_group i;
++
++	mode = READ_ONCE(btl->mode);
++
++	for (i = STAT_READ, mask = 1; i <= STAT_FLUSH; ++i, mask <<= 1) {
++
++		if (!(mode & mask))
++			continue;
++
++		if (time_before_eq(btb->last_activity[i], btl->last_checked))
++			continue;
++
++		delay_on = READ_ONCE(btl->blink_msec);
++		delay_off = 1;	/* 0 leaves LED turned on */
++
++		led_blink_set_oneshot(btl->led, &delay_on, &delay_off, 0);
++		return true;
++	}
++
++	return false;
++}
++
++/**
++ * blkdev_trig_update_btb() - Update a BTB's activity counters and timestamps.
++ * @btb:	The BTB
++ * @now:	Timestamp (in jiffies)
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_update_btb(struct blkdev_trig_bdev *btb,
++				   unsigned long now)
++{
++	unsigned long new_ios;
++	enum stat_group i;
++
++	for (i = STAT_READ; i <= STAT_FLUSH; ++i) {
++
++		new_ios = part_stat_read(btb->bdev, ios[i]);
++
++		if (new_ios != btb->ios[i]) {
++			btb->ios[i] = new_ios;
++			btb->last_activity[i] = now;
++		}
++	}
++
++	btb->last_checked = now;
++}
++
++/**
++ * blkdev_trig_check() - Check linked devices for activity and blink LEDs.
++ * @work:	Delayed work (&blkdev_trig_work)
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ */
++static void blkdev_trig_check(struct work_struct *work)
++{
++	struct blkdev_trig_led *btl;
++	struct blkdev_trig_bdev *btb;
++	unsigned long index, delay, now, led_check, led_delay;
++	bool blinked;
++
++	if (!mutex_trylock(&blkdev_trig_mutex)) {
++		delay = msecs_to_jiffies(BLKDEV_TRIG_CHECK_RETRY);
++		goto exit_reschedule;
++	}
++
++	now = jiffies;
++	delay = ULONG_MAX;
++
++	hlist_for_each_entry (btl, &blkdev_trig_all_btls, all_btls_node) {
++
++		led_check = btl->last_checked + btl->check_jiffies;
++
++		if (time_before_eq(led_check, now)) {
++
++			blinked = false;
++
++			xa_for_each (&btl->linked_btbs, index, btb) {
++
++				if (btb->last_checked != now)
++					blkdev_trig_update_btb(btb, now);
++				if (!blinked)
++					blinked = blkdev_trig_blink(btl, btb);
++			}
++
++			btl->last_checked = now;
++			led_delay = btl->check_jiffies;
++
++		} else {
++			led_delay = led_check - now;
++		}
++
++		if (led_delay < delay)
++			delay = led_delay;
++	}
++
++	mutex_unlock(&blkdev_trig_mutex);
++
++exit_reschedule:
++	WARN_ON_ONCE(delay == ULONG_MAX);
++	WARN_ON_ONCE(!schedule_delayed_work(&blkdev_trig_work, delay));
++}
++
++/**
++ * blkdev_trig_sched_led() - Set the schedule of the delayed work when a new
++ *	LED is added to the schedule.
++ * @btl:	The BTL that represents the LED
++ *
++ * Called when the number of block devices to which an LED is linked becomes
++ * non-zero.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_sched_led(const struct blkdev_trig_led *btl)
++{
++	unsigned long delay = READ_ONCE(btl->check_jiffies);
++	unsigned long check_by = jiffies + delay;
++
++	/*
++	 * If no other LED-to-block device links exist, simply schedule the
++	 * delayed work according to this LED's check_interval attribute
++	 * (check_jiffies).
++	 */
++	if (blkdev_trig_link_count == 0) {
++		WARN_ON(!schedule_delayed_work(&blkdev_trig_work, delay));
++		blkdev_trig_next_check = check_by;
++		return;
++	}
++
++	/*
++	 * If the next check is already scheduled to occur soon enough to
++	 * accomodate this LED's check_interval, the schedule doesn't need
++	 * to be changed.
++	 */
++	if (time_after_eq(check_by, blkdev_trig_next_check))
++		return;
++
++	/*
++	 * Modify the schedule, so that the delayed work runs soon enough for
++	 * this LED.
++	 */
++	WARN_ON(!mod_delayed_work(system_wq, &blkdev_trig_work, delay));
++	blkdev_trig_next_check = check_by;
++}
++
++
++/*
++ *
++ *	Linking and unlinking LEDs and block devices
++ *
++ */
++
++/**
++ * blkdev_trig_link() - Link a block device to an LED.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ * Return:	&0 on success, negative &errno on error.
++ */
++static int blkdev_trig_link(struct blkdev_trig_led *btl,
++			    struct blkdev_trig_bdev *btb)
++{
++	bool led_first_link;
++	int err;
++
++	led_first_link = xa_empty(&btl->linked_btbs);
++
++	err = xa_insert(&btb->linked_btls, btl->index, btl, GFP_KERNEL);
++	if (err)
++		return err;
++
++	err = xa_insert(&btl->linked_btbs, btb->index, btb, GFP_KERNEL);
++	if (err)
++		goto error_erase_btl;
++
++	/* Create /sys/class/block/<bdev>/linked_leds/<led> symlink */
++	err = sysfs_add_link_to_group(bdev_kobj(btb->bdev),
++				      blkdev_trig_linked_leds.name,
++				      &btl->led->dev->kobj, btl->led->name);
++	if (err)
++		goto error_erase_btb;
++
++	/* Create /sys/class/leds/<led>/linked_devices/<bdev> symlink */
++	err = sysfs_add_link_to_group(&btl->led->dev->kobj,
++				      blkdev_trig_linked_devs.name,
++				      bdev_kobj(btb->bdev),
++				      dev_name(&btb->bdev->bd_device));
++	if (err)
++		goto error_remove_symlink;
++
++	/*
++	 * If this is the first block device linked to this LED, the delayed
++	 * work schedule may need to be changed.
++	 */
++	if (led_first_link)
++		blkdev_trig_sched_led(btl);
++
++	++blkdev_trig_link_count;
++
++	return 0;
++
++error_remove_symlink:
++	sysfs_remove_link_from_group(bdev_kobj(btb->bdev),
++				     blkdev_trig_linked_leds.name,
++				     btl->led->name);
++error_erase_btb:
++	xa_erase(&btl->linked_btbs, btb->index);
++error_erase_btl:
++	xa_erase(&btb->linked_btls, btl->index);
++	return err;
++}
++
++/**
++ * blkdev_trig_put_btb() - Remove and free a BTB, if it is no longer needed.
++ * @btb:	The BTB
++ *
++ * Does nothing if the BTB (block device) is still linked to at least one LED.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_put_btb(struct blkdev_trig_bdev *btb)
++{
++	struct block_device *bdev = btb->bdev;
++	int err;
++
++	if (xa_empty(&btb->linked_btls)) {
++
++		sysfs_remove_group(bdev_kobj(bdev), &blkdev_trig_linked_leds);
++		err = devres_destroy(&bdev->bd_device, blkdev_trig_btb_release,
++				     NULL, NULL);
++		WARN_ON(err);
++	}
++}
++
++/**
++ * _blkdev_trig_unlink_always() - Perform the unconditionally required steps of
++ *	unlinking a block device from an LED.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * When a block device is unlinked from an LED, certain steps must be performed
++ * only if the block device is **not** being released.  This function performs
++ * those steps that are **always** required, whether or not the block device is
++ * being released.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void _blkdev_trig_unlink_always(struct blkdev_trig_led *btl,
++				       struct blkdev_trig_bdev *btb)
++{
++	--blkdev_trig_link_count;
++
++	if (blkdev_trig_link_count == 0)
++		WARN_ON(!cancel_delayed_work_sync(&blkdev_trig_work));
++
++	xa_erase(&btb->linked_btls, btl->index);
++	xa_erase(&btl->linked_btbs, btb->index);
++
++	/* Remove /sys/class/leds/<led>/linked_devices/<bdev> symlink */
++	sysfs_remove_link_from_group(&btl->led->dev->kobj,
++				     blkdev_trig_linked_devs.name,
++				     dev_name(&btb->bdev->bd_device));
++}
++
++/**
++ * blkdev_trig_unlink_norelease() - Unlink an LED from a block device that is
++ *	**not** being released.
++ * @btl:	The BTL that represents the LED.
++ * @btb:	The BTB that represents the block device.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_unlink_norelease(struct blkdev_trig_led *btl,
++					 struct blkdev_trig_bdev *btb)
++{
++	_blkdev_trig_unlink_always(btl, btb);
++
++	/* Remove /sys/class/block/<bdev>/linked_leds/<led> symlink */
++	sysfs_remove_link_from_group(bdev_kobj(btb->bdev),
++				     blkdev_trig_linked_leds.name,
++				     btl->led->name);
++
++	blkdev_trig_put_btb(btb);
++}
++
++/**
++ * blkdev_trig_unlink_release() - Unlink an LED from a block device that is
++ *	being released.
++ * @btl:	The BTL that represents the LED
++ * @btb:	The BTB that represents the block device
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ */
++static void blkdev_trig_unlink_release(struct blkdev_trig_led *btl,
++				       struct blkdev_trig_bdev *btb)
++{
++	_blkdev_trig_unlink_always(btl, btb);
++
++	/*
++	 * If the BTB is being released, the driver core has already removed the
++	 * device's attribute groups, and the BTB will be freed automatically,
++	 * so there's nothing else to do.
++	 */
++}
++
++
++/*
++ *
++ *	BTB creation
++ *
++ */
++
++/**
++ * blkdev_trig_btb_release() - BTB device resource release function.
++ * @dev:	The block device
++ * @res:	The BTB
++ *
++ * Called by the driver core when a block device with a BTB is removed.
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ */
++static void blkdev_trig_btb_release(struct device *dev, void *res)
++{
++	struct blkdev_trig_bdev *btb = res;
++	struct blkdev_trig_led *btl;
++	unsigned long index;
++
++	mutex_lock(&blkdev_trig_mutex);
++
++	xa_for_each (&btb->linked_btls, index, btl)
++		blkdev_trig_unlink_release(btl, btb);
++
++	mutex_unlock(&blkdev_trig_mutex);
++}
++
++/**
++ * blkdev_trig_get_bdev() - Get a block device by path.
++ * @path:	The value written to an LED's &link_dev_by_path or
++ *		&unlink_dev_by_path attribute, which should be the path to a
++ *		special file that represents a block device
++ * @len:	The number of characters in &path (not including its
++ *		terminating null)
++ *
++ * The caller must call blkdev_put() when finished with the device.
++ *
++ * Context:	Process context.
++ * Return:	The block device, or an error pointer.
++ */
++static struct block_device *blkdev_trig_get_bdev(const char *path, size_t len)
++{
++	struct block_device *bdev;
++	char *buf;
++
++	buf = kmemdup(path, len + 1, GFP_KERNEL);  /* +1 to include null */
++	if (buf == NULL)
++		return ERR_PTR(-ENOMEM);
++
++	bdev = blkdev_get_by_path(strim(buf), BLKDEV_TRIG_FMODE, THIS_MODULE);
++	kfree(buf);
++	return bdev;
++}
++
++/**
++ * blkdev_trig_get_btb() - Find or create the BTB for a block device.
++ * @path:	The value written to an LED's &link_dev_by_path attribute,
++ *		which should be the path to a special file that represents a
++ *		block device
++ * @len:	The number of characters in &path
++ *
++ * If a new BTB is created, because the block device was not previously linked
++ * to any LEDs, the block device's &linked_leds &sysfs directory is created.
++ *
++ * Context:	Process context.  Caller must hold &blkdev_trig_mutex.
++ * Return:	Pointer to the BTB, error pointer on error.
++ */
++static struct blkdev_trig_bdev *blkdev_trig_get_btb(const char *path,
++						    size_t len)
++{
++	struct block_device *bdev;
++	struct blkdev_trig_bdev *btb;
++	int err;
++
++	bdev = blkdev_trig_get_bdev(path, len);
++	if (IS_ERR(bdev))
++		return ERR_CAST(bdev);
++
++	btb = devres_find(&bdev->bd_device, blkdev_trig_btb_release,
++			  NULL, NULL);
++	if (btb != NULL) {
++		err = 0;
++		goto exit_put_bdev;
++	}
++
++	if (blkdev_trig_next_index == ULONG_MAX) {
++		err = -EOVERFLOW;
++		goto exit_put_bdev;
++	}
++
++	btb = devres_alloc(blkdev_trig_btb_release, sizeof(*btb), GFP_KERNEL);
++	if (btb == NULL) {
++		err = -ENOMEM;
++		goto exit_put_bdev;
++	}
++
++	err = sysfs_create_group(bdev_kobj(bdev), &blkdev_trig_linked_leds);
++	if (err)
++		goto exit_free_btb;
++
++	btb->index = blkdev_trig_next_index++;
++	btb->bdev = bdev;
++	xa_init(&btb->linked_btls);
++
++	/* Populate BTB activity counters */
++	blkdev_trig_update_btb(btb, jiffies);
++
++	devres_add(&bdev->bd_device, btb);
++
++exit_free_btb:
++	if (err)
++		devres_free(btb);
++exit_put_bdev:
++	blkdev_put(bdev, BLKDEV_TRIG_FMODE);
++	return err ? ERR_PTR(err) : btb;
++}
++
++
++/*
++ *
++ *	Activating and deactivating the trigger on an LED
++ *
++ */
++
++/**
++ * blkdev_trig_activate() - Called by the LEDs subsystem when an LED is
++ *	associated with the trigger.
++ * @led:	The LED
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&0 on success, negative &errno on error.
++ */
++static int blkdev_trig_activate(struct led_classdev *led)
++{
++	struct blkdev_trig_led *btl;
++	int err;
++
++	btl = kzalloc(sizeof(*btl), GFP_KERNEL);
++	if (btl == NULL)
++		return -ENOMEM;
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		goto exit_free;
++
++	if (blkdev_trig_next_index == ULONG_MAX) {
++		err = -EOVERFLOW;
++		goto exit_unlock;
++	}
++
++	btl->index = blkdev_trig_next_index++;
++	btl->last_checked = jiffies;
++	btl->mode = -1;  /* set all bits */
++	btl->led = led;
++	btl->blink_msec = BLKDEV_TRIG_BLINK_DEF;
++	btl->check_jiffies = msecs_to_jiffies(BLKDEV_TRIG_CHECK_DEF);
++	xa_init(&btl->linked_btbs);
++
++	hlist_add_head(&btl->all_btls_node, &blkdev_trig_all_btls);
++	led_set_trigger_data(led, btl);
++
++exit_unlock:
++	mutex_unlock(&blkdev_trig_mutex);
++exit_free:
++	if (err)
++		kfree(btl);
++	return err;
++}
++
++/**
++ * blkdev_trig_deactivate() - Called by the the LEDs subsystem when an LED is
++ *	disassociated from the trigger.
++ * @led:	The LED
++ *
++ * The LEDs subsystem also calls this function when an LED associated with the
++ * trigger is removed or when the trigger is unregistered (if the module is
++ * unloaded).
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ */
++static void blkdev_trig_deactivate(struct led_classdev *led)
++{
++	struct blkdev_trig_led *btl = led_get_trigger_data(led);
++	struct blkdev_trig_bdev *btb;
++	unsigned long index;
++
++	mutex_lock(&blkdev_trig_mutex);
++
++	xa_for_each (&btl->linked_btbs, index, btb)
++		blkdev_trig_unlink_norelease(btl, btb);
++
++	hlist_del(&btl->all_btls_node);
++	kfree(btl);
++
++	mutex_unlock(&blkdev_trig_mutex);
++}
++
++
++/*
++ *
++ *	Link-related attribute store functions
++ *
++ */
++
++/**
++ * link_dev_by_path_store() - &link_dev_by_path device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &link_dev_by_path attribute (&dev_attr_link_dev_by_path)
++ * @buf:	The value written to the attribute, which should be the path to
++ *		a special file that represents a block device to be linked to
++ *		the LED (e.g. ``/dev/sda``)
++ * @count:	The number of characters in &buf
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t link_dev_by_path_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	struct blkdev_trig_bdev *btb;
++	int err;
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		return err;
++
++	btb = blkdev_trig_get_btb(buf, count);
++	if (IS_ERR(btb)) {
++		err = PTR_ERR(btb);
++		goto exit_unlock;
++	}
++
++	if (xa_load(&btb->linked_btls, btl->index) != NULL) {
++		err = -EEXIST;
++		goto exit_put_btb;
++	}
++
++	err = blkdev_trig_link(btl, btb);
++
++exit_put_btb:
++	if (err)
++		blkdev_trig_put_btb(btb);
++exit_unlock:
++	mutex_unlock(&blkdev_trig_mutex);
++	return err ? : count;
++}
++
++/**
++ * unlink_dev_by_path_store() - &unlink_dev_by_path device attribute store
++ *	function.
++ * @dev:	The LED device
++ * @attr:	The &unlink_dev_by_path attribute (&dev_attr_unlink_dev_by_path)
++ * @buf:	The value written to the attribute, which should be the path to
++ *		a special file that represents a block device to be unlinked
++ *		from the LED (e.g. ``/dev/sda``)
++ * @count:	The number of characters in &buf
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t unlink_dev_by_path_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	struct block_device *bdev;
++	struct blkdev_trig_bdev *btb;
++	int err;
++
++	bdev = blkdev_trig_get_bdev(buf, count);
++	if (IS_ERR(bdev))
++		return PTR_ERR(bdev);
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		goto exit_put_bdev;
++
++	btb = devres_find(&bdev->bd_device, blkdev_trig_btb_release,
++			  NULL, NULL);
++	if (btb == NULL) {
++		err = -EUNATCH;  /* bdev isn't linked to any LED */
++		goto exit_unlock;
++	}
++
++	if (xa_load(&btb->linked_btls, btl->index) == NULL) {
++		err = -EUNATCH;  /* bdev isn't linked to this LED */
++		goto exit_unlock;
++	}
++
++	blkdev_trig_unlink_norelease(btl, btb);
++
++exit_unlock:
++	mutex_unlock(&blkdev_trig_mutex);
++exit_put_bdev:
++	blkdev_put(bdev, BLKDEV_TRIG_FMODE);
++	return err ? : count;
++}
++
++/**
++ * unlink_dev_by_name_store() - &unlink_dev_by_name device attribute store
++ *	function.
++ * @dev:	The LED device
++ * @attr:	The &unlink_dev_by_name attribute (&dev_attr_unlink_dev_by_name)
++ * @buf:	The value written to the attribute, which should be the kernel
++ *		name of a block device to be unlinked from the LED (e.g.
++ *		``sda``)
++ * @count:	The number of characters in &buf
++ *
++ * Context:	Process context.  Takes and releases &blkdev_trig_mutex.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t unlink_dev_by_name_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	struct blkdev_trig_bdev *btb;
++	unsigned long index;
++	int err;
++
++	err = mutex_lock_interruptible(&blkdev_trig_mutex);
++	if (err)
++		return err;
++
++	err = -EUNATCH;
++
++	xa_for_each (&btl->linked_btbs, index, btb) {
++
++		if (sysfs_streq(dev_name(&btb->bdev->bd_device), buf)) {
++			blkdev_trig_unlink_norelease(btl, btb);
++			err = 0;
++			break;
++		}
++	}
++
++	mutex_unlock(&blkdev_trig_mutex);
++	return err ? : count;
++}
++
++
++/*
++ *
++ *	Atomic attribute show & store functions
++ *
++ */
++
++/**
++ * blink_time_show() - &blink_time device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_time attribute (&dev_attr_blink_time)
++ * @buf:	Output buffer
++ *
++ * Writes the value of &blkdev_trig_led.blink_msec to &buf.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_time_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	const struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++
++	return sprintf(buf, "%u\n", READ_ONCE(btl->blink_msec));
++}
++
++/**
++ * blink_time_store() - &blink_time device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_time attribute (&dev_attr_blink_time)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets &blkdev_trig_led.blink_msec to the value in &buf.
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_time_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++	unsigned int value;
++	int err;
++
++	err = kstrtouint(buf, 0, &value);
++	if (err)
++		return err;
++
++	if (value < BLKDEV_TRIG_BLINK_MIN || value > BLKDEV_TRIG_BLINK_MAX)
++		return -ERANGE;
++
++	WRITE_ONCE(btl->blink_msec, value);
++	return count;
++}
++
++/**
++ * check_interval_show() - &check_interval device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &check_interval attribute (&dev_attr_check_interval)
++ * @buf:	Output buffer
++ *
++ * Writes the value of &blkdev_trig_led.check_jiffies (converted to
++ * milliseconds) to &buf.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t check_interval_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct blkdev_trig_led *btl = led_trigger_get_drvdata(dev);
++
++	return sprintf(buf, "%u\n",
++		       jiffies_to_msecs(READ_ONCE(btl->check_jiffies)));
++}
++
++/**
++ * check_interval_store() - &check_interval device attribute store function
++ * @dev:	The LED device
++ * @attr:	The &check_interval attribute (&dev_attr_check_interval)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets &blkdev_trig_led.check_jiffies to the value in &buf (after converting
++ * from milliseconds).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t check_interval_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct blkdev_trig_led *led = led_trigger_get_drvdata(dev);
++	unsigned int value;
++	int err;
++
++	err = kstrtouint(buf, 0, &value);
++	if (err)
++		return err;
++
++	if (value < BLKDEV_TRIG_CHECK_MIN || value > BLKDEV_TRIG_CHECK_MAX)
++		return -ERANGE;
++
++	WRITE_ONCE(led->check_jiffies, msecs_to_jiffies(value));
++
++	return count;
++}
++
++/**
++ * blkdev_trig_mode_show() - Helper for boolean attribute show functions.
++ * @led:	The LED
++ * @buf:	Output buffer
++ * @bit:	Which bit to show
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static int blkdev_trig_mode_show(const struct blkdev_trig_led *led, char *buf,
++				 enum stat_group bit)
++{
++	return sprintf(buf, READ_ONCE(led->mode) & (1 << bit) ? "Y\n" : "N\n");
++}
++
++/**
++ * blkdev_trig_mode_store() - Helper for boolean attribute store functions.
++ * @led:	The LED
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ * @bit:	Which bit to set
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static int blkdev_trig_mode_store(struct blkdev_trig_led *led,
++				  const char *buf, size_t count,
++				  enum stat_group bit)
++{
++	bool set;
++	int err;
++
++	err = kstrtobool(buf, &set);
++	if (err)
++		return err;
++
++	if (set)
++		set_bit(bit, &led->mode);
++	else
++		clear_bit(bit, &led->mode);
++
++	return count;
++}
++
++/**
++ * blink_on_read_show() - &blink_on_read device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_read attribute (&dev_attr_blink_on_read)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending on whether the &STAT_READ bit in
++ * &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_read_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_READ);
++}
++
++/**
++ * blink_on_read_store() - &blink_on_read device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_read attribute (&dev_attr_blink_on_read)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_READ bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_read_store(struct device *dev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_READ);
++}
++
++/**
++ * blink_on_write_show() - &blink_on_write device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_write attribute (&dev_attr_blink_on_write)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending on whether the &STAT_WRITE bit in
++ * in &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_write_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_WRITE);
++}
++
++/**
++ * blink_on_write_store() - &blink_on_write device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_write attribute (&dev_attr_blink_on_write)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_WRITE bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_write_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_WRITE);
++}
++
++/**
++ * blink_on_flush_show() - &blink_on_flush device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_flush attribute (&dev_attr_blink_on_flush)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending whether the &STAT_FLUSH bit in
++ * &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_flush_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_FLUSH);
++}
++
++/**
++ * blink_on_flush_store() - &blink_on_flush device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_flush attribute (&dev_attr_blink_on_flush)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_FLUSH bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_flush_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_FLUSH);
++}
++
++/**
++ * blink_on_discard_show() - &blink_on_discard device attribute show function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_discard attribute (&dev_attr_blink_on_discard)
++ * @buf:	Output buffer
++ *
++ * Writes ``Y`` or ``N`` to &buf, depending on whether the &STAT_DISCARD bit in
++ * &blkdev_trig_led.mode is set or cleared.
++ *
++ * Context:	Process context.
++ * Return:	The number of characters written to &buf.
++ */
++static ssize_t blink_on_discard_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	return blkdev_trig_mode_show(led_trigger_get_drvdata(dev),
++				     buf, STAT_DISCARD);
++}
++
++/**
++ * blink_on_discard_store() - &blink_on_discard device attribute store function.
++ * @dev:	The LED device
++ * @attr:	The &blink_on_discard attribute (&dev_attr_blink_on_discard)
++ * @buf:	The new value (as written to the &sysfs attribute)
++ * @count:	The number of characters in &buf
++ *
++ * Sets the &STAT_DISCARD bit in &blkdev_trig_led.mode to the value in &buf
++ * (interpretted as a boolean).
++ *
++ * Context:	Process context.
++ * Return:	&count on success, negative &errno on error.
++ */
++static ssize_t blink_on_discard_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	return blkdev_trig_mode_store(led_trigger_get_drvdata(dev),
++				      buf, count, STAT_DISCARD);
++}
++
++/* Device attributes */
++static DEVICE_ATTR_WO(link_dev_by_path);
++static DEVICE_ATTR_WO(unlink_dev_by_path);
++static DEVICE_ATTR_WO(unlink_dev_by_name);
++static DEVICE_ATTR_RW(blink_time);
++static DEVICE_ATTR_RW(check_interval);
++static DEVICE_ATTR_RW(blink_on_read);
++static DEVICE_ATTR_RW(blink_on_write);
++static DEVICE_ATTR_RW(blink_on_flush);
++static DEVICE_ATTR_RW(blink_on_discard);
++
++/* Device attributes in LED directory (/sys/class/leds/<led>/...) */
++static struct attribute *blkdev_trig_attrs[] = {
++	&dev_attr_link_dev_by_path.attr,
++	&dev_attr_unlink_dev_by_path.attr,
++	&dev_attr_unlink_dev_by_name.attr,
++	&dev_attr_blink_time.attr,
++	&dev_attr_check_interval.attr,
++	&dev_attr_blink_on_read.attr,
++	&dev_attr_blink_on_write.attr,
++	&dev_attr_blink_on_flush.attr,
++	&dev_attr_blink_on_discard.attr,
++	NULL
++};
++
++/* Unnamed attribute group == no subdirectory */
++static const struct attribute_group blkdev_trig_attr_group = {
++	.attrs	= blkdev_trig_attrs,
++};
++
++/* Attribute groups for the trigger */
++static const struct attribute_group *blkdev_trig_attr_groups[] = {
++	&blkdev_trig_attr_group,   /* /sys/class/leds/<led>/... */
++	&blkdev_trig_linked_devs,  /* /sys/class/leds/<led>/linked_devices/ */
++	NULL
++};
++
++/* Trigger registration data */
++static struct led_trigger blkdev_trig_trigger = {
++	.name		= "blkdev",
++	.activate	= blkdev_trig_activate,
++	.deactivate	= blkdev_trig_deactivate,
++	.groups		= blkdev_trig_attr_groups,
++};
++
++/**
++ * blkdev_trig_init() - Block device LED trigger initialization.
++ *
++ * Registers the ``blkdev`` LED trigger.
++ *
++ * Return:	&0 on success, negative &errno on failure.
++ */
++static int __init blkdev_trig_init(void)
++{
++	return led_trigger_register(&blkdev_trig_trigger);
++}
++module_init(blkdev_trig_init);
++
++/**
++ * blkdev_trig_exit() - Block device LED trigger module exit.
++ *
++ * Unregisters the ``blkdev`` LED trigger.
++ */
++static void __exit blkdev_trig_exit(void)
++{
++	led_trigger_unregister(&blkdev_trig_trigger);
++}
++module_exit(blkdev_trig_exit);
++
++MODULE_DESCRIPTION("Block device LED trigger");
++MODULE_AUTHOR("Ian Pilcher <arequipeno@gmail.com>");
++MODULE_LICENSE("GPL v2");
+-- 
+2.38.1.385.g3b08839926
+
+
+From c1afcd34b96b17e152b5d2453b2f0f5cd03e6acf Mon Sep 17 00:00:00 2001
+From: Ian Pilcher <arequipeno@gmail.com>
+Date: Mon, 26 Sep 2022 11:25:02 -0500
+Subject: [PATCH 06/16] docs: Add block device (blkdev) LED trigger
+ documentation
+
+Add Documentation/ABI/testing/sysfs-class-led-trigger-blkdev to
+document:
+
+  * /sys/class/leds/<led>/blink_time
+  * /sys/class/leds/<led>/check_interval
+  * /sys/class/leds/<led>/blink_on_{read,write,discard,flush}
+  * /sys/class/leds/<led>/link_dev_by_path
+  * /sys/class/leds/<led>/unlink_dev_by_path
+  * /sys/class/leds/<led>/unlink_dev_by_name
+  * /sys/class/leds/<led>/linked_devices
+
+Add /sys/block/<disk>/linked_leds to
+Documentation/ABI/stable/sysfs-block.
+
+Add overview in Documentation/leds/ledtrig-blkdev.rst.
+
+Signed-off-by: Ian Pilcher <arequipeno@gmail.com>
+---
+ Documentation/ABI/stable/sysfs-block          |  10 ++
+ .../testing/sysfs-class-led-trigger-blkdev    |  78 +++++++++
+ Documentation/leds/index.rst                  |   1 +
+ Documentation/leds/ledtrig-blkdev.rst         | 158 ++++++++++++++++++
+ 4 files changed, 247 insertions(+)
+ create mode 100644 Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
+ create mode 100644 Documentation/leds/ledtrig-blkdev.rst
+
+diff --git a/Documentation/ABI/stable/sysfs-block b/Documentation/ABI/stable/sysfs-block
+index cd14ecb3c..853cb2601 100644
+--- a/Documentation/ABI/stable/sysfs-block
++++ b/Documentation/ABI/stable/sysfs-block
+@@ -101,6 +101,16 @@ Description:
+ 		devices that support receiving integrity metadata.
+ 
+ 
++What:		/sys/block/<disk>/linked_leds
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Directory that contains symbolic links to all LEDs that
++		are associated with (linked to) this block device by the
++		blkdev LED trigger.  Only present when at least one LED
++		is linked.  (See Documentation/leds/ledtrig-blkdev.rst.)
++
++
+ What:		/sys/block/<disk>/<partition>/alignment_offset
+ Date:		April 2009
+ Contact:	Martin K. Petersen <martin.petersen@oracle.com>
+diff --git a/Documentation/ABI/testing/sysfs-class-led-trigger-blkdev b/Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
+new file mode 100644
+index 000000000..45275eb0b
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
+@@ -0,0 +1,78 @@
++What:		/sys/class/leds/<led>/blink_time
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Time (in milliseconds) that the LED will be on during a single
++		"blink".
++
++What:		/sys/class/leds/<led>/check_interval
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Interval (in milliseconds) between checks of the block devices
++		linked to this LED.  The LED will be blinked if the correct type
++		of activity (see blink_on_{read,write,discard,flush} attributes)
++		has occurred on any of the linked devices since the previous
++		check.
++
++What:		/sys/class/leds/<led>/blink_on_read
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to read activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/blink_on_write
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to write activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/blink_on_discard
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to discard activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/blink_on_flush
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gamil.com>
++Description:
++		Boolean that determines whether the LED will blink in response
++		to cache flush activity on any of its linked block devices.
++
++What:		/sys/class/leds/<led>/link_dev_by_path
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Associate a block device with this LED by writing the path to
++		the device special file (e.g. /dev/sda) to this attribute.
++		Symbolic links are followed.
++
++What:		/sys/class/leds/<led>/unlink_dev_by_path
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Remove the association between this LED and a block device by
++		writing the path to the device special file (e.g. /dev/sda) to
++		this attribute.  Symbolic links are followed.
++
++What:		/sys/class/leds/<led>/unlink_dev_by_name
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Remove the association between this LED and a block device by
++		writing the kernel name of the device (e.g. sda) to this
++		attribute.
++
++What:		/sys/class/leds/<led>/linked_devices
++Date:		October 2022
++Contact:	Ian Pilcher <arequipeno@gmail.com>
++Description:
++		Directory containing links to all block devices that are
++		associated with this LED.  (Note that the names of the
++		symbolic links in this directory are *kernel* names, which
++		may not match the device special file paths written to
++		link_device and unlink_device.)
+diff --git a/Documentation/leds/index.rst b/Documentation/leds/index.rst
+index e5d63b940..e3c24e468 100644
+--- a/Documentation/leds/index.rst
++++ b/Documentation/leds/index.rst
+@@ -10,6 +10,7 @@ LEDs
+    leds-class
+    leds-class-flash
+    leds-class-multicolor
++   ledtrig-blkdev
+    ledtrig-oneshot
+    ledtrig-transient
+    ledtrig-usbport
+diff --git a/Documentation/leds/ledtrig-blkdev.rst b/Documentation/leds/ledtrig-blkdev.rst
+new file mode 100644
+index 000000000..9ff5b99de
+--- /dev/null
++++ b/Documentation/leds/ledtrig-blkdev.rst
+@@ -0,0 +1,158 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=================================
++Block Device (blkdev) LED Trigger
++=================================
++
++Available when ``CONFIG_LEDS_TRIGGER_BLKDEV=y`` or
++``CONFIG_LEDS_TRIGGER_BLKDEV=m``.
++
++See also:
++
++* ``Documentation/ABI/testing/sysfs-class-led-trigger-blkdev``
++* ``Documentation/ABI/stable/sysfs-block`` (``/sys/block/<disk>/linked_leds``)
++
++Overview
++========
++
++.. note::
++	The examples below use ``<LED>`` to refer to the name of a
++	system-specific LED.  If no suitable LED is available on a test
++	system (in a virtual machine, for example), it is possible to
++	use a userspace LED.  (See ``Documentation/leds/uleds.rst``.)
++
++Verify that the ``blkdev`` LED trigger is available::
++
++	# grep blkdev /sys/class/leds/<LED>/trigger
++	... rfkill-none blkdev
++
++(If the previous command produces no output, you may need to load the trigger
++module - ``modprobe ledtrig_blkdev``.  If the module is not available, check
++the value of ``CONFIG_LEDS_TRIGGER_BLKDEV`` in your kernel configuration.)
++
++Associate the LED with the ``blkdev`` LED trigger::
++
++	# echo blkdev > /sys/class/leds/<LED>/trigger
++
++	# cat /sys/class/leds/<LED>/trigger
++	... rfkill-none [blkdev]
++
++Note that several new device attributes are available in the
++``/sys/class/leds/<LED>`` directory.
++
++* ``link_dev_by_path``, ``unlink_dev_by_path``, and ``unlink_dev_by_name`` are
++  used to manage the set of block devices associated with this LED.  The LED
++  will blink when activity occurs on any of its linked devices.
++
++* ``blink_on_read``, ``blink_on_write``, ``blink_on_discard``, and
++  ``blink_on_flush`` are boolean values that determine whether the LED will
++  blink when a particular type of activity is detected on one of its linked
++  block devices.
++
++* ``blink_time`` is the duration (in milliseconds) of each blink of this LED.
++  (The minimum value is 10 milliseconds.)
++
++* ``check_interval`` is the frequency (in milliseconds) with which block devices
++  linked to this LED will be checked for activity and the LED blinked (if the
++  correct type of activity has occurred).
++
++* The ``linked_devices`` directory will contain a symbolic link to every device
++  that is associated with this LED.
++
++Link a block device to the LED::
++
++	# echo /dev/sda > /sys/class/leds/<LED>/link_dev_by_path
++
++	# ls /sys/class/leds/<LED>/linked_devices
++	sda
++
++(The value written to ``link_dev_by_path`` must be the path of the device
++special file, such as ``/dev/sda``, that represents the block device - or the
++path of a symbolic link to such a device special file.)
++
++Activity on the device will now cause the LED to blink.  The duration of each
++blink (in milliseconds) can be adjusted by setting
++``/sys/class/leds/<LED>/blink_time``.  (But see **check_interval and
++blink_time** below.)
++
++Associate a second device with the LED::
++
++	# echo /dev/sdb > /sys/class/leds/<LED>/link_dev_by_path
++
++	# ls /sys/class/leds/<LED>/linked_devices
++	sda  sdb
++
++When a block device is linked to one or more LEDs, the LEDs are linked from
++the device's ``linked_leds`` directory::
++
++	# ls /sys/class/block/sd{a,b}/linked_leds
++	/sys/class/block/sda/linked_leds:
++	<LED>
++
++	/sys/class/block/sdb/linked_leds:
++	<LED>
++
++(The ``linked_leds`` directory only exists when the block device is linked to
++at least one LED.)
++
++``check_interval`` and ``blink_time``
++=====================================
++
++* By default, linked block devices are checked for activity every 100
++  milliseconds.  This frequency can be changed for an LED via the
++  ``/sys/class/leds/<led>/check_interval`` attribute.  (The minimum value is 25
++  milliseconds.)
++
++* All block devices associated with an LED are checked for activity every
++  ``check_interval`` milliseconds, and a blink is triggered if the correct type
++  of activity (as determined by the LED's ``blink_on_*`` attributes) is
++  detected.  The duration of an LED's blink is determined by its ``blink_time``
++  attribute.  Thus (when the correct type of activity is detected), the LED will
++  be on for ``blink_time`` milliseconds and off for
++  ``check_interval - blink_time`` milliseconds.
++
++* The LED subsystem ignores new blink requests for an LED that is already in
++  in the process of blinking, so setting a ``blink_time`` greater than or equal
++  to ``check_interval`` will cause some blinks to be missed.
++
++* Because of processing times, scheduling latencies, etc., avoiding missed
++  blinks actually requires a difference of at least a few milliseconds between
++  the ``blink_time`` and ``check_interval``.  The required difference is likely
++  to vary from system to system.  As a  reference, a Thecus N5550 NAS requires a
++  difference of 7 milliseconds (e.g. ``check_interval == 100``,
++  ``blink_time == 93``).
++
++* The default values (``check_interval == 100``, ``blink_time == 75``) cause the
++  LED associated with a continuously active device to blink rapidly.  For a more
++  "always on" effect, increase the ``blink_time`` (but not too much; see the
++  previous bullet).
++
++Other Notes
++===========
++
++* Many (possibly all) types of block devices work with this trigger, including:
++
++  * SCSI (including SATA and USB) hard disk drives and SSDs
++  * SCSI (including SATA and USB) optical drives
++  * NVMe SSDs
++  * SD cards
++  * loopback block devices (``/dev/loop*``)
++  * device mapper devices, such as LVM logical volumes
++  * MD RAID devices
++  * zRAM compressed RAM-disks
++  * partitions on block devices that support them
++
++* The names of the symbolic links in ``/sys/class/leds/<LED>/linked_devices``
++  are **kernel** names, which may not match the paths used for
++  ``link_dev_by_path`` and ``unlink_dev_by_path``.  This is most likely when a
++  symbolic link is used to refer to the device (as is common with logical
++  volumes), but it can be true for any device, because nothing prevents the
++  creation of device special files with arbitrary names (e.g.
++  ``sudo mknod /foo b 8 0``).
++
++  Kernel names can be used to unlink block devices from LEDs by writing them to
++  the LED's ``unlink_dev_by_name`` attribute.
++
++* The ``blkdev`` LED trigger supports many-to-many device/LED associations.
++  A device can be associated with multiple LEDs, and an LED can be associated
++  with multiple devices.
+-- 
+2.38.1.385.g3b08839926
+
+
+From 05508aa9fc9d8a339d4837bc4f82d63001f13e65 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:13 +0800
+Subject: [PATCH 07/16] elevator: remove redundant code in
+ elv_unregister_queue()
+
+"elevator_queue *e" is already declared and initialized in the beginning
+of elv_unregister_queue().
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Eric Biggers <ebiggers@google.com>
+---
+ block/elevator.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index bd71f0fc4..20e70fd3f 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -524,8 +524,6 @@ void elv_unregister_queue(struct request_queue *q)
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+ 	if (e && e->registered) {
+-		struct elevator_queue *e = q->elevator;
+-
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
+ 
+-- 
+2.38.1.385.g3b08839926
+
+
+From a3e15ff8a7afedbf97b3870bb100e9f4329805fd Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:14 +0800
+Subject: [PATCH 08/16] blk-wbt: remove unnecessary check in
+ wbt_enable_default()
+
+If CONFIG_BLK_WBT_MQ is disabled, wbt_init() won't do anything.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/blk-wbt.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c293e08b3..c5a8c1002 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -651,7 +651,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q) && IS_ENABLED(CONFIG_BLK_WBT_MQ))
++	if (queue_is_mq(q))
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+-- 
+2.38.1.385.g3b08839926
+
+
+From 457a44170f2eabdea5ed659b37af822f9388d8da Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:15 +0800
+Subject: [PATCH 09/16] blk-wbt: make enable_state more accurate
+
+Currently, if user disable wbt through sysfs, 'enable_state' will be
+'WBT_STATE_ON_MANUAL', which will be confusing. Add a new state
+'WBT_STATE_OFF_MANUAL' to cover that case.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/blk-wbt.c |  7 ++++++-
+ block/blk-wbt.h | 12 +++++++-----
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c5a8c1002..4680691a9 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -435,8 +435,13 @@ void wbt_set_min_lat(struct request_queue *q, u64 val)
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+ 	if (!rqos)
+ 		return;
++
+ 	RQWB(rqos)->min_lat_nsec = val;
+-	RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
++	if (val)
++		RQWB(rqos)->enable_state = WBT_STATE_ON_MANUAL;
++	else
++		RQWB(rqos)->enable_state = WBT_STATE_OFF_MANUAL;
++
+ 	wbt_update_limits(RQWB(rqos));
+ }
+ 
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index 7e44eccc6..7fe98638f 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -28,13 +28,15 @@ enum {
+ };
+ 
+ /*
+- * Enable states. Either off, or on by default (done at init time),
+- * or on through manual setup in sysfs.
++ * If current state is WBT_STATE_ON/OFF_DEFAULT, it can be covered to any other
++ * state, if current state is WBT_STATE_ON/OFF_MANUAL, it can only be covered
++ * to WBT_STATE_OFF/ON_MANUAL.
+  */
+ enum {
+-	WBT_STATE_ON_DEFAULT	= 1,
+-	WBT_STATE_ON_MANUAL	= 2,
+-	WBT_STATE_OFF_DEFAULT
++	WBT_STATE_ON_DEFAULT	= 1,	/* on by default */
++	WBT_STATE_ON_MANUAL	= 2,	/* on manually by sysfs */
++	WBT_STATE_OFF_DEFAULT	= 3,	/* off by default */
++	WBT_STATE_OFF_MANUAL	= 4,	/* off manually by sysfs */
+ };
+ 
+ struct rq_wb {
+-- 
+2.38.1.385.g3b08839926
+
+
+From 49edc3969876b7fa69067133f20aced732509bc5 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:16 +0800
+Subject: [PATCH 10/16] blk-wbt: don't show valid wbt_lat_usec in sysfs while
+ wbt is disabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, if wbt is initialized and then disabled by
+wbt_disable_default(), sysfs will still show valid wbt_lat_usec, which
+will confuse users that wbt is still enabled.
+
+This patch shows wbt_lat_usec as zero if it's disabled.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reported-and-tested-by: Holger Hoffstätte <holger@applied-asynchrony.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/blk-sysfs.c | 3 +++
+ block/blk-wbt.c   | 8 ++++++++
+ block/blk-wbt.h   | 5 +++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index e71b3b439..7b98c7074 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -470,6 +470,9 @@ static ssize_t queue_wb_lat_show(struct request_queue *q, char *page)
+ 	if (!wbt_rq_qos(q))
+ 		return -EINVAL;
+ 
++	if (wbt_disabled(q))
++		return sprintf(page, "0\n");
++
+ 	return sprintf(page, "%llu\n", div_u64(wbt_get_min_lat(q), 1000));
+ }
+ 
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 4680691a9..07ed0b0ae 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -422,6 +422,14 @@ static void wbt_update_limits(struct rq_wb *rwb)
+ 	rwb_wake_all(rwb);
+ }
+ 
++bool wbt_disabled(struct request_queue *q)
++{
++	struct rq_qos *rqos = wbt_rq_qos(q);
++
++	return !rqos || RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT ||
++	       RQWB(rqos)->enable_state == WBT_STATE_OFF_MANUAL;
++}
++
+ u64 wbt_get_min_lat(struct request_queue *q)
+ {
+ 	struct rq_qos *rqos = wbt_rq_qos(q);
+diff --git a/block/blk-wbt.h b/block/blk-wbt.h
+index 7fe98638f..e3ea6e7e2 100644
+--- a/block/blk-wbt.h
++++ b/block/blk-wbt.h
+@@ -96,6 +96,7 @@ void wbt_enable_default(struct request_queue *);
+ 
+ u64 wbt_get_min_lat(struct request_queue *q);
+ void wbt_set_min_lat(struct request_queue *q, u64 val);
++bool wbt_disabled(struct request_queue *);
+ 
+ void wbt_set_write_cache(struct request_queue *, bool);
+ 
+@@ -127,6 +128,10 @@ static inline u64 wbt_default_latency_nsec(struct request_queue *q)
+ {
+ 	return 0;
+ }
++static inline bool wbt_disabled(struct request_queue *q)
++{
++	return true;
++}
+ 
+ #endif /* CONFIG_BLK_WBT */
+ 
+-- 
+2.38.1.385.g3b08839926
+
+
+From eb6ac3c76eceea86ff7d5fec4fb70e9274f5a6e1 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:17 +0800
+Subject: [PATCH 11/16] elevator: add new field flags in struct elevator_queue
+
+There are only one flag to indicate that elevator is registered currently,
+prepare to add a flag to disable wbt if default elevator is bfq.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/elevator.c | 6 ++----
+ block/elevator.h | 4 +++-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index 20e70fd3f..9e12706e8 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -512,7 +512,7 @@ int elv_register_queue(struct request_queue *q, bool uevent)
+ 		if (uevent)
+ 			kobject_uevent(&e->kobj, KOBJ_ADD);
+ 
+-		e->registered = 1;
++		set_bit(ELEVATOR_FLAG_REGISTERED, &e->flags);
+ 	}
+ 	return error;
+ }
+@@ -523,11 +523,9 @@ void elv_unregister_queue(struct request_queue *q)
+ 
+ 	lockdep_assert_held(&q->sysfs_lock);
+ 
+-	if (e && e->registered) {
++	if (e && test_and_clear_bit(ELEVATOR_FLAG_REGISTERED, &e->flags)) {
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
+-
+-		e->registered = 0;
+ 	}
+ }
+ 
+diff --git a/block/elevator.h b/block/elevator.h
+index 3f0593b3b..ed574bf3e 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -100,10 +100,12 @@ struct elevator_queue
+ 	void *elevator_data;
+ 	struct kobject kobj;
+ 	struct mutex sysfs_lock;
+-	unsigned int registered:1;
++	unsigned long flags;
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
++#define ELEVATOR_FLAG_REGISTERED 0
++
+ /*
+  * block elevator interface
+  */
+-- 
+2.38.1.385.g3b08839926
+
+
+From 1c1eb537fc735ac8e6da590a61900fe0e07a8fec Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 19 Oct 2022 20:15:18 +0800
+Subject: [PATCH 12/16] blk-wbt: don't enable throttling if default elevator is
+ bfq
+
+Commit b5dc5d4d1f4f ("block,bfq: Disable writeback throttling") tries to
+disable wbt for bfq, it's done by calling wbt_disable_default() in
+bfq_init_queue(). However, wbt is still enabled if default elevator is
+bfq:
+
+device_add_disk
+ elevator_init_mq
+  bfq_init_queue
+   wbt_disable_default -> done nothing
+
+ blk_register_queue
+  wbt_enable_default -> wbt is enabled
+
+Fix the problem by adding a new flag ELEVATOR_FLAG_DISBALE_WBT, bfq
+will set the flag in bfq_init_queue, and following wbt_enable_default()
+won't enable wbt while the flag is set.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ block/bfq-iosched.c |  2 ++
+ block/blk-wbt.c     | 11 ++++++++---
+ block/elevator.h    |  3 ++-
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 7ea427817..ccfadc6f7 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -7045,6 +7045,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
+ #endif
+ 
+ 	blk_stat_disable_accounting(bfqd->queue);
++	clear_bit(ELEVATOR_FLAG_DISABLE_WBT, &e->flags);
+ 	wbt_enable_default(bfqd->queue);
+ 
+ 	kfree(bfqd);
+@@ -7190,6 +7191,7 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	/* We dispatch from request queue wide instead of hw queue */
+ 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+ 
++	set_bit(ELEVATOR_FLAG_DISABLE_WBT, &eq->flags);
+ 	wbt_disable_default(q);
+ 	blk_stat_enable_accounting(q);
+ 
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 07ed0b0ae..68a774d7a 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -27,6 +27,7 @@
+ 
+ #include "blk-wbt.h"
+ #include "blk-rq-qos.h"
++#include "elevator.h"
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/wbt.h>
+@@ -651,11 +652,15 @@ void wbt_set_write_cache(struct request_queue *q, bool write_cache_on)
+  */
+ void wbt_enable_default(struct request_queue *q)
+ {
+-	struct rq_qos *rqos = wbt_rq_qos(q);
++	struct rq_qos *rqos;
++	bool disable_flag = q->elevator &&
++		    test_bit(ELEVATOR_FLAG_DISABLE_WBT, &q->elevator->flags);
+ 
+ 	/* Throttling already enabled? */
++	rqos = wbt_rq_qos(q);
+ 	if (rqos) {
+-		if (RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
++		if (!disable_flag &&
++		    RQWB(rqos)->enable_state == WBT_STATE_OFF_DEFAULT)
+ 			RQWB(rqos)->enable_state = WBT_STATE_ON_DEFAULT;
+ 		return;
+ 	}
+@@ -664,7 +669,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!blk_queue_registered(q))
+ 		return;
+ 
+-	if (queue_is_mq(q))
++	if (queue_is_mq(q) && !disable_flag)
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+diff --git a/block/elevator.h b/block/elevator.h
+index ed574bf3e..753824712 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -104,7 +104,8 @@ struct elevator_queue
+ 	DECLARE_HASHTABLE(hash, ELV_HASH_BITS);
+ };
+ 
+-#define ELEVATOR_FLAG_REGISTERED 0
++#define ELEVATOR_FLAG_REGISTERED	0
++#define ELEVATOR_FLAG_DISABLE_WBT	1
+ 
+ /*
+  * block elevator interface
+-- 
+2.38.1.385.g3b08839926
+
+
+From 9f0557d7541e89bafbc149201248f709460163f5 Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Thu, 13 Oct 2022 15:31:13 -0400
+Subject: [PATCH 13/16] mm: vmscan: make rotations a secondary factor in
+ balancing anon vs file
+
+We noticed a 2% webserver throughput regression after upgrading from 5.6.
+This could be tracked down to a shift in the anon/file reclaim balance
+(confirmed with swappiness) that resulted in worse reclaim efficiency and
+thus more kswapd activity for the same outcome.
+
+The change that exposed the problem is aae466b0052e ("mm/swap: implement
+workingset detection for anonymous LRU").  By qualifying swapins based on
+their refault distance, it lowered the cost of anon reclaim in this
+workload, in turn causing (much) more anon scanning than before.  Scanning
+the anon list is more expensive due to the higher ratio of mmapped pages
+that may rotate during reclaim, and so the result was an increase in %sys
+time.
+
+Right now, rotations aren't considered a cost when balancing scan pressure
+between LRUs.  We can end up with very few file refaults putting all the
+scan pressure on hot anon pages that are rotated en masse, don't get
+reclaimed, and never push back on the file LRU again.  We still only
+reclaim file cache in that case, but we burn a lot CPU rotating anon
+pages.  It's "fair" from an LRU age POV, but doesn't reflect the real cost
+it imposes on the system.
+
+Consider rotations as a secondary factor in balancing the LRUs.  This
+doesn't attempt to make a precise comparison between IO cost and CPU cost,
+it just says: if reloads are about comparable between the lists, or
+rotations are overwhelmingly different, adjust for CPU work.
+
+This fixed the regression on our webservers.  It has since been deployed
+to the entire Meta fleet and hasn't caused any problems.
+
+Link: https://lkml.kernel.org/r/20221013193113.726425-1-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Rik van Riel <riel@surriel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ include/linux/swap.h |  5 +++--
+ mm/swap.c            | 22 +++++++++++++++++-----
+ mm/vmscan.c          |  4 +++-
+ mm/workingset.c      |  2 +-
+ 4 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index a18cf4b7c..369d77992 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -384,8 +384,9 @@ extern unsigned long totalreserve_pages;
+ 
+ 
+ /* linux/mm/swap.c */
+-void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages);
+-void lru_note_cost_folio(struct folio *);
++void lru_note_cost(struct lruvec *lruvec, bool file,
++		   unsigned int nr_io, unsigned int nr_rotated);
++void lru_note_cost_refault(struct folio *);
+ void folio_add_lru(struct folio *);
+ void folio_add_lru_vma(struct folio *, struct vm_area_struct *);
+ void lru_cache_add(struct page *);
+diff --git a/mm/swap.c b/mm/swap.c
+index 955930f41..2f12a2ee1 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -295,8 +295,20 @@ void folio_rotate_reclaimable(struct folio *folio)
+ 	}
+ }
+ 
+-void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
++void lru_note_cost(struct lruvec *lruvec, bool file,
++		   unsigned int nr_io, unsigned int nr_rotated)
+ {
++	unsigned long cost;
++
++	/*
++	 * Reflect the relative cost of incurring IO and spending CPU
++	 * time on rotations. This doesn't attempt to make a precise
++	 * comparison, it just says: if reloads are about comparable
++	 * between the LRU lists, or rotations are overwhelmingly
++	 * different between them, adjust scan balance for CPU work.
++	 */
++	cost = nr_io * SWAP_CLUSTER_MAX + nr_rotated;
++
+ 	do {
+ 		unsigned long lrusize;
+ 
+@@ -310,9 +322,9 @@ void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
+ 		spin_lock_irq(&lruvec->lru_lock);
+ 		/* Record cost event */
+ 		if (file)
+-			lruvec->file_cost += nr_pages;
++			lruvec->file_cost += cost;
+ 		else
+-			lruvec->anon_cost += nr_pages;
++			lruvec->anon_cost += cost;
+ 
+ 		/*
+ 		 * Decay previous events
+@@ -335,10 +347,10 @@ void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
+ 	} while ((lruvec = parent_lruvec(lruvec)));
+ }
+ 
+-void lru_note_cost_folio(struct folio *folio)
++void lru_note_cost_refault(struct folio *folio)
+ {
+ 	lru_note_cost(folio_lruvec(folio), folio_is_file_lru(folio),
+-			folio_nr_pages(folio));
++		      folio_nr_pages(folio), 0);
+ }
+ 
+ static void folio_activate_fn(struct lruvec *lruvec, struct folio *folio)
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 0317d4cf4..18f649799 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2499,7 +2499,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
+ 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+ 	spin_unlock_irq(&lruvec->lru_lock);
+ 
+-	lru_note_cost(lruvec, file, stat.nr_pageout);
++	lru_note_cost(lruvec, file, stat.nr_pageout, nr_scanned - nr_reclaimed);
+ 	mem_cgroup_uncharge_list(&folio_list);
+ 	free_unref_page_list(&folio_list);
+ 
+@@ -2639,6 +2639,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+ 	spin_unlock_irq(&lruvec->lru_lock);
+ 
++	if (nr_rotated)
++		lru_note_cost(lruvec, file, 0, nr_rotated);
+ 	mem_cgroup_uncharge_list(&l_active);
+ 	free_unref_page_list(&l_active);
+ 	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
+diff --git a/mm/workingset.c b/mm/workingset.c
+index ae7e984b2..d2d029785 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -493,7 +493,7 @@ void workingset_refault(struct folio *folio, void *shadow)
+ 	if (workingset) {
+ 		folio_set_workingset(folio);
+ 		/* XXX: Move to lru_cache_add() when it supports new vs putback */
+-		lru_note_cost_folio(folio);
++		lru_note_cost_refault(folio);
+ 		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file, nr);
+ 	}
+ out:
+-- 
+2.38.1.385.g3b08839926
+
+
+From c4587445f84faa881f0d942125d8a7c29968821f Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 2 Nov 2022 22:31:19 +0100
+Subject: [PATCH 14/16] objtool: Optimize elf_dirty_reloc_sym()
+
+When moving a symbol in the symtab its index changes and any reloc
+referring that symtol-table-index will need to be rewritten too.
+
+In order to facilitate this, objtool simply marks the whole reloc
+section 'changed' which will cause the whole section to be
+re-generated.
+
+However, finding the relocs that use any given symbol is implemented
+rather crudely -- a fully iteration of all sections and their relocs.
+Given that some builds have over 20k sections (kallsyms etc..)
+iterating all that for *each* symbol moved takes a bit of time.
+
+Instead have each symbol keep a list of relocs that reference it.
+
+This *vastly* improves build times for certain configs.
+
+Reported-by: Borislav Petkov <bp@alien8.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/Y2LlRA7x+8UsE1xf@hirez.programming.kicks-ass.net
+---
+ tools/objtool/elf.c                 | 27 ++++++++++-----------------
+ tools/objtool/include/objtool/elf.h |  2 ++
+ 2 files changed, 12 insertions(+), 17 deletions(-)
+
+diff --git a/tools/objtool/elf.c b/tools/objtool/elf.c
+index 7e24b09b1..ae6493558 100644
+--- a/tools/objtool/elf.c
++++ b/tools/objtool/elf.c
+@@ -374,6 +374,7 @@ static void elf_add_symbol(struct elf *elf, struct symbol *sym)
+ 	struct list_head *entry;
+ 	struct rb_node *pnode;
+ 
++	INIT_LIST_HEAD(&sym->reloc_list);
+ 	INIT_LIST_HEAD(&sym->pv_target);
+ 	sym->alias = sym;
+ 
+@@ -570,6 +571,7 @@ int elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
+ 	reloc->sym = sym;
+ 	reloc->addend = addend;
+ 
++	list_add_tail(&reloc->sym_reloc_entry, &sym->reloc_list);
+ 	list_add_tail(&reloc->list, &sec->reloc->reloc_list);
+ 	elf_hash_add(reloc, &reloc->hash, reloc_hash(reloc));
+ 
+@@ -586,21 +588,10 @@ int elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
+  */
+ static void elf_dirty_reloc_sym(struct elf *elf, struct symbol *sym)
+ {
+-	struct section *sec;
+-
+-	list_for_each_entry(sec, &elf->sections, list) {
+-		struct reloc *reloc;
+-
+-		if (sec->changed)
+-			continue;
++	struct reloc *reloc;
+ 
+-		list_for_each_entry(reloc, &sec->reloc_list, list) {
+-			if (reloc->sym == sym) {
+-				sec->changed = true;
+-				break;
+-			}
+-		}
+-	}
++	list_for_each_entry(reloc, &sym->reloc_list, sym_reloc_entry)
++		reloc->sec->changed = true;
+ }
+ 
+ /*
+@@ -850,11 +841,12 @@ static int read_rela_reloc(struct section *sec, int i, struct reloc *reloc, unsi
+ 
+ static int read_relocs(struct elf *elf)
+ {
++	unsigned long nr_reloc, max_reloc = 0, tot_reloc = 0;
+ 	struct section *sec;
+ 	struct reloc *reloc;
+-	int i;
+ 	unsigned int symndx;
+-	unsigned long nr_reloc, max_reloc = 0, tot_reloc = 0;
++	struct symbol *sym;
++	int i;
+ 
+ 	if (!elf_alloc_hash(reloc, elf->text_size / 16))
+ 		return -1;
+@@ -895,13 +887,14 @@ static int read_relocs(struct elf *elf)
+ 
+ 			reloc->sec = sec;
+ 			reloc->idx = i;
+-			reloc->sym = find_symbol_by_index(elf, symndx);
++			reloc->sym = sym = find_symbol_by_index(elf, symndx);
+ 			if (!reloc->sym) {
+ 				WARN("can't find reloc entry symbol %d for %s",
+ 				     symndx, sec->name);
+ 				return -1;
+ 			}
+ 
++			list_add_tail(&reloc->sym_reloc_entry, &sym->reloc_list);
+ 			list_add_tail(&reloc->list, &sec->reloc_list);
+ 			elf_hash_add(reloc, &reloc->hash, reloc_hash(reloc));
+ 
+diff --git a/tools/objtool/include/objtool/elf.h b/tools/objtool/include/objtool/elf.h
+index 16f4067b8..2b893f8bc 100644
+--- a/tools/objtool/include/objtool/elf.h
++++ b/tools/objtool/include/objtool/elf.h
+@@ -61,6 +61,7 @@ struct symbol {
+ 	u8 fentry            : 1;
+ 	u8 profiling_func    : 1;
+ 	struct list_head pv_target;
++	struct list_head reloc_list;
+ };
+ 
+ struct reloc {
+@@ -72,6 +73,7 @@ struct reloc {
+ 	};
+ 	struct section *sec;
+ 	struct symbol *sym;
++	struct list_head sym_reloc_entry;
+ 	unsigned long offset;
+ 	unsigned int type;
+ 	s64 addend;
+-- 
+2.38.1.385.g3b08839926
+
+
+From 98e64621a7f37de46917c8167ae7016f732488b4 Mon Sep 17 00:00:00 2001
+From: Masahiro Yamada <masahiroy@kernel.org>
+Date: Tue, 15 Nov 2022 02:46:17 +0900
+Subject: [PATCH 15/16] kbuild: revive parallel execution for
+ .tmp_initcalls.lds rule
+
+Prior to commit 5d45950dfbb1 ("kbuild: move vmlinux.o link to
+scripts/Makefile.vmlinux_o"), jobserver-exec was invoked from the shell
+script, link-vmlinux.sh. It can get access to the jobserver because
+Makefile adds '+' prefix, as in:
+
+    +$(call if_changed_dep,link_vmlinux)
+
+Since 5d45950dfbb1, jobserver-exec is invoked from Makefile, but the
+'+' prefix is missing, hence jobserver-exec has no access to the
+jobserver.
+
+Fixes: 5d45950dfbb1 ("kbuild: move vmlinux.o link to scripts/Makefile.vmlinux_o")
+Signed-off-by: Masahiro Yamada <masahiroy@kernel.org>
+Reviewed-by: Nathan Chancellor <nathan@kernel.org>
+Reviewed-by: Nicolas Schier <nicolas@fjasle.eu>
+---
+ scripts/Makefile.vmlinux_o | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scripts/Makefile.vmlinux_o b/scripts/Makefile.vmlinux_o
+index 0edfdb403..ae52d3b3f 100644
+--- a/scripts/Makefile.vmlinux_o
++++ b/scripts/Makefile.vmlinux_o
+@@ -19,7 +19,7 @@ quiet_cmd_gen_initcalls_lds = GEN     $@
+ 
+ .tmp_initcalls.lds: $(srctree)/scripts/generate_initcall_order.pl \
+ 		vmlinux.a $(KBUILD_VMLINUX_LIBS) FORCE
+-	$(call if_changed,gen_initcalls_lds)
++	+$(call if_changed,gen_initcalls_lds)
+ 
+ targets := .tmp_initcalls.lds
+ 
+-- 
+2.38.1.385.g3b08839926
+
+
+From 1642d65d367b59fba2312636aaab65614352f948 Mon Sep 17 00:00:00 2001
+From: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Date: Fri, 18 Nov 2022 12:36:03 +0530
+Subject: [PATCH 16/16] mm/cgroup/reclaim: fix dirty pages throttling on cgroup
+ v1
+
+balance_dirty_pages doesn't do the required dirty throttling on cgroupv1.
+See commit 9badce000e2c ("cgroup, writeback: don't enable cgroup writeback
+on traditional hierarchies").  Instead, the kernel depends on writeback
+throttling in shrink_folio_list to achieve the same goal.  With large
+memory systems, the flusher may not be able to writeback quickly enough
+such that we will start finding pages in the shrink_folio_list already in
+writeback.  Hence for cgroupv1 let's do a reclaim throttle after waking up
+the flusher.
+
+The below test which used to fail on a 256GB system completes till the the
+file system is full with this change.
+
+root@lp2:/sys/fs/cgroup/memory# mkdir test
+root@lp2:/sys/fs/cgroup/memory# cd test/
+root@lp2:/sys/fs/cgroup/memory/test# echo 120M > memory.limit_in_bytes
+root@lp2:/sys/fs/cgroup/memory/test# echo $$ > tasks
+root@lp2:/sys/fs/cgroup/memory/test# dd if=/dev/zero of=/home/kvaneesh/test bs=1M
+Killed
+
+Link: https://lkml.kernel.org/r/20221118070603.84081-1-aneesh.kumar@linux.ibm.com
+Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Suggested-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: zefan li <lizefan.x@bytedance.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ mm/vmscan.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 18f649799..803c86fc8 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2514,8 +2514,20 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
+ 	 * the flushers simply cannot keep up with the allocation
+ 	 * rate. Nudge the flusher threads in case they are asleep.
+ 	 */
+-	if (stat.nr_unqueued_dirty == nr_taken)
++	if (stat.nr_unqueued_dirty == nr_taken) {
+ 		wakeup_flusher_threads(WB_REASON_VMSCAN);
++		/*
++		 * For cgroupv1 dirty throttling is achieved by waking up
++		 * the kernel flusher here and later waiting on folios
++		 * which are in writeback to finish (see shrink_folio_list()).
++		 *
++		 * Flusher may not be able to issue writeback quickly
++		 * enough for cgroupv1 writeback throttling to work
++		 * on a large system.
++		 */
++		if (!writeback_throttling_sane(sc))
++			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
++	}
+ 
+ 	sc->nr.dirty += stat.nr_dirty;
+ 	sc->nr.congested += stat.nr_congested;
+-- 
+2.38.1.385.g3b08839926
+
