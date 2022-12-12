@@ -1,0 +1,371 @@
+From f8a278431754d2efe6ce34845b2cc3ef49520b6f Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Thu, 13 Oct 2022 15:52:09 -0700
+Subject: [PATCH 1/3] btrfs: skip reclaim if block_group is empty
+
+As we delete extents from a block group, at some deletion we cross below
+the reclaim threshold. It is possible we are still in the middle of
+deleting more extents and might soon hit 0. If the block group is empty
+by the time the reclaim worker runs, we will still relocate it.
+
+This works just fine, as relocating an empty block group ultimately
+results in properly deleting it. However, we have more direct ways of
+removing empty block groups in the cleaner thread. Those are either
+async discard or the unused_bgs list. In fact, when we decide whether to
+relocate a block group during extent deletion, we do check for emptiness
+and prefer the discard/unused_bgs mechanisms when possible.
+
+Not using relocation for this case reduces some modest overhead from
+empty bg relocation:
+
+- extra transactions
+- extra metadata use/churn for creating relocation metadata
+- trying to read the extent tree to look for extents (and in this case
+  finding none)
+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Boris Burkov <boris@bur.io>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/block-group.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index deebc8ddb..592568c9c 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -1594,6 +1594,24 @@ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ 			up_write(&space_info->groups_sem);
+ 			goto next;
+ 		}
++		if (bg->used == 0) {
++			/*
++			 * It is possible that we trigger relocation on a block
++			 * group as its extents are deleted and it first goes
++			 * below the threshold, then shortly after goes empty.
++			 *
++			 * In this case, relocating it does delete it, but has
++			 * some overhead in relocation specific metadata, looking
++			 * for the non-existent extents and running some extra
++			 * transactions, which we can avoid by using one of the
++			 * other mechanisms for dealing with empty block groups.
++			 */
++			if (!btrfs_test_opt(fs_info, DISCARD_ASYNC))
++				btrfs_mark_bg_unused(bg);
++			spin_unlock(&bg->lock);
++			up_write(&space_info->groups_sem);
++			goto next;
++		}
+ 		spin_unlock(&bg->lock);
+ 
+ 		/* Get out fast, in case we're unmounting the filesystem */
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From b50c36663a253521414246d57c303a5fa218b320 Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Thu, 13 Oct 2022 15:52:10 -0700
+Subject: [PATCH 2/3] btrfs: re-check reclaim condition in reclaim worker
+
+I have observed the following case play out and lead to unnecessary
+relocations:
+
+1. write a file across multiple block groups
+2. delete the file
+3. several block groups fall below the reclaim threshold
+4. reclaim the first, moving extents into the others
+5. reclaim the others which are now actually very full, leading to poor
+   reclaim behavior with lots of writing, allocating new block groups,
+   etc.
+
+I believe the risk of missing some reasonable reclaims is worth it
+when traded off against the savings of avoiding overfull reclaims.
+
+Going forward, it could be interesting to make the check more advanced
+(zoned aware, fragmentation aware, etc...) so that it can be a really
+strong signal both at extent delete and reclaim time.
+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Boris Burkov <boris@bur.io>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/block-group.c | 65 ++++++++++++++++++++++++++----------------
+ 1 file changed, 40 insertions(+), 25 deletions(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 592568c9c..732972f07 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -1527,6 +1527,30 @@ static inline bool btrfs_should_reclaim(struct btrfs_fs_info *fs_info)
+ 	return true;
+ }
+ 
++static bool should_reclaim_block_group(struct btrfs_block_group *bg, u64 bytes_freed)
++{
++	const struct btrfs_space_info *space_info = bg->space_info;
++	const int reclaim_thresh = READ_ONCE(space_info->bg_reclaim_threshold);
++	const u64 new_val = bg->used;
++	const u64 old_val = new_val + bytes_freed;
++	u64 thresh;
++
++	if (reclaim_thresh == 0)
++		return false;
++
++	thresh = div_factor_fine(bg->length, reclaim_thresh);
++
++	/*
++	 * If we were below the threshold before don't reclaim, we are likely a
++	 * brand new block group and we don't want to relocate new block groups.
++	 */
++	if (old_val < thresh)
++		return false;
++	if (new_val >= thresh)
++		return false;
++	return true;
++}
++
+ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ {
+ 	struct btrfs_fs_info *fs_info =
+@@ -1611,6 +1635,22 @@ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ 			spin_unlock(&bg->lock);
+ 			up_write(&space_info->groups_sem);
+ 			goto next;
++
++		}
++		/*
++		 * The block group might no longer meet the reclaim condition by
++		 * the time we get around to reclaiming it, so to avoid
++		 * reclaiming overly full block_groups, skip reclaiming them.
++		 *
++		 * Since the decision making process also depends on the amount
++		 * being freed, pass in a fake giant value to skip that extra
++		 * check, which is more meaningful when adding to the list in
++		 * the first place.
++		 */
++		if (!should_reclaim_block_group(bg, bg->length)) {
++			spin_unlock(&bg->lock);
++			up_write(&space_info->groups_sem);
++			goto next;
+ 		}
+ 		spin_unlock(&bg->lock);
+ 
+@@ -3229,31 +3269,6 @@ int btrfs_write_dirty_block_groups(struct btrfs_trans_handle *trans)
+ 	return ret;
+ }
+ 
+-static inline bool should_reclaim_block_group(struct btrfs_block_group *bg,
+-					      u64 bytes_freed)
+-{
+-	const struct btrfs_space_info *space_info = bg->space_info;
+-	const int reclaim_thresh = READ_ONCE(space_info->bg_reclaim_threshold);
+-	const u64 new_val = bg->used;
+-	const u64 old_val = new_val + bytes_freed;
+-	u64 thresh;
+-
+-	if (reclaim_thresh == 0)
+-		return false;
+-
+-	thresh = div_factor_fine(bg->length, reclaim_thresh);
+-
+-	/*
+-	 * If we were below the threshold before don't reclaim, we are likely a
+-	 * brand new block group and we don't want to relocate new block groups.
+-	 */
+-	if (old_val < thresh)
+-		return false;
+-	if (new_val >= thresh)
+-		return false;
+-	return true;
+-}
+-
+ int btrfs_update_block_group(struct btrfs_trans_handle *trans,
+ 			     u64 bytenr, u64 num_bytes, bool alloc)
+ {
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 2903ce8adbe5a840779840ceb19ad0a80b87a3bc Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Fri, 9 Sep 2022 14:45:22 +0800
+Subject: [PATCH 3/3] btrfs: skip update of block group item if used bytes are
+ the same
+
+[BACKGROUND]
+
+When committing a transaction, we will update block group items for all
+dirty block groups.
+
+But in fact, dirty block groups don't always need to update their block
+group items.
+It's pretty common to have a metadata block group which experienced
+several COW operations, but still have the same amount of used bytes.
+
+In that case, we may unnecessarily COW a tree block doing nothing.
+
+[ENHANCEMENT]
+
+This patch will introduce btrfs_block_group::commit_used member to
+remember the last used bytes, and use that new member to skip
+unnecessary block group item update.
+
+This would be more common for large filesystems, where metadata block
+group can be as large as 1GiB, containing at most 64K metadata items.
+
+In that case, if COW added and then deleted one metadata item near the
+end of the block group, then it's completely possible we don't need to
+touch the block group item at all.
+
+[BENCHMARK]
+
+The change itself can have quite a high chance (20~80%) to skip block
+group item updates in lot of workloads.
+
+As a result, it would result shorter time spent on
+btrfs_write_dirty_block_groups(), and overall reduce the execution time
+of the critical section of btrfs_commit_transaction().
+
+Here comes a fio command, which will do random writes in 4K block size,
+causing a very heavy metadata updates.
+
+fio --filename=$mnt/file --size=512M --rw=randwrite --direct=1 --bs=4k \
+    --ioengine=libaio --iodepth=64 --runtime=300 --numjobs=4 \
+    --name=random_write --fallocate=none --time_based --fsync_on_close=1
+
+The file size (512M) and number of threads (4) means 2GiB file size in
+total, but during the full 300s run time, my dedicated SATA SSD is able
+to write around 20~25GiB, which is over 10 times the file size.
+
+Thus after we fill the initial 2G, we should not cause much block group
+item updates.
+
+Please note, the fio numbers by themselves don't have much change, but
+if we look deeper, there is some reduced execution time, especially for
+the critical section of btrfs_commit_transaction().
+
+I added extra trace_printk() to measure the following per-transaction
+execution time:
+
+- Critical section of btrfs_commit_transaction()
+  By re-using the existing update_commit_stats() function, which
+  has already calculated the interval correctly.
+
+- The while() loop for btrfs_write_dirty_block_groups()
+  Although this includes the execution time of btrfs_run_delayed_refs(),
+  it should still be representative overall.
+
+Both result involves transid 7~30, the same amount of transaction
+committed.
+
+The result looks like this:
+
+                      |      Before       |     After      |  Diff
+----------------------+-------------------+----------------+--------
+Transaction interval  | 229247198.5       | 215016933.6    | -6.2%
+Block group interval  | 23133.33333       | 18970.83333    | -18.0%
+
+The change in block group item updates is more obvious, as skipped block
+group item updates also mean less delayed refs.
+
+And the overall execution time for that block group update loop is
+pretty small, thus we can assume the extent tree is already mostly
+cached.  If we can skip an uncached tree block, it would cause more
+obvious change.
+
+Unfortunately the overall reduction in commit transaction critical
+section is much smaller, as the block group item updates loop is not
+really the major part, at least not for the above fio script.
+
+But still we have a observable reduction in the critical section.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/block-group.c | 28 +++++++++++++++++++++++++++-
+ fs/btrfs/block-group.h |  6 ++++++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 732972f07..adb8ae1b4 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -2059,6 +2059,7 @@ static int read_one_block_group(struct btrfs_fs_info *info,
+ 
+ 	cache->length = key->offset;
+ 	cache->used = btrfs_stack_block_group_used(bgi);
++	cache->commit_used = cache->used;
+ 	cache->flags = btrfs_stack_block_group_flags(bgi);
+ 	cache->global_root_id = btrfs_stack_block_group_chunk_objectid(bgi);
+ 
+@@ -2750,6 +2751,25 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 	struct extent_buffer *leaf;
+ 	struct btrfs_block_group_item bgi;
+ 	struct btrfs_key key;
++	u64 old_commit_used;
++	u64 used;
++
++	/*
++	 * Block group items update can be triggered out of commit transaction
++	 * critical section, thus we need a consistent view of used bytes.
++	 * We cannot use cache->used directly outside of the spin lock, as it
++	 * may be changed.
++	 */
++	spin_lock(&cache->lock);
++	old_commit_used = cache->commit_used;
++	used = cache->used;
++	/* No change in used bytes, can safely skip it. */
++	if (cache->commit_used == used) {
++		spin_unlock(&cache->lock);
++		return 0;
++	}
++	cache->commit_used = used;
++	spin_unlock(&cache->lock);
+ 
+ 	key.objectid = cache->start;
+ 	key.type = BTRFS_BLOCK_GROUP_ITEM_KEY;
+@@ -2764,7 +2784,7 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 
+ 	leaf = path->nodes[0];
+ 	bi = btrfs_item_ptr_offset(leaf, path->slots[0]);
+-	btrfs_set_stack_block_group_used(&bgi, cache->used);
++	btrfs_set_stack_block_group_used(&bgi, used);
+ 	btrfs_set_stack_block_group_chunk_objectid(&bgi,
+ 						   cache->global_root_id);
+ 	btrfs_set_stack_block_group_flags(&bgi, cache->flags);
+@@ -2772,6 +2792,12 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 	btrfs_mark_buffer_dirty(leaf);
+ fail:
+ 	btrfs_release_path(path);
++	/* We didn't update the block group item, need to revert @commit_used. */
++	if (ret < 0) {
++		spin_lock(&cache->lock);
++		cache->commit_used = old_commit_used;
++		spin_unlock(&cache->lock);
++	}
+ 	return ret;
+ 
+ }
+diff --git a/fs/btrfs/block-group.h b/fs/btrfs/block-group.h
+index 8fb14b99a..e83eef195 100644
+--- a/fs/btrfs/block-group.h
++++ b/fs/btrfs/block-group.h
+@@ -99,6 +99,12 @@ struct btrfs_block_group {
+ 	u64 cache_generation;
+ 	u64 global_root_id;
+ 
++	/*
++	 * The last committed used bytes of this block group, if the above @used
++	 * is still the same as @commit_used, we don't need to update block
++	 * group item of this block group.
++	 */
++	u64 commit_used;
+ 	/*
+ 	 * If the free space extent count exceeds this number, convert the block
+ 	 * group to bitmaps.
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
