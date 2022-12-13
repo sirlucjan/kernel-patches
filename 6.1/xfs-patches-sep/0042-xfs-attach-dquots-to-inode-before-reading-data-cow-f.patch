@@ -1,0 +1,154 @@
+From 38d561a4f19e276ba3d8a2ffbc9e23dce0c1dcda Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 28 Nov 2022 17:24:43 -0800
+Subject: [PATCH 42/59] xfs: attach dquots to inode before reading data/cow
+ fork mappings
+
+I've been running near-continuous integration testing of online fsck,
+and I've noticed that once a day, one of the ARM VMs will fail the test
+with out of order records in the data fork.
+
+xfs/804 races fsstress with online scrub (aka scan but do not change
+anything), so I think this might be a bug in the core xfs code.  This
+also only seems to trigger if one runs the test for more than ~6 minutes
+via TIME_FACTOR=13 or something.
+https://git.kernel.org/pub/scm/linux/kernel/git/djwong/xfstests-dev.git/tree/tests/xfs/804?h=djwong-wtf
+
+I added a debugging patch to the kernel to check the data fork extents
+after taking the ILOCK, before dropping ILOCK, and before and after each
+bmapping operation.  So far I've narrowed it down to the delalloc code
+inserting a record in the wrong place in the iext tree:
+
+xfs_bmap_add_extent_hole_delay, near line 2691:
+
+	case 0:
+		/*
+		 * New allocation is not contiguous with another
+		 * delayed allocation.
+		 * Insert a new entry.
+		 */
+		oldlen = newlen = 0;
+		xfs_iunlock_check_datafork(ip);		<-- ok here
+		xfs_iext_insert(ip, icur, new, state);
+		xfs_iunlock_check_datafork(ip);		<-- bad here
+		break;
+	}
+
+I recorded the state of the data fork mappings and iext cursor state
+when a corrupt data fork is detected immediately after the
+xfs_bmap_add_extent_hole_delay call in xfs_bmapi_reserve_delalloc:
+
+ino 0x140bb3 func xfs_bmapi_reserve_delalloc line 4164 data fork:
+    ino 0x140bb3 nr 0x0 nr_real 0x0 offset 0xb9 blockcount 0x1f startblock 0x935de2 state 1
+    ino 0x140bb3 nr 0x1 nr_real 0x1 offset 0xe6 blockcount 0xa startblock 0xffffffffe0007 state 0
+    ino 0x140bb3 nr 0x2 nr_real 0x1 offset 0xd8 blockcount 0xe startblock 0x935e01 state 0
+
+Here we see that a delalloc extent was inserted into the wrong position
+in the iext leaf, same as all the other times.  The extra trace data I
+collected are as follows:
+
+ino 0x140bb3 fork 0 oldoff 0xe6 oldlen 0x4 oldprealloc 0x6 isize 0xe6000
+    ino 0x140bb3 oldgotoff 0xea oldgotstart 0xfffffffffffffffe oldgotcount 0x0 oldgotstate 0
+    ino 0x140bb3 crapgotoff 0x0 crapgotstart 0x0 crapgotcount 0x0 crapgotstate 0
+    ino 0x140bb3 freshgotoff 0xd8 freshgotstart 0x935e01 freshgotcount 0xe freshgotstate 0
+    ino 0x140bb3 nowgotoff 0xe6 nowgotstart 0xffffffffe0007 nowgotcount 0xa nowgotstate 0
+    ino 0x140bb3 oldicurpos 1 oldleafnr 2 oldleaf 0xfffffc00f0609a00
+    ino 0x140bb3 crapicurpos 2 crapleafnr 2 crapleaf 0xfffffc00f0609a00
+    ino 0x140bb3 freshicurpos 1 freshleafnr 2 freshleaf 0xfffffc00f0609a00
+    ino 0x140bb3 newicurpos 1 newleafnr 3 newleaf 0xfffffc00f0609a00
+
+The first line shows that xfs_bmapi_reserve_delalloc was called with
+whichfork=XFS_DATA_FORK, off=0xe6, len=0x4, prealloc=6.
+
+The second line ("oldgot") shows the contents of @got at the beginning
+of the call, which are the results of the first iext lookup in
+xfs_buffered_write_iomap_begin.
+
+Line 3 ("crapgot") is the result of duplicating the cursor at the start
+of the body of xfs_bmapi_reserve_delalloc and performing a fresh lookup
+at @off.
+
+Line 4 ("freshgot") is the result of a new xfs_iext_get_extent right
+before the call to xfs_bmap_add_extent_hole_delay.  Totally garbage.
+
+Line 5 ("nowgot") is contents of @got after the
+xfs_bmap_add_extent_hole_delay call.
+
+Line 6 is the contents of @icur at the beginning fo the call.  Lines 7-9
+are the contents of the iext cursors at the point where the block
+mappings were sampled.
+
+I think @oldgot is a HOLESTARTBLOCK extent because the first lookup
+didn't find anything, so we filled in imap with "fake hole until the
+end".  At the time of the first lookup, I suspect that there's only one
+32-block unwritten extent in the mapping (hence oldicurpos==1) but by
+the time we get to recording crapgot, crapicurpos==2.
+
+Dave then added:
+
+Ok, that's much simpler to reason about, and implies the smoke is
+coming from xfs_buffered_write_iomap_begin() or
+xfs_bmapi_reserve_delalloc(). I suspect the former - it does a lot
+of stuff with the ILOCK_EXCL held.....
+
+.... including calling xfs_qm_dqattach_locked().
+
+xfs_buffered_write_iomap_begin
+  ILOCK_EXCL
+  look up icur
+  xfs_qm_dqattach_locked
+    xfs_qm_dqattach_one
+      xfs_qm_dqget_inode
+        dquot cache miss
+        xfs_iunlock(ip, XFS_ILOCK_EXCL);
+        error = xfs_qm_dqread(mp, id, type, can_alloc, &dqp);
+        xfs_ilock(ip, XFS_ILOCK_EXCL);
+  ....
+  xfs_bmapi_reserve_delalloc(icur)
+
+Yup, that's what is letting the magic smoke out -
+xfs_qm_dqattach_locked() can cycle the ILOCK. If that happens, we
+can pass a stale icur to xfs_bmapi_reserve_delalloc() and it all
+goes downhill from there.
+
+Back to Darrick now:
+
+So.  Fix this by moving the dqattach_locked call up before we take the
+ILOCK, like all the other callers in that file.
+
+Fixes: a526c85c2236 ("xfs: move xfs_file_iomap_begin_delay around") # goes further back than this
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+---
+ fs/xfs/xfs_iomap.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 1005f1e36..684363709 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -978,6 +978,10 @@ xfs_buffered_write_iomap_begin(
+ 
+ 	ASSERT(!XFS_IS_REALTIME_INODE(ip));
+ 
++	error = xfs_qm_dqattach(ip);
++	if (error)
++		return error;
++
+ 	error = xfs_ilock_for_iomap(ip, flags, &lockmode);
+ 	if (error)
+ 		return error;
+@@ -1081,10 +1085,6 @@ xfs_buffered_write_iomap_begin(
+ 			allocfork = XFS_COW_FORK;
+ 	}
+ 
+-	error = xfs_qm_dqattach_locked(ip, false);
+-	if (error)
+-		goto out_unlock;
+-
+ 	if (eof && offset + count > XFS_ISIZE(ip)) {
+ 		/*
+ 		 * Determine the initial size of the preallocation.
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
