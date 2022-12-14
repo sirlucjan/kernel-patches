@@ -1,0 +1,668 @@
+From 85967f7464a8a521febd5505adac56a8806bfef5 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Fri, 16 Sep 2022 10:11:26 +0200
+Subject: [PATCH 1/5] bfq-6.1: support concurrent sync io for bfq on a specail
+ occasion
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/bfq-cgroup.c  | 10 +++++++
+ block/bfq-iosched.c | 71 +++++++--------------------------------------
+ block/bfq-iosched.h | 30 +++++++++----------
+ block/bfq-wf2q.c    | 69 ++++++++++++++++++++++++++-----------------
+ 4 files changed, 76 insertions(+), 104 deletions(-)
+
+diff --git a/block/bfq-cgroup.c b/block/bfq-cgroup.c
+index 7d624a3a3..09dab3971 100644
+--- a/block/bfq-cgroup.c
++++ b/block/bfq-cgroup.c
+@@ -552,6 +552,7 @@ static void bfq_pd_init(struct blkg_policy_data *pd)
+ 				   */
+ 	bfqg->bfqd = bfqd;
+ 	bfqg->active_entities = 0;
++	bfqg->num_queues_with_pending_reqs = 0;
+ 	bfqg->online = true;
+ 	bfqg->rq_pos_tree = RB_ROOT;
+ }
+@@ -645,6 +646,7 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ {
+ 	struct bfq_entity *entity = &bfqq->entity;
+ 	struct bfq_group *old_parent = bfqq_group(bfqq);
++	bool has_pending_reqs = false;
+ 
+ 	/*
+ 	 * No point to move bfqq to the same group, which can happen when
+@@ -665,6 +667,11 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 	 */
+ 	bfqq->ref++;
+ 
++	if (entity->in_groups_with_pending_reqs) {
++		has_pending_reqs = true;
++		bfq_del_bfqq_in_groups_with_pending_reqs(bfqq);
++	}
++
+ 	/* If bfqq is empty, then bfq_bfqq_expire also invokes
+ 	 * bfq_del_bfqq_busy, thereby removing bfqq and its entity
+ 	 * from data structures related to current group. Otherwise we
+@@ -692,6 +699,9 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 	/* pin down bfqg and its associated blkg  */
+ 	bfqg_and_blkg_get(bfqg);
+ 
++	if (has_pending_reqs)
++		bfq_add_bfqq_in_groups_with_pending_reqs(bfqq);
++
+ 	if (bfq_bfqq_busy(bfqq)) {
+ 		if (unlikely(!bfqd->nonrot_with_queueing))
+ 			bfq_pos_tree_add_move(bfqd, bfqq);
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 7ea427817..24649c34c 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -820,7 +820,7 @@ bfq_pos_tree_add_move(struct bfq_data *bfqd, struct bfq_queue *bfqq)
+  * much easier to maintain the needed state:
+  * 1) all active queues have the same weight,
+  * 2) all active queues belong to the same I/O-priority class,
+- * 3) there are no active groups.
++ * 3) there is at most one active group.
+  * In particular, the last condition is always true if hierarchical
+  * support or the cgroups interface are not enabled, thus no state
+  * needs to be maintained in this case.
+@@ -852,7 +852,7 @@ static bool bfq_asymmetric_scenario(struct bfq_data *bfqd,
+ 
+ 	return varied_queue_weights || multiple_classes_busy
+ #ifdef CONFIG_BFQ_GROUP_IOSCHED
+-	       || bfqd->num_groups_with_pending_reqs > 0
++	       || bfqd->num_groups_with_pending_reqs > 1
+ #endif
+ 		;
+ }
+@@ -870,9 +870,9 @@ static bool bfq_asymmetric_scenario(struct bfq_data *bfqd,
+  * In most scenarios, the rate at which nodes are created/destroyed
+  * should be low too.
+  */
+-void bfq_weights_tree_add(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+-			  struct rb_root_cached *root)
++void bfq_weights_tree_add(struct bfq_queue *bfqq)
+ {
++	struct rb_root_cached *root = &bfqq->bfqd->queue_weights_tree;
+ 	struct bfq_entity *entity = &bfqq->entity;
+ 	struct rb_node **new = &(root->rb_root.rb_node), *parent = NULL;
+ 	bool leftmost = true;
+@@ -944,13 +944,14 @@ void bfq_weights_tree_add(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+  * See the comments to the function bfq_weights_tree_add() for considerations
+  * about overhead.
+  */
+-void __bfq_weights_tree_remove(struct bfq_data *bfqd,
+-			       struct bfq_queue *bfqq,
+-			       struct rb_root_cached *root)
++void bfq_weights_tree_remove(struct bfq_queue *bfqq)
+ {
++	struct rb_root_cached *root;
++
+ 	if (!bfqq->weight_counter)
+ 		return;
+ 
++	root = &bfqq->bfqd->queue_weights_tree;
+ 	bfqq->weight_counter->num_active--;
+ 	if (bfqq->weight_counter->num_active > 0)
+ 		goto reset_entity_pointer;
+@@ -963,59 +964,6 @@ void __bfq_weights_tree_remove(struct bfq_data *bfqd,
+ 	bfq_put_queue(bfqq);
+ }
+ 
+-/*
+- * Invoke __bfq_weights_tree_remove on bfqq and decrement the number
+- * of active groups for each queue's inactive parent entity.
+- */
+-void bfq_weights_tree_remove(struct bfq_data *bfqd,
+-			     struct bfq_queue *bfqq)
+-{
+-	struct bfq_entity *entity = bfqq->entity.parent;
+-
+-	for_each_entity(entity) {
+-		struct bfq_sched_data *sd = entity->my_sched_data;
+-
+-		if (sd->next_in_service || sd->in_service_entity) {
+-			/*
+-			 * entity is still active, because either
+-			 * next_in_service or in_service_entity is not
+-			 * NULL (see the comments on the definition of
+-			 * next_in_service for details on why
+-			 * in_service_entity must be checked too).
+-			 *
+-			 * As a consequence, its parent entities are
+-			 * active as well, and thus this loop must
+-			 * stop here.
+-			 */
+-			break;
+-		}
+-
+-		/*
+-		 * The decrement of num_groups_with_pending_reqs is
+-		 * not performed immediately upon the deactivation of
+-		 * entity, but it is delayed to when it also happens
+-		 * that the first leaf descendant bfqq of entity gets
+-		 * all its pending requests completed. The following
+-		 * instructions perform this delayed decrement, if
+-		 * needed. See the comments on
+-		 * num_groups_with_pending_reqs for details.
+-		 */
+-		if (entity->in_groups_with_pending_reqs) {
+-			entity->in_groups_with_pending_reqs = false;
+-			bfqd->num_groups_with_pending_reqs--;
+-		}
+-	}
+-
+-	/*
+-	 * Next function is invoked last, because it causes bfqq to be
+-	 * freed if the following holds: bfqq is not in service and
+-	 * has no dispatched request. DO NOT use bfqq after the next
+-	 * function invocation.
+-	 */
+-	__bfq_weights_tree_remove(bfqd, bfqq,
+-				  &bfqd->queue_weights_tree);
+-}
+-
+ /*
+  * Return expired entry, or NULL to just start from scratch in rbtree.
+  */
+@@ -6261,7 +6209,8 @@ static void bfq_completed_request(struct bfq_queue *bfqq, struct bfq_data *bfqd)
+ 		 */
+ 		bfqq->budget_timeout = jiffies;
+ 
+-		bfq_weights_tree_remove(bfqd, bfqq);
++		bfq_del_bfqq_in_groups_with_pending_reqs(bfqq);
++		bfq_weights_tree_remove(bfqq);
+ 	}
+ 
+ 	now_ns = ktime_get_ns();
+diff --git a/block/bfq-iosched.h b/block/bfq-iosched.h
+index 71f721670..76363841d 100644
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -492,27 +492,27 @@ struct bfq_data {
+ 	struct rb_root_cached queue_weights_tree;
+ 
+ 	/*
+-	 * Number of groups with at least one descendant process that
++	 * Number of groups with at least one process that
+ 	 * has at least one request waiting for completion. Note that
+ 	 * this accounts for also requests already dispatched, but not
+ 	 * yet completed. Therefore this number of groups may differ
+ 	 * (be larger) than the number of active groups, as a group is
+ 	 * considered active only if its corresponding entity has
+-	 * descendant queues with at least one request queued. This
++	 * queues with at least one request queued. This
+ 	 * number is used to decide whether a scenario is symmetric.
+ 	 * For a detailed explanation see comments on the computation
+ 	 * of the variable asymmetric_scenario in the function
+ 	 * bfq_better_to_idle().
+ 	 *
+ 	 * However, it is hard to compute this number exactly, for
+-	 * groups with multiple descendant processes. Consider a group
+-	 * that is inactive, i.e., that has no descendant process with
++	 * groups with multiple processes. Consider a group
++	 * that is inactive, i.e., that has no process with
+ 	 * pending I/O inside BFQ queues. Then suppose that
+ 	 * num_groups_with_pending_reqs is still accounting for this
+-	 * group, because the group has descendant processes with some
++	 * group, because the group has processes with some
+ 	 * I/O request still in flight. num_groups_with_pending_reqs
+ 	 * should be decremented when the in-flight request of the
+-	 * last descendant process is finally completed (assuming that
++	 * last process is finally completed (assuming that
+ 	 * nothing else has changed for the group in the meantime, in
+ 	 * terms of composition of the group and active/inactive state of child
+ 	 * groups and processes). To accomplish this, an additional
+@@ -521,7 +521,7 @@ struct bfq_data {
+ 	 * we resort to the following tradeoff between simplicity and
+ 	 * accuracy: for an inactive group that is still counted in
+ 	 * num_groups_with_pending_reqs, we decrement
+-	 * num_groups_with_pending_reqs when the first descendant
++	 * num_groups_with_pending_reqs when the first
+ 	 * process of the group remains with no request waiting for
+ 	 * completion.
+ 	 *
+@@ -529,12 +529,12 @@ struct bfq_data {
+ 	 * carefulness: to avoid multiple decrements, we flag a group,
+ 	 * more precisely an entity representing a group, as still
+ 	 * counted in num_groups_with_pending_reqs when it becomes
+-	 * inactive. Then, when the first descendant queue of the
++	 * inactive. Then, when the first queue of the
+ 	 * entity remains with no request waiting for completion,
+ 	 * num_groups_with_pending_reqs is decremented, and this flag
+ 	 * is reset. After this flag is reset for the entity,
+ 	 * num_groups_with_pending_reqs won't be decremented any
+-	 * longer in case a new descendant queue of the entity remains
++	 * longer in case a new queue of the entity remains
+ 	 * with no request waiting for completion.
+ 	 */
+ 	unsigned int num_groups_with_pending_reqs;
+@@ -939,6 +939,7 @@ struct bfq_group {
+ 	struct bfq_entity *my_entity;
+ 
+ 	int active_entities;
++	int num_queues_with_pending_reqs;
+ 
+ 	struct rb_root rq_pos_tree;
+ 
+@@ -968,13 +969,8 @@ struct bfq_queue *bic_to_bfqq(struct bfq_io_cq *bic, bool is_sync);
+ void bic_set_bfqq(struct bfq_io_cq *bic, struct bfq_queue *bfqq, bool is_sync);
+ struct bfq_data *bic_to_bfqd(struct bfq_io_cq *bic);
+ void bfq_pos_tree_add_move(struct bfq_data *bfqd, struct bfq_queue *bfqq);
+-void bfq_weights_tree_add(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+-			  struct rb_root_cached *root);
+-void __bfq_weights_tree_remove(struct bfq_data *bfqd,
+-			       struct bfq_queue *bfqq,
+-			       struct rb_root_cached *root);
+-void bfq_weights_tree_remove(struct bfq_data *bfqd,
+-			     struct bfq_queue *bfqq);
++void bfq_weights_tree_add(struct bfq_queue *bfqq);
++void bfq_weights_tree_remove(struct bfq_queue *bfqq);
+ void bfq_bfqq_expire(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 		     bool compensate, enum bfqq_expiration reason);
+ void bfq_put_queue(struct bfq_queue *bfqq);
+@@ -1078,6 +1074,8 @@ void bfq_requeue_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 		      bool expiration);
+ void bfq_del_bfqq_busy(struct bfq_queue *bfqq, bool expiration);
+ void bfq_add_bfqq_busy(struct bfq_queue *bfqq);
++void bfq_add_bfqq_in_groups_with_pending_reqs(struct bfq_queue *bfqq);
++void bfq_del_bfqq_in_groups_with_pending_reqs(struct bfq_queue *bfqq);
+ 
+ /* --------------- end of interface of B-WF2Q+ ---------------- */
+ 
+diff --git a/block/bfq-wf2q.c b/block/bfq-wf2q.c
+index 8fc3da4c2..5a02cb94d 100644
+--- a/block/bfq-wf2q.c
++++ b/block/bfq-wf2q.c
+@@ -707,7 +707,6 @@ __bfq_entity_update_weight_prio(struct bfq_service_tree *old_st,
+ 		struct bfq_queue *bfqq = bfq_entity_to_bfqq(entity);
+ 		unsigned int prev_weight, new_weight;
+ 		struct bfq_data *bfqd = NULL;
+-		struct rb_root_cached *root;
+ #ifdef CONFIG_BFQ_GROUP_IOSCHED
+ 		struct bfq_sched_data *sd;
+ 		struct bfq_group *bfqg;
+@@ -770,19 +769,15 @@ __bfq_entity_update_weight_prio(struct bfq_service_tree *old_st,
+ 		 * queue, remove the entity from its old weight counter (if
+ 		 * there is a counter associated with the entity).
+ 		 */
+-		if (prev_weight != new_weight && bfqq) {
+-			root = &bfqd->queue_weights_tree;
+-			__bfq_weights_tree_remove(bfqd, bfqq, root);
+-		}
++		if (prev_weight != new_weight && bfqq)
++			bfq_weights_tree_remove(bfqq);
+ 		entity->weight = new_weight;
+ 		/*
+ 		 * Add the entity, if it is not a weight-raised queue,
+ 		 * to the counter associated with its new weight.
+ 		 */
+-		if (prev_weight != new_weight && bfqq && bfqq->wr_coeff == 1) {
+-			/* If we get here, root has been initialized. */
+-			bfq_weights_tree_add(bfqd, bfqq, root);
+-		}
++		if (prev_weight != new_weight && bfqq && bfqq->wr_coeff == 1)
++			bfq_weights_tree_add(bfqq);
+ 
+ 		new_st->wsum += entity->weight;
+ 
+@@ -984,19 +979,6 @@ static void __bfq_activate_entity(struct bfq_entity *entity,
+ 		entity->on_st_or_in_serv = true;
+ 	}
+ 
+-#ifdef CONFIG_BFQ_GROUP_IOSCHED
+-	if (!bfq_entity_to_bfqq(entity)) { /* bfq_group */
+-		struct bfq_group *bfqg =
+-			container_of(entity, struct bfq_group, entity);
+-		struct bfq_data *bfqd = bfqg->bfqd;
+-
+-		if (!entity->in_groups_with_pending_reqs) {
+-			entity->in_groups_with_pending_reqs = true;
+-			bfqd->num_groups_with_pending_reqs++;
+-		}
+-	}
+-#endif
+-
+ 	bfq_update_fin_time_enqueue(entity, st, backshifted);
+ }
+ 
+@@ -1646,6 +1628,32 @@ void bfq_requeue_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 				    bfqq == bfqd->in_service_queue, expiration);
+ }
+ 
++void bfq_add_bfqq_in_groups_with_pending_reqs(struct bfq_queue *bfqq)
++{
++	struct bfq_entity *entity = &bfqq->entity;
++
++	if (!entity->in_groups_with_pending_reqs) {
++		entity->in_groups_with_pending_reqs = true;
++#ifdef CONFIG_BFQ_GROUP_IOSCHED
++		if (!(bfqq_group(bfqq)->num_queues_with_pending_reqs++))
++			bfqq->bfqd->num_groups_with_pending_reqs++;
++#endif
++	}
++}
++
++void bfq_del_bfqq_in_groups_with_pending_reqs(struct bfq_queue *bfqq)
++{
++	struct bfq_entity *entity = &bfqq->entity;
++
++	if (entity->in_groups_with_pending_reqs) {
++		entity->in_groups_with_pending_reqs = false;
++#ifdef CONFIG_BFQ_GROUP_IOSCHED
++		if (!(--bfqq_group(bfqq)->num_queues_with_pending_reqs))
++			bfqq->bfqd->num_groups_with_pending_reqs--;
++#endif
++	}
++}
++
+ /*
+  * Called when the bfqq no longer has requests pending, remove it from
+  * the service tree. As a special case, it can be invoked during an
+@@ -1668,8 +1676,14 @@ void bfq_del_bfqq_busy(struct bfq_queue *bfqq, bool expiration)
+ 
+ 	bfq_deactivate_bfqq(bfqd, bfqq, true, expiration);
+ 
+-	if (!bfqq->dispatched)
+-		bfq_weights_tree_remove(bfqd, bfqq);
++	if (!bfqq->dispatched) {
++		bfq_del_bfqq_in_groups_with_pending_reqs(bfqq);
++		/*
++		 * Next function is invoked last, because it causes bfqq to be
++		 * freed. DO NOT use bfqq after the next function invocation.
++		 */
++		bfq_weights_tree_remove(bfqq);
++	}
+ }
+ 
+ /*
+@@ -1686,10 +1700,11 @@ void bfq_add_bfqq_busy(struct bfq_queue *bfqq)
+ 	bfq_mark_bfqq_busy(bfqq);
+ 	bfqd->busy_queues[bfqq->ioprio_class - 1]++;
+ 
+-	if (!bfqq->dispatched)
++	if (!bfqq->dispatched) {
++		bfq_add_bfqq_in_groups_with_pending_reqs(bfqq);
+ 		if (bfqq->wr_coeff == 1)
+-			bfq_weights_tree_add(bfqd, bfqq,
+-					     &bfqd->queue_weights_tree);
++			bfq_weights_tree_add(bfqq);
++	}
+ 
+ 	if (bfqq->wr_coeff > 1)
+ 		bfqd->wr_busy_queues++;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 55c54a98e6726d26f679a6a7bd4781af1451a4dc Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 14 Dec 2022 11:04:30 +0800
+Subject: [PATCH 2/5] block, bfq: fix possible uaf for 'bfqq->bic'
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Our test report a uaf for 'bfqq->bic' in 5.10:
+
+==================================================================
+BUG: KASAN: use-after-free in bfq_select_queue+0x378/0xa30
+
+CPU: 6 PID: 2318352 Comm: fsstress Kdump: loaded Not tainted 5.10.0-60.18.0.50.h602.kasan.eulerosv2r11.x86_64 #1
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.1-0-ga5cab58-20220320_160524-szxrtosci10000 04/01/2014
+Call Trace:
+ bfq_select_queue+0x378/0xa30
+ bfq_dispatch_request+0xe8/0x130
+ blk_mq_do_dispatch_sched+0x62/0xb0
+ __blk_mq_sched_dispatch_requests+0x215/0x2a0
+ blk_mq_sched_dispatch_requests+0x8f/0xd0
+ __blk_mq_run_hw_queue+0x98/0x180
+ __blk_mq_delay_run_hw_queue+0x22b/0x240
+ blk_mq_run_hw_queue+0xe3/0x190
+ blk_mq_sched_insert_requests+0x107/0x200
+ blk_mq_flush_plug_list+0x26e/0x3c0
+ blk_finish_plug+0x63/0x90
+ __iomap_dio_rw+0x7b5/0x910
+ iomap_dio_rw+0x36/0x80
+ ext4_dio_read_iter+0x146/0x190 [ext4]
+ ext4_file_read_iter+0x1e2/0x230 [ext4]
+ new_sync_read+0x29f/0x400
+ vfs_read+0x24e/0x2d0
+ ksys_read+0xd5/0x1b0
+ do_syscall_64+0x33/0x40
+ entry_SYSCALL_64_after_hwframe+0x61/0xc6
+
+Commit 3bc5e683c67d ("bfq: Split shared queues on move between cgroups")
+changes that move process to a new cgroup will allocate a new bfqq to
+use, however, the old bfqq and new bfqq can point to the same bic:
+
+1) Initial state, two process with io in the same cgroup.
+
+Process 1       Process 2
+ (BIC1)          (BIC2)
+  |  Λ            |  Λ
+  |  |            |  |
+  V  |            V  |
+  bfqq1           bfqq2
+
+2) bfqq1 is merged to bfqq2.
+
+Process 1       Process 2
+ (BIC1)          (BIC2)
+  |               |
+   \-------------\|
+                  V
+  bfqq1           bfqq2(coop)
+
+3) Process 1 exit, then issue new io(denoce IOA) from Process 2.
+
+ (BIC2)
+  |  Λ
+  |  |
+  V  |
+  bfqq2(coop)
+
+4) Before IOA is completed, move Process 2 to another cgroup and issue io.
+
+Process 2
+ (BIC2)
+   Λ
+   |\--------------\
+   |                V
+  bfqq2           bfqq3
+
+Now that BIC2 points to bfqq3, while bfqq2 and bfqq3 both point to BIC2.
+If all the requests are completed, and Process 2 exit, BIC2 will be
+freed while there is no guarantee that bfqq2 will be freed before BIC2.
+
+Fix the problem by clearing bfqq->bic while bfqq is detached from bic.
+
+Fixes: 3bc5e683c67d ("bfq: Split shared queues on move between cgroups")
+Suggested-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+---
+ block/bfq-iosched.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 24649c34c..bffc303ff 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -386,6 +386,12 @@ static void bfq_put_stable_ref(struct bfq_queue *bfqq);
+ 
+ void bic_set_bfqq(struct bfq_io_cq *bic, struct bfq_queue *bfqq, bool is_sync)
+ {
++	struct bfq_queue *old_bfqq = bic->bfqq[is_sync];
++
++	/* Clear bic pointer if bfqq is detached from this bic */
++	if (old_bfqq && old_bfqq->bic == bic)
++		old_bfqq->bic = NULL;
++
+ 	/*
+ 	 * If bfqq != NULL, then a non-stable queue merge between
+ 	 * bic->bfqq and bfqq is happening here. This causes troubles
+@@ -5325,7 +5331,6 @@ static void bfq_exit_icq_bfqq(struct bfq_io_cq *bic, bool is_sync)
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&bfqd->lock, flags);
+-		bfqq->bic = NULL;
+ 		bfq_exit_bfqq(bfqd, bfqq);
+ 		bic_set_bfqq(bic, NULL, is_sync);
+ 		spin_unlock_irqrestore(&bfqd->lock, flags);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 2256aaa5e6214ea8ebc072fa7ea8a647037be10f Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 14 Dec 2022 11:31:54 +0800
+Subject: [PATCH 3/5] block, bfq: don't return bfqg from
+ __bfq_bic_change_cgroup()
+
+The return value is not used, hence remove it.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ block/bfq-cgroup.c | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/block/bfq-cgroup.c b/block/bfq-cgroup.c
+index 09dab3971..efcd3c009 100644
+--- a/block/bfq-cgroup.c
++++ b/block/bfq-cgroup.c
+@@ -724,9 +724,9 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+  * sure that the reference to cgroup is valid across the call (see
+  * comments in bfq_bic_update_cgroup on this issue)
+  */
+-static void *__bfq_bic_change_cgroup(struct bfq_data *bfqd,
+-				     struct bfq_io_cq *bic,
+-				     struct bfq_group *bfqg)
++static void __bfq_bic_change_cgroup(struct bfq_data *bfqd,
++				    struct bfq_io_cq *bic,
++				    struct bfq_group *bfqg)
+ {
+ 	struct bfq_queue *async_bfqq = bic_to_bfqq(bic, 0);
+ 	struct bfq_queue *sync_bfqq = bic_to_bfqq(bic, 1);
+@@ -776,8 +776,6 @@ static void *__bfq_bic_change_cgroup(struct bfq_data *bfqd,
+ 			}
+ 		}
+ 	}
+-
+-	return bfqg;
+ }
+ 
+ void bfq_bic_update_cgroup(struct bfq_io_cq *bic, struct bio *bio)
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 92698a319dd62707f583ef436146b4465784cab9 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 14 Dec 2022 11:31:55 +0800
+Subject: [PATCH 4/5] block, bfq: replace 0/1 with false/true in bic apis
+
+Just to make the code a litter cleaner, there are no functional changes.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ block/bfq-cgroup.c  | 8 ++++----
+ block/bfq-iosched.c | 4 ++--
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/block/bfq-cgroup.c b/block/bfq-cgroup.c
+index efcd3c009..3a74a8f94 100644
+--- a/block/bfq-cgroup.c
++++ b/block/bfq-cgroup.c
+@@ -728,15 +728,15 @@ static void __bfq_bic_change_cgroup(struct bfq_data *bfqd,
+ 				    struct bfq_io_cq *bic,
+ 				    struct bfq_group *bfqg)
+ {
+-	struct bfq_queue *async_bfqq = bic_to_bfqq(bic, 0);
+-	struct bfq_queue *sync_bfqq = bic_to_bfqq(bic, 1);
++	struct bfq_queue *async_bfqq = bic_to_bfqq(bic, false);
++	struct bfq_queue *sync_bfqq = bic_to_bfqq(bic, true);
+ 	struct bfq_entity *entity;
+ 
+ 	if (async_bfqq) {
+ 		entity = &async_bfqq->entity;
+ 
+ 		if (entity->sched_data != &bfqg->sched_data) {
+-			bic_set_bfqq(bic, NULL, 0);
++			bic_set_bfqq(bic, NULL, false);
+ 			bfq_release_process_ref(bfqd, async_bfqq);
+ 		}
+ 	}
+@@ -772,7 +772,7 @@ static void __bfq_bic_change_cgroup(struct bfq_data *bfqd,
+ 				 */
+ 				bfq_put_cooperator(sync_bfqq);
+ 				bfq_release_process_ref(bfqd, sync_bfqq);
+-				bic_set_bfqq(bic, NULL, 1);
++				bic_set_bfqq(bic, NULL, true);
+ 			}
+ 		}
+ 	}
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index bffc303ff..e3b2d817c 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -3128,7 +3128,7 @@ bfq_merge_bfqqs(struct bfq_data *bfqd, struct bfq_io_cq *bic,
+ 	/*
+ 	 * Merge queues (that is, let bic redirect its requests to new_bfqq)
+ 	 */
+-	bic_set_bfqq(bic, new_bfqq, 1);
++	bic_set_bfqq(bic, new_bfqq, true);
+ 	bfq_mark_bfqq_coop(new_bfqq);
+ 	/*
+ 	 * new_bfqq now belongs to at least two bics (it is a shared queue):
+@@ -6576,7 +6576,7 @@ bfq_split_bfqq(struct bfq_io_cq *bic, struct bfq_queue *bfqq)
+ 		return bfqq;
+ 	}
+ 
+-	bic_set_bfqq(bic, NULL, 1);
++	bic_set_bfqq(bic, NULL, true);
+ 
+ 	bfq_put_cooperator(bfqq);
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 8f4da55052ff4944c45c5099befd4889021b83e6 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 18 Aug 2022 15:42:01 +0200
+Subject: [PATCH 5/5] bfq-6.1: set CachyOS branding
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ block/bfq-iosched.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index e3b2d817c..2c71e5bcb 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -7415,6 +7415,7 @@ MODULE_ALIAS("bfq-iosched");
+ static int __init bfq_init(void)
+ {
+ 	int ret;
++	char msg[60] = "BFQ I/O-scheduler: BFQ-CachyOS v6.1";
+ 
+ #ifdef CONFIG_BFQ_GROUP_IOSCHED
+ 	ret = blkcg_policy_register(&blkcg_policy_bfq);
+@@ -7446,6 +7447,11 @@ static int __init bfq_init(void)
+ 	if (ret)
+ 		goto slab_kill;
+ 
++#ifdef CONFIG_BFQ_GROUP_IOSCHED
++	strcat(msg, " (with cgroups support)");
++#endif
++	pr_info("%s", msg);
++
+ 	return 0;
+ 
+ slab_kill:
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
