@@ -1,0 +1,166 @@
+From 6625fb97ae7a60f7cdb601b244aea038b21a943c Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Tue, 11 Oct 2022 13:17:09 +0100
+Subject: [PATCH 042/249] btrfs: avoid unnecessary resolution of indirect
+ backrefs during fiemap
+
+During fiemap, when determining if a data extent is shared or not, if we
+don't find the extent is directly shared, then we need to determine if
+it's shared through subtrees. For that we need to resolve the indirect
+reference we found in order to figure out the path in the inode's fs tree,
+which is a path starting at the fs tree's root node and going down to the
+leaf that contains the file extent item that points to the data extent.
+We then proceed to determine if any extent buffer in that path is shared
+with other trees or not.
+
+However when the generation of the data extent is more recent than the
+last generation used to snapshot the root, we don't need to determine
+the path, since the data extent can not be shared through snapshots.
+For this case we currently still determine the leaf of that path (at
+find_parent_nodes(), but then stop determining the other nodes in the
+path (at btrfs_is_data_extent_shared()) as it's pointless.
+
+So do the check of the data extent's generation earlier, at
+find_parent_nodes(), before trying to resolve the indirect reference to
+determine the leaf in the path. This saves us from doing one expensive
+b+tree search in the fs tree of our target inode, as well as other minor
+work.
+
+The following test was run on a non-debug kernel (Debian's default kernel
+config):
+
+   $ cat test-fiemap.sh
+   #!/bin/bash
+
+   DEV=/dev/sdi
+   MNT=/mnt/sdi
+
+   umount $DEV &> /dev/null
+   mkfs.btrfs -f $DEV
+   # Use compression to quickly create files with a lot of extents
+   # (each with a size of 128K).
+   mount -o compress=lzo $DEV $MNT
+
+   # 40G gives 327680 extents, each with a size of 128K.
+   xfs_io -f -c "pwrite -S 0xab -b 1M 0 40G" $MNT/foobar
+
+   # Add some more files to increase the size of the fs and extent
+   # trees (in the real world there's a lot of files and extents
+   # from other files).
+   xfs_io -f -c "pwrite -S 0xcd -b 1M 0 20G" $MNT/file1
+   xfs_io -f -c "pwrite -S 0xef -b 1M 0 20G" $MNT/file2
+   xfs_io -f -c "pwrite -S 0x73 -b 1M 0 20G" $MNT/file3
+
+   umount $MNT
+   mount -o compress=lzo $DEV $MNT
+
+   start=$(date +%s%N)
+   filefrag $MNT/foobar
+   end=$(date +%s%N)
+   dur=$(( (end - start) / 1000000 ))
+   echo "fiemap took $dur milliseconds (metadata not cached)"
+   echo
+
+   start=$(date +%s%N)
+   filefrag $MNT/foobar
+   end=$(date +%s%N)
+   dur=$(( (end - start) / 1000000 ))
+   echo "fiemap took $dur milliseconds (metadata cached)"
+
+   umount $MNT
+
+Before applying this patch:
+
+   (...)
+   /mnt/sdi/foobar: 327680 extents found
+   fiemap took 1285 milliseconds (metadata not cached)
+
+   /mnt/sdi/foobar: 327680 extents found
+   fiemap took 742 milliseconds (metadata cached)
+
+After applying this patch:
+
+   (...)
+   /mnt/sdi/foobar: 327680 extents found
+   fiemap took 689 milliseconds (metadata not cached)
+
+   /mnt/sdi/foobar: 327680 extents found
+   fiemap took 393 milliseconds (metadata cached)
+
+That's a -46.4% total reduction for the metadata not cached case, and
+a -47.0% reduction for the cached metadata case.
+
+The test is somewhat limited in the sense the gains may be higher in
+practice, because in the test the filesystem is small, so we have small
+fs and extent trees, plus there's no concurrent access to the trees as
+well, therefore no lock contention there.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/backref.c | 28 +++++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+index 94a3c6dea..232f49415 100644
+--- a/fs/btrfs/backref.c
++++ b/fs/btrfs/backref.c
+@@ -140,6 +140,7 @@ struct share_check {
+ 	struct btrfs_root *root;
+ 	u64 inum;
+ 	u64 data_bytenr;
++	u64 data_extent_gen;
+ 	/*
+ 	 * Counts number of inodes that refer to an extent (different inodes in
+ 	 * the same root or different roots) that we could find. The sharedness
+@@ -1480,6 +1481,21 @@ static int find_parent_nodes(struct btrfs_trans_handle *trans,
+ 	 * of the extent buffers in the path is referenced by other trees.
+ 	 */
+ 	if (sc && bytenr == sc->data_bytenr) {
++		/*
++		 * If our data extent is from a generation more recent than the
++		 * last generation used to snapshot the root, then we know that
++		 * it can not be shared through subtrees, so we can skip
++		 * resolving indirect references, there's no point in
++		 * determining the extent buffers for the path from the fs tree
++		 * root node down to the leaf that has the file extent item that
++		 * points to the data extent.
++		 */
++		if (sc->data_extent_gen >
++		    btrfs_root_last_snapshot(&sc->root->root_item)) {
++			ret = BACKREF_FOUND_NOT_SHARED;
++			goto out;
++		}
++
+ 		/*
+ 		 * If we are only determining if a data extent is shared or not
+ 		 * and the corresponding file extent item is located in the same
+@@ -1789,6 +1805,7 @@ int btrfs_is_data_extent_shared(struct btrfs_inode *inode, u64 bytenr,
+ 		.root = root,
+ 		.inum = btrfs_ino(inode),
+ 		.data_bytenr = bytenr,
++		.data_extent_gen = extent_gen,
+ 		.share_count = 0,
+ 		.self_ref_count = 0,
+ 		.have_delayed_delete_refs = false,
+@@ -1836,17 +1853,6 @@ int btrfs_is_data_extent_shared(struct btrfs_inode *inode, u64 bytenr,
+ 		if (ret < 0 && ret != -ENOENT)
+ 			break;
+ 		ret = 0;
+-		/*
+-		 * If our data extent is not shared through reflinks and it was
+-		 * created in a generation after the last one used to create a
+-		 * snapshot of the inode's root, then it can not be shared
+-		 * indirectly through subtrees, as that can only happen with
+-		 * snapshots. In this case bail out, no need to check for the
+-		 * sharedness of extent buffers.
+-		 */
+-		if (level == -1 &&
+-		    extent_gen > btrfs_root_last_snapshot(&root->root_item))
+-			break;
+ 
+ 		/*
+ 		 * If our data extent was not directly shared (without multiple
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

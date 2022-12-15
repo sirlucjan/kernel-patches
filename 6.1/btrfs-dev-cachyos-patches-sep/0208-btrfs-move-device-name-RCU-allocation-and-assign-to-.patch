@@ -1,0 +1,241 @@
+From 1631cbe3adaa82641aced3c6092013a94606256a Mon Sep 17 00:00:00 2001
+From: Anand Jain <anand.jain@oracle.com>
+Date: Mon, 7 Nov 2022 23:07:17 +0800
+Subject: [PATCH 208/249] btrfs: move device->name RCU allocation and assign to
+ btrfs_alloc_device()
+
+There is a repeating code section in the parent function after calling
+btrfs_alloc_device(), as below:
+
+      name = rcu_string_strdup(path, GFP_...);
+      if (!name) {
+              btrfs_free_device(device);
+              return ERR_PTR(-ENOMEM);
+      }
+      rcu_assign_pointer(device->name, name);
+
+Except in add_missing_dev() for obvious reasons.
+
+This patch consolidates that repeating code into the btrfs_alloc_device()
+itself so that the parent function doesn't have to duplicate code.
+This consolidation also helps to review issues regarding RCU lock
+violation with device->name.
+
+Parent function device_list_add() and add_missing_dev() use GFP_NOFS for
+the allocation, whereas the rest of the parent functions use GFP_KERNEL,
+so bring the NOFS allocation context using memalloc_nofs_save() in the
+function device_list_add() and add_missing_dev() is already doing it.
+
+Signed-off-by: Anand Jain <anand.jain@oracle.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/dev-replace.c | 10 +------
+ fs/btrfs/volumes.c     | 68 +++++++++++++++++++-----------------------
+ fs/btrfs/volumes.h     |  4 +--
+ 3 files changed, 34 insertions(+), 48 deletions(-)
+
+diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+index 84af2010f..9c4a8649a 100644
+--- a/fs/btrfs/dev-replace.c
++++ b/fs/btrfs/dev-replace.c
+@@ -249,7 +249,6 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+ 	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
+ 	struct btrfs_device *device;
+ 	struct block_device *bdev;
+-	struct rcu_string *name;
+ 	u64 devid = BTRFS_DEV_REPLACE_DEVID;
+ 	int ret = 0;
+ 
+@@ -293,19 +292,12 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+ 	}
+ 
+ 
+-	device = btrfs_alloc_device(NULL, &devid, NULL);
++	device = btrfs_alloc_device(NULL, &devid, NULL, device_path);
+ 	if (IS_ERR(device)) {
+ 		ret = PTR_ERR(device);
+ 		goto error;
+ 	}
+ 
+-	name = rcu_string_strdup(device_path, GFP_KERNEL);
+-	if (!name) {
+-		btrfs_free_device(device);
+-		ret = -ENOMEM;
+-		goto error;
+-	}
+-	rcu_assign_pointer(device->name, name);
+ 	ret = lookup_bdev(device_path, &device->devt);
+ 	if (ret)
+ 		goto error;
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index acb97494b..49d6e79d4 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -845,26 +845,23 @@ static noinline struct btrfs_device *device_list_add(const char *path,
+ 	}
+ 
+ 	if (!device) {
++		unsigned int nofs_flag;
++
+ 		if (fs_devices->opened) {
+ 			mutex_unlock(&fs_devices->device_list_mutex);
+ 			return ERR_PTR(-EBUSY);
+ 		}
+ 
++		nofs_flag = memalloc_nofs_save();
+ 		device = btrfs_alloc_device(NULL, &devid,
+-					    disk_super->dev_item.uuid);
++					    disk_super->dev_item.uuid, path);
++		memalloc_nofs_restore(nofs_flag);
+ 		if (IS_ERR(device)) {
+ 			mutex_unlock(&fs_devices->device_list_mutex);
+ 			/* we can safely leave the fs_devices entry around */
+ 			return device;
+ 		}
+ 
+-		name = rcu_string_strdup(path, GFP_NOFS);
+-		if (!name) {
+-			btrfs_free_device(device);
+-			mutex_unlock(&fs_devices->device_list_mutex);
+-			return ERR_PTR(-ENOMEM);
+-		}
+-		rcu_assign_pointer(device->name, name);
+ 		device->devt = path_devt;
+ 
+ 		list_add_rcu(&device->dev_list, &fs_devices->devices);
+@@ -997,30 +994,22 @@ static struct btrfs_fs_devices *clone_fs_devices(struct btrfs_fs_devices *orig)
+ 	fs_devices->total_devices = orig->total_devices;
+ 
+ 	list_for_each_entry(orig_dev, &orig->devices, dev_list) {
+-		struct rcu_string *name;
++		const char *dev_path = NULL;
++
++		/*
++		 * This is ok to do without RCU read locked because we hold the
++		 * uuid mutex so nothing we touch in here is going to disappear.
++		 */
++		if (orig_dev->name)
++			dev_path = orig_dev->name->str;
+ 
+ 		device = btrfs_alloc_device(NULL, &orig_dev->devid,
+-					    orig_dev->uuid);
++					    orig_dev->uuid, dev_path);
+ 		if (IS_ERR(device)) {
+ 			ret = PTR_ERR(device);
+ 			goto error;
+ 		}
+ 
+-		/*
+-		 * This is ok to do without rcu read locked because we hold the
+-		 * uuid mutex so nothing we touch in here is going to disappear.
+-		 */
+-		if (orig_dev->name) {
+-			name = rcu_string_strdup(orig_dev->name->str,
+-					GFP_KERNEL);
+-			if (!name) {
+-				btrfs_free_device(device);
+-				ret = -ENOMEM;
+-				goto error;
+-			}
+-			rcu_assign_pointer(device->name, name);
+-		}
+-
+ 		if (orig_dev->zone_info) {
+ 			struct btrfs_zoned_device_info *zone_info;
+ 
+@@ -2604,7 +2593,6 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+ 	struct btrfs_device *device;
+ 	struct block_device *bdev;
+ 	struct super_block *sb = fs_info->sb;
+-	struct rcu_string *name;
+ 	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
+ 	struct btrfs_fs_devices *seed_devices;
+ 	u64 orig_super_total_bytes;
+@@ -2645,20 +2633,13 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+ 	}
+ 	rcu_read_unlock();
+ 
+-	device = btrfs_alloc_device(fs_info, NULL, NULL);
++	device = btrfs_alloc_device(fs_info, NULL, NULL, device_path);
+ 	if (IS_ERR(device)) {
+ 		/* we can safely leave the fs_devices entry around */
+ 		ret = PTR_ERR(device);
+ 		goto error;
+ 	}
+ 
+-	name = rcu_string_strdup(device_path, GFP_KERNEL);
+-	if (!name) {
+-		ret = -ENOMEM;
+-		goto error_free_device;
+-	}
+-	rcu_assign_pointer(device->name, name);
+-
+ 	device->fs_info = fs_info;
+ 	device->bdev = bdev;
+ 	ret = lookup_bdev(device_path, &device->devt);
+@@ -6998,8 +6979,9 @@ static struct btrfs_device *add_missing_dev(struct btrfs_fs_devices *fs_devices,
+ 	 * always do NOFS because we use it in a lot of other GFP_KERNEL safe
+ 	 * places.
+ 	 */
++
+ 	nofs_flag = memalloc_nofs_save();
+-	device = btrfs_alloc_device(NULL, &devid, dev_uuid);
++	device = btrfs_alloc_device(NULL, &devid, dev_uuid, NULL);
+ 	memalloc_nofs_restore(nofs_flag);
+ 	if (IS_ERR(device))
+ 		return device;
+@@ -7023,14 +7005,15 @@ static struct btrfs_device *add_missing_dev(struct btrfs_fs_devices *fs_devices,
+  *		is generated.
+  * @uuid:	a pointer to UUID for this device.  If NULL a new UUID
+  *		is generated.
++ * @path:	a pointer to device path if available, NULL otherwise.
+  *
+  * Return: a pointer to a new &struct btrfs_device on success; ERR_PTR()
+  * on error.  Returned struct is not linked onto any lists and must be
+  * destroyed with btrfs_free_device.
+  */
+ struct btrfs_device *btrfs_alloc_device(struct btrfs_fs_info *fs_info,
+-					const u64 *devid,
+-					const u8 *uuid)
++					const u64 *devid, const u8 *uuid,
++					const char *path)
+ {
+ 	struct btrfs_device *dev;
+ 	u64 tmp;
+@@ -7068,6 +7051,17 @@ struct btrfs_device *btrfs_alloc_device(struct btrfs_fs_info *fs_info,
+ 	else
+ 		generate_random_uuid(dev->uuid);
+ 
++	if (path) {
++		struct rcu_string *name;
++
++		name = rcu_string_strdup(path, GFP_KERNEL);
++		if (!name) {
++			btrfs_free_device(dev);
++			return ERR_PTR(-ENOMEM);
++		}
++		rcu_assign_pointer(dev->name, name);
++	}
++
+ 	return dev;
+ }
+ 
+diff --git a/fs/btrfs/volumes.h b/fs/btrfs/volumes.h
+index b05124e62..f2a152937 100644
+--- a/fs/btrfs/volumes.h
++++ b/fs/btrfs/volumes.h
+@@ -649,8 +649,8 @@ int btrfs_get_dev_args_from_path(struct btrfs_fs_info *fs_info,
+ 				 struct btrfs_dev_lookup_args *args,
+ 				 const char *path);
+ struct btrfs_device *btrfs_alloc_device(struct btrfs_fs_info *fs_info,
+-					const u64 *devid,
+-					const u8 *uuid);
++					const u64 *devid, const u8 *uuid,
++					const char *path);
+ void btrfs_put_dev_args_from_path(struct btrfs_dev_lookup_args *args);
+ void btrfs_free_device(struct btrfs_device *device);
+ int btrfs_rm_device(struct btrfs_fs_info *fs_info,
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

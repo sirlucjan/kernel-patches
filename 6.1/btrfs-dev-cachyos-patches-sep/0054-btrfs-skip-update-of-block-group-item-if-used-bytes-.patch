@@ -1,0 +1,181 @@
+From 42cccdec88cd22b5ab68e137df543a7df83d1453 Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Fri, 9 Sep 2022 14:45:22 +0800
+Subject: [PATCH 054/249] btrfs: skip update of block group item if used bytes
+ are the same
+
+[BACKGROUND]
+
+When committing a transaction, we will update block group items for all
+dirty block groups.
+
+But in fact, dirty block groups don't always need to update their block
+group items.
+It's pretty common to have a metadata block group which experienced
+several COW operations, but still have the same amount of used bytes.
+
+In that case, we may unnecessarily COW a tree block doing nothing.
+
+[ENHANCEMENT]
+
+This patch will introduce btrfs_block_group::commit_used member to
+remember the last used bytes, and use that new member to skip
+unnecessary block group item update.
+
+This would be more common for large filesystems, where metadata block
+group can be as large as 1GiB, containing at most 64K metadata items.
+
+In that case, if COW added and then deleted one metadata item near the
+end of the block group, then it's completely possible we don't need to
+touch the block group item at all.
+
+[BENCHMARK]
+
+The change itself can have quite a high chance (20~80%) to skip block
+group item updates in lot of workloads.
+
+As a result, it would result shorter time spent on
+btrfs_write_dirty_block_groups(), and overall reduce the execution time
+of the critical section of btrfs_commit_transaction().
+
+Here comes a fio command, which will do random writes in 4K block size,
+causing a very heavy metadata updates.
+
+fio --filename=$mnt/file --size=512M --rw=randwrite --direct=1 --bs=4k \
+    --ioengine=libaio --iodepth=64 --runtime=300 --numjobs=4 \
+    --name=random_write --fallocate=none --time_based --fsync_on_close=1
+
+The file size (512M) and number of threads (4) means 2GiB file size in
+total, but during the full 300s run time, my dedicated SATA SSD is able
+to write around 20~25GiB, which is over 10 times the file size.
+
+Thus after we fill the initial 2G, we should not cause much block group
+item updates.
+
+Please note, the fio numbers by themselves don't have much change, but
+if we look deeper, there is some reduced execution time, especially for
+the critical section of btrfs_commit_transaction().
+
+I added extra trace_printk() to measure the following per-transaction
+execution time:
+
+- Critical section of btrfs_commit_transaction()
+  By re-using the existing update_commit_stats() function, which
+  has already calculated the interval correctly.
+
+- The while() loop for btrfs_write_dirty_block_groups()
+  Although this includes the execution time of btrfs_run_delayed_refs(),
+  it should still be representative overall.
+
+Both result involves transid 7~30, the same amount of transaction
+committed.
+
+The result looks like this:
+
+                      |      Before       |     After      |  Diff
+----------------------+-------------------+----------------+--------
+Transaction interval  | 229247198.5       | 215016933.6    | -6.2%
+Block group interval  | 23133.33333       | 18970.83333    | -18.0%
+
+The change in block group item updates is more obvious, as skipped block
+group item updates also mean less delayed refs.
+
+And the overall execution time for that block group update loop is
+pretty small, thus we can assume the extent tree is already mostly
+cached.  If we can skip an uncached tree block, it would cause more
+obvious change.
+
+Unfortunately the overall reduction in commit transaction critical
+section is much smaller, as the block group item updates loop is not
+really the major part, at least not for the above fio script.
+
+But still we have a observable reduction in the critical section.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/block-group.c | 28 +++++++++++++++++++++++++++-
+ fs/btrfs/block-group.h |  6 ++++++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index b1f4acdea..47461fd21 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -2071,6 +2071,7 @@ static int read_one_block_group(struct btrfs_fs_info *info,
+ 
+ 	cache->length = key->offset;
+ 	cache->used = btrfs_stack_block_group_used(bgi);
++	cache->commit_used = cache->used;
+ 	cache->flags = btrfs_stack_block_group_flags(bgi);
+ 	cache->global_root_id = btrfs_stack_block_group_chunk_objectid(bgi);
+ 
+@@ -2762,6 +2763,25 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 	struct extent_buffer *leaf;
+ 	struct btrfs_block_group_item bgi;
+ 	struct btrfs_key key;
++	u64 old_commit_used;
++	u64 used;
++
++	/*
++	 * Block group items update can be triggered out of commit transaction
++	 * critical section, thus we need a consistent view of used bytes.
++	 * We cannot use cache->used directly outside of the spin lock, as it
++	 * may be changed.
++	 */
++	spin_lock(&cache->lock);
++	old_commit_used = cache->commit_used;
++	used = cache->used;
++	/* No change in used bytes, can safely skip it. */
++	if (cache->commit_used == used) {
++		spin_unlock(&cache->lock);
++		return 0;
++	}
++	cache->commit_used = used;
++	spin_unlock(&cache->lock);
+ 
+ 	key.objectid = cache->start;
+ 	key.type = BTRFS_BLOCK_GROUP_ITEM_KEY;
+@@ -2776,7 +2796,7 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 
+ 	leaf = path->nodes[0];
+ 	bi = btrfs_item_ptr_offset(leaf, path->slots[0]);
+-	btrfs_set_stack_block_group_used(&bgi, cache->used);
++	btrfs_set_stack_block_group_used(&bgi, used);
+ 	btrfs_set_stack_block_group_chunk_objectid(&bgi,
+ 						   cache->global_root_id);
+ 	btrfs_set_stack_block_group_flags(&bgi, cache->flags);
+@@ -2784,6 +2804,12 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 	btrfs_mark_buffer_dirty(leaf);
+ fail:
+ 	btrfs_release_path(path);
++	/* We didn't update the block group item, need to revert @commit_used. */
++	if (ret < 0) {
++		spin_lock(&cache->lock);
++		cache->commit_used = old_commit_used;
++		spin_unlock(&cache->lock);
++	}
+ 	return ret;
+ 
+ }
+diff --git a/fs/btrfs/block-group.h b/fs/btrfs/block-group.h
+index 39e79bed1..6c970a486 100644
+--- a/fs/btrfs/block-group.h
++++ b/fs/btrfs/block-group.h
+@@ -99,6 +99,12 @@ struct btrfs_block_group {
+ 	u64 cache_generation;
+ 	u64 global_root_id;
+ 
++	/*
++	 * The last committed used bytes of this block group, if the above @used
++	 * is still the same as @commit_used, we don't need to update block
++	 * group item of this block group.
++	 */
++	u64 commit_used;
+ 	/*
+ 	 * If the free space extent count exceeds this number, convert the block
+ 	 * group to bitmaps.
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
