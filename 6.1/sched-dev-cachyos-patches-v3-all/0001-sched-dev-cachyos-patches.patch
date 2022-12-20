@@ -1,0 +1,1692 @@
+From f690684330c955de47479c7718756a6754a061ba Mon Sep 17 00:00:00 2001
+From: Josh Don <joshdon@google.com>
+Date: Wed, 16 Nov 2022 16:54:18 -0800
+Subject: [PATCH 01/11] sched: Async unthrottling for cfs bandwidth
+
+CFS bandwidth currently distributes new runtime and unthrottles cfs_rq's
+inline in an hrtimer callback. Runtime distribution is a per-cpu
+operation, and unthrottling is a per-cgroup operation, since a tg walk
+is required. On machines with a large number of cpus and large cgroup
+hierarchies, this cpus*cgroups work can be too much to do in a single
+hrtimer callback: since IRQ are disabled, hard lockups may easily occur.
+Specifically, we've found this scalability issue on configurations with
+256 cpus, O(1000) cgroups in the hierarchy being throttled, and high
+memory bandwidth usage.
+
+To fix this, we can instead unthrottle cfs_rq's asynchronously via a
+CSD. Each cpu is responsible for unthrottling itself, thus sharding the
+total work more fairly across the system, and avoiding hard lockups.
+
+Signed-off-by: Josh Don <joshdon@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20221117005418.3499691-1-joshdon@google.com
+---
+ kernel/sched/fair.c  | 155 +++++++++++++++++++++++++++++++++++++++----
+ kernel/sched/sched.h |   8 +++
+ 2 files changed, 150 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3b95a93e1..438e1ff5b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5791,22 +5791,105 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ 		resched_curr(rq);
+ }
+ 
+-static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
++#ifdef CONFIG_SMP
++static void __cfsb_csd_unthrottle(void *arg)
+ {
+-	struct cfs_rq *cfs_rq;
++	struct cfs_rq *cursor, *tmp;
++	struct rq *rq = arg;
++	struct rq_flags rf;
++
++	rq_lock(rq, &rf);
++
++	/*
++	 * Since we hold rq lock we're safe from concurrent manipulation of
++	 * the CSD list. However, this RCU critical section annotates the
++	 * fact that we pair with sched_free_group_rcu(), so that we cannot
++	 * race with group being freed in the window between removing it
++	 * from the list and advancing to the next entry in the list.
++	 */
++	rcu_read_lock();
++
++	list_for_each_entry_safe(cursor, tmp, &rq->cfsb_csd_list,
++				 throttled_csd_list) {
++		list_del_init(&cursor->throttled_csd_list);
++
++		if (cfs_rq_throttled(cursor))
++			unthrottle_cfs_rq(cursor);
++	}
++
++	rcu_read_unlock();
++
++	rq_unlock(rq, &rf);
++}
++
++static inline void __unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
++{
++	struct rq *rq = rq_of(cfs_rq);
++	bool first;
++
++	if (rq == this_rq()) {
++		unthrottle_cfs_rq(cfs_rq);
++		return;
++	}
++
++	/* Already enqueued */
++	if (SCHED_WARN_ON(!list_empty(&cfs_rq->throttled_csd_list)))
++		return;
++
++	first = list_empty(&rq->cfsb_csd_list);
++	list_add_tail(&cfs_rq->throttled_csd_list, &rq->cfsb_csd_list);
++	if (first)
++		smp_call_function_single_async(cpu_of(rq), &rq->cfsb_csd);
++}
++#else
++static inline void __unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
++{
++	unthrottle_cfs_rq(cfs_rq);
++}
++#endif
++
++static void unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
++{
++	lockdep_assert_rq_held(rq_of(cfs_rq));
++
++	if (SCHED_WARN_ON(!cfs_rq_throttled(cfs_rq) ||
++	    cfs_rq->runtime_remaining <= 0))
++		return;
++
++	__unthrottle_cfs_rq_async(cfs_rq);
++}
++
++static bool distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
++{
++	struct cfs_rq *local_unthrottle = NULL;
++	int this_cpu = smp_processor_id();
+ 	u64 runtime, remaining = 1;
++	bool throttled = false;
++	struct cfs_rq *cfs_rq;
++	struct rq_flags rf;
++	struct rq *rq;
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
+ 				throttled_list) {
+-		struct rq *rq = rq_of(cfs_rq);
+-		struct rq_flags rf;
++		rq = rq_of(cfs_rq);
++
++		if (!remaining) {
++			throttled = true;
++			break;
++		}
+ 
+ 		rq_lock_irqsave(rq, &rf);
+ 		if (!cfs_rq_throttled(cfs_rq))
+ 			goto next;
+ 
+-		/* By the above check, this should never be true */
++#ifdef CONFIG_SMP
++		/* Already queued for async unthrottle */
++		if (!list_empty(&cfs_rq->throttled_csd_list))
++			goto next;
++#endif
++
++		/* By the above checks, this should never be true */
+ 		SCHED_WARN_ON(cfs_rq->runtime_remaining > 0);
+ 
+ 		raw_spin_lock(&cfs_b->lock);
+@@ -5820,16 +5903,30 @@ static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
+ 		cfs_rq->runtime_remaining += runtime;
+ 
+ 		/* we check whether we're throttled above */
+-		if (cfs_rq->runtime_remaining > 0)
+-			unthrottle_cfs_rq(cfs_rq);
++		if (cfs_rq->runtime_remaining > 0) {
++			if (cpu_of(rq) != this_cpu ||
++			    SCHED_WARN_ON(local_unthrottle))
++				unthrottle_cfs_rq_async(cfs_rq);
++			else
++				local_unthrottle = cfs_rq;
++		} else {
++			throttled = true;
++		}
+ 
+ next:
+ 		rq_unlock_irqrestore(rq, &rf);
+-
+-		if (!remaining)
+-			break;
+ 	}
+ 	rcu_read_unlock();
++
++	if (local_unthrottle) {
++		rq = cpu_rq(this_cpu);
++		rq_lock_irqsave(rq, &rf);
++		if (cfs_rq_throttled(local_unthrottle))
++			unthrottle_cfs_rq(local_unthrottle);
++		rq_unlock_irqrestore(rq, &rf);
++	}
++
++	return throttled;
+ }
+ 
+ /*
+@@ -5874,10 +5971,8 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
+ 	while (throttled && cfs_b->runtime > 0) {
+ 		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+ 		/* we can't nest cfs_b->lock while distributing bandwidth */
+-		distribute_cfs_runtime(cfs_b);
++		throttled = distribute_cfs_runtime(cfs_b);
+ 		raw_spin_lock_irqsave(&cfs_b->lock, flags);
+-
+-		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
+ 	}
+ 
+ 	/*
+@@ -6154,6 +6249,9 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->runtime_enabled = 0;
+ 	INIT_LIST_HEAD(&cfs_rq->throttled_list);
++#ifdef CONFIG_SMP
++	INIT_LIST_HEAD(&cfs_rq->throttled_csd_list);
++#endif
+ }
+ 
+ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+@@ -6170,12 +6268,38 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ 
+ static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ {
++	int __maybe_unused i;
++
+ 	/* init_cfs_bandwidth() was not called */
+ 	if (!cfs_b->throttled_cfs_rq.next)
+ 		return;
+ 
+ 	hrtimer_cancel(&cfs_b->period_timer);
+ 	hrtimer_cancel(&cfs_b->slack_timer);
++
++	/*
++	 * It is possible that we still have some cfs_rq's pending on a CSD
++	 * list, though this race is very rare. In order for this to occur, we
++	 * must have raced with the last task leaving the group while there
++	 * exist throttled cfs_rq(s), and the period_timer must have queued the
++	 * CSD item but the remote cpu has not yet processed it. To handle this,
++	 * we can simply flush all pending CSD work inline here. We're
++	 * guaranteed at this point that no additional cfs_rq of this group can
++	 * join a CSD list.
++	 */
++#ifdef CONFIG_SMP
++	for_each_possible_cpu(i) {
++		struct rq *rq = cpu_rq(i);
++		unsigned long flags;
++
++		if (list_empty(&rq->cfsb_csd_list))
++			continue;
++
++		local_irq_save(flags);
++		__cfsb_csd_unthrottle(rq);
++		local_irq_restore(flags);
++	}
++#endif
+ }
+ 
+ /*
+@@ -12804,6 +12928,11 @@ __init void init_sched_fair_class(void)
+ 	for_each_possible_cpu(i) {
+ 		zalloc_cpumask_var_node(&per_cpu(load_balance_mask, i), GFP_KERNEL, cpu_to_node(i));
+ 		zalloc_cpumask_var_node(&per_cpu(select_rq_mask,    i), GFP_KERNEL, cpu_to_node(i));
++
++#ifdef CONFIG_CFS_BANDWIDTH
++		INIT_CSD(&cpu_rq(i)->cfsb_csd, __cfsb_csd_unthrottle, cpu_rq(i));
++		INIT_LIST_HEAD(&cpu_rq(i)->cfsb_csd_list);
++#endif
+ 	}
+ 
+ 	open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 2c89aaa92..23b6dc73f 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -645,6 +645,9 @@ struct cfs_rq {
+ 	int			throttled;
+ 	int			throttle_count;
+ 	struct list_head	throttled_list;
++#ifdef CONFIG_SMP
++	struct list_head	throttled_csd_list;
++#endif
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ };
+@@ -1155,6 +1158,11 @@ struct rq {
+ 
+ 	/* Scratch cpumask to be temporarily used under rq_lock */
+ 	cpumask_var_t		scratch_mask;
++
++#if defined(CONFIG_CFS_BANDWIDTH) && defined(CONFIG_SMP)
++	call_single_data_t	cfsb_csd;
++	struct list_head	cfsb_csd_list;
++#endif
+ };
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 99b3eb751ff7ad427c0d15e6184590de8176b4e7 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 19 Dec 2022 16:34:48 +0100
+Subject: [PATCH 02/11] sched: Introduce per-memory-map concurrency ID
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This feature allows the scheduler to expose a per-memory map concurrency
+ID to user-space. This concurrency ID is within the possible cpus range,
+and is temporarily (and uniquely) assigned while threads are actively
+running within a memory map. If a memory map has fewer threads than
+cores, or is limited to run on few cores concurrently through sched
+affinity or cgroup cpusets, the concurrency IDs will be values close
+to 0, thus allowing efficient use of user-space memory for per-cpu
+data structures.
+
+This feature is meant to be exposed by a new rseq thread area field.
+
+The primary purpose of this feature is to do the heavy-lifting needed
+by memory allocators to allow them to use per-cpu data structures
+efficiently in the following situations:
+
+- Single-threaded applications,
+- Multi-threaded applications on large systems (many cores) with limited
+  cpu affinity mask,
+- Multi-threaded applications on large systems (many cores) with
+  restricted cgroup cpuset per container.
+
+One of the key concern from scheduler maintainers is the overhead
+associated with additional spin locks or atomic operations in the
+scheduler fast-path. This is why the following optimization is
+implemented.
+
+On context switch between threads belonging to the same memory map,
+transfer the mm_cid from prev to next without any atomic ops. This
+takes care of use-cases involving frequent context switch between
+threads belonging to the same memory map.
+
+Additional optimizations can be done if the spin locks added when
+context switching between threads belonging to different memory maps end
+up being a performance bottleneck. Those are left out of this patch
+though. A performance impact would have to be clearly demonstrated to
+justify the added complexity.
+
+The credit goes to Paul Turner (Google) for the original virtual cpu id
+idea. This feature is implemented based on the discussions with Paul
+Turner and Peter Oskolkov (Google), but I took the liberty to implement
+scheduler fast-path optimizations and my own NUMA-awareness scheme. The
+rumor has it that Google have been running a rseq vcpu_id extension
+internally in production for a year. The tcmalloc source code indeed has
+comments hinting at a vcpu_id prototype extension to the rseq system
+call [1].
+
+The following benchmarks do not show any significant overhead added to
+the scheduler context switch by this feature:
+
+* perf bench sched messaging (process)
+
+Baseline:                    86.5±0.3 ms
+With mm_cid:                 86.7±2.6 ms
+
+* perf bench sched messaging (threaded)
+
+Baseline:                    84.3±3.0 ms
+With mm_cid:                 84.7±2.6 ms
+
+* hackbench (process)
+
+Baseline:                    82.9±2.7 ms
+With mm_cid:                 82.9±2.9 ms
+
+* hackbench (threaded)
+
+Baseline:                    85.2±2.6 ms
+With mm_cid:                 84.4±2.9 ms
+
+[1] https://github.com/google/tcmalloc/blob/master/tcmalloc/internal/linux_syscall_support.h#L26
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20221122203932.231377-8-mathieu.desnoyers@efficios.com
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ fs/exec.c                |  4 +++
+ include/linux/mm.h       | 25 +++++++++++++++++
+ include/linux/mm_types.h | 43 ++++++++++++++++++++++++++++-
+ include/linux/sched.h    |  5 ++++
+ init/Kconfig             |  4 +++
+ kernel/fork.c            |  8 +++++-
+ kernel/sched/core.c      | 51 +++++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h     | 58 ++++++++++++++++++++++++++++++++++++++++
+ kernel/signal.c          |  2 ++
+ 9 files changed, 198 insertions(+), 2 deletions(-)
+
+diff --git a/fs/exec.c b/fs/exec.c
+index a0b1f0337..a27b8f700 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1012,6 +1012,7 @@ static int exec_mmap(struct mm_struct *mm)
+ 	active_mm = tsk->active_mm;
+ 	tsk->active_mm = mm;
+ 	tsk->mm = mm;
++	mm_init_cid(mm);
+ 	/*
+ 	 * This prevents preemption while active_mm is being loaded and
+ 	 * it and mm are being updated, which could cause problems for
+@@ -1808,6 +1809,7 @@ static int bprm_execve(struct linux_binprm *bprm,
+ 
+ 	check_unsafe_exec(bprm);
+ 	current->in_execve = 1;
++	sched_mm_cid_before_execve(current);
+ 
+ 	file = do_open_execat(fd, filename, flags);
+ 	retval = PTR_ERR(file);
+@@ -1838,6 +1840,7 @@ static int bprm_execve(struct linux_binprm *bprm,
+ 	if (retval < 0)
+ 		goto out;
+ 
++	sched_mm_cid_after_execve(current);
+ 	/* execve succeeded */
+ 	current->fs->in_exec = 0;
+ 	current->in_execve = 0;
+@@ -1857,6 +1860,7 @@ static int bprm_execve(struct linux_binprm *bprm,
+ 		force_fatal_sig(SIGSEGV);
+ 
+ out_unmark:
++	sched_mm_cid_after_execve(current);
+ 	current->fs->in_exec = 0;
+ 	current->in_execve = 0;
+ 
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 974ccca60..f31d8d41a 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1915,6 +1915,31 @@ void pagecache_isize_extended(struct inode *inode, loff_t from, loff_t to);
+ void truncate_pagecache_range(struct inode *inode, loff_t offset, loff_t end);
+ int generic_error_remove_page(struct address_space *mapping, struct page *page);
+ 
++#ifdef CONFIG_SCHED_MM_CID
++void sched_mm_cid_before_execve(struct task_struct *t);
++void sched_mm_cid_after_execve(struct task_struct *t);
++void sched_mm_cid_fork(struct task_struct *t);
++void sched_mm_cid_exit_signals(struct task_struct *t);
++static inline int task_mm_cid(struct task_struct *t)
++{
++	return t->mm_cid;
++}
++#else
++static inline void sched_mm_cid_before_execve(struct task_struct *t) { }
++static inline void sched_mm_cid_after_execve(struct task_struct *t) { }
++static inline void sched_mm_cid_fork(struct task_struct *t) { }
++static inline void sched_mm_cid_exit_signals(struct task_struct *t) { }
++static inline int task_mm_cid(struct task_struct *t)
++{
++	/*
++	 * Use the processor id as a fall-back when the mm cid feature is
++	 * disabled. This provides functional per-cpu data structure accesses
++	 * in user-space, althrough it won't provide the memory usage benefits.
++	 */
++	return raw_smp_processor_id();
++}
++#endif
++
+ #ifdef CONFIG_MMU
+ extern vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
+ 				  unsigned long address, unsigned int flags,
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 9824b1b36..09a8bda0a 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -556,7 +556,18 @@ struct mm_struct {
+ 		 * &struct mm_struct is freed.
+ 		 */
+ 		atomic_t mm_count;
+-
++#ifdef CONFIG_SCHED_MM_CID
++		/**
++		 * @cid_lock: Protect cid bitmap updates vs lookups.
++		 *
++		 * Prevent situations where updates to the cid bitmap happen
++		 * concurrently with lookups. Those can lead to situations
++		 * where a lookup cannot find a free bit simply because it was
++		 * unlucky enough to load, non-atomically, bitmap words as they
++		 * were being concurrently updated by the updaters.
++		 */
++		raw_spinlock_t cid_lock;
++#endif
+ #ifdef CONFIG_MMU
+ 		atomic_long_t pgtables_bytes;	/* PTE page table pages */
+ #endif
+@@ -838,6 +849,36 @@ static inline void vma_iter_init(struct vma_iterator *vmi,
+ 	vmi->mas.node = MAS_START;
+ }
+ 
++#ifdef CONFIG_SCHED_MM_CID
++/* Accessor for struct mm_struct's cidmask. */
++static inline cpumask_t *mm_cidmask(struct mm_struct *mm)
++{
++	unsigned long cid_bitmap = (unsigned long)mm;
++
++	cid_bitmap += offsetof(struct mm_struct, cpu_bitmap);
++	/* Skip cpu_bitmap */
++	cid_bitmap += cpumask_size();
++	return (struct cpumask *)cid_bitmap;
++}
++
++static inline void mm_init_cid(struct mm_struct *mm)
++{
++	raw_spin_lock_init(&mm->cid_lock);
++	cpumask_clear(mm_cidmask(mm));
++}
++
++static inline unsigned int mm_cid_size(void)
++{
++	return cpumask_size();
++}
++#else /* CONFIG_SCHED_MM_CID */
++static inline void mm_init_cid(struct mm_struct *mm) { }
++static inline unsigned int mm_cid_size(void)
++{
++	return 0;
++}
++#endif /* CONFIG_SCHED_MM_CID */
++
+ struct mmu_gather;
+ extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm);
+ extern void tlb_gather_mmu_fullmm(struct mmu_gather *tlb, struct mm_struct *mm);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 23de7fe86..a0d7963d6 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1313,6 +1313,11 @@ struct task_struct {
+ 	unsigned long rseq_event_mask;
+ #endif
+ 
++#ifdef CONFIG_SCHED_MM_CID
++	int				mm_cid;		/* Current cid in mm */
++	int				mm_cid_active;	/* Whether cid bitmap is active */
++#endif
++
+ 	struct tlbflush_unmap_batch	tlb_ubc;
+ 
+ 	union {
+diff --git a/init/Kconfig b/init/Kconfig
+index 05a4ddccc..2a7ac2949 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1039,6 +1039,10 @@ config RT_GROUP_SCHED
+ 
+ endif #CGROUP_SCHED
+ 
++config SCHED_MM_CID
++	def_bool y
++	depends on SMP && RSEQ
++
+ config UCLAMP_TASK_GROUP
+ 	bool "Utilization clamping per group of tasks"
+ 	depends on CGROUP_SCHED
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 08969f5aa..d48dedc4b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1047,6 +1047,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	tsk->reported_split_lock = 0;
+ #endif
+ 
++#ifdef CONFIG_SCHED_MM_CID
++	tsk->mm_cid = -1;
++	tsk->mm_cid_active = 0;
++#endif
+ 	return tsk;
+ 
+ free_stack:
+@@ -1150,6 +1154,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 
+ 	mm->user_ns = get_user_ns(user_ns);
+ 	lru_gen_init_mm(mm);
++	mm_init_cid(mm);
+ 	return mm;
+ 
+ fail_nocontext:
+@@ -1579,6 +1584,7 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
+ 
+ 	tsk->mm = mm;
+ 	tsk->active_mm = mm;
++	sched_mm_cid_fork(tsk);
+ 	return 0;
+ }
+ 
+@@ -3041,7 +3047,7 @@ void __init proc_caches_init(void)
+ 	 * dynamically sized based on the maximum CPU number this system
+ 	 * can have, taking hotplug into account (nr_cpu_ids).
+ 	 */
+-	mm_size = sizeof(struct mm_struct) + cpumask_size();
++	mm_size = sizeof(struct mm_struct) + cpumask_size() + mm_cid_size();
+ 
+ 	mm_cachep = kmem_cache_create_usercopy("mm_struct",
+ 			mm_size, ARCH_MIN_MMSTRUCT_ALIGN,
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index a7831ce37..2b9a224ab 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -5041,6 +5041,7 @@ prepare_task_switch(struct rq *rq, struct task_struct *prev,
+ 	sched_info_switch(rq, prev, next);
+ 	perf_event_task_sched_out(prev, next);
+ 	rseq_preempt(prev);
++	switch_mm_cid(prev, next);
+ 	fire_sched_out_preempt_notifiers(prev, next);
+ 	kmap_local_sched_out();
+ 	prepare_task(next);
+@@ -11295,3 +11296,53 @@ void call_trace_sched_update_nr_running(struct rq *rq, int count)
+ {
+         trace_sched_update_nr_running_tp(rq, count);
+ }
++
++#ifdef CONFIG_SCHED_MM_CID
++void sched_mm_cid_exit_signals(struct task_struct *t)
++{
++	struct mm_struct *mm = t->mm;
++	unsigned long flags;
++
++	if (!mm)
++		return;
++	local_irq_save(flags);
++	mm_cid_put(mm, t->mm_cid);
++	t->mm_cid = -1;
++	t->mm_cid_active = 0;
++	local_irq_restore(flags);
++}
++
++void sched_mm_cid_before_execve(struct task_struct *t)
++{
++	struct mm_struct *mm = t->mm;
++	unsigned long flags;
++
++	if (!mm)
++		return;
++	local_irq_save(flags);
++	mm_cid_put(mm, t->mm_cid);
++	t->mm_cid = -1;
++	t->mm_cid_active = 0;
++	local_irq_restore(flags);
++}
++
++void sched_mm_cid_after_execve(struct task_struct *t)
++{
++	struct mm_struct *mm = t->mm;
++	unsigned long flags;
++
++	WARN_ON_ONCE((t->flags & PF_KTHREAD) || !t->mm);
++
++	local_irq_save(flags);
++	t->mm_cid = mm_cid_get(mm);
++	t->mm_cid_active = 1;
++	local_irq_restore(flags);
++	rseq_set_notify_resume(t);
++}
++
++void sched_mm_cid_fork(struct task_struct *t)
++{
++	WARN_ON_ONCE((t->flags & PF_KTHREAD) || !t->mm || t->mm_cid != -1);
++	t->mm_cid_active = 1;
++}
++#endif
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 23b6dc73f..f20cbdc18 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -3272,4 +3272,62 @@ static inline void update_current_exec_runtime(struct task_struct *curr,
+ 	cgroup_account_cputime(curr, delta_exec);
+ }
+ 
++#ifdef CONFIG_SCHED_MM_CID
++static inline int __mm_cid_get(struct mm_struct *mm)
++{
++	struct cpumask *cpumask;
++	int cid;
++
++	cpumask = mm_cidmask(mm);
++	cid = cpumask_first_zero(cpumask);
++	if (cid >= nr_cpu_ids)
++		return -1;
++	__cpumask_set_cpu(cid, cpumask);
++	return cid;
++}
++
++static inline void mm_cid_put(struct mm_struct *mm, int cid)
++{
++	lockdep_assert_irqs_disabled();
++	if (cid < 0)
++		return;
++	raw_spin_lock(&mm->cid_lock);
++	__cpumask_clear_cpu(cid, mm_cidmask(mm));
++	raw_spin_unlock(&mm->cid_lock);
++}
++
++static inline int mm_cid_get(struct mm_struct *mm)
++{
++	int ret;
++
++	lockdep_assert_irqs_disabled();
++	raw_spin_lock(&mm->cid_lock);
++	ret = __mm_cid_get(mm);
++	raw_spin_unlock(&mm->cid_lock);
++	return ret;
++}
++
++static inline void switch_mm_cid(struct task_struct *prev, struct task_struct *next)
++{
++	if (prev->mm_cid_active) {
++		if (next->mm_cid_active && next->mm == prev->mm) {
++			/*
++			 * Context switch between threads in same mm, hand over
++			 * the mm_cid from prev to next.
++			 */
++			next->mm_cid = prev->mm_cid;
++			prev->mm_cid = -1;
++			return;
++		}
++		mm_cid_put(prev->mm, prev->mm_cid);
++		prev->mm_cid = -1;
++	}
++	if (next->mm_cid_active)
++		next->mm_cid = mm_cid_get(next->mm);
++}
++
++#else
++static inline void switch_mm_cid(struct task_struct *prev, struct task_struct *next) { }
++#endif
++
+ #endif /* _KERNEL_SCHED_SCHED_H */
+diff --git a/kernel/signal.c b/kernel/signal.c
+index d14067218..88d849f15 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2950,6 +2950,7 @@ void exit_signals(struct task_struct *tsk)
+ 	cgroup_threadgroup_change_begin(tsk);
+ 
+ 	if (thread_group_empty(tsk) || (tsk->signal->flags & SIGNAL_GROUP_EXIT)) {
++		sched_mm_cid_exit_signals(tsk);
+ 		tsk->flags |= PF_EXITING;
+ 		cgroup_threadgroup_change_end(tsk);
+ 		return;
+@@ -2960,6 +2961,7 @@ void exit_signals(struct task_struct *tsk)
+ 	 * From now this task is not visible for group-wide signals,
+ 	 * see wants_signal(), do_signal_stop().
+ 	 */
++	sched_mm_cid_exit_signals(tsk);
+ 	tsk->flags |= PF_EXITING;
+ 
+ 	cgroup_threadgroup_change_end(tsk);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 3341e98f19eaae9e87308819630477a5a9e83508 Mon Sep 17 00:00:00 2001
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Date: Mon, 12 Dec 2022 14:49:46 +0000
+Subject: [PATCH 03/11] sched: Make const-safe
+
+With a modified container_of() that preserves constness, the compiler
+finds some pointers which should have been marked as const.  task_of()
+also needs to become const-preserving for the !FAIR_GROUP_SCHED case so
+that cfs_rq_of() can take a const argument.  No change to generated code.
+
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20221212144946.2657785-1-willy@infradead.org
+---
+ kernel/sched/core.c  |  8 +++++---
+ kernel/sched/fair.c  | 16 +++++++++-------
+ kernel/sched/sched.h | 22 ++++++++++------------
+ 3 files changed, 24 insertions(+), 22 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 2b9a224ab..d0508a581 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -152,7 +152,7 @@ __read_mostly int scheduler_running;
+ DEFINE_STATIC_KEY_FALSE(__sched_core_enabled);
+ 
+ /* kernel prio, less is more */
+-static inline int __task_prio(struct task_struct *p)
++static inline int __task_prio(const struct task_struct *p)
+ {
+ 	if (p->sched_class == &stop_sched_class) /* trumps deadline */
+ 		return -2;
+@@ -174,7 +174,8 @@ static inline int __task_prio(struct task_struct *p)
+  */
+ 
+ /* real prio, less is less */
+-static inline bool prio_less(struct task_struct *a, struct task_struct *b, bool in_fi)
++static inline bool prio_less(const struct task_struct *a,
++			     const struct task_struct *b, bool in_fi)
+ {
+ 
+ 	int pa = __task_prio(a), pb = __task_prio(b);
+@@ -194,7 +195,8 @@ static inline bool prio_less(struct task_struct *a, struct task_struct *b, bool
+ 	return false;
+ }
+ 
+-static inline bool __sched_core_less(struct task_struct *a, struct task_struct *b)
++static inline bool __sched_core_less(const struct task_struct *a,
++				     const struct task_struct *b)
+ {
+ 	if (a->core_cookie < b->core_cookie)
+ 		return true;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 438e1ff5b..5ec9792d5 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -453,7 +453,7 @@ is_same_group(struct sched_entity *se, struct sched_entity *pse)
+ 	return NULL;
+ }
+ 
+-static inline struct sched_entity *parent_entity(struct sched_entity *se)
++static inline struct sched_entity *parent_entity(const struct sched_entity *se)
+ {
+ 	return se->parent;
+ }
+@@ -580,8 +580,8 @@ static inline u64 min_vruntime(u64 min_vruntime, u64 vruntime)
+ 	return min_vruntime;
+ }
+ 
+-static inline bool entity_before(struct sched_entity *a,
+-				struct sched_entity *b)
++static inline bool entity_before(const struct sched_entity *a,
++				 const struct sched_entity *b)
+ {
+ 	return (s64)(a->vruntime - b->vruntime) < 0;
+ }
+@@ -12182,7 +12182,8 @@ static inline void task_tick_core(struct rq *rq, struct task_struct *curr)
+ /*
+  * se_fi_update - Update the cfs_rq->min_vruntime_fi in a CFS hierarchy if needed.
+  */
+-static void se_fi_update(struct sched_entity *se, unsigned int fi_seq, bool forceidle)
++static void se_fi_update(const struct sched_entity *se, unsigned int fi_seq,
++			 bool forceidle)
+ {
+ 	for_each_sched_entity(se) {
+ 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+@@ -12207,11 +12208,12 @@ void task_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi)
+ 	se_fi_update(se, rq->core->core_forceidle_seq, in_fi);
+ }
+ 
+-bool cfs_prio_less(struct task_struct *a, struct task_struct *b, bool in_fi)
++bool cfs_prio_less(const struct task_struct *a, const struct task_struct *b,
++			bool in_fi)
+ {
+ 	struct rq *rq = task_rq(a);
+-	struct sched_entity *sea = &a->se;
+-	struct sched_entity *seb = &b->se;
++	const struct sched_entity *sea = &a->se;
++	const struct sched_entity *seb = &b->se;
+ 	struct cfs_rq *cfs_rqa;
+ 	struct cfs_rq *cfs_rqb;
+ 	s64 delta;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index f20cbdc18..acf163cad 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -248,7 +248,7 @@ static inline void update_avg(u64 *avg, u64 sample)
+ 
+ #define SCHED_DL_FLAGS (SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN | SCHED_FLAG_SUGOV)
+ 
+-static inline bool dl_entity_is_special(struct sched_dl_entity *dl_se)
++static inline bool dl_entity_is_special(const struct sched_dl_entity *dl_se)
+ {
+ #ifdef CONFIG_CPU_FREQ_GOV_SCHEDUTIL
+ 	return unlikely(dl_se->flags & SCHED_FLAG_SUGOV);
+@@ -260,8 +260,8 @@ static inline bool dl_entity_is_special(struct sched_dl_entity *dl_se)
+ /*
+  * Tells if entity @a should preempt entity @b.
+  */
+-static inline bool
+-dl_entity_preempt(struct sched_dl_entity *a, struct sched_dl_entity *b)
++static inline bool dl_entity_preempt(const struct sched_dl_entity *a,
++				     const struct sched_dl_entity *b)
+ {
+ 	return dl_entity_is_special(a) ||
+ 	       dl_time_before(a->deadline, b->deadline);
+@@ -1245,7 +1245,8 @@ static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
+ 	return &rq->__lock;
+ }
+ 
+-bool cfs_prio_less(struct task_struct *a, struct task_struct *b, bool fi);
++bool cfs_prio_less(const struct task_struct *a, const struct task_struct *b,
++			bool fi);
+ 
+ /*
+  * Helpers to check if the CPU's core cookie matches with the task's cookie
+@@ -1424,7 +1425,7 @@ static inline struct cfs_rq *task_cfs_rq(struct task_struct *p)
+ }
+ 
+ /* runqueue on which this entity is (to be) queued */
+-static inline struct cfs_rq *cfs_rq_of(struct sched_entity *se)
++static inline struct cfs_rq *cfs_rq_of(const struct sched_entity *se)
+ {
+ 	return se->cfs_rq;
+ }
+@@ -1437,19 +1438,16 @@ static inline struct cfs_rq *group_cfs_rq(struct sched_entity *grp)
+ 
+ #else
+ 
+-static inline struct task_struct *task_of(struct sched_entity *se)
+-{
+-	return container_of(se, struct task_struct, se);
+-}
++#define task_of(_se)	container_of(_se, struct task_struct, se)
+ 
+-static inline struct cfs_rq *task_cfs_rq(struct task_struct *p)
++static inline struct cfs_rq *task_cfs_rq(const struct task_struct *p)
+ {
+ 	return &task_rq(p)->cfs;
+ }
+ 
+-static inline struct cfs_rq *cfs_rq_of(struct sched_entity *se)
++static inline struct cfs_rq *cfs_rq_of(const struct sched_entity *se)
+ {
+-	struct task_struct *p = task_of(se);
++	const struct task_struct *p = task_of(se);
+ 	struct rq *rq = task_rq(p);
+ 
+ 	return &rq->cfs;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 84978cc09d39b90102adcdfb7c8a91cbab1066ee Mon Sep 17 00:00:00 2001
+From: Hao Jia <jiahao.os@bytedance.com>
+Date: Fri, 16 Dec 2022 14:24:05 +0800
+Subject: [PATCH 04/11] sched/numa: Stop an exhastive search if an idle core is
+ found
+
+In update_numa_stats() we try to find an idle cpu on the NUMA node,
+preferably an idle core. we can stop looking for the next idle core
+or idle cpu after finding an idle core. But we can't stop the
+whole loop of scanning the CPU, because we need to calculate
+approximate NUMA stats at a point in time. For example,
+the src and dst nr_running is needed by task_numa_find_cpu().
+
+Signed-off-by: Hao Jia <jiahao.os@bytedance.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Link: https://lore.kernel.org/r/20221216062406.7812-2-jiahao.os@bytedance.com
+---
+ kernel/sched/fair.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 5ec9792d5..5f56b83e9 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1796,7 +1796,7 @@ static void update_numa_stats(struct task_numa_env *env,
+ 		ns->nr_running += rq->cfs.h_nr_running;
+ 		ns->compute_capacity += capacity_of(cpu);
+ 
+-		if (find_idle && !rq->nr_running && idle_cpu(cpu)) {
++		if (find_idle && idle_core < 0 && !rq->nr_running && idle_cpu(cpu)) {
+ 			if (READ_ONCE(rq->numa_migrate_on) ||
+ 			    !cpumask_test_cpu(cpu, env->p->cpus_ptr))
+ 				continue;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 575ef6e8cb80cf0225505b5fbbd0bfdd0fb21c75 Mon Sep 17 00:00:00 2001
+From: Hao Jia <jiahao.os@bytedance.com>
+Date: Fri, 16 Dec 2022 14:24:06 +0800
+Subject: [PATCH 05/11] sched/core: Adjusting the order of scanning CPU
+
+When select_idle_capacity() starts scanning for an idle CPU, it starts
+with target CPU that has already been checked in select_idle_sibling().
+So we start checking from the next CPU and try the target CPU at the end.
+Similarly for task_numa_assign(), we have just checked numa_migrate_on
+of dst_cpu, so start from the next CPU. This also works for
+steal_cookie_task(), the first scan must fail and start directly
+from the next one.
+
+Signed-off-by: Hao Jia <jiahao.os@bytedance.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Link: https://lore.kernel.org/r/20221216062406.7812-3-jiahao.os@bytedance.com
+---
+ kernel/sched/core.c | 2 +-
+ kernel/sched/fair.c | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d0508a581..d8361b759 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6199,7 +6199,7 @@ static bool steal_cookie_task(int cpu, struct sched_domain *sd)
+ {
+ 	int i;
+ 
+-	for_each_cpu_wrap(i, sched_domain_span(sd), cpu) {
++	for_each_cpu_wrap(i, sched_domain_span(sd), cpu + 1) {
+ 		if (i == cpu)
+ 			continue;
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 5f56b83e9..16ad0a2ae 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1828,7 +1828,7 @@ static void task_numa_assign(struct task_numa_env *env,
+ 		int start = env->dst_cpu;
+ 
+ 		/* Find alternative idle CPU. */
+-		for_each_cpu_wrap(cpu, cpumask_of_node(env->dst_nid), start) {
++		for_each_cpu_wrap(cpu, cpumask_of_node(env->dst_nid), start + 1) {
+ 			if (cpu == env->best_cpu || !idle_cpu(cpu) ||
+ 			    !cpumask_test_cpu(cpu, env->p->cpus_ptr)) {
+ 				continue;
+@@ -7265,7 +7265,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+ 	util_min = uclamp_eff_value(p, UCLAMP_MIN);
+ 	util_max = uclamp_eff_value(p, UCLAMP_MAX);
+ 
+-	for_each_cpu_wrap(cpu, cpus, target) {
++	for_each_cpu_wrap(cpu, cpus, target + 1) {
+ 		unsigned long cpu_cap = capacity_of(cpu);
+ 
+ 		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 1debdad3c4446666ef92253b8aca705f4163a948 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 22 Nov 2022 15:39:04 -0500
+Subject: [PATCH 06/11] rseq: Introduce feature size and alignment ELF
+ auxiliary vector entries
+
+Export the rseq feature size supported by the kernel as well as the
+required allocation alignment for the rseq per-thread area to user-space
+through ELF auxiliary vector entries.
+
+This is part of the extensible rseq ABI.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20221122203932.231377-3-mathieu.desnoyers@efficios.com
+---
+ fs/binfmt_elf.c             | 5 +++++
+ include/uapi/linux/auxvec.h | 2 ++
+ include/uapi/linux/rseq.h   | 5 +++++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index 6a11025e5..38c1744c9 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -46,6 +46,7 @@
+ #include <linux/cred.h>
+ #include <linux/dax.h>
+ #include <linux/uaccess.h>
++#include <linux/rseq.h>
+ #include <asm/param.h>
+ #include <asm/page.h>
+ 
+@@ -288,6 +289,10 @@ create_elf_tables(struct linux_binprm *bprm, const struct elfhdr *exec,
+ 	if (bprm->have_execfd) {
+ 		NEW_AUX_ENT(AT_EXECFD, bprm->execfd);
+ 	}
++#ifdef CONFIG_RSEQ
++	NEW_AUX_ENT(AT_RSEQ_FEATURE_SIZE, offsetof(struct rseq, end));
++	NEW_AUX_ENT(AT_RSEQ_ALIGN, __alignof__(struct rseq));
++#endif
+ #undef NEW_AUX_ENT
+ 	/* AT_NULL is zero; clear the rest too */
+ 	memset(elf_info, 0, (char *)mm->saved_auxv +
+diff --git a/include/uapi/linux/auxvec.h b/include/uapi/linux/auxvec.h
+index c7e502bf5..6991c4b8a 100644
+--- a/include/uapi/linux/auxvec.h
++++ b/include/uapi/linux/auxvec.h
+@@ -30,6 +30,8 @@
+ 				 * differ from AT_PLATFORM. */
+ #define AT_RANDOM 25	/* address of 16 random bytes */
+ #define AT_HWCAP2 26	/* extension of AT_HWCAP */
++#define AT_RSEQ_FEATURE_SIZE	27	/* rseq supported feature size */
++#define AT_RSEQ_ALIGN		28	/* rseq allocation alignment */
+ 
+ #define AT_EXECFN  31	/* filename of program */
+ 
+diff --git a/include/uapi/linux/rseq.h b/include/uapi/linux/rseq.h
+index 77ee20762..05d3c4cde 100644
+--- a/include/uapi/linux/rseq.h
++++ b/include/uapi/linux/rseq.h
+@@ -130,6 +130,11 @@ struct rseq {
+ 	 *     this thread.
+ 	 */
+ 	__u32 flags;
++
++	/*
++	 * Flexible array member at end of structure, after last feature field.
++	 */
++	char end[];
+ } __attribute__((aligned(4 * sizeof(__u64))));
+ 
+ #endif /* _UAPI_LINUX_RSEQ_H */
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From e5953840ca74df5217e440a433ac6c6a13ec3eb0 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 22 Nov 2022 15:39:05 -0500
+Subject: [PATCH 07/11] rseq: Introduce extensible rseq ABI
+
+Introduce the extensible rseq ABI, where the feature size supported by
+the kernel and the required alignment are communicated to user-space
+through ELF auxiliary vectors.
+
+This allows user-space to call rseq registration with a rseq_len of
+either 32 bytes for the original struct rseq size (which includes
+padding), or larger.
+
+If rseq_len is larger than 32 bytes, then it must be large enough to
+contain the feature size communicated to user-space through ELF
+auxiliary vectors.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20221122203932.231377-4-mathieu.desnoyers@efficios.com
+---
+ include/linux/sched.h |  4 ++++
+ kernel/ptrace.c       |  2 +-
+ kernel/rseq.c         | 37 ++++++++++++++++++++++++++++++-------
+ 3 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index a0d7963d6..c7e3c27e0 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1305,6 +1305,7 @@ struct task_struct {
+ 
+ #ifdef CONFIG_RSEQ
+ 	struct rseq __user *rseq;
++	u32 rseq_len;
+ 	u32 rseq_sig;
+ 	/*
+ 	 * RmW on rseq_event_mask must be performed atomically
+@@ -2360,10 +2361,12 @@ static inline void rseq_fork(struct task_struct *t, unsigned long clone_flags)
+ {
+ 	if (clone_flags & CLONE_VM) {
+ 		t->rseq = NULL;
++		t->rseq_len = 0;
+ 		t->rseq_sig = 0;
+ 		t->rseq_event_mask = 0;
+ 	} else {
+ 		t->rseq = current->rseq;
++		t->rseq_len = current->rseq_len;
+ 		t->rseq_sig = current->rseq_sig;
+ 		t->rseq_event_mask = current->rseq_event_mask;
+ 	}
+@@ -2372,6 +2375,7 @@ static inline void rseq_fork(struct task_struct *t, unsigned long clone_flags)
+ static inline void rseq_execve(struct task_struct *t)
+ {
+ 	t->rseq = NULL;
++	t->rseq_len = 0;
+ 	t->rseq_sig = 0;
+ 	t->rseq_event_mask = 0;
+ }
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index 54482193e..078645007 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -813,7 +813,7 @@ static long ptrace_get_rseq_configuration(struct task_struct *task,
+ {
+ 	struct ptrace_rseq_configuration conf = {
+ 		.rseq_abi_pointer = (u64)(uintptr_t)task->rseq,
+-		.rseq_abi_size = sizeof(*task->rseq),
++		.rseq_abi_size = task->rseq_len,
+ 		.signature = task->rseq_sig,
+ 		.flags = 0,
+ 	};
+diff --git a/kernel/rseq.c b/kernel/rseq.c
+index d38ab9441..796273845 100644
+--- a/kernel/rseq.c
++++ b/kernel/rseq.c
+@@ -18,6 +18,9 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/rseq.h>
+ 
++/* The original rseq structure size (including padding) is 32 bytes. */
++#define ORIG_RSEQ_SIZE		32
++
+ #define RSEQ_CS_NO_RESTART_FLAGS (RSEQ_CS_FLAG_NO_RESTART_ON_PREEMPT | \
+ 				  RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL | \
+ 				  RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE)
+@@ -87,10 +90,15 @@ static int rseq_update_cpu_id(struct task_struct *t)
+ 	u32 cpu_id = raw_smp_processor_id();
+ 	struct rseq __user *rseq = t->rseq;
+ 
+-	if (!user_write_access_begin(rseq, sizeof(*rseq)))
++	if (!user_write_access_begin(rseq, t->rseq_len))
+ 		goto efault;
+ 	unsafe_put_user(cpu_id, &rseq->cpu_id_start, efault_end);
+ 	unsafe_put_user(cpu_id, &rseq->cpu_id, efault_end);
++	/*
++	 * Additional feature fields added after ORIG_RSEQ_SIZE
++	 * need to be conditionally updated only if
++	 * t->rseq_len != ORIG_RSEQ_SIZE.
++	 */
+ 	user_write_access_end();
+ 	trace_rseq_update(t);
+ 	return 0;
+@@ -117,6 +125,11 @@ static int rseq_reset_rseq_cpu_id(struct task_struct *t)
+ 	 */
+ 	if (put_user(cpu_id, &t->rseq->cpu_id))
+ 		return -EFAULT;
++	/*
++	 * Additional feature fields added after ORIG_RSEQ_SIZE
++	 * need to be conditionally reset only if
++	 * t->rseq_len != ORIG_RSEQ_SIZE.
++	 */
+ 	return 0;
+ }
+ 
+@@ -344,7 +357,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
+ 		/* Unregister rseq for current thread. */
+ 		if (current->rseq != rseq || !current->rseq)
+ 			return -EINVAL;
+-		if (rseq_len != sizeof(*rseq))
++		if (rseq_len != current->rseq_len)
+ 			return -EINVAL;
+ 		if (current->rseq_sig != sig)
+ 			return -EPERM;
+@@ -353,6 +366,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
+ 			return ret;
+ 		current->rseq = NULL;
+ 		current->rseq_sig = 0;
++		current->rseq_len = 0;
+ 		return 0;
+ 	}
+ 
+@@ -365,7 +379,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
+ 		 * the provided address differs from the prior
+ 		 * one.
+ 		 */
+-		if (current->rseq != rseq || rseq_len != sizeof(*rseq))
++		if (current->rseq != rseq || rseq_len != current->rseq_len)
+ 			return -EINVAL;
+ 		if (current->rseq_sig != sig)
+ 			return -EPERM;
+@@ -374,15 +388,24 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
+ 	}
+ 
+ 	/*
+-	 * If there was no rseq previously registered,
+-	 * ensure the provided rseq is properly aligned and valid.
++	 * If there was no rseq previously registered, ensure the provided rseq
++	 * is properly aligned, as communcated to user-space through the ELF
++	 * auxiliary vector AT_RSEQ_ALIGN. If rseq_len is the original rseq
++	 * size, the required alignment is the original struct rseq alignment.
++	 *
++	 * In order to be valid, rseq_len is either the original rseq size, or
++	 * large enough to contain all supported fields, as communicated to
++	 * user-space through the ELF auxiliary vector AT_RSEQ_FEATURE_SIZE.
+ 	 */
+-	if (!IS_ALIGNED((unsigned long)rseq, __alignof__(*rseq)) ||
+-	    rseq_len != sizeof(*rseq))
++	if (rseq_len < ORIG_RSEQ_SIZE ||
++	    (rseq_len == ORIG_RSEQ_SIZE && !IS_ALIGNED((unsigned long)rseq, ORIG_RSEQ_SIZE)) ||
++	    (rseq_len != ORIG_RSEQ_SIZE && (!IS_ALIGNED((unsigned long)rseq, __alignof__(*rseq)) ||
++					    rseq_len < offsetof(struct rseq, end))))
+ 		return -EINVAL;
+ 	if (!access_ok(rseq, rseq_len))
+ 		return -EFAULT;
+ 	current->rseq = rseq;
++	current->rseq_len = rseq_len;
+ 	current->rseq_sig = sig;
+ 	/*
+ 	 * If rseq was previously inactive, and has just been
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 31741dd1d0be065154a345ceae4b7244936c97bd Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 22 Nov 2022 15:39:06 -0500
+Subject: [PATCH 08/11] rseq: Extend struct rseq with numa node id
+
+Adding the NUMA node id to struct rseq is a straightforward thing to do,
+and a good way to figure out if anything in the user-space ecosystem
+prevents extending struct rseq.
+
+This NUMA node id field allows memory allocators such as tcmalloc to
+take advantage of fast access to the current NUMA node id to perform
+NUMA-aware memory allocation.
+
+It can also be useful for implementing fast-paths for NUMA-aware
+user-space mutexes.
+
+It also allows implementing getcpu(2) purely in user-space.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20221122203932.231377-5-mathieu.desnoyers@efficios.com
+---
+ include/trace/events/rseq.h |  4 +++-
+ include/uapi/linux/rseq.h   |  8 ++++++++
+ kernel/rseq.c               | 19 +++++++++++++------
+ 3 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/include/trace/events/rseq.h b/include/trace/events/rseq.h
+index a04a64bc1..dde7a359b 100644
+--- a/include/trace/events/rseq.h
++++ b/include/trace/events/rseq.h
+@@ -16,13 +16,15 @@ TRACE_EVENT(rseq_update,
+ 
+ 	TP_STRUCT__entry(
+ 		__field(s32, cpu_id)
++		__field(s32, node_id)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		__entry->cpu_id = raw_smp_processor_id();
++		__entry->node_id = cpu_to_node(__entry->cpu_id);
+ 	),
+ 
+-	TP_printk("cpu_id=%d", __entry->cpu_id)
++	TP_printk("cpu_id=%d node_id=%d", __entry->cpu_id, __entry->node_id)
+ );
+ 
+ TRACE_EVENT(rseq_ip_fixup,
+diff --git a/include/uapi/linux/rseq.h b/include/uapi/linux/rseq.h
+index 05d3c4cde..1cb90a435 100644
+--- a/include/uapi/linux/rseq.h
++++ b/include/uapi/linux/rseq.h
+@@ -131,6 +131,14 @@ struct rseq {
+ 	 */
+ 	__u32 flags;
+ 
++	/*
++	 * Restartable sequences node_id field. Updated by the kernel. Read by
++	 * user-space with single-copy atomicity semantics. This field should
++	 * only be read by the thread which registered this data structure.
++	 * Aligned on 32-bit. Contains the current NUMA node ID.
++	 */
++	__u32 node_id;
++
+ 	/*
+ 	 * Flexible array member at end of structure, after last feature field.
+ 	 */
+diff --git a/kernel/rseq.c b/kernel/rseq.c
+index 796273845..193cfcc94 100644
+--- a/kernel/rseq.c
++++ b/kernel/rseq.c
+@@ -85,15 +85,17 @@
+  *   F1. <failure>
+  */
+ 
+-static int rseq_update_cpu_id(struct task_struct *t)
++static int rseq_update_cpu_node_id(struct task_struct *t)
+ {
+-	u32 cpu_id = raw_smp_processor_id();
+ 	struct rseq __user *rseq = t->rseq;
++	u32 cpu_id = raw_smp_processor_id();
++	u32 node_id = cpu_to_node(cpu_id);
+ 
+ 	if (!user_write_access_begin(rseq, t->rseq_len))
+ 		goto efault;
+ 	unsafe_put_user(cpu_id, &rseq->cpu_id_start, efault_end);
+ 	unsafe_put_user(cpu_id, &rseq->cpu_id, efault_end);
++	unsafe_put_user(node_id, &rseq->node_id, efault_end);
+ 	/*
+ 	 * Additional feature fields added after ORIG_RSEQ_SIZE
+ 	 * need to be conditionally updated only if
+@@ -109,9 +111,9 @@ static int rseq_update_cpu_id(struct task_struct *t)
+ 	return -EFAULT;
+ }
+ 
+-static int rseq_reset_rseq_cpu_id(struct task_struct *t)
++static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
+ {
+-	u32 cpu_id_start = 0, cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
++	u32 cpu_id_start = 0, cpu_id = RSEQ_CPU_ID_UNINITIALIZED, node_id = 0;
+ 
+ 	/*
+ 	 * Reset cpu_id_start to its initial state (0).
+@@ -125,6 +127,11 @@ static int rseq_reset_rseq_cpu_id(struct task_struct *t)
+ 	 */
+ 	if (put_user(cpu_id, &t->rseq->cpu_id))
+ 		return -EFAULT;
++	/*
++	 * Reset node_id to its initial state (0).
++	 */
++	if (put_user(node_id, &t->rseq->node_id))
++		return -EFAULT;
+ 	/*
+ 	 * Additional feature fields added after ORIG_RSEQ_SIZE
+ 	 * need to be conditionally reset only if
+@@ -314,7 +321,7 @@ void __rseq_handle_notify_resume(struct ksignal *ksig, struct pt_regs *regs)
+ 		if (unlikely(ret < 0))
+ 			goto error;
+ 	}
+-	if (unlikely(rseq_update_cpu_id(t)))
++	if (unlikely(rseq_update_cpu_node_id(t)))
+ 		goto error;
+ 	return;
+ 
+@@ -361,7 +368,7 @@ SYSCALL_DEFINE4(rseq, struct rseq __user *, rseq, u32, rseq_len,
+ 			return -EINVAL;
+ 		if (current->rseq_sig != sig)
+ 			return -EPERM;
+-		ret = rseq_reset_rseq_cpu_id(current);
++		ret = rseq_reset_rseq_cpu_node_id(current);
+ 		if (ret)
+ 			return ret;
+ 		current->rseq = NULL;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 8f1e8392b4b53607929b87e821710df0625cb52f Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 22 Nov 2022 15:39:10 -0500
+Subject: [PATCH 09/11] rseq: Extend struct rseq with per-memory-map
+ concurrency ID
+
+If a memory map has fewer threads than there are cores on the system, or
+is limited to run on few cores concurrently through sched affinity or
+cgroup cpusets, the concurrency IDs will be values close to 0, thus
+allowing efficient use of user-space memory for per-cpu data structures.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20221122203932.231377-9-mathieu.desnoyers@efficios.com
+---
+ include/uapi/linux/rseq.h |  9 +++++++++
+ kernel/rseq.c             | 11 ++++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/rseq.h b/include/uapi/linux/rseq.h
+index 1cb90a435..c233aae5e 100644
+--- a/include/uapi/linux/rseq.h
++++ b/include/uapi/linux/rseq.h
+@@ -139,6 +139,15 @@ struct rseq {
+ 	 */
+ 	__u32 node_id;
+ 
++	/*
++	 * Restartable sequences mm_cid field. Updated by the kernel. Read by
++	 * user-space with single-copy atomicity semantics. This field should
++	 * only be read by the thread which registered this data structure.
++	 * Aligned on 32-bit. Contains the current thread's concurrency ID
++	 * (allocated uniquely within a memory map).
++	 */
++	__u32 mm_cid;
++
+ 	/*
+ 	 * Flexible array member at end of structure, after last feature field.
+ 	 */
+diff --git a/kernel/rseq.c b/kernel/rseq.c
+index 193cfcc94..9de6e35fe 100644
+--- a/kernel/rseq.c
++++ b/kernel/rseq.c
+@@ -90,12 +90,15 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
+ 	struct rseq __user *rseq = t->rseq;
+ 	u32 cpu_id = raw_smp_processor_id();
+ 	u32 node_id = cpu_to_node(cpu_id);
++	u32 mm_cid = task_mm_cid(t);
+ 
++	WARN_ON_ONCE((int) mm_cid < 0);
+ 	if (!user_write_access_begin(rseq, t->rseq_len))
+ 		goto efault;
+ 	unsafe_put_user(cpu_id, &rseq->cpu_id_start, efault_end);
+ 	unsafe_put_user(cpu_id, &rseq->cpu_id, efault_end);
+ 	unsafe_put_user(node_id, &rseq->node_id, efault_end);
++	unsafe_put_user(mm_cid, &rseq->mm_cid, efault_end);
+ 	/*
+ 	 * Additional feature fields added after ORIG_RSEQ_SIZE
+ 	 * need to be conditionally updated only if
+@@ -113,7 +116,8 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
+ 
+ static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
+ {
+-	u32 cpu_id_start = 0, cpu_id = RSEQ_CPU_ID_UNINITIALIZED, node_id = 0;
++	u32 cpu_id_start = 0, cpu_id = RSEQ_CPU_ID_UNINITIALIZED, node_id = 0,
++	    mm_cid = 0;
+ 
+ 	/*
+ 	 * Reset cpu_id_start to its initial state (0).
+@@ -132,6 +136,11 @@ static int rseq_reset_rseq_cpu_node_id(struct task_struct *t)
+ 	 */
+ 	if (put_user(node_id, &t->rseq->node_id))
+ 		return -EFAULT;
++	/*
++	 * Reset mm_cid to its initial state (0).
++	 */
++	if (put_user(mm_cid, &t->rseq->mm_cid))
++		return -EFAULT;
+ 	/*
+ 	 * Additional feature fields added after ORIG_RSEQ_SIZE
+ 	 * need to be conditionally reset only if
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From bbe4545053bebe0804c3eaa7e0d5bfb21127cede Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 22 Nov 2022 15:39:23 -0500
+Subject: [PATCH 10/11] tracing/rseq: Add mm_cid field to rseq_update
+
+Add the mm_cid field to the rseq_update event, allowing tracers to
+follow which mm_cid is observed by user-space, and whether negative
+mm_cid values are visible in case of internal scheduler implementation
+issues.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20221122203932.231377-22-mathieu.desnoyers@efficios.com
+---
+ include/trace/events/rseq.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/include/trace/events/rseq.h b/include/trace/events/rseq.h
+index dde7a359b..823b47d1b 100644
+--- a/include/trace/events/rseq.h
++++ b/include/trace/events/rseq.h
+@@ -17,14 +17,17 @@ TRACE_EVENT(rseq_update,
+ 	TP_STRUCT__entry(
+ 		__field(s32, cpu_id)
+ 		__field(s32, node_id)
++		__field(s32, mm_cid)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		__entry->cpu_id = raw_smp_processor_id();
+ 		__entry->node_id = cpu_to_node(__entry->cpu_id);
++		__entry->mm_cid = task_mm_cid(t);
+ 	),
+ 
+-	TP_printk("cpu_id=%d node_id=%d", __entry->cpu_id, __entry->node_id)
++	TP_printk("cpu_id=%d node_id=%d mm_cid=%d", __entry->cpu_id,
++		  __entry->node_id, __entry->mm_cid)
+ );
+ 
+ TRACE_EVENT(rseq_ip_fixup,
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 51ba03114be151a0f0950d68a4170aaa9897a286 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 20 Dec 2022 20:27:35 +0100
+Subject: [PATCH 11/11] Revert "sched: Make const-safe"
+
+This reverts commit 4fead52fc975c586045b469ff8ea7ac13bda8089.
+---
+ kernel/sched/core.c  |  8 +++-----
+ kernel/sched/fair.c  | 16 +++++++---------
+ kernel/sched/sched.h | 22 ++++++++++++----------
+ 3 files changed, 22 insertions(+), 24 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d8361b759..53157361b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -152,7 +152,7 @@ __read_mostly int scheduler_running;
+ DEFINE_STATIC_KEY_FALSE(__sched_core_enabled);
+ 
+ /* kernel prio, less is more */
+-static inline int __task_prio(const struct task_struct *p)
++static inline int __task_prio(struct task_struct *p)
+ {
+ 	if (p->sched_class == &stop_sched_class) /* trumps deadline */
+ 		return -2;
+@@ -174,8 +174,7 @@ static inline int __task_prio(const struct task_struct *p)
+  */
+ 
+ /* real prio, less is less */
+-static inline bool prio_less(const struct task_struct *a,
+-			     const struct task_struct *b, bool in_fi)
++static inline bool prio_less(struct task_struct *a, struct task_struct *b, bool in_fi)
+ {
+ 
+ 	int pa = __task_prio(a), pb = __task_prio(b);
+@@ -195,8 +194,7 @@ static inline bool prio_less(const struct task_struct *a,
+ 	return false;
+ }
+ 
+-static inline bool __sched_core_less(const struct task_struct *a,
+-				     const struct task_struct *b)
++static inline bool __sched_core_less(struct task_struct *a, struct task_struct *b)
+ {
+ 	if (a->core_cookie < b->core_cookie)
+ 		return true;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 16ad0a2ae..4276eda26 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -453,7 +453,7 @@ is_same_group(struct sched_entity *se, struct sched_entity *pse)
+ 	return NULL;
+ }
+ 
+-static inline struct sched_entity *parent_entity(const struct sched_entity *se)
++static inline struct sched_entity *parent_entity(struct sched_entity *se)
+ {
+ 	return se->parent;
+ }
+@@ -580,8 +580,8 @@ static inline u64 min_vruntime(u64 min_vruntime, u64 vruntime)
+ 	return min_vruntime;
+ }
+ 
+-static inline bool entity_before(const struct sched_entity *a,
+-				 const struct sched_entity *b)
++static inline bool entity_before(struct sched_entity *a,
++				struct sched_entity *b)
+ {
+ 	return (s64)(a->vruntime - b->vruntime) < 0;
+ }
+@@ -12182,8 +12182,7 @@ static inline void task_tick_core(struct rq *rq, struct task_struct *curr)
+ /*
+  * se_fi_update - Update the cfs_rq->min_vruntime_fi in a CFS hierarchy if needed.
+  */
+-static void se_fi_update(const struct sched_entity *se, unsigned int fi_seq,
+-			 bool forceidle)
++static void se_fi_update(struct sched_entity *se, unsigned int fi_seq, bool forceidle)
+ {
+ 	for_each_sched_entity(se) {
+ 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+@@ -12208,12 +12207,11 @@ void task_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi)
+ 	se_fi_update(se, rq->core->core_forceidle_seq, in_fi);
+ }
+ 
+-bool cfs_prio_less(const struct task_struct *a, const struct task_struct *b,
+-			bool in_fi)
++bool cfs_prio_less(struct task_struct *a, struct task_struct *b, bool in_fi)
+ {
+ 	struct rq *rq = task_rq(a);
+-	const struct sched_entity *sea = &a->se;
+-	const struct sched_entity *seb = &b->se;
++	struct sched_entity *sea = &a->se;
++	struct sched_entity *seb = &b->se;
+ 	struct cfs_rq *cfs_rqa;
+ 	struct cfs_rq *cfs_rqb;
+ 	s64 delta;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index acf163cad..f20cbdc18 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -248,7 +248,7 @@ static inline void update_avg(u64 *avg, u64 sample)
+ 
+ #define SCHED_DL_FLAGS (SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN | SCHED_FLAG_SUGOV)
+ 
+-static inline bool dl_entity_is_special(const struct sched_dl_entity *dl_se)
++static inline bool dl_entity_is_special(struct sched_dl_entity *dl_se)
+ {
+ #ifdef CONFIG_CPU_FREQ_GOV_SCHEDUTIL
+ 	return unlikely(dl_se->flags & SCHED_FLAG_SUGOV);
+@@ -260,8 +260,8 @@ static inline bool dl_entity_is_special(const struct sched_dl_entity *dl_se)
+ /*
+  * Tells if entity @a should preempt entity @b.
+  */
+-static inline bool dl_entity_preempt(const struct sched_dl_entity *a,
+-				     const struct sched_dl_entity *b)
++static inline bool
++dl_entity_preempt(struct sched_dl_entity *a, struct sched_dl_entity *b)
+ {
+ 	return dl_entity_is_special(a) ||
+ 	       dl_time_before(a->deadline, b->deadline);
+@@ -1245,8 +1245,7 @@ static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
+ 	return &rq->__lock;
+ }
+ 
+-bool cfs_prio_less(const struct task_struct *a, const struct task_struct *b,
+-			bool fi);
++bool cfs_prio_less(struct task_struct *a, struct task_struct *b, bool fi);
+ 
+ /*
+  * Helpers to check if the CPU's core cookie matches with the task's cookie
+@@ -1425,7 +1424,7 @@ static inline struct cfs_rq *task_cfs_rq(struct task_struct *p)
+ }
+ 
+ /* runqueue on which this entity is (to be) queued */
+-static inline struct cfs_rq *cfs_rq_of(const struct sched_entity *se)
++static inline struct cfs_rq *cfs_rq_of(struct sched_entity *se)
+ {
+ 	return se->cfs_rq;
+ }
+@@ -1438,16 +1437,19 @@ static inline struct cfs_rq *group_cfs_rq(struct sched_entity *grp)
+ 
+ #else
+ 
+-#define task_of(_se)	container_of(_se, struct task_struct, se)
++static inline struct task_struct *task_of(struct sched_entity *se)
++{
++	return container_of(se, struct task_struct, se);
++}
+ 
+-static inline struct cfs_rq *task_cfs_rq(const struct task_struct *p)
++static inline struct cfs_rq *task_cfs_rq(struct task_struct *p)
+ {
+ 	return &task_rq(p)->cfs;
+ }
+ 
+-static inline struct cfs_rq *cfs_rq_of(const struct sched_entity *se)
++static inline struct cfs_rq *cfs_rq_of(struct sched_entity *se)
+ {
+-	const struct task_struct *p = task_of(se);
++	struct task_struct *p = task_of(se);
+ 	struct rq *rq = task_rq(p);
+ 
+ 	return &rq->cfs;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
