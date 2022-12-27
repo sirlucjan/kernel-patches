@@ -1,0 +1,160 @@
+From a33a3f3ff5e9bc0d0844e42f9457f2b8ab7b76bd Mon Sep 17 00:00:00 2001
+From: Aaron Tomlin <atomlin@atomlin.com>
+Date: Tue, 27 Dec 2022 09:11:42 -0300
+Subject: [PATCH 5/6] tick/sched: Ensure quiet_vmstat() is called when the idle
+ tick was stopped too
+
+In the context of the idle task and an adaptive-tick mode/or a nohz_full
+CPU, quiet_vmstat() can be called: before stopping the idle tick,
+entering an idle state and on exit. In particular, for the latter case,
+when the idle task is required to reschedule, the idle tick can remain
+stopped and the timer expiration time endless i.e., KTIME_MAX. Now,
+indeed before a nohz_full CPU enters an idle state, CPU-specific vmstat
+counters should be processed to ensure the respective values have been
+reset and folded into the zone specific 'vm_stat[]'. That being said, it
+can only occur when: the idle tick was previously stopped, and
+reprogramming of the timer is not required.
+
+A customer provided some evidence which indicates that the idle tick was
+stopped; albeit, CPU-specific vmstat counters still remained populated.
+Thus one can only assume quiet_vmstat() was not invoked on return to the
+idle loop.
+
+If I understand correctly, I suspect this divergence might erroneously
+prevent a reclaim attempt by kswapd. If the number of zone specific free
+pages are below their per-cpu drift value then
+zone_page_state_snapshot() is used to compute a more accurate view of
+the aforementioned statistic.  Thus any task blocked on the NUMA node
+specific pfmemalloc_wait queue will be unable to make significant
+progress via direct reclaim unless it is killed after being woken up by
+kswapd (see throttle_direct_reclaim()).
+
+Consider the following theoretical scenario:
+
+ - Note: CPU X is part of 'tick_nohz_full_mask'
+
+    1.      CPU Y migrated running task A to CPU X that
+	    was in an idle state i.e. waiting for an IRQ;
+	    marked the current task on CPU X to need/or
+	    require a reschedule i.e., set TIF_NEED_RESCHED
+	    and invoked a reschedule IPI to CPU X
+	    (see sched_move_task())
+
+    2.      CPU X acknowledged the reschedule IPI. Generic
+	    idle loop code noticed the TIF_NEED_RESCHED flag
+	    against the idle task and attempts to exit of the
+	    loop and calls the main scheduler function i.e.
+	    __schedule().
+
+	    Since the idle tick was previously stopped no
+	    scheduling-clock tick would occur.
+	    So, no deferred timers would be handled
+
+    3.      Post transition to kernel execution Task A
+	    running on CPU X, indirectly released a few pages
+	    (e.g. see __free_one_page()); CPU X's
+	    'vm_stat_diff[NR_FREE_PAGES]' was updated and zone
+	    specific 'vm_stat[]' update was deferred as per the
+	    CPU-specific stat threshold
+
+    4.      Task A does invoke exit(2) and the kernel does
+	    remove the task from the run-queue; the idle task
+	    was selected to execute next since there are no
+	    other runnable tasks assigned to the given CPU
+	    (see pick_next_task() and pick_next_task_idle())
+
+    5.      On return to the idle loop since the idle tick
+	    was already stopped and can remain so (see [1]
+	    below) e.g. no pending soft IRQs, no attempt is
+	    made to zero and fold CPU X's vmstat counters
+	    since reprogramming of the scheduling-clock tick
+	    is not required/or needed (see [2])
+
+		  ...
+		    do_idle
+		    {
+
+		      __current_set_polling()
+		      tick_nohz_idle_enter()
+
+		      while (!need_resched()) {
+
+			local_irq_disable()
+
+			...
+
+			/* No polling or broadcast event */
+			cpuidle_idle_call()
+			{
+
+			  if (cpuidle_not_available(drv, dev)) {
+			    tick_nohz_idle_stop_tick()
+			      __tick_nohz_idle_stop_tick(this_cpu_ptr(&tick_cpu_sched))
+			      {
+				int cpu = smp_processor_id()
+
+				if (ts->timer_expires_base)
+				  expires = ts->timer_expires
+				else if (can_stop_idle_tick(cpu, ts))
+	      (1) ------->        expires = tick_nohz_next_event(ts, cpu)
+				else
+				  return
+
+				ts->idle_calls++
+
+				if (expires > 0LL) {
+
+				  tick_nohz_stop_tick(ts, cpu)
+				  {
+
+				    if (ts->tick_stopped && (expires == ts->next_tick)) {
+	      (2) ------->            if (tick == KTIME_MAX || ts->next_tick ==
+					hrtimer_get_expires(&ts->sched_timer))
+					return
+				    }
+				    ...
+				  }
+
+So, the idea of this patch is to ensure refresh_cpu_vm_stats(false) is
+called, when it is appropriate, on return to the idle loop if the idle
+tick was previously stopped too.
+
+A trivial test program was used to determine the impact of the proposed
+changes and under vanilla. The nanosleep(2) system call was used several
+times to suspend execution for a period of time to approximately compute
+the number of CPU-cycles in the idle code path. The following is an average
+count of CPU-cycles:
+
+				  Vanilla                 Modified
+
+  Cycles per idle loop            151858                  153258  (+1.0%)
+
+Signed-off-by: Aaron Tomlin <atomlin@atomlin.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+---
+ kernel/time/tick-sched.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 608c081d3..14289632f 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -929,13 +929,14 @@ static void tick_nohz_stop_tick(struct tick_sched *ts, int cpu)
+ 	 */
+ 	if (!ts->tick_stopped) {
+ 		calc_load_nohz_start();
+-		quiet_vmstat(false);
+ 
+ 		ts->last_tick = hrtimer_get_expires(&ts->sched_timer);
+ 		ts->tick_stopped = 1;
+ 		trace_tick_stop(1, TICK_DEP_MASK_NONE);
+ 	}
+ 
++	/* Attempt to fold when the idle tick is stopped or not */
++	quiet_vmstat(false);
+ 	ts->next_tick = tick;
+ 
+ 	/*
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
