@@ -1,0 +1,4585 @@
+From 2326c6a6c7a36867c479ed409c3c6e9d94361acc Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Wed, 29 Jun 2022 19:26:46 +0800
+Subject: [PATCH 01/57] ext4: silence the warning when evicting inode with
+ dioread_nolock
+
+When evicting an inode with default dioread_nolock, it could be raced by
+the unwritten extents converting kworker after writeback some new
+allocated dirty blocks. It convert unwritten extents to written, the
+extents could be merged to upper level and free extent blocks, so it
+could mark the inode dirty again even this inode has been marked
+I_FREEING. But the inode->i_io_list check and warning in
+ext4_evict_inode() missing this corner case. Fortunately,
+ext4_evict_inode() will wait all extents converting finished before this
+check, so it will not lead to inode use-after-free problem, every thing
+is OK besides this warning. The WARN_ON_ONCE was originally designed
+for finding inode use-after-free issues in advance, but if we add
+current dioread_nolock case in, it will become not quite useful, so fix
+this warning by just remove this check.
+
+ ======
+ WARNING: CPU: 7 PID: 1092 at fs/ext4/inode.c:227
+ ext4_evict_inode+0x875/0xc60
+ ...
+ RIP: 0010:ext4_evict_inode+0x875/0xc60
+ ...
+ Call Trace:
+  <TASK>
+  evict+0x11c/0x2b0
+  iput+0x236/0x3a0
+  do_unlinkat+0x1b4/0x490
+  __x64_sys_unlinkat+0x4c/0xb0
+  do_syscall_64+0x3b/0x90
+  entry_SYSCALL_64_after_hwframe+0x46/0xb0
+ RIP: 0033:0x7fa933c1115b
+ ======
+
+rm                          kworker
+                            ext4_end_io_end()
+vfs_unlink()
+ ext4_unlink()
+                             ext4_convert_unwritten_io_end_vec()
+                              ext4_convert_unwritten_extents()
+                               ext4_map_blocks()
+                                ext4_ext_map_blocks()
+                                 ext4_ext_try_to_merge_up()
+                                  __mark_inode_dirty()
+                                   check !I_FREEING
+                                   locked_inode_to_wb_and_lock_list()
+ iput()
+  iput_final()
+   evict()
+    ext4_evict_inode()
+     truncate_inode_pages_final() //wait release io_end
+                                    inode_io_list_move_locked()
+                             ext4_release_io_end()
+     trigger WARN_ON_ONCE()
+
+Cc: stable@kernel.org
+Fixes: ceff86fddae8 ("ext4: Avoid freeing inodes on dirty list")
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20220629112647.4141034-1-yi.zhang@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 2b5ef1b64..7c5f5dabe 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -222,13 +222,13 @@ void ext4_evict_inode(struct inode *inode)
+ 
+ 	/*
+ 	 * For inodes with journalled data, transaction commit could have
+-	 * dirtied the inode. Flush worker is ignoring it because of I_FREEING
+-	 * flag but we still need to remove the inode from the writeback lists.
++	 * dirtied the inode. And for inodes with dioread_nolock, unwritten
++	 * extents converting worker could merge extents and also have dirtied
++	 * the inode. Flush worker is ignoring it because of I_FREEING flag but
++	 * we still need to remove the inode from the writeback lists.
+ 	 */
+-	if (!list_empty_careful(&inode->i_io_list)) {
+-		WARN_ON_ONCE(!ext4_should_journal_data(inode));
++	if (!list_empty_careful(&inode->i_io_list))
+ 		inode_io_list_del(inode);
+-	}
+ 
+ 	/*
+ 	 * Protect us against freezing - iput() caller didn't have to have any
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 7a2610554a0e582a9677d4f77b2ce7fcb82e1fde Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Wed, 29 Jun 2022 19:26:47 +0800
+Subject: [PATCH 02/57] ext4: check and assert if marking an no_delete evicting
+ inode dirty
+
+In ext4_evict_inode(), if we evicting an inode in the 'no_delete' path,
+it cannot be raced by another mark_inode_dirty(). If it happens,
+someone else may accidentally dirty it without holding inode refcount
+and probably cause use-after-free issues in the writeback procedure.
+It's indiscoverable and hard to debug, so add an WARN_ON_ONCE() to
+check and detect this issue in advance.
+
+Suggested-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20220629112647.4141034-2-yi.zhang@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/inode.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 7c5f5dabe..121ce2fcc 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -335,6 +335,12 @@ void ext4_evict_inode(struct inode *inode)
+ 	ext4_xattr_inode_array_free(ea_inode_array);
+ 	return;
+ no_delete:
++	/*
++	 * Check out some where else accidentally dirty the evicting inode,
++	 * which may probably cause inode use-after-free issues later.
++	 */
++	WARN_ON_ONCE(!list_empty_careful(&inode->i_io_list));
++
+ 	if (!list_empty(&EXT4_I(inode)->i_fc_list))
+ 		ext4_fc_mark_ineligible(inode->i_sb, EXT4_FC_REASON_NOMEM, NULL);
+ 	ext4_clear_inode(inode);	/* We must guarantee clearing of inode... */
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 122b09916c92155b034da26cfa6bef4701d44ad5 Mon Sep 17 00:00:00 2001
+From: Jiangshan Yi <yijiangshan@kylinos.cn>
+Date: Wed, 17 Aug 2022 10:59:28 +0800
+Subject: [PATCH 03/57] fs/ext4: replace ternary operator with min()/max() and
+ min_t()
+
+Fix the following coccicheck warning:
+
+fs/ext4/inline.c:183: WARNING opportunity for min().
+fs/ext4/extents.c:2631: WARNING opportunity for max().
+fs/ext4/extents.c:2632: WARNING opportunity for min().
+fs/ext4/extents.c:5559: WARNING opportunity for max().
+fs/ext4/super.c:6908: WARNING opportunity for min().
+
+min()/max() and min_t() macro is defined in include/linux/minmax.h.
+It avoids multiple evaluations of the arguments when non-constant and
+performs strict type-checking.
+
+Reported-by: kernel test robot <lkp@intel.com>
+Suggested-by: Lukas Czerner <lczerner@redhat.com>
+Signed-off-by: Jiangshan Yi <yijiangshan@kylinos.cn>
+Reviewed-by: Lukas Czerner <lczerner@redhat.com>
+Link: https://lore.kernel.org/r/20220817025928.612851-1-13667453960@163.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/extents.c | 8 +++-----
+ fs/ext4/inline.c  | 3 +--
+ fs/ext4/super.c   | 3 +--
+ 3 files changed, 5 insertions(+), 9 deletions(-)
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 6c399a8b2..ec008278d 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -2635,9 +2635,8 @@ ext4_ext_rm_leaf(handle_t *handle, struct inode *inode,
+ 			  unwritten, ex_ee_len);
+ 		path[depth].p_ext = ex;
+ 
+-		a = ex_ee_block > start ? ex_ee_block : start;
+-		b = ex_ee_block+ex_ee_len - 1 < end ?
+-			ex_ee_block+ex_ee_len - 1 : end;
++		a = max(ex_ee_block, start);
++		b = min(ex_ee_block + ex_ee_len - 1, end);
+ 
+ 		ext_debug(inode, "  border %u:%u\n", a, b);
+ 
+@@ -5567,8 +5566,7 @@ static int ext4_insert_range(struct file *file, loff_t offset, loff_t len)
+ 	 * ee_start_lblk to shift extents
+ 	 */
+ 	ret = ext4_ext_shift_extents(inode, handle,
+-		ee_start_lblk > offset_lblk ? ee_start_lblk : offset_lblk,
+-		len_lblk, SHIFT_RIGHT);
++		max(ee_start_lblk, offset_lblk), len_lblk, SHIFT_RIGHT);
+ 
+ 	up_write(&EXT4_I(inode)->i_data_sem);
+ 	if (IS_SYNC(inode))
+diff --git a/fs/ext4/inline.c b/fs/ext4/inline.c
+index a4fbe8256..2b42ececa 100644
+--- a/fs/ext4/inline.c
++++ b/fs/ext4/inline.c
+@@ -180,8 +180,7 @@ static int ext4_read_inline_data(struct inode *inode, void *buffer,
+ 
+ 	BUG_ON(len > EXT4_I(inode)->i_inline_size);
+ 
+-	cp_len = len < EXT4_MIN_INLINE_DATA_SIZE ?
+-			len : EXT4_MIN_INLINE_DATA_SIZE;
++	cp_len = min_t(unsigned int, len, EXT4_MIN_INLINE_DATA_SIZE);
+ 
+ 	raw_inode = ext4_raw_inode(iloc);
+ 	memcpy(buffer, (void *)(raw_inode->i_block), cp_len);
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 7cdd2138c..4749b303f 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -7031,8 +7031,7 @@ static ssize_t ext4_quota_read(struct super_block *sb, int type, char *data,
+ 		len = i_size-off;
+ 	toread = len;
+ 	while (toread > 0) {
+-		tocopy = sb->s_blocksize - offset < toread ?
+-				sb->s_blocksize - offset : toread;
++		tocopy = min_t(unsigned long, sb->s_blocksize - offset, toread);
+ 		bh = ext4_bread(NULL, inode, blk, 0);
+ 		if (IS_ERR(bh))
+ 			return PTR_ERR(bh);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From b614d0858f6bbe5b4484b92346cd216f9679779b Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Wed, 17 Aug 2022 21:27:01 +0800
+Subject: [PATCH 04/57] ext4: add inode table check in __ext4_get_inode_loc to
+ aovid possible infinite loop
+
+In do_writepages, if the value returned by ext4_writepages is "-ENOMEM"
+and "wbc->sync_mode == WB_SYNC_ALL", retry until the condition is not met.
+
+In __ext4_get_inode_loc, if the bh returned by sb_getblk is NULL,
+the function returns -ENOMEM.
+
+In __getblk_slow, if the return value of grow_buffers is less than 0,
+the function returns NULL.
+
+When the three processes are connected in series like the following stack,
+an infinite loop may occur:
+
+do_writepages					<--- keep retrying
+ ext4_writepages
+  mpage_map_and_submit_extent
+   mpage_map_one_extent
+    ext4_map_blocks
+     ext4_ext_map_blocks
+      ext4_ext_handle_unwritten_extents
+       ext4_ext_convert_to_initialized
+        ext4_split_extent
+         ext4_split_extent_at
+          __ext4_ext_dirty
+           __ext4_mark_inode_dirty
+            ext4_reserve_inode_write
+             ext4_get_inode_loc
+              __ext4_get_inode_loc		<--- return -ENOMEM
+               sb_getblk
+                __getblk_gfp
+                 __getblk_slow			<--- return NULL
+                  grow_buffers
+                   grow_dev_page		<--- return -ENXIO
+                    ret = (block < end_block) ? 1 : -ENXIO;
+
+In this issue, bg_inode_table_hi is overwritten as an incorrect value.
+As a result, `block < end_block` cannot be met in grow_dev_page.
+Therefore, __ext4_get_inode_loc always returns '-ENOMEM' and do_writepages
+keeps retrying. As a result, the writeback process is in the D state due
+to an infinite loop.
+
+Add a check on inode table block in the __ext4_get_inode_loc function by
+referring to ext4_read_inode_bitmap to avoid this infinite loop.
+
+Cc: stable@kernel.org
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Link: https://lore.kernel.org/r/20220817132701.3015912-3-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 121ce2fcc..6d1624166 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4479,9 +4479,17 @@ static int __ext4_get_inode_loc(struct super_block *sb, unsigned long ino,
+ 	inodes_per_block = EXT4_SB(sb)->s_inodes_per_block;
+ 	inode_offset = ((ino - 1) %
+ 			EXT4_INODES_PER_GROUP(sb));
+-	block = ext4_inode_table(sb, gdp) + (inode_offset / inodes_per_block);
+ 	iloc->offset = (inode_offset % inodes_per_block) * EXT4_INODE_SIZE(sb);
+ 
++	block = ext4_inode_table(sb, gdp);
++	if ((block <= le32_to_cpu(EXT4_SB(sb)->s_es->s_first_data_block)) ||
++	    (block >= ext4_blocks_count(EXT4_SB(sb)->s_es))) {
++		ext4_error(sb, "Invalid inode table block %llu in "
++			   "block_group %u", block, iloc->block_group);
++		return -EFSCORRUPTED;
++	}
++	block += (inode_offset / inodes_per_block);
++
+ 	bh = sb_getblk(sb, block);
+ 	if (unlikely(!bh))
+ 		return -ENOMEM;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 495f49b65c6fec9eced67242270b0d8f11f312a6 Mon Sep 17 00:00:00 2001
+From: Jinpeng Cui <cui.jinpeng2@zte.com.cn>
+Date: Wed, 31 Aug 2022 16:08:43 +0000
+Subject: [PATCH 05/57] ext4: remove redundant variable err
+
+Return value directly from ext4_group_extend_no_check()
+instead of getting value from redundant variable err.
+
+Reported-by: Zeal Robot <zealci@zte.com.cn>
+Signed-off-by: Jinpeng Cui <cui.jinpeng2@zte.com.cn>
+Link: https://lore.kernel.org/r/20220831160843.305836-1-cui.jinpeng2@zte.com.cn
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/resize.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/fs/ext4/resize.c b/fs/ext4/resize.c
+index 46b87ffeb..6e88a85ab 100644
+--- a/fs/ext4/resize.c
++++ b/fs/ext4/resize.c
+@@ -1831,7 +1831,6 @@ int ext4_group_extend(struct super_block *sb, struct ext4_super_block *es,
+ 	ext4_grpblk_t last;
+ 	ext4_grpblk_t add;
+ 	struct buffer_head *bh;
+-	int err;
+ 	ext4_group_t group;
+ 
+ 	o_blocks_count = ext4_blocks_count(es);
+@@ -1886,8 +1885,7 @@ int ext4_group_extend(struct super_block *sb, struct ext4_super_block *es,
+ 	}
+ 	brelse(bh);
+ 
+-	err = ext4_group_extend_no_check(sb, o_blocks_count, add);
+-	return err;
++	return ext4_group_extend_no_check(sb, o_blocks_count, add);
+ } /* ext4_group_extend */
+ 
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From c5cc990921abcca14ddbb1132adbbb9f0a29eeb5 Mon Sep 17 00:00:00 2001
+From: Li Zhong <floridsleeves@gmail.com>
+Date: Fri, 16 Sep 2022 17:28:16 -0700
+Subject: [PATCH 06/57] ext4: check the return value of
+ ext4_xattr_inode_dec_ref()
+
+Check the return value of ext4_xattr_inode_dec_ref(), which could
+return error code and need to be warned.
+
+Signed-off-by: Li Zhong <floridsleeves@gmail.com>
+Link: https://lore.kernel.org/r/20220917002816.3804400-1-floridsleeves@gmail.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/xattr.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 36d6ba719..718ef3987 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -1540,7 +1540,8 @@ static int ext4_xattr_inode_lookup_create(handle_t *handle, struct inode *inode,
+ 
+ 	err = ext4_xattr_inode_write(handle, ea_inode, value, value_len);
+ 	if (err) {
+-		ext4_xattr_inode_dec_ref(handle, ea_inode);
++		if (ext4_xattr_inode_dec_ref(handle, ea_inode))
++			ext4_warning_inode(ea_inode, "cleanup dec ref error %d", err);
+ 		iput(ea_inode);
+ 		return err;
+ 	}
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 706c2c2cc23ceb4a1f93d6948918c347dc7f3e80 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Tue, 4 Oct 2022 15:58:03 +0200
+Subject: [PATCH 07/57] ext4: journal_path mount options should follow links
+
+Before the commit 461c3af045d3 ("ext4: Change handle_mount_opt() to use
+fs_parameter") ext4 mount option journal_path did follow links in the
+provided path.
+
+Bring this behavior back by allowing to pass pathwalk flags to
+fs_lookup_param().
+
+Fixes: 461c3af045d3 ("ext4: Change handle_mount_opt() to use fs_parameter")
+Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Link: https://lore.kernel.org/r/20221004135803.32283-1-lczerner@redhat.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ Documentation/filesystems/mount_api.rst | 1 +
+ fs/ext4/super.c                         | 2 +-
+ fs/fs_parser.c                          | 3 ++-
+ include/linux/fs_parser.h               | 1 +
+ 4 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/filesystems/mount_api.rst b/Documentation/filesystems/mount_api.rst
+index eb358a00b..1d16787a0 100644
+--- a/Documentation/filesystems/mount_api.rst
++++ b/Documentation/filesystems/mount_api.rst
+@@ -814,6 +814,7 @@ process the parameters it is given.
+        int fs_lookup_param(struct fs_context *fc,
+ 			   struct fs_parameter *value,
+ 			   bool want_bdev,
++			   unsigned int flags,
+ 			   struct path *_path);
+ 
+      This takes a parameter that carries a string or filename type and attempts
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 4749b303f..0f71542cf 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -2247,7 +2247,7 @@ static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 			return -EINVAL;
+ 		}
+ 
+-		error = fs_lookup_param(fc, param, 1, &path);
++		error = fs_lookup_param(fc, param, 1, LOOKUP_FOLLOW, &path);
+ 		if (error) {
+ 			ext4_msg(NULL, KERN_ERR, "error: could not find "
+ 				 "journal device path");
+diff --git a/fs/fs_parser.c b/fs/fs_parser.c
+index ed40ce574..edb3712dc 100644
+--- a/fs/fs_parser.c
++++ b/fs/fs_parser.c
+@@ -138,15 +138,16 @@ EXPORT_SYMBOL(__fs_parse);
+  * @fc: The filesystem context to log errors through.
+  * @param: The parameter.
+  * @want_bdev: T if want a blockdev
++ * @flags: Pathwalk flags passed to filename_lookup()
+  * @_path: The result of the lookup
+  */
+ int fs_lookup_param(struct fs_context *fc,
+ 		    struct fs_parameter *param,
+ 		    bool want_bdev,
++		    unsigned int flags,
+ 		    struct path *_path)
+ {
+ 	struct filename *f;
+-	unsigned int flags = 0;
+ 	bool put_f;
+ 	int ret;
+ 
+diff --git a/include/linux/fs_parser.h b/include/linux/fs_parser.h
+index f103c9113..01542c4b8 100644
+--- a/include/linux/fs_parser.h
++++ b/include/linux/fs_parser.h
+@@ -76,6 +76,7 @@ static inline int fs_parse(struct fs_context *fc,
+ extern int fs_lookup_param(struct fs_context *fc,
+ 			   struct fs_parameter *param,
+ 			   bool want_bdev,
++			   unsigned int flags,
+ 			   struct path *_path);
+ 
+ extern int lookup_constant(const struct constant_table tbl[], const char *name, int not_found);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 7da389b5207cd6bbd03bd2ee5233f6410049e6f7 Mon Sep 17 00:00:00 2001
+From: changfengnan <changfengnan@bytedance.com>
+Date: Sat, 8 Oct 2022 20:05:18 +0800
+Subject: [PATCH 08/57] ext4: split ext4_journal_start trace for debug
+
+we might want to know why jbd2 thread using high io for detail,
+split ext4_journal_start trace to ext4_journal_start_sb and
+ext4_journal_start_inode, show ino and handle type when possible.
+
+Signed-off-by: changfengnan <changfengnan@bytedance.com>
+Link: https://lore.kernel.org/r/20221008120518.74870-1-changfengnan@bytedance.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/ext4_jbd2.c         | 14 ++++++---
+ fs/ext4/ext4_jbd2.h         | 10 +++----
+ fs/ext4/ialloc.c            |  4 +--
+ include/trace/events/ext4.h | 57 ++++++++++++++++++++++++++++++-------
+ 4 files changed, 63 insertions(+), 22 deletions(-)
+
+diff --git a/fs/ext4/ext4_jbd2.c b/fs/ext4/ext4_jbd2.c
+index 8e1fb18f4..77f318ec8 100644
+--- a/fs/ext4/ext4_jbd2.c
++++ b/fs/ext4/ext4_jbd2.c
+@@ -86,15 +86,21 @@ static int ext4_journal_check_start(struct super_block *sb)
+ 	return 0;
+ }
+ 
+-handle_t *__ext4_journal_start_sb(struct super_block *sb, unsigned int line,
++handle_t *__ext4_journal_start_sb(struct inode *inode,
++				  struct super_block *sb, unsigned int line,
+ 				  int type, int blocks, int rsv_blocks,
+ 				  int revoke_creds)
+ {
+ 	journal_t *journal;
+ 	int err;
+-
+-	trace_ext4_journal_start(sb, blocks, rsv_blocks, revoke_creds,
+-				 _RET_IP_);
++	if (inode)
++		trace_ext4_journal_start_inode(inode, blocks, rsv_blocks,
++					revoke_creds, type,
++					_RET_IP_);
++	else
++		trace_ext4_journal_start_sb(sb, blocks, rsv_blocks,
++					revoke_creds, type,
++					_RET_IP_);
+ 	err = ext4_journal_check_start(sb);
+ 	if (err < 0)
+ 		return ERR_PTR(err);
+diff --git a/fs/ext4/ext4_jbd2.h b/fs/ext4/ext4_jbd2.h
+index db2ae4a2b..0c77697d5 100644
+--- a/fs/ext4/ext4_jbd2.h
++++ b/fs/ext4/ext4_jbd2.h
+@@ -261,9 +261,9 @@ int __ext4_handle_dirty_metadata(const char *where, unsigned int line,
+ 	__ext4_handle_dirty_metadata(__func__, __LINE__, (handle), (inode), \
+ 				     (bh))
+ 
+-handle_t *__ext4_journal_start_sb(struct super_block *sb, unsigned int line,
+-				  int type, int blocks, int rsv_blocks,
+-				  int revoke_creds);
++handle_t *__ext4_journal_start_sb(struct inode *inode, struct super_block *sb,
++				  unsigned int line, int type, int blocks,
++				  int rsv_blocks, int revoke_creds);
+ int __ext4_journal_stop(const char *where, unsigned int line, handle_t *handle);
+ 
+ #define EXT4_NOJOURNAL_MAX_REF_COUNT ((unsigned long) 4096)
+@@ -303,7 +303,7 @@ static inline int ext4_trans_default_revoke_credits(struct super_block *sb)
+ }
+ 
+ #define ext4_journal_start_sb(sb, type, nblocks)			\
+-	__ext4_journal_start_sb((sb), __LINE__, (type), (nblocks), 0,	\
++	__ext4_journal_start_sb(NULL, (sb), __LINE__, (type), (nblocks), 0,\
+ 				ext4_trans_default_revoke_credits(sb))
+ 
+ #define ext4_journal_start(inode, type, nblocks)			\
+@@ -323,7 +323,7 @@ static inline handle_t *__ext4_journal_start(struct inode *inode,
+ 					     int blocks, int rsv_blocks,
+ 					     int revoke_creds)
+ {
+-	return __ext4_journal_start_sb(inode->i_sb, line, type, blocks,
++	return __ext4_journal_start_sb(inode, inode->i_sb, line, type, blocks,
+ 				       rsv_blocks, revoke_creds);
+ }
+ 
+diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
+index e9bc46684..d70197767 100644
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -1076,8 +1076,8 @@ struct inode *__ext4_new_inode(struct user_namespace *mnt_userns,
+ 
+ 		if ((!(sbi->s_mount_state & EXT4_FC_REPLAY)) && !handle) {
+ 			BUG_ON(nblocks <= 0);
+-			handle = __ext4_journal_start_sb(dir->i_sb, line_no,
+-				 handle_type, nblocks, 0,
++			handle = __ext4_journal_start_sb(NULL, dir->i_sb,
++				 line_no, handle_type, nblocks, 0,
+ 				 ext4_trans_default_revoke_credits(sb));
+ 			if (IS_ERR(handle)) {
+ 				err = PTR_ERR(handle);
+diff --git a/include/trace/events/ext4.h b/include/trace/events/ext4.h
+index 229e8fae6..44dc438c9 100644
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@ -1744,18 +1744,19 @@ TRACE_EVENT(ext4_load_inode,
+ 		  (unsigned long) __entry->ino)
+ );
+ 
+-TRACE_EVENT(ext4_journal_start,
++TRACE_EVENT(ext4_journal_start_sb,
+ 	TP_PROTO(struct super_block *sb, int blocks, int rsv_blocks,
+-		 int revoke_creds, unsigned long IP),
++		 int revoke_creds, int type, unsigned long IP),
+ 
+-	TP_ARGS(sb, blocks, rsv_blocks, revoke_creds, IP),
++	TP_ARGS(sb, blocks, rsv_blocks, revoke_creds, type, IP),
+ 
+ 	TP_STRUCT__entry(
+-		__field(	dev_t,	dev			)
+-		__field(unsigned long,	ip			)
+-		__field(	  int,	blocks			)
+-		__field(	  int,	rsv_blocks		)
+-		__field(	  int,	revoke_creds		)
++		__field(	dev_t,		dev		)
++		__field(	unsigned long,	ip		)
++		__field(	int,		blocks		)
++		__field(	int,		rsv_blocks	)
++		__field(	int,		revoke_creds	)
++		__field(	int,		type		)
+ 	),
+ 
+ 	TP_fast_assign(
+@@ -1764,11 +1765,45 @@ TRACE_EVENT(ext4_journal_start,
+ 		__entry->blocks		 = blocks;
+ 		__entry->rsv_blocks	 = rsv_blocks;
+ 		__entry->revoke_creds	 = revoke_creds;
++		__entry->type		 = type;
++	),
++
++	TP_printk("dev %d,%d blocks %d, rsv_blocks %d, revoke_creds %d,"
++		  " type %d, caller %pS", MAJOR(__entry->dev),
++		  MINOR(__entry->dev), __entry->blocks, __entry->rsv_blocks,
++		  __entry->revoke_creds, __entry->type, (void *)__entry->ip)
++);
++
++TRACE_EVENT(ext4_journal_start_inode,
++	TP_PROTO(struct inode *inode, int blocks, int rsv_blocks,
++		 int revoke_creds, int type, unsigned long IP),
++
++	TP_ARGS(inode, blocks, rsv_blocks, revoke_creds, type, IP),
++
++	TP_STRUCT__entry(
++		__field(	unsigned long,	ino		)
++		__field(	dev_t,		dev		)
++		__field(	unsigned long,	ip		)
++		__field(	int,		blocks		)
++		__field(	int,		rsv_blocks	)
++		__field(	int,		revoke_creds	)
++		__field(	int,		type		)
++	),
++
++	TP_fast_assign(
++		__entry->dev		 = inode->i_sb->s_dev;
++		__entry->ip		 = IP;
++		__entry->blocks		 = blocks;
++		__entry->rsv_blocks	 = rsv_blocks;
++		__entry->revoke_creds	 = revoke_creds;
++		__entry->type		 = type;
++		__entry->ino		 = inode->i_ino;
+ 	),
+ 
+-	TP_printk("dev %d,%d blocks %d, rsv_blocks %d, revoke_creds %d, "
+-		  "caller %pS", MAJOR(__entry->dev), MINOR(__entry->dev),
+-		  __entry->blocks, __entry->rsv_blocks, __entry->revoke_creds,
++	TP_printk("dev %d,%d blocks %d, rsv_blocks %d, revoke_creds %d,"
++		  " type %d, ino %lu, caller %pS", MAJOR(__entry->dev),
++		  MINOR(__entry->dev), __entry->blocks, __entry->rsv_blocks,
++		  __entry->revoke_creds, __entry->type, __entry->ino,
+ 		  (void *)__entry->ip)
+ );
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From a1a0631217b42fd15a865753a96b2c5ea1529256 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Lu=C3=ADs=20Henriques?= <lhenriques@suse.de>
+Date: Tue, 11 Oct 2022 16:57:58 +0100
+Subject: [PATCH 09/57] ext4: remove trailing newline from ext4_msg() message
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The ext4_msg() function adds a new line to the message.  Remove extra '\n'
+from call to ext4_msg() in ext4_orphan_cleanup().
+
+Signed-off-by: Luís Henriques <lhenriques@suse.de>
+Link: https://lore.kernel.org/r/20221011155758.15287-1-lhenriques@suse.de
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/orphan.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/orphan.c b/fs/ext4/orphan.c
+index 69a9cf913..e5b47dda3 100644
+--- a/fs/ext4/orphan.c
++++ b/fs/ext4/orphan.c
+@@ -412,7 +412,7 @@ void ext4_orphan_cleanup(struct super_block *sb, struct ext4_super_block *es)
+ 		/* don't clear list on RO mount w/ errors */
+ 		if (es->s_last_orphan && !(s_flags & SB_RDONLY)) {
+ 			ext4_msg(sb, KERN_INFO, "Errors on filesystem, "
+-				  "clearing orphan list.\n");
++				  "clearing orphan list.");
+ 			es->s_last_orphan = 0;
+ 		}
+ 		ext4_debug("Skipping orphan recovery on fs with errors.\n");
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 73f0304dd006340d8eda7758d86a328580c068d0 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Wed, 26 Oct 2022 12:23:07 +0800
+Subject: [PATCH 10/57] ext4: fix bug_on in __es_tree_search caused by bad
+ quota inode
+
+We got a issue as fllows:
+==================================================================
+ kernel BUG at fs/ext4/extents_status.c:202!
+ invalid opcode: 0000 [#1] PREEMPT SMP
+ CPU: 1 PID: 810 Comm: mount Not tainted 6.1.0-rc1-next-g9631525255e3 #352
+ RIP: 0010:__es_tree_search.isra.0+0xb8/0xe0
+ RSP: 0018:ffffc90001227900 EFLAGS: 00010202
+ RAX: 0000000000000000 RBX: 0000000077512a0f RCX: 0000000000000000
+ RDX: 0000000000000002 RSI: 0000000000002a10 RDI: ffff8881004cd0c8
+ RBP: ffff888177512ac8 R08: 47ffffffffffffff R09: 0000000000000001
+ R10: 0000000000000001 R11: 00000000000679af R12: 0000000000002a10
+ R13: ffff888177512d88 R14: 0000000077512a10 R15: 0000000000000000
+ FS: 00007f4bd76dbc40(0000)GS:ffff88842fd00000(0000)knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 00005653bf993cf8 CR3: 000000017bfdf000 CR4: 00000000000006e0
+ DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+ DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+ Call Trace:
+  <TASK>
+  ext4_es_cache_extent+0xe2/0x210
+  ext4_cache_extents+0xd2/0x110
+  ext4_find_extent+0x5d5/0x8c0
+  ext4_ext_map_blocks+0x9c/0x1d30
+  ext4_map_blocks+0x431/0xa50
+  ext4_getblk+0x82/0x340
+  ext4_bread+0x14/0x110
+  ext4_quota_read+0xf0/0x180
+  v2_read_header+0x24/0x90
+  v2_check_quota_file+0x2f/0xa0
+  dquot_load_quota_sb+0x26c/0x760
+  dquot_load_quota_inode+0xa5/0x190
+  ext4_enable_quotas+0x14c/0x300
+  __ext4_fill_super+0x31cc/0x32c0
+  ext4_fill_super+0x115/0x2d0
+  get_tree_bdev+0x1d2/0x360
+  ext4_get_tree+0x19/0x30
+  vfs_get_tree+0x26/0xe0
+  path_mount+0x81d/0xfc0
+  do_mount+0x8d/0xc0
+  __x64_sys_mount+0xc0/0x160
+  do_syscall_64+0x35/0x80
+  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+  </TASK>
+==================================================================
+
+Above issue may happen as follows:
+-------------------------------------
+ext4_fill_super
+ ext4_orphan_cleanup
+  ext4_enable_quotas
+   ext4_quota_enable
+    ext4_iget --> get error inode <5>
+     ext4_ext_check_inode --> Wrong imode makes it escape inspection
+     make_bad_inode(inode) --> EXT4_BOOT_LOADER_INO set imode
+    dquot_load_quota_inode
+     vfs_setup_quota_inode --> check pass
+     dquot_load_quota_sb
+      v2_check_quota_file
+       v2_read_header
+        ext4_quota_read
+         ext4_bread
+          ext4_getblk
+           ext4_map_blocks
+            ext4_ext_map_blocks
+             ext4_find_extent
+              ext4_cache_extents
+               ext4_es_cache_extent
+                __es_tree_search.isra.0
+                 ext4_es_end --> Wrong extents trigger BUG_ON
+
+In the above issue, s_usr_quota_inum is set to 5, but inode<5> contains
+incorrect imode and disordered extents. Because 5 is EXT4_BOOT_LOADER_INO,
+the ext4_ext_check_inode check in the ext4_iget function can be bypassed,
+finally, the extents that are not checked trigger the BUG_ON in the
+__es_tree_search function. To solve this issue, check whether the inode is
+bad_inode in vfs_setup_quota_inode().
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Chaitanya Kulkarni <kch@nvidia.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221026042310.3839669-2-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/quota/dquot.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/quota/dquot.c b/fs/quota/dquot.c
+index 0427b44bf..f27faf5db 100644
+--- a/fs/quota/dquot.c
++++ b/fs/quota/dquot.c
+@@ -2324,6 +2324,8 @@ static int vfs_setup_quota_inode(struct inode *inode, int type)
+ 	struct super_block *sb = inode->i_sb;
+ 	struct quota_info *dqopt = sb_dqopt(sb);
+ 
++	if (is_bad_inode(inode))
++		return -EUCLEAN;
+ 	if (!S_ISREG(inode->i_mode))
+ 		return -EACCES;
+ 	if (IS_RDONLY(inode))
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From a0416661059dc5a72fc32a476fa66ffc7288c9b3 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Wed, 26 Oct 2022 12:23:08 +0800
+Subject: [PATCH 11/57] ext4: add helper to check quota inums
+
+Before quota is enabled, a check on the preset quota inums in
+ext4_super_block is added to prevent wrong quota inodes from being loaded.
+In addition, when the quota fails to be enabled, the quota type and quota
+inum are printed to facilitate fault locating.
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221026042310.3839669-3-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/super.c | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 0f71542cf..6f944f5e4 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -6886,6 +6886,20 @@ static int ext4_quota_on(struct super_block *sb, int type, int format_id,
+ 	return err;
+ }
+ 
++static inline bool ext4_check_quota_inum(int type, unsigned long qf_inum)
++{
++	switch (type) {
++	case USRQUOTA:
++		return qf_inum == EXT4_USR_QUOTA_INO;
++	case GRPQUOTA:
++		return qf_inum == EXT4_GRP_QUOTA_INO;
++	case PRJQUOTA:
++		return qf_inum >= EXT4_GOOD_OLD_FIRST_INO;
++	default:
++		BUG();
++	}
++}
++
+ static int ext4_quota_enable(struct super_block *sb, int type, int format_id,
+ 			     unsigned int flags)
+ {
+@@ -6902,9 +6916,16 @@ static int ext4_quota_enable(struct super_block *sb, int type, int format_id,
+ 	if (!qf_inums[type])
+ 		return -EPERM;
+ 
++	if (!ext4_check_quota_inum(type, qf_inums[type])) {
++		ext4_error(sb, "Bad quota inum: %lu, type: %d",
++				qf_inums[type], type);
++		return -EUCLEAN;
++	}
++
+ 	qf_inode = ext4_iget(sb, qf_inums[type], EXT4_IGET_SPECIAL);
+ 	if (IS_ERR(qf_inode)) {
+-		ext4_error(sb, "Bad quota inode # %lu", qf_inums[type]);
++		ext4_error(sb, "Bad quota inode: %lu, type: %d",
++				qf_inums[type], type);
+ 		return PTR_ERR(qf_inode);
+ 	}
+ 
+@@ -6943,8 +6964,9 @@ int ext4_enable_quotas(struct super_block *sb)
+ 			if (err) {
+ 				ext4_warning(sb,
+ 					"Failed to enable quota tracking "
+-					"(type=%d, err=%d). Please run "
+-					"e2fsck to fix.", type, err);
++					"(type=%d, err=%d, ino=%lu). "
++					"Please run e2fsck to fix.", type,
++					err, qf_inums[type]);
+ 				for (type--; type >= 0; type--) {
+ 					struct inode *inode;
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From f2080b8832ba4dbc7f14ffb78a1313f7e940e9f5 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Wed, 26 Oct 2022 12:23:09 +0800
+Subject: [PATCH 12/57] ext4: add EXT4_IGET_BAD flag to prevent unexpected bad
+ inode
+
+There are many places that will get unhappy (and crash) when ext4_iget()
+returns a bad inode. However, if iget the boot loader inode, allows a bad
+inode to be returned, because the inode may not be initialized. This
+mechanism can be used to bypass some checks and cause panic. To solve this
+problem, we add a special iget flag EXT4_IGET_BAD. Only with this flag
+we'd be returning bad inode from ext4_iget(), otherwise we always return
+the error code if the inode is bad inode.(suggested by Jan Kara)
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221026042310.3839669-4-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/ext4.h  | 3 ++-
+ fs/ext4/inode.c | 8 +++++++-
+ fs/ext4/ioctl.c | 3 ++-
+ 3 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 8d5453852..2b574b143 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2964,7 +2964,8 @@ int do_journal_get_write_access(handle_t *handle, struct inode *inode,
+ typedef enum {
+ 	EXT4_IGET_NORMAL =	0,
+ 	EXT4_IGET_SPECIAL =	0x0001, /* OK to iget a system inode */
+-	EXT4_IGET_HANDLE = 	0x0002	/* Inode # is from a handle */
++	EXT4_IGET_HANDLE = 	0x0002,	/* Inode # is from a handle */
++	EXT4_IGET_BAD =		0x0004  /* Allow to iget a bad inode */
+ } ext4_iget_flags;
+ 
+ extern struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 6d1624166..a4bf643aa 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5058,8 +5058,14 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
+ 	if (IS_CASEFOLDED(inode) && !ext4_has_feature_casefold(inode->i_sb))
+ 		ext4_error_inode(inode, function, line, 0,
+ 				 "casefold flag without casefold feature");
+-	brelse(iloc.bh);
++	if (is_bad_inode(inode) && !(flags & EXT4_IGET_BAD)) {
++		ext4_error_inode(inode, function, line, 0,
++				 "bad inode without EXT4_IGET_BAD flag");
++		ret = -EUCLEAN;
++		goto bad_inode;
++	}
+ 
++	brelse(iloc.bh);
+ 	unlock_new_inode(inode);
+ 	return inode;
+ 
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index 95dfea28b..9ed7b9fe2 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -374,7 +374,8 @@ static long swap_inode_boot_loader(struct super_block *sb,
+ 	blkcnt_t blocks;
+ 	unsigned short bytes;
+ 
+-	inode_bl = ext4_iget(sb, EXT4_BOOT_LOADER_INO, EXT4_IGET_SPECIAL);
++	inode_bl = ext4_iget(sb, EXT4_BOOT_LOADER_INO,
++			EXT4_IGET_SPECIAL | EXT4_IGET_BAD);
+ 	if (IS_ERR(inode_bl))
+ 		return PTR_ERR(inode_bl);
+ 	ei_bl = EXT4_I(inode_bl);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 612b595593e860644e9b08758b8f4401b9ffd82d Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Wed, 26 Oct 2022 12:23:10 +0800
+Subject: [PATCH 13/57] ext4: fix bug_on in __es_tree_search caused by bad boot
+ loader inode
+
+We got a issue as fllows:
+==================================================================
+ kernel BUG at fs/ext4/extents_status.c:203!
+ invalid opcode: 0000 [#1] PREEMPT SMP
+ CPU: 1 PID: 945 Comm: cat Not tainted 6.0.0-next-20221007-dirty #349
+ RIP: 0010:ext4_es_end.isra.0+0x34/0x42
+ RSP: 0018:ffffc9000143b768 EFLAGS: 00010203
+ RAX: 0000000000000000 RBX: ffff8881769cd0b8 RCX: 0000000000000000
+ RDX: 0000000000000000 RSI: ffffffff8fc27cf7 RDI: 00000000ffffffff
+ RBP: ffff8881769cd0bc R08: 0000000000000000 R09: ffffc9000143b5f8
+ R10: 0000000000000001 R11: 0000000000000001 R12: ffff8881769cd0a0
+ R13: ffff8881768e5668 R14: 00000000768e52f0 R15: 0000000000000000
+ FS: 00007f359f7f05c0(0000)GS:ffff88842fd00000(0000)knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 00007f359f5a2000 CR3: 000000017130c000 CR4: 00000000000006e0
+ DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+ DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+ Call Trace:
+  <TASK>
+  __es_tree_search.isra.0+0x6d/0xf5
+  ext4_es_cache_extent+0xfa/0x230
+  ext4_cache_extents+0xd2/0x110
+  ext4_find_extent+0x5d5/0x8c0
+  ext4_ext_map_blocks+0x9c/0x1d30
+  ext4_map_blocks+0x431/0xa50
+  ext4_mpage_readpages+0x48e/0xe40
+  ext4_readahead+0x47/0x50
+  read_pages+0x82/0x530
+  page_cache_ra_unbounded+0x199/0x2a0
+  do_page_cache_ra+0x47/0x70
+  page_cache_ra_order+0x242/0x400
+  ondemand_readahead+0x1e8/0x4b0
+  page_cache_sync_ra+0xf4/0x110
+  filemap_get_pages+0x131/0xb20
+  filemap_read+0xda/0x4b0
+  generic_file_read_iter+0x13a/0x250
+  ext4_file_read_iter+0x59/0x1d0
+  vfs_read+0x28f/0x460
+  ksys_read+0x73/0x160
+  __x64_sys_read+0x1e/0x30
+  do_syscall_64+0x35/0x80
+  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+  </TASK>
+==================================================================
+
+In the above issue, ioctl invokes the swap_inode_boot_loader function to
+swap inode<5> and inode<12>. However, inode<5> contain incorrect imode and
+disordered extents, and i_nlink is set to 1. The extents check for inode in
+the ext4_iget function can be bypassed bacause 5 is EXT4_BOOT_LOADER_INO.
+While links_count is set to 1, the extents are not initialized in
+swap_inode_boot_loader. After the ioctl command is executed successfully,
+the extents are swapped to inode<12>, in this case, run the `cat` command
+to view inode<12>. And Bug_ON is triggered due to the incorrect extents.
+
+When the boot loader inode is not initialized, its imode can be one of the
+following:
+1) the imode is a bad type, which is marked as bad_inode in ext4_iget and
+   set to S_IFREG.
+2) the imode is good type but not S_IFREG.
+3) the imode is S_IFREG.
+
+The BUG_ON may be triggered by bypassing the check in cases 1 and 2.
+Therefore, when the boot loader inode is bad_inode or its imode is not
+S_IFREG, initialize the inode to avoid triggering the BUG.
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221026042310.3839669-5-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/ioctl.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index 9ed7b9fe2..e5f60057d 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -425,7 +425,7 @@ static long swap_inode_boot_loader(struct super_block *sb,
+ 	/* Protect extent tree against block allocations via delalloc */
+ 	ext4_double_down_write_data_sem(inode, inode_bl);
+ 
+-	if (inode_bl->i_nlink == 0) {
++	if (is_bad_inode(inode_bl) || !S_ISREG(inode_bl->i_mode)) {
+ 		/* this inode has never been used as a BOOT_LOADER */
+ 		set_nlink(inode_bl, 1);
+ 		i_uid_write(inode_bl, 0);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 956e1f16a5db39356cf85870aa82f22111a3c3ec Mon Sep 17 00:00:00 2001
+From: Gaosheng Cui <cuigaosheng1@huawei.com>
+Date: Mon, 31 Oct 2022 13:58:33 +0800
+Subject: [PATCH 14/57] ext4: fix undefined behavior in bit shift for
+ ext4_check_flag_values
+
+Shifting signed 32-bit value by 31 bits is undefined, so changing
+significant bit to unsigned. The UBSAN warning calltrace like below:
+
+UBSAN: shift-out-of-bounds in fs/ext4/ext4.h:591:2
+left shift of 1 by 31 places cannot be represented in type 'int'
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0x7d/0xa5
+ dump_stack+0x15/0x1b
+ ubsan_epilogue+0xe/0x4e
+ __ubsan_handle_shift_out_of_bounds+0x1e7/0x20c
+ ext4_init_fs+0x5a/0x277
+ do_one_initcall+0x76/0x430
+ kernel_init_freeable+0x3b3/0x422
+ kernel_init+0x24/0x1e0
+ ret_from_fork+0x1f/0x30
+ </TASK>
+
+Fixes: 9a4c80194713 ("ext4: ensure Inode flags consistency are checked at build time")
+Signed-off-by: Gaosheng Cui <cuigaosheng1@huawei.com>
+Link: https://lore.kernel.org/r/20221031055833.3966222-1-cuigaosheng1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/ext4.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 2b574b143..3afdd99bb 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -558,7 +558,7 @@ enum {
+  *
+  * It's not paranoia if the Murphy's Law really *is* out to get you.  :-)
+  */
+-#define TEST_FLAG_VALUE(FLAG) (EXT4_##FLAG##_FL == (1 << EXT4_INODE_##FLAG))
++#define TEST_FLAG_VALUE(FLAG) (EXT4_##FLAG##_FL == (1U << EXT4_INODE_##FLAG))
+ #define CHECK_FLAG_VALUE(FLAG) BUILD_BUG_ON(!TEST_FLAG_VALUE(FLAG))
+ 
+ static inline void ext4_check_flag_values(void)
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From af42846dcf35f4168b44fa97c024e9b230339b49 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Tue, 1 Nov 2022 22:33:12 -0700
+Subject: [PATCH 15/57] ext4: don't allow journal inode to have encrypt flag
+
+Mounting a filesystem whose journal inode has the encrypt flag causes a
+NULL dereference in fscrypt_limit_io_blocks() when the 'inlinecrypt'
+mount option is used.
+
+The problem is that when jbd2_journal_init_inode() calls bmap(), it
+eventually finds its way into ext4_iomap_begin(), which calls
+fscrypt_limit_io_blocks().  fscrypt_limit_io_blocks() requires that if
+the inode is encrypted, then its encryption key must already be set up.
+That's not the case here, since the journal inode is never "opened" like
+a normal file would be.  Hence the crash.
+
+A reproducer is:
+
+    mkfs.ext4 -F /dev/vdb
+    debugfs -w /dev/vdb -R "set_inode_field <8> flags 0x80808"
+    mount /dev/vdb /mnt -o inlinecrypt
+
+To fix this, make ext4 consider journal inodes with the encrypt flag to
+be invalid.  (Note, maybe other flags should be rejected on the journal
+inode too.  For now, this is just the minimal fix for the above issue.)
+
+I've marked this as fixing the commit that introduced the call to
+fscrypt_limit_io_blocks(), since that's what made an actual crash start
+being possible.  But this fix could be applied to any version of ext4
+that supports the encrypt feature.
+
+Reported-by: syzbot+ba9dac45bc76c490b7c3@syzkaller.appspotmail.com
+Fixes: 38ea50daa7a4 ("ext4: support direct I/O with fscrypt using blk-crypto")
+Cc: stable@vger.kernel.org
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221102053312.189962-1-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/super.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 6f944f5e4..9185131e0 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -5723,7 +5723,7 @@ static struct inode *ext4_get_journal_inode(struct super_block *sb,
+ 
+ 	ext4_debug("Journal inode found at %p: %lld bytes\n",
+ 		  journal_inode, journal_inode->i_size);
+-	if (!S_ISREG(journal_inode->i_mode)) {
++	if (!S_ISREG(journal_inode->i_mode) || IS_ENCRYPTED(journal_inode)) {
+ 		ext4_msg(sb, KERN_ERR, "invalid journal inode");
+ 		iput(journal_inode);
+ 		return NULL;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 2edbdf5281ec589bba438581b04031bf245b226b Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Wed, 2 Nov 2022 16:06:33 +0800
+Subject: [PATCH 16/57] ext4: fix use-after-free in ext4_orphan_cleanup
+
+I caught a issue as follows:
+==================================================================
+ BUG: KASAN: use-after-free in __list_add_valid+0x28/0x1a0
+ Read of size 8 at addr ffff88814b13f378 by task mount/710
+
+ CPU: 1 PID: 710 Comm: mount Not tainted 6.1.0-rc3-next #370
+ Call Trace:
+  <TASK>
+  dump_stack_lvl+0x73/0x9f
+  print_report+0x25d/0x759
+  kasan_report+0xc0/0x120
+  __asan_load8+0x99/0x140
+  __list_add_valid+0x28/0x1a0
+  ext4_orphan_cleanup+0x564/0x9d0 [ext4]
+  __ext4_fill_super+0x48e2/0x5300 [ext4]
+  ext4_fill_super+0x19f/0x3a0 [ext4]
+  get_tree_bdev+0x27b/0x450
+  ext4_get_tree+0x19/0x30 [ext4]
+  vfs_get_tree+0x49/0x150
+  path_mount+0xaae/0x1350
+  do_mount+0xe2/0x110
+  __x64_sys_mount+0xf0/0x190
+  do_syscall_64+0x35/0x80
+  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+  </TASK>
+ [...]
+==================================================================
+
+Above issue may happen as follows:
+-------------------------------------
+ext4_fill_super
+  ext4_orphan_cleanup
+   --- loop1: assume last_orphan is 12 ---
+    list_add(&EXT4_I(inode)->i_orphan, &EXT4_SB(sb)->s_orphan)
+    ext4_truncate --> return 0
+      ext4_inode_attach_jinode --> return -ENOMEM
+    iput(inode) --> free inode<12>
+   --- loop2: last_orphan is still 12 ---
+    list_add(&EXT4_I(inode)->i_orphan, &EXT4_SB(sb)->s_orphan);
+    // use inode<12> and trigger UAF
+
+To solve this issue, we need to propagate the return value of
+ext4_inode_attach_jinode() appropriately.
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221102080633.1630225-1-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/inode.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index a4bf643aa..181bc161b 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4231,7 +4231,8 @@ int ext4_truncate(struct inode *inode)
+ 
+ 	/* If we zero-out tail of the page, we have to create jinode for jbd2 */
+ 	if (inode->i_size & (inode->i_sb->s_blocksize - 1)) {
+-		if (ext4_inode_attach_jinode(inode) < 0)
++		err = ext4_inode_attach_jinode(inode);
++		if (err)
+ 			goto out_trace;
+ 	}
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 582fb6175dfbfa01b74981fd20eb345d1e3fc2cf Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 6 Nov 2022 14:48:35 -0800
+Subject: [PATCH 17/57] ext4: disable fast-commit of encrypted dir operations
+
+fast-commit of create, link, and unlink operations in encrypted
+directories is completely broken because the unencrypted filenames are
+being written to the fast-commit journal instead of the encrypted
+filenames.  These operations can't be replayed, as encryption keys
+aren't present at journal replay time.  It is also an information leak.
+
+Until if/when we can get this working properly, make encrypted directory
+operations ineligible for fast-commit.
+
+Note that fast-commit operations on encrypted regular files continue to
+be allowed, as they seem to work.
+
+Fixes: aa75f4d3daae ("ext4: main fast-commit commit path")
+Cc: <stable@vger.kernel.org> # v5.10+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221106224841.279231-2-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c       | 41 ++++++++++++++++++++++---------------
+ fs/ext4/fast_commit.h       |  1 +
+ include/trace/events/ext4.h |  7 +++++--
+ 3 files changed, 31 insertions(+), 18 deletions(-)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index 0f6d0a804..6d98f2b39 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -420,25 +420,34 @@ static int __track_dentry_update(struct inode *inode, void *arg, bool update)
+ 	struct __track_dentry_update_args *dentry_update =
+ 		(struct __track_dentry_update_args *)arg;
+ 	struct dentry *dentry = dentry_update->dentry;
+-	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
++	struct inode *dir = dentry->d_parent->d_inode;
++	struct super_block *sb = inode->i_sb;
++	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 
+ 	mutex_unlock(&ei->i_fc_lock);
++
++	if (IS_ENCRYPTED(dir)) {
++		ext4_fc_mark_ineligible(sb, EXT4_FC_REASON_ENCRYPTED_FILENAME,
++					NULL);
++		mutex_lock(&ei->i_fc_lock);
++		return -EOPNOTSUPP;
++	}
++
+ 	node = kmem_cache_alloc(ext4_fc_dentry_cachep, GFP_NOFS);
+ 	if (!node) {
+-		ext4_fc_mark_ineligible(inode->i_sb, EXT4_FC_REASON_NOMEM, NULL);
++		ext4_fc_mark_ineligible(sb, EXT4_FC_REASON_NOMEM, NULL);
+ 		mutex_lock(&ei->i_fc_lock);
+ 		return -ENOMEM;
+ 	}
+ 
+ 	node->fcd_op = dentry_update->op;
+-	node->fcd_parent = dentry->d_parent->d_inode->i_ino;
++	node->fcd_parent = dir->i_ino;
+ 	node->fcd_ino = inode->i_ino;
+ 	if (dentry->d_name.len > DNAME_INLINE_LEN) {
+ 		node->fcd_name.name = kmalloc(dentry->d_name.len, GFP_NOFS);
+ 		if (!node->fcd_name.name) {
+ 			kmem_cache_free(ext4_fc_dentry_cachep, node);
+-			ext4_fc_mark_ineligible(inode->i_sb,
+-				EXT4_FC_REASON_NOMEM, NULL);
++			ext4_fc_mark_ineligible(sb, EXT4_FC_REASON_NOMEM, NULL);
+ 			mutex_lock(&ei->i_fc_lock);
+ 			return -ENOMEM;
+ 		}
+@@ -2249,17 +2258,17 @@ void ext4_fc_init(struct super_block *sb, journal_t *journal)
+ 	journal->j_fc_cleanup_callback = ext4_fc_cleanup;
+ }
+ 
+-static const char *fc_ineligible_reasons[] = {
+-	"Extended attributes changed",
+-	"Cross rename",
+-	"Journal flag changed",
+-	"Insufficient memory",
+-	"Swap boot",
+-	"Resize",
+-	"Dir renamed",
+-	"Falloc range op",
+-	"Data journalling",
+-	"FC Commit Failed"
++static const char * const fc_ineligible_reasons[] = {
++	[EXT4_FC_REASON_XATTR] = "Extended attributes changed",
++	[EXT4_FC_REASON_CROSS_RENAME] = "Cross rename",
++	[EXT4_FC_REASON_JOURNAL_FLAG_CHANGE] = "Journal flag changed",
++	[EXT4_FC_REASON_NOMEM] = "Insufficient memory",
++	[EXT4_FC_REASON_SWAP_BOOT] = "Swap boot",
++	[EXT4_FC_REASON_RESIZE] = "Resize",
++	[EXT4_FC_REASON_RENAME_DIR] = "Dir renamed",
++	[EXT4_FC_REASON_FALLOC_RANGE] = "Falloc range op",
++	[EXT4_FC_REASON_INODE_JOURNAL_DATA] = "Data journalling",
++	[EXT4_FC_REASON_ENCRYPTED_FILENAME] = "Encrypted filename",
+ };
+ 
+ int ext4_fc_info_show(struct seq_file *seq, void *v)
+diff --git a/fs/ext4/fast_commit.h b/fs/ext4/fast_commit.h
+index a6154c3ed..256f2ad27 100644
+--- a/fs/ext4/fast_commit.h
++++ b/fs/ext4/fast_commit.h
+@@ -96,6 +96,7 @@ enum {
+ 	EXT4_FC_REASON_RENAME_DIR,
+ 	EXT4_FC_REASON_FALLOC_RANGE,
+ 	EXT4_FC_REASON_INODE_JOURNAL_DATA,
++	EXT4_FC_REASON_ENCRYPTED_FILENAME,
+ 	EXT4_FC_REASON_MAX
+ };
+ 
+diff --git a/include/trace/events/ext4.h b/include/trace/events/ext4.h
+index 44dc438c9..77b426ae0 100644
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@ -104,6 +104,7 @@ TRACE_DEFINE_ENUM(EXT4_FC_REASON_RESIZE);
+ TRACE_DEFINE_ENUM(EXT4_FC_REASON_RENAME_DIR);
+ TRACE_DEFINE_ENUM(EXT4_FC_REASON_FALLOC_RANGE);
+ TRACE_DEFINE_ENUM(EXT4_FC_REASON_INODE_JOURNAL_DATA);
++TRACE_DEFINE_ENUM(EXT4_FC_REASON_ENCRYPTED_FILENAME);
+ TRACE_DEFINE_ENUM(EXT4_FC_REASON_MAX);
+ 
+ #define show_fc_reason(reason)						\
+@@ -116,7 +117,8 @@ TRACE_DEFINE_ENUM(EXT4_FC_REASON_MAX);
+ 		{ EXT4_FC_REASON_RESIZE,	"RESIZE"},		\
+ 		{ EXT4_FC_REASON_RENAME_DIR,	"RENAME_DIR"},		\
+ 		{ EXT4_FC_REASON_FALLOC_RANGE,	"FALLOC_RANGE"},	\
+-		{ EXT4_FC_REASON_INODE_JOURNAL_DATA,	"INODE_JOURNAL_DATA"})
++		{ EXT4_FC_REASON_INODE_JOURNAL_DATA,	"INODE_JOURNAL_DATA"}, \
++		{ EXT4_FC_REASON_ENCRYPTED_FILENAME,	"ENCRYPTED_FILENAME"})
+ 
+ TRACE_EVENT(ext4_other_inode_update_time,
+ 	TP_PROTO(struct inode *inode, ino_t orig_ino),
+@@ -2799,7 +2801,7 @@ TRACE_EVENT(ext4_fc_stats,
+ 	),
+ 
+ 	TP_printk("dev %d,%d fc ineligible reasons:\n"
+-		  "%s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u "
++		  "%s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u, %s:%u"
+ 		  "num_commits:%lu, ineligible: %lu, numblks: %lu",
+ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
+ 		  FC_REASON_NAME_STAT(EXT4_FC_REASON_XATTR),
+@@ -2811,6 +2813,7 @@ TRACE_EVENT(ext4_fc_stats,
+ 		  FC_REASON_NAME_STAT(EXT4_FC_REASON_RENAME_DIR),
+ 		  FC_REASON_NAME_STAT(EXT4_FC_REASON_FALLOC_RANGE),
+ 		  FC_REASON_NAME_STAT(EXT4_FC_REASON_INODE_JOURNAL_DATA),
++		  FC_REASON_NAME_STAT(EXT4_FC_REASON_ENCRYPTED_FILENAME),
+ 		  __entry->fc_commits, __entry->fc_ineligible_commits,
+ 		  __entry->fc_numblks)
+ );
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From b5ce4bf5c097dc642dee8c026f297f55e7b7de63 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 6 Nov 2022 14:48:36 -0800
+Subject: [PATCH 18/57] ext4: don't set up encryption key during jbd2
+ transaction
+
+Commit a80f7fcf1867 ("ext4: fixup ext4_fc_track_* functions' signature")
+extended the scope of the transaction in ext4_unlink() too far, making
+it include the call to ext4_find_entry().  However, ext4_find_entry()
+can deadlock when called from within a transaction because it may need
+to set up the directory's encryption key.
+
+Fix this by restoring the transaction to its original scope.
+
+Reported-by: syzbot+1a748d0007eeac3ab079@syzkaller.appspotmail.com
+Fixes: a80f7fcf1867 ("ext4: fixup ext4_fc_track_* functions' signature")
+Cc: <stable@vger.kernel.org> # v5.10+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221106224841.279231-3-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/ext4.h        |  4 ++--
+ fs/ext4/fast_commit.c |  2 +-
+ fs/ext4/namei.c       | 44 +++++++++++++++++++++++--------------------
+ 3 files changed, 27 insertions(+), 23 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 3afdd99bb..4e739902d 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -3620,8 +3620,8 @@ extern void ext4_initialize_dirent_tail(struct buffer_head *bh,
+ 					unsigned int blocksize);
+ extern int ext4_handle_dirty_dirblock(handle_t *handle, struct inode *inode,
+ 				      struct buffer_head *bh);
+-extern int __ext4_unlink(handle_t *handle, struct inode *dir, const struct qstr *d_name,
+-			 struct inode *inode);
++extern int __ext4_unlink(struct inode *dir, const struct qstr *d_name,
++			 struct inode *inode, struct dentry *dentry);
+ extern int __ext4_link(struct inode *dir, struct inode *inode,
+ 		       struct dentry *dentry);
+ 
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index 6d98f2b39..da0c8228c 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -1397,7 +1397,7 @@ static int ext4_fc_replay_unlink(struct super_block *sb, struct ext4_fc_tl *tl,
+ 		return 0;
+ 	}
+ 
+-	ret = __ext4_unlink(NULL, old_parent, &entry, inode);
++	ret = __ext4_unlink(old_parent, &entry, inode, NULL);
+ 	/* -ENOENT ok coz it might not exist anymore. */
+ 	if (ret == -ENOENT)
+ 		ret = 0;
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index c08c0aba1..a789ea9b6 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3204,14 +3204,20 @@ static int ext4_rmdir(struct inode *dir, struct dentry *dentry)
+ 	return retval;
+ }
+ 
+-int __ext4_unlink(handle_t *handle, struct inode *dir, const struct qstr *d_name,
+-		  struct inode *inode)
++int __ext4_unlink(struct inode *dir, const struct qstr *d_name,
++		  struct inode *inode,
++		  struct dentry *dentry /* NULL during fast_commit recovery */)
+ {
+ 	int retval = -ENOENT;
+ 	struct buffer_head *bh;
+ 	struct ext4_dir_entry_2 *de;
++	handle_t *handle;
+ 	int skip_remove_dentry = 0;
+ 
++	/*
++	 * Keep this outside the transaction; it may have to set up the
++	 * directory's encryption key, which isn't GFP_NOFS-safe.
++	 */
+ 	bh = ext4_find_entry(dir, d_name, &de, NULL);
+ 	if (IS_ERR(bh))
+ 		return PTR_ERR(bh);
+@@ -3228,7 +3234,14 @@ int __ext4_unlink(handle_t *handle, struct inode *dir, const struct qstr *d_name
+ 		if (EXT4_SB(inode->i_sb)->s_mount_state & EXT4_FC_REPLAY)
+ 			skip_remove_dentry = 1;
+ 		else
+-			goto out;
++			goto out_bh;
++	}
++
++	handle = ext4_journal_start(dir, EXT4_HT_DIR,
++				    EXT4_DATA_TRANS_BLOCKS(dir->i_sb));
++	if (IS_ERR(handle)) {
++		retval = PTR_ERR(handle);
++		goto out_bh;
+ 	}
+ 
+ 	if (IS_DIRSYNC(dir))
+@@ -3237,12 +3250,12 @@ int __ext4_unlink(handle_t *handle, struct inode *dir, const struct qstr *d_name
+ 	if (!skip_remove_dentry) {
+ 		retval = ext4_delete_entry(handle, dir, de, bh);
+ 		if (retval)
+-			goto out;
++			goto out_handle;
+ 		dir->i_ctime = dir->i_mtime = current_time(dir);
+ 		ext4_update_dx_flag(dir);
+ 		retval = ext4_mark_inode_dirty(handle, dir);
+ 		if (retval)
+-			goto out;
++			goto out_handle;
+ 	} else {
+ 		retval = 0;
+ 	}
+@@ -3255,15 +3268,17 @@ int __ext4_unlink(handle_t *handle, struct inode *dir, const struct qstr *d_name
+ 		ext4_orphan_add(handle, inode);
+ 	inode->i_ctime = current_time(inode);
+ 	retval = ext4_mark_inode_dirty(handle, inode);
+-
+-out:
++	if (dentry && !retval)
++		ext4_fc_track_unlink(handle, dentry);
++out_handle:
++	ext4_journal_stop(handle);
++out_bh:
+ 	brelse(bh);
+ 	return retval;
+ }
+ 
+ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
+ {
+-	handle_t *handle;
+ 	int retval;
+ 
+ 	if (unlikely(ext4_forced_shutdown(EXT4_SB(dir->i_sb))))
+@@ -3281,16 +3296,7 @@ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
+ 	if (retval)
+ 		goto out_trace;
+ 
+-	handle = ext4_journal_start(dir, EXT4_HT_DIR,
+-				    EXT4_DATA_TRANS_BLOCKS(dir->i_sb));
+-	if (IS_ERR(handle)) {
+-		retval = PTR_ERR(handle);
+-		goto out_trace;
+-	}
+-
+-	retval = __ext4_unlink(handle, dir, &dentry->d_name, d_inode(dentry));
+-	if (!retval)
+-		ext4_fc_track_unlink(handle, dentry);
++	retval = __ext4_unlink(dir, &dentry->d_name, d_inode(dentry), dentry);
+ #if IS_ENABLED(CONFIG_UNICODE)
+ 	/* VFS negative dentries are incompatible with Encoding and
+ 	 * Case-insensitiveness. Eventually we'll want avoid
+@@ -3301,8 +3307,6 @@ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
+ 	if (IS_CASEFOLDED(dir))
+ 		d_invalidate(dentry);
+ #endif
+-	if (handle)
+-		ext4_journal_stop(handle);
+ 
+ out_trace:
+ 	trace_ext4_unlink_exit(dentry, retval);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 792cae8f438f5625f41eb6ca5086c7feeda06b44 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 6 Nov 2022 14:48:37 -0800
+Subject: [PATCH 19/57] ext4: fix leaking uninitialized memory in fast-commit
+ journal
+
+When space at the end of fast-commit journal blocks is unused, make sure
+to zero it out so that uninitialized memory is not leaked to disk.
+
+Fixes: aa75f4d3daae ("ext4: main fast-commit commit path")
+Cc: <stable@vger.kernel.org> # v5.10+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221106224841.279231-4-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index da0c8228c..1e8be0554 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -737,6 +737,9 @@ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
+ 		*crc = ext4_chksum(sbi, *crc, tl, EXT4_FC_TAG_BASE_LEN);
+ 	if (pad_len > 0)
+ 		ext4_fc_memzero(sb, tl + 1, pad_len, crc);
++	/* Don't leak uninitialized memory in the unused last byte. */
++	*((u8 *)(tl + 1) + pad_len) = 0;
++
+ 	ext4_fc_submit_bh(sb, false);
+ 
+ 	ret = jbd2_fc_get_buf(EXT4_SB(sb)->s_journal, &bh);
+@@ -793,6 +796,8 @@ static int ext4_fc_write_tail(struct super_block *sb, u32 crc)
+ 	dst += sizeof(tail.fc_tid);
+ 	tail.fc_crc = cpu_to_le32(crc);
+ 	ext4_fc_memcpy(sb, dst, &tail.fc_crc, sizeof(tail.fc_crc), NULL);
++	dst += sizeof(tail.fc_crc);
++	memset(dst, 0, bsize - off); /* Don't leak uninitialized memory. */
+ 
+ 	ext4_fc_submit_bh(sb, true);
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From e57758783989bd54c82e7b04690d9d2bd8df8299 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 6 Nov 2022 14:48:38 -0800
+Subject: [PATCH 20/57] ext4: add missing validation of fast-commit record
+ lengths
+
+Validate the inode and filename lengths in fast-commit journal records
+so that a malicious fast-commit journal cannot cause a crash by having
+invalid values for these.  Also validate EXT4_FC_TAG_DEL_RANGE.
+
+Fixes: aa75f4d3daae ("ext4: main fast-commit commit path")
+Cc: <stable@vger.kernel.org> # v5.10+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221106224841.279231-5-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c | 38 +++++++++++++++++++-------------------
+ fs/ext4/fast_commit.h |  2 +-
+ 2 files changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index 1e8be0554..d5ad4b2b2 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -1991,32 +1991,31 @@ void ext4_fc_replay_cleanup(struct super_block *sb)
+ 	kfree(sbi->s_fc_replay_state.fc_modified_inodes);
+ }
+ 
+-static inline bool ext4_fc_tag_len_isvalid(struct ext4_fc_tl *tl,
+-					   u8 *val, u8 *end)
++static bool ext4_fc_value_len_isvalid(struct ext4_sb_info *sbi,
++				      int tag, int len)
+ {
+-	if (val + tl->fc_len > end)
+-		return false;
+-
+-	/* Here only check ADD_RANGE/TAIL/HEAD which will read data when do
+-	 * journal rescan before do CRC check. Other tags length check will
+-	 * rely on CRC check.
+-	 */
+-	switch (tl->fc_tag) {
++	switch (tag) {
+ 	case EXT4_FC_TAG_ADD_RANGE:
+-		return (sizeof(struct ext4_fc_add_range) == tl->fc_len);
+-	case EXT4_FC_TAG_TAIL:
+-		return (sizeof(struct ext4_fc_tail) <= tl->fc_len);
+-	case EXT4_FC_TAG_HEAD:
+-		return (sizeof(struct ext4_fc_head) == tl->fc_len);
++		return len == sizeof(struct ext4_fc_add_range);
+ 	case EXT4_FC_TAG_DEL_RANGE:
++		return len == sizeof(struct ext4_fc_del_range);
++	case EXT4_FC_TAG_CREAT:
+ 	case EXT4_FC_TAG_LINK:
+ 	case EXT4_FC_TAG_UNLINK:
+-	case EXT4_FC_TAG_CREAT:
++		len -= sizeof(struct ext4_fc_dentry_info);
++		return len >= 1 && len <= EXT4_NAME_LEN;
+ 	case EXT4_FC_TAG_INODE:
++		len -= sizeof(struct ext4_fc_inode);
++		return len >= EXT4_GOOD_OLD_INODE_SIZE &&
++			len <= sbi->s_inode_size;
+ 	case EXT4_FC_TAG_PAD:
+-	default:
+-		return true;
++		return true; /* padding can have any length */
++	case EXT4_FC_TAG_TAIL:
++		return len >= sizeof(struct ext4_fc_tail);
++	case EXT4_FC_TAG_HEAD:
++		return len == sizeof(struct ext4_fc_head);
+ 	}
++	return false;
+ }
+ 
+ /*
+@@ -2079,7 +2078,8 @@ static int ext4_fc_replay_scan(journal_t *journal,
+ 	     cur = cur + EXT4_FC_TAG_BASE_LEN + tl.fc_len) {
+ 		ext4_fc_get_tl(&tl, cur);
+ 		val = cur + EXT4_FC_TAG_BASE_LEN;
+-		if (!ext4_fc_tag_len_isvalid(&tl, val, end)) {
++		if (tl.fc_len > end - val ||
++		    !ext4_fc_value_len_isvalid(sbi, tl.fc_tag, tl.fc_len)) {
+ 			ret = state->fc_replay_num_tags ?
+ 				JBD2_FC_REPLAY_STOP : -ECANCELED;
+ 			goto out_err;
+diff --git a/fs/ext4/fast_commit.h b/fs/ext4/fast_commit.h
+index 256f2ad27..2fadb2c47 100644
+--- a/fs/ext4/fast_commit.h
++++ b/fs/ext4/fast_commit.h
+@@ -58,7 +58,7 @@ struct ext4_fc_dentry_info {
+ 	__u8 fc_dname[];
+ };
+ 
+-/* Value structure for EXT4_FC_TAG_INODE and EXT4_FC_TAG_INODE_PARTIAL. */
++/* Value structure for EXT4_FC_TAG_INODE. */
+ struct ext4_fc_inode {
+ 	__le32 fc_ino;
+ 	__u8 fc_raw_inode[];
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From babb4155ed30eca47c94e45d4fdb51b49c6bcd8c Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 6 Nov 2022 14:48:39 -0800
+Subject: [PATCH 21/57] ext4: fix unaligned memory access in
+ ext4_fc_reserve_space()
+
+As is done elsewhere in the file, build the struct ext4_fc_tl on the
+stack and memcpy() it into the buffer, rather than directly writing it
+to a potentially-unaligned location in the buffer.
+
+Fixes: aa75f4d3daae ("ext4: main fast-commit commit path")
+Cc: <stable@vger.kernel.org> # v5.10+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221106224841.279231-6-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c | 39 +++++++++++++++++++++------------------
+ 1 file changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index d5ad4b2b2..892fa7c7a 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -675,6 +675,15 @@ static void ext4_fc_submit_bh(struct super_block *sb, bool is_tail)
+ 
+ /* Ext4 commit path routines */
+ 
++/* memcpy to fc reserved space and update CRC */
++static void *ext4_fc_memcpy(struct super_block *sb, void *dst, const void *src,
++				int len, u32 *crc)
++{
++	if (crc)
++		*crc = ext4_chksum(EXT4_SB(sb), *crc, src, len);
++	return memcpy(dst, src, len);
++}
++
+ /* memzero and update CRC */
+ static void *ext4_fc_memzero(struct super_block *sb, void *dst, int len,
+ 				u32 *crc)
+@@ -700,12 +709,13 @@ static void *ext4_fc_memzero(struct super_block *sb, void *dst, int len,
+  */
+ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
+ {
+-	struct ext4_fc_tl *tl;
++	struct ext4_fc_tl tl;
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	struct buffer_head *bh;
+ 	int bsize = sbi->s_journal->j_blocksize;
+ 	int ret, off = sbi->s_fc_bytes % bsize;
+ 	int pad_len;
++	u8 *dst;
+ 
+ 	/*
+ 	 * After allocating len, we should have space at least for a 0 byte
+@@ -729,16 +739,18 @@ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
+ 		return sbi->s_fc_bh->b_data + off;
+ 	}
+ 	/* Need to add PAD tag */
+-	tl = (struct ext4_fc_tl *)(sbi->s_fc_bh->b_data + off);
+-	tl->fc_tag = cpu_to_le16(EXT4_FC_TAG_PAD);
++	dst = sbi->s_fc_bh->b_data + off;
++	tl.fc_tag = cpu_to_le16(EXT4_FC_TAG_PAD);
+ 	pad_len = bsize - off - 1 - EXT4_FC_TAG_BASE_LEN;
+-	tl->fc_len = cpu_to_le16(pad_len);
+-	if (crc)
+-		*crc = ext4_chksum(sbi, *crc, tl, EXT4_FC_TAG_BASE_LEN);
+-	if (pad_len > 0)
+-		ext4_fc_memzero(sb, tl + 1, pad_len, crc);
++	tl.fc_len = cpu_to_le16(pad_len);
++	ext4_fc_memcpy(sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, crc);
++	dst += EXT4_FC_TAG_BASE_LEN;
++	if (pad_len > 0) {
++		ext4_fc_memzero(sb, dst, pad_len, crc);
++		dst += pad_len;
++	}
+ 	/* Don't leak uninitialized memory in the unused last byte. */
+-	*((u8 *)(tl + 1) + pad_len) = 0;
++	*dst = 0;
+ 
+ 	ext4_fc_submit_bh(sb, false);
+ 
+@@ -750,15 +762,6 @@ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
+ 	return sbi->s_fc_bh->b_data;
+ }
+ 
+-/* memcpy to fc reserved space and update CRC */
+-static void *ext4_fc_memcpy(struct super_block *sb, void *dst, const void *src,
+-				int len, u32 *crc)
+-{
+-	if (crc)
+-		*crc = ext4_chksum(EXT4_SB(sb), *crc, src, len);
+-	return memcpy(dst, src, len);
+-}
+-
+ /*
+  * Complete a fast commit by writing tail tag.
+  *
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 7e8d339f4463063c2fcd0e5f9383cdc323206e01 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 6 Nov 2022 14:48:40 -0800
+Subject: [PATCH 22/57] ext4: fix off-by-one errors in fast-commit block
+ filling
+
+Due to several different off-by-one errors, or perhaps due to a late
+change in design that wasn't fully reflected in the code that was
+actually merged, there are several very strange constraints on how
+fast-commit blocks are filled with tlv entries:
+
+- tlvs must start at least 10 bytes before the end of the block, even
+  though the minimum tlv length is 8.  Otherwise, the replay code will
+  ignore them.  (BUG: ext4_fc_reserve_space() could violate this
+  requirement if called with a len of blocksize - 9 or blocksize - 8.
+  Fortunately, this doesn't seem to happen currently.)
+
+- tlvs must end at least 1 byte before the end of the block.  Otherwise
+  the replay code will consider them to be invalid.  This quirk
+  contributed to a bug (fixed by an earlier commit) where uninitialized
+  memory was being leaked to disk in the last byte of blocks.
+
+Also, strangely these constraints don't apply to the replay code in
+e2fsprogs, which will accept any tlvs in the blocks (with no bounds
+checks at all, but that is a separate issue...).
+
+Given that this all seems to be a bug, let's fix it by just filling
+blocks with tlv entries in the natural way.
+
+Note that old kernels will be unable to replay fast-commit journals
+created by kernels that have this commit.
+
+Fixes: aa75f4d3daae ("ext4: main fast-commit commit path")
+Cc: <stable@vger.kernel.org> # v5.10+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221106224841.279231-7-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c | 66 +++++++++++++++++++++----------------------
+ 1 file changed, 33 insertions(+), 33 deletions(-)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index 892fa7c7a..7ed71c652 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -714,43 +714,43 @@ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
+ 	struct buffer_head *bh;
+ 	int bsize = sbi->s_journal->j_blocksize;
+ 	int ret, off = sbi->s_fc_bytes % bsize;
+-	int pad_len;
++	int remaining;
+ 	u8 *dst;
+ 
+ 	/*
+-	 * After allocating len, we should have space at least for a 0 byte
+-	 * padding.
++	 * If 'len' is too long to fit in any block alongside a PAD tlv, then we
++	 * cannot fulfill the request.
+ 	 */
+-	if (len + EXT4_FC_TAG_BASE_LEN > bsize)
++	if (len > bsize - EXT4_FC_TAG_BASE_LEN)
+ 		return NULL;
+ 
+-	if (bsize - off - 1 > len + EXT4_FC_TAG_BASE_LEN) {
+-		/*
+-		 * Only allocate from current buffer if we have enough space for
+-		 * this request AND we have space to add a zero byte padding.
+-		 */
+-		if (!sbi->s_fc_bh) {
+-			ret = jbd2_fc_get_buf(EXT4_SB(sb)->s_journal, &bh);
+-			if (ret)
+-				return NULL;
+-			sbi->s_fc_bh = bh;
+-		}
+-		sbi->s_fc_bytes += len;
+-		return sbi->s_fc_bh->b_data + off;
++	if (!sbi->s_fc_bh) {
++		ret = jbd2_fc_get_buf(EXT4_SB(sb)->s_journal, &bh);
++		if (ret)
++			return NULL;
++		sbi->s_fc_bh = bh;
+ 	}
+-	/* Need to add PAD tag */
+ 	dst = sbi->s_fc_bh->b_data + off;
++
++	/*
++	 * Allocate the bytes in the current block if we can do so while still
++	 * leaving enough space for a PAD tlv.
++	 */
++	remaining = bsize - EXT4_FC_TAG_BASE_LEN - off;
++	if (len <= remaining) {
++		sbi->s_fc_bytes += len;
++		return dst;
++	}
++
++	/*
++	 * Else, terminate the current block with a PAD tlv, then allocate a new
++	 * block and allocate the bytes at the start of that new block.
++	 */
++
+ 	tl.fc_tag = cpu_to_le16(EXT4_FC_TAG_PAD);
+-	pad_len = bsize - off - 1 - EXT4_FC_TAG_BASE_LEN;
+-	tl.fc_len = cpu_to_le16(pad_len);
++	tl.fc_len = cpu_to_le16(remaining);
+ 	ext4_fc_memcpy(sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, crc);
+-	dst += EXT4_FC_TAG_BASE_LEN;
+-	if (pad_len > 0) {
+-		ext4_fc_memzero(sb, dst, pad_len, crc);
+-		dst += pad_len;
+-	}
+-	/* Don't leak uninitialized memory in the unused last byte. */
+-	*dst = 0;
++	ext4_fc_memzero(sb, dst + EXT4_FC_TAG_BASE_LEN, remaining, crc);
+ 
+ 	ext4_fc_submit_bh(sb, false);
+ 
+@@ -758,7 +758,7 @@ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
+ 	if (ret)
+ 		return NULL;
+ 	sbi->s_fc_bh = bh;
+-	sbi->s_fc_bytes = (sbi->s_fc_bytes / bsize + 1) * bsize + len;
++	sbi->s_fc_bytes += bsize - off + len;
+ 	return sbi->s_fc_bh->b_data;
+ }
+ 
+@@ -789,7 +789,7 @@ static int ext4_fc_write_tail(struct super_block *sb, u32 crc)
+ 	off = sbi->s_fc_bytes % bsize;
+ 
+ 	tl.fc_tag = cpu_to_le16(EXT4_FC_TAG_TAIL);
+-	tl.fc_len = cpu_to_le16(bsize - off - 1 + sizeof(struct ext4_fc_tail));
++	tl.fc_len = cpu_to_le16(bsize - off + sizeof(struct ext4_fc_tail));
+ 	sbi->s_fc_bytes = round_up(sbi->s_fc_bytes, bsize);
+ 
+ 	ext4_fc_memcpy(sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, &crc);
+@@ -2056,7 +2056,7 @@ static int ext4_fc_replay_scan(journal_t *journal,
+ 	state = &sbi->s_fc_replay_state;
+ 
+ 	start = (u8 *)bh->b_data;
+-	end = (__u8 *)bh->b_data + journal->j_blocksize - 1;
++	end = start + journal->j_blocksize;
+ 
+ 	if (state->fc_replay_expected_off == 0) {
+ 		state->fc_cur_tag = 0;
+@@ -2077,7 +2077,7 @@ static int ext4_fc_replay_scan(journal_t *journal,
+ 	}
+ 
+ 	state->fc_replay_expected_off++;
+-	for (cur = start; cur < end - EXT4_FC_TAG_BASE_LEN;
++	for (cur = start; cur <= end - EXT4_FC_TAG_BASE_LEN;
+ 	     cur = cur + EXT4_FC_TAG_BASE_LEN + tl.fc_len) {
+ 		ext4_fc_get_tl(&tl, cur);
+ 		val = cur + EXT4_FC_TAG_BASE_LEN;
+@@ -2195,9 +2195,9 @@ static int ext4_fc_replay(journal_t *journal, struct buffer_head *bh,
+ #endif
+ 
+ 	start = (u8 *)bh->b_data;
+-	end = (__u8 *)bh->b_data + journal->j_blocksize - 1;
++	end = start + journal->j_blocksize;
+ 
+-	for (cur = start; cur < end - EXT4_FC_TAG_BASE_LEN;
++	for (cur = start; cur <= end - EXT4_FC_TAG_BASE_LEN;
+ 	     cur = cur + EXT4_FC_TAG_BASE_LEN + tl.fc_len) {
+ 		ext4_fc_get_tl(&tl, cur);
+ 		val = cur + EXT4_FC_TAG_BASE_LEN;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From afa43784481f4614bd3b1047d3773fd99e851592 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sun, 6 Nov 2022 14:48:41 -0800
+Subject: [PATCH 23/57] ext4: simplify fast-commit CRC calculation
+
+Instead of checksumming each field as it is added to the block, just
+checksum each block before it is written.  This is simpler, and also
+much more efficient.
+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221106224841.279231-8-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c | 54 +++++++++++++------------------------------
+ 1 file changed, 16 insertions(+), 38 deletions(-)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index 7ed71c652..1da85f626 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -675,27 +675,6 @@ static void ext4_fc_submit_bh(struct super_block *sb, bool is_tail)
+ 
+ /* Ext4 commit path routines */
+ 
+-/* memcpy to fc reserved space and update CRC */
+-static void *ext4_fc_memcpy(struct super_block *sb, void *dst, const void *src,
+-				int len, u32 *crc)
+-{
+-	if (crc)
+-		*crc = ext4_chksum(EXT4_SB(sb), *crc, src, len);
+-	return memcpy(dst, src, len);
+-}
+-
+-/* memzero and update CRC */
+-static void *ext4_fc_memzero(struct super_block *sb, void *dst, int len,
+-				u32 *crc)
+-{
+-	void *ret;
+-
+-	ret = memset(dst, 0, len);
+-	if (crc)
+-		*crc = ext4_chksum(EXT4_SB(sb), *crc, dst, len);
+-	return ret;
+-}
+-
+ /*
+  * Allocate len bytes on a fast commit buffer.
+  *
+@@ -749,8 +728,9 @@ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
+ 
+ 	tl.fc_tag = cpu_to_le16(EXT4_FC_TAG_PAD);
+ 	tl.fc_len = cpu_to_le16(remaining);
+-	ext4_fc_memcpy(sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, crc);
+-	ext4_fc_memzero(sb, dst + EXT4_FC_TAG_BASE_LEN, remaining, crc);
++	memcpy(dst, &tl, EXT4_FC_TAG_BASE_LEN);
++	memset(dst + EXT4_FC_TAG_BASE_LEN, 0, remaining);
++	*crc = ext4_chksum(sbi, *crc, sbi->s_fc_bh->b_data, bsize);
+ 
+ 	ext4_fc_submit_bh(sb, false);
+ 
+@@ -792,13 +772,15 @@ static int ext4_fc_write_tail(struct super_block *sb, u32 crc)
+ 	tl.fc_len = cpu_to_le16(bsize - off + sizeof(struct ext4_fc_tail));
+ 	sbi->s_fc_bytes = round_up(sbi->s_fc_bytes, bsize);
+ 
+-	ext4_fc_memcpy(sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, &crc);
++	memcpy(dst, &tl, EXT4_FC_TAG_BASE_LEN);
+ 	dst += EXT4_FC_TAG_BASE_LEN;
+ 	tail.fc_tid = cpu_to_le32(sbi->s_journal->j_running_transaction->t_tid);
+-	ext4_fc_memcpy(sb, dst, &tail.fc_tid, sizeof(tail.fc_tid), &crc);
++	memcpy(dst, &tail.fc_tid, sizeof(tail.fc_tid));
+ 	dst += sizeof(tail.fc_tid);
++	crc = ext4_chksum(sbi, crc, sbi->s_fc_bh->b_data,
++			  dst - (u8 *)sbi->s_fc_bh->b_data);
+ 	tail.fc_crc = cpu_to_le32(crc);
+-	ext4_fc_memcpy(sb, dst, &tail.fc_crc, sizeof(tail.fc_crc), NULL);
++	memcpy(dst, &tail.fc_crc, sizeof(tail.fc_crc));
+ 	dst += sizeof(tail.fc_crc);
+ 	memset(dst, 0, bsize - off); /* Don't leak uninitialized memory. */
+ 
+@@ -824,8 +806,8 @@ static bool ext4_fc_add_tlv(struct super_block *sb, u16 tag, u16 len, u8 *val,
+ 	tl.fc_tag = cpu_to_le16(tag);
+ 	tl.fc_len = cpu_to_le16(len);
+ 
+-	ext4_fc_memcpy(sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, crc);
+-	ext4_fc_memcpy(sb, dst + EXT4_FC_TAG_BASE_LEN, val, len, crc);
++	memcpy(dst, &tl, EXT4_FC_TAG_BASE_LEN);
++	memcpy(dst + EXT4_FC_TAG_BASE_LEN, val, len);
+ 
+ 	return true;
+ }
+@@ -847,11 +829,11 @@ static bool ext4_fc_add_dentry_tlv(struct super_block *sb, u32 *crc,
+ 	fcd.fc_ino = cpu_to_le32(fc_dentry->fcd_ino);
+ 	tl.fc_tag = cpu_to_le16(fc_dentry->fcd_op);
+ 	tl.fc_len = cpu_to_le16(sizeof(fcd) + dlen);
+-	ext4_fc_memcpy(sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, crc);
++	memcpy(dst, &tl, EXT4_FC_TAG_BASE_LEN);
+ 	dst += EXT4_FC_TAG_BASE_LEN;
+-	ext4_fc_memcpy(sb, dst, &fcd, sizeof(fcd), crc);
++	memcpy(dst, &fcd, sizeof(fcd));
+ 	dst += sizeof(fcd);
+-	ext4_fc_memcpy(sb, dst, fc_dentry->fcd_name.name, dlen, crc);
++	memcpy(dst, fc_dentry->fcd_name.name, dlen);
+ 
+ 	return true;
+ }
+@@ -889,15 +871,11 @@ static int ext4_fc_write_inode(struct inode *inode, u32 *crc)
+ 	if (!dst)
+ 		goto err;
+ 
+-	if (!ext4_fc_memcpy(inode->i_sb, dst, &tl, EXT4_FC_TAG_BASE_LEN, crc))
+-		goto err;
++	memcpy(dst, &tl, EXT4_FC_TAG_BASE_LEN);
+ 	dst += EXT4_FC_TAG_BASE_LEN;
+-	if (!ext4_fc_memcpy(inode->i_sb, dst, &fc_inode, sizeof(fc_inode), crc))
+-		goto err;
++	memcpy(dst, &fc_inode, sizeof(fc_inode));
+ 	dst += sizeof(fc_inode);
+-	if (!ext4_fc_memcpy(inode->i_sb, dst, (u8 *)ext4_raw_inode(&iloc),
+-					inode_len, crc))
+-		goto err;
++	memcpy(dst, (u8 *)ext4_raw_inode(&iloc), inode_len);
+ 	ret = 0;
+ err:
+ 	brelse(iloc.bh);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 19a13f05e5c431ead9b7a8e82e0130a6b98a1bda Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Mon, 7 Nov 2022 09:53:35 +0800
+Subject: [PATCH 24/57] ext4: init quota for 'old.inode' in 'ext4_rename'
+
+Syzbot found the following issue:
+ext4_parse_param: s_want_extra_isize=128
+ext4_inode_info_init: s_want_extra_isize=32
+ext4_rename: old.inode=ffff88823869a2c8 old.dir=ffff888238699828 new.inode=ffff88823869d7e8 new.dir=ffff888238699828
+__ext4_mark_inode_dirty: inode=ffff888238699828 ea_isize=32 want_ea_size=128
+__ext4_mark_inode_dirty: inode=ffff88823869a2c8 ea_isize=32 want_ea_size=128
+ext4_xattr_block_set: inode=ffff88823869a2c8
+------------[ cut here ]------------
+WARNING: CPU: 13 PID: 2234 at fs/ext4/xattr.c:2070 ext4_xattr_block_set.cold+0x22/0x980
+Modules linked in:
+RIP: 0010:ext4_xattr_block_set.cold+0x22/0x980
+RSP: 0018:ffff888227d3f3b0 EFLAGS: 00010202
+RAX: 0000000000000001 RBX: ffff88823007a000 RCX: 0000000000000000
+RDX: 0000000000000a03 RSI: 0000000000000040 RDI: ffff888230078178
+RBP: 0000000000000000 R08: 000000000000002c R09: ffffed1075c7df8e
+R10: ffff8883ae3efc6b R11: ffffed1075c7df8d R12: 0000000000000000
+R13: ffff88823869a2c8 R14: ffff8881012e0460 R15: dffffc0000000000
+FS:  00007f350ac1f740(0000) GS:ffff8883ae200000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007f350a6ed6a0 CR3: 0000000237456000 CR4: 00000000000006e0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+Call Trace:
+ <TASK>
+ ? ext4_xattr_set_entry+0x3b7/0x2320
+ ? ext4_xattr_block_set+0x0/0x2020
+ ? ext4_xattr_set_entry+0x0/0x2320
+ ? ext4_xattr_check_entries+0x77/0x310
+ ? ext4_xattr_ibody_set+0x23b/0x340
+ ext4_xattr_move_to_block+0x594/0x720
+ ext4_expand_extra_isize_ea+0x59a/0x10f0
+ __ext4_expand_extra_isize+0x278/0x3f0
+ __ext4_mark_inode_dirty.cold+0x347/0x410
+ ext4_rename+0xed3/0x174f
+ vfs_rename+0x13a7/0x2510
+ do_renameat2+0x55d/0x920
+ __x64_sys_rename+0x7d/0xb0
+ do_syscall_64+0x3b/0xa0
+ entry_SYSCALL_64_after_hwframe+0x72/0xdc
+
+As 'ext4_rename' will modify 'old.inode' ctime and mark inode dirty,
+which may trigger expand 'extra_isize' and allocate block. If inode
+didn't init quota will lead to warning.  To solve above issue, init
+'old.inode' firstly in 'ext4_rename'.
+
+Reported-by: syzbot+98346927678ac3059c77@syzkaller.appspotmail.com
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221107015335.2524319-1-yebin@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/namei.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index a789ea9b6..1c5518a4b 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3796,6 +3796,9 @@ static int ext4_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
+ 		return -EXDEV;
+ 
+ 	retval = dquot_initialize(old.dir);
++	if (retval)
++		return retval;
++	retval = dquot_initialize(old.inode);
+ 	if (retval)
+ 		return retval;
+ 	retval = dquot_initialize(new.dir);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 72d09b909713471d402f43c3440742171de869d0 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Tue, 8 Nov 2022 15:50:42 +0100
+Subject: [PATCH 25/57] ext4: print file system UUID on mount, remount and
+ unmount
+
+The device names are not necessarily consistent across reboots which can
+make it more difficult to identify the right file system when tracking
+down issues using system logs.
+
+Print file system UUID string on every mount, remount and unmount to
+make this task easier.
+
+This is similar to the functionality recently propsed for XFS.
+
+Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+Cc: Lukas Herbolt <lukas@herbolt.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Link: https://lore.kernel.org/r/20221108145042.85770-1-lczerner@redhat.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/super.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 9185131e0..f5e6919ea 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1206,7 +1206,8 @@ static void ext4_put_super(struct super_block *sb)
+ 	ext4_unregister_sysfs(sb);
+ 
+ 	if (___ratelimit(&ext4_mount_msg_ratelimit, "EXT4-fs unmount"))
+-		ext4_msg(sb, KERN_INFO, "unmounting filesystem.");
++		ext4_msg(sb, KERN_INFO, "unmounting filesystem %pU.",
++			 &sb->s_uuid);
+ 
+ 	ext4_unregister_li_request(sb);
+ 	ext4_quota_off_umount(sb);
+@@ -5655,8 +5656,9 @@ static int ext4_fill_super(struct super_block *sb, struct fs_context *fc)
+ 		descr = "out journal";
+ 
+ 	if (___ratelimit(&ext4_mount_msg_ratelimit, "EXT4-fs mount"))
+-		ext4_msg(sb, KERN_INFO, "mounted filesystem with%s. "
+-			 "Quota mode: %s.", descr, ext4_quota_mode(sb));
++		ext4_msg(sb, KERN_INFO, "mounted filesystem %pU with%s. "
++			 "Quota mode: %s.", &sb->s_uuid, descr,
++			 ext4_quota_mode(sb));
+ 
+ 	/* Update the s_overhead_clusters if necessary */
+ 	ext4_update_overhead(sb, false);
+@@ -6611,8 +6613,8 @@ static int ext4_reconfigure(struct fs_context *fc)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ext4_msg(sb, KERN_INFO, "re-mounted. Quota mode: %s.",
+-		 ext4_quota_mode(sb));
++	ext4_msg(sb, KERN_INFO, "re-mounted %pU. Quota mode: %s.",
++		 &sb->s_uuid, ext4_quota_mode(sb));
+ 
+ 	return 0;
+ }
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 2d78ed6e4fab844e60016ddfd43e514abd5f8531 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Wed, 9 Nov 2022 15:43:43 +0800
+Subject: [PATCH 26/57] ext4: correct inconsistent error msg in nojournal mode
+
+When we used the journal_async_commit mounting option in nojournal mode,
+the kernel told me that "can't mount with journal_checksum", was very
+confusing. I find that when we mount with journal_async_commit, both the
+JOURNAL_ASYNC_COMMIT and EXPLICIT_JOURNAL_CHECKSUM flags are set. However,
+in the error branch, CHECKSUM is checked before ASYNC_COMMIT. As a result,
+the above inconsistency occurs, and the ASYNC_COMMIT branch becomes dead
+code that cannot be executed. Therefore, we exchange the positions of the
+two judgments to make the error msg more accurate.
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221109074343.4184862-1-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/super.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index f5e6919ea..878be47fa 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -5288,14 +5288,15 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
+ 		goto failed_mount3a;
+ 	} else {
+ 		/* Nojournal mode, all journal mount options are illegal */
+-		if (test_opt2(sb, EXPLICIT_JOURNAL_CHECKSUM)) {
++		if (test_opt(sb, JOURNAL_ASYNC_COMMIT)) {
+ 			ext4_msg(sb, KERN_ERR, "can't mount with "
+-				 "journal_checksum, fs mounted w/o journal");
++				 "journal_async_commit, fs mounted w/o journal");
+ 			goto failed_mount3a;
+ 		}
+-		if (test_opt(sb, JOURNAL_ASYNC_COMMIT)) {
++
++		if (test_opt2(sb, EXPLICIT_JOURNAL_CHECKSUM)) {
+ 			ext4_msg(sb, KERN_ERR, "can't mount with "
+-				 "journal_async_commit, fs mounted w/o journal");
++				 "journal_checksum, fs mounted w/o journal");
+ 			goto failed_mount3a;
+ 		}
+ 		if (sbi->s_commit_interval != JBD2_DEFAULT_MAX_COMMIT_AGE*HZ) {
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From f547da7373455cb8e18b31b7f0c08627bd8589a6 Mon Sep 17 00:00:00 2001
+From: JunChao Sun <sunjunchao2870@gmail.com>
+Date: Wed, 9 Nov 2022 07:38:22 -0800
+Subject: [PATCH 27/57] ext4: replace kmem_cache_create with KMEM_CACHE
+
+Replace kmem_cache_create with KMEM_CACHE macro that
+guaranteed struct alignment
+
+Signed-off-by: JunChao Sun <sunjunchao2870@gmail.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221109153822.80250-1-sunjunchao2870@gmail.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/extents_status.c | 8 ++------
+ fs/ext4/readpage.c       | 5 ++---
+ 2 files changed, 4 insertions(+), 9 deletions(-)
+
+diff --git a/fs/ext4/extents_status.c b/fs/ext4/extents_status.c
+index cd0a86185..97eccc002 100644
+--- a/fs/ext4/extents_status.c
++++ b/fs/ext4/extents_status.c
+@@ -155,9 +155,7 @@ static void __revise_pending(struct inode *inode, ext4_lblk_t lblk,
+ 
+ int __init ext4_init_es(void)
+ {
+-	ext4_es_cachep = kmem_cache_create("ext4_extent_status",
+-					   sizeof(struct extent_status),
+-					   0, (SLAB_RECLAIM_ACCOUNT), NULL);
++	ext4_es_cachep = KMEM_CACHE(extent_status, SLAB_RECLAIM_ACCOUNT);
+ 	if (ext4_es_cachep == NULL)
+ 		return -ENOMEM;
+ 	return 0;
+@@ -1807,9 +1805,7 @@ static void ext4_print_pending_tree(struct inode *inode)
+ 
+ int __init ext4_init_pending(void)
+ {
+-	ext4_pending_cachep = kmem_cache_create("ext4_pending_reservation",
+-					   sizeof(struct pending_reservation),
+-					   0, (SLAB_RECLAIM_ACCOUNT), NULL);
++	ext4_pending_cachep = KMEM_CACHE(pending_reservation, SLAB_RECLAIM_ACCOUNT);
+ 	if (ext4_pending_cachep == NULL)
+ 		return -ENOMEM;
+ 	return 0;
+diff --git a/fs/ext4/readpage.c b/fs/ext4/readpage.c
+index 3d21eae26..773176e7f 100644
+--- a/fs/ext4/readpage.c
++++ b/fs/ext4/readpage.c
+@@ -410,9 +410,8 @@ int ext4_mpage_readpages(struct inode *inode,
+ 
+ int __init ext4_init_post_read_processing(void)
+ {
+-	bio_post_read_ctx_cache =
+-		kmem_cache_create("ext4_bio_post_read_ctx",
+-				  sizeof(struct bio_post_read_ctx), 0, 0, NULL);
++	bio_post_read_ctx_cache = KMEM_CACHE(bio_post_read_ctx, SLAB_RECLAIM_ACCOUNT);
++
+ 	if (!bio_post_read_ctx_cache)
+ 		goto fail;
+ 	bio_post_read_ctx_pool =
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 3ca354df87b973ab491e9f99c4d98a32889f45f7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Lu=C3=ADs=20Henriques?= <lhenriques@suse.de>
+Date: Wed, 9 Nov 2022 18:14:45 +0000
+Subject: [PATCH 28/57] ext4: fix error code return to user-space in
+ ext4_get_branch()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If a block is out of range in ext4_get_branch(), -ENOMEM will be returned
+to user-space.  Obviously, this error code isn't really useful.  This
+patch fixes it by making sure the right error code (-EFSCORRUPTED) is
+propagated to user-space.  EUCLEAN is more informative than ENOMEM.
+
+Signed-off-by: Luís Henriques <lhenriques@suse.de>
+Link: https://lore.kernel.org/r/20221109181445.17843-1-lhenriques@suse.de
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/indirect.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/indirect.c b/fs/ext4/indirect.c
+index 860fc5119..c68bebe7f 100644
+--- a/fs/ext4/indirect.c
++++ b/fs/ext4/indirect.c
+@@ -148,6 +148,7 @@ static Indirect *ext4_get_branch(struct inode *inode, int depth,
+ 	struct super_block *sb = inode->i_sb;
+ 	Indirect *p = chain;
+ 	struct buffer_head *bh;
++	unsigned int key;
+ 	int ret = -EIO;
+ 
+ 	*err = 0;
+@@ -156,7 +157,13 @@ static Indirect *ext4_get_branch(struct inode *inode, int depth,
+ 	if (!p->key)
+ 		goto no_block;
+ 	while (--depth) {
+-		bh = sb_getblk(sb, le32_to_cpu(p->key));
++		key = le32_to_cpu(p->key);
++		if (key > ext4_blocks_count(EXT4_SB(sb)->s_es)) {
++			/* the block was out of range */
++			ret = -EFSCORRUPTED;
++			goto failure;
++		}
++		bh = sb_getblk(sb, key);
+ 		if (unlikely(!bh)) {
+ 			ret = -ENOMEM;
+ 			goto failure;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 6ede9f2c4b572db5591a7723efc4fadb0eb70695 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Thu, 10 Nov 2022 12:16:29 -0800
+Subject: [PATCH 29/57] ext4: dont return EINVAL from GETFSUUID when reporting
+ UUID length
+
+If userspace calls this ioctl with fsu_length (the length of the
+fsuuid.fsu_uuid array) set to zero, ext4 copies the desired uuid length
+out to userspace.  The kernel call returned a result from a valid input,
+so the return value here should be zero, not EINVAL.
+
+While we're at it, fix the copy_to_user call to make it clear that we're
+only copying out fsu_len.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Catherine Hoang <catherine.hoang@oracle.com>
+Link: https://lore.kernel.org/r/166811138914.327006.9241306894437166566.stgit@magnolia
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/ioctl.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index e5f60057d..beedaebab 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -1154,9 +1154,10 @@ static int ext4_ioctl_getuuid(struct ext4_sb_info *sbi,
+ 
+ 	if (fsuuid.fsu_len == 0) {
+ 		fsuuid.fsu_len = UUID_SIZE;
+-		if (copy_to_user(ufsuuid, &fsuuid, sizeof(fsuuid.fsu_len)))
++		if (copy_to_user(&ufsuuid->fsu_len, &fsuuid.fsu_len,
++					sizeof(fsuuid.fsu_len)))
+ 			return -EFAULT;
+-		return -EINVAL;
++		return 0;
+ 	}
+ 
+ 	if (fsuuid.fsu_len != UUID_SIZE || fsuuid.fsu_flags != 0)
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From eb5bbb9f5cf3838a792a4434977a71168a029c45 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Thu, 10 Nov 2022 12:16:34 -0800
+Subject: [PATCH 30/57] ext4: don't fail GETFSUUID when the caller provides a
+ long buffer
+
+If userspace provides a longer UUID buffer than is required, we
+shouldn't fail the call with EINVAL -- rather, we can fill the caller's
+buffer with the bytes we /can/ fill, and update the length field to
+reflect what we copied.  This doesn't break the UAPI since we're
+enabling a case that currently fails, and so far Ted hasn't released a
+version of e2fsprogs that uses the new ext4 ioctl.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Catherine Hoang <catherine.hoang@oracle.com>
+Link: https://lore.kernel.org/r/166811139478.327006.13879198441587445544.stgit@magnolia
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/ioctl.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index beedaebab..202953b5d 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -1160,14 +1160,16 @@ static int ext4_ioctl_getuuid(struct ext4_sb_info *sbi,
+ 		return 0;
+ 	}
+ 
+-	if (fsuuid.fsu_len != UUID_SIZE || fsuuid.fsu_flags != 0)
++	if (fsuuid.fsu_len < UUID_SIZE || fsuuid.fsu_flags != 0)
+ 		return -EINVAL;
+ 
+ 	lock_buffer(sbi->s_sbh);
+ 	memcpy(uuid, sbi->s_es->s_uuid, UUID_SIZE);
+ 	unlock_buffer(sbi->s_sbh);
+ 
+-	if (copy_to_user(&ufsuuid->fsu_uuid[0], uuid, UUID_SIZE))
++	fsuuid.fsu_len = UUID_SIZE;
++	if (copy_to_user(ufsuuid, &fsuuid, sizeof(fsuuid)) ||
++	    copy_to_user(&ufsuuid->fsu_uuid[0], uuid, UUID_SIZE))
+ 		return -EFAULT;
+ 	return 0;
+ }
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 72fa471ea20342e15351bd46651f3403d3153ceb Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Thu, 17 Nov 2022 12:03:39 +0800
+Subject: [PATCH 31/57] ext4: fix bad checksum after online resize
+
+When online resizing is performed twice consecutively, the error message
+"Superblock checksum does not match superblock" is displayed for the
+second time. Here's the reproducer:
+
+	mkfs.ext4 -F /dev/sdb 100M
+	mount /dev/sdb /tmp/test
+	resize2fs /dev/sdb 5G
+	resize2fs /dev/sdb 6G
+
+To solve this issue, we moved the update of the checksum after the
+es->s_overhead_clusters is updated.
+
+Fixes: 026d0d27c488 ("ext4: reduce computation of overhead during resize")
+Fixes: de394a86658f ("ext4: update s_overhead_clusters in the superblock during an on-line resize")
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: stable@kernel.org
+Link: https://lore.kernel.org/r/20221117040341.1380702-2-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/resize.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/resize.c b/fs/ext4/resize.c
+index 6e88a85ab..70fef50ab 100644
+--- a/fs/ext4/resize.c
++++ b/fs/ext4/resize.c
+@@ -1476,8 +1476,6 @@ static void ext4_update_super(struct super_block *sb,
+ 	 * active. */
+ 	ext4_r_blocks_count_set(es, ext4_r_blocks_count(es) +
+ 				reserved_blocks);
+-	ext4_superblock_csum_set(sb);
+-	unlock_buffer(sbi->s_sbh);
+ 
+ 	/* Update the free space counts */
+ 	percpu_counter_add(&sbi->s_freeclusters_counter,
+@@ -1513,6 +1511,8 @@ static void ext4_update_super(struct super_block *sb,
+ 		ext4_calculate_overhead(sb);
+ 	es->s_overhead_clusters = cpu_to_le32(sbi->s_overhead);
+ 
++	ext4_superblock_csum_set(sb);
++	unlock_buffer(sbi->s_sbh);
+ 	if (test_opt(sb, DEBUG))
+ 		printk(KERN_DEBUG "EXT4-fs: added group %u:"
+ 		       "%llu blocks(%llu free %llu reserved)\n", flex_gd->count,
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From e68686c5d4c0460974c71a6b32278f98abce8490 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Thu, 17 Nov 2022 12:03:40 +0800
+Subject: [PATCH 32/57] ext4: fix corrupt backup group descriptors after online
+ resize
+
+In commit 9a8c5b0d0615 ("ext4: update the backup superblock's at the end
+of the online resize"), it is assumed that update_backups() only updates
+backup superblocks, so each b_data is treated as a backupsuper block to
+update its s_block_group_nr and s_checksum. However, update_backups()
+also updates the backup group descriptors, which causes the backup group
+descriptors to be corrupted.
+
+The above commit fixes the problem of invalid checksum of the backup
+superblock. The root cause of this problem is that the checksum of
+ext4_update_super() is not set correctly. This problem has been fixed
+in the previous patch ("ext4: fix bad checksum after online resize").
+
+However, we do need to set block_group_nr for the backup superblock in
+update_backups(). When a block is in a group that contains a backup
+superblock, and the block is the first block in the group, the block is
+definitely a superblock. We add a helper function that includes setting
+s_block_group_nr and updating checksum, and then call it only when the
+above conditions are met to prevent the backup group descriptors from
+being incorrectly modified.
+
+Fixes: 9a8c5b0d0615 ("ext4: update the backup superblock's at the end of the online resize")
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: stable@kernel.org
+Link: https://lore.kernel.org/r/20221117040341.1380702-3-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/resize.c | 22 +++++++++++++++-------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/fs/ext4/resize.c b/fs/ext4/resize.c
+index 70fef50ab..d460440d6 100644
+--- a/fs/ext4/resize.c
++++ b/fs/ext4/resize.c
+@@ -1110,6 +1110,16 @@ static int reserve_backup_gdb(handle_t *handle, struct inode *inode,
+ 	return err;
+ }
+ 
++static inline void ext4_set_block_group_nr(struct super_block *sb, char *data,
++					   ext4_group_t group)
++{
++	struct ext4_super_block *es = (struct ext4_super_block *) data;
++
++	es->s_block_group_nr = cpu_to_le16(group);
++	if (ext4_has_metadata_csum(sb))
++		es->s_checksum = ext4_superblock_csum(sb, es);
++}
++
+ /*
+  * Update the backup copies of the ext4 metadata.  These don't need to be part
+  * of the main resize transaction, because e2fsck will re-write them if there
+@@ -1158,7 +1168,8 @@ static void update_backups(struct super_block *sb, sector_t blk_off, char *data,
+ 	while (group < sbi->s_groups_count) {
+ 		struct buffer_head *bh;
+ 		ext4_fsblk_t backup_block;
+-		struct ext4_super_block *es;
++		int has_super = ext4_bg_has_super(sb, group);
++		ext4_fsblk_t first_block = ext4_group_first_block_no(sb, group);
+ 
+ 		/* Out of journal space, and can't get more - abort - so sad */
+ 		err = ext4_resize_ensure_credits_batch(handle, 1);
+@@ -1168,8 +1179,7 @@ static void update_backups(struct super_block *sb, sector_t blk_off, char *data,
+ 		if (meta_bg == 0)
+ 			backup_block = ((ext4_fsblk_t)group) * bpg + blk_off;
+ 		else
+-			backup_block = (ext4_group_first_block_no(sb, group) +
+-					ext4_bg_has_super(sb, group));
++			backup_block = first_block + has_super;
+ 
+ 		bh = sb_getblk(sb, backup_block);
+ 		if (unlikely(!bh)) {
+@@ -1187,10 +1197,8 @@ static void update_backups(struct super_block *sb, sector_t blk_off, char *data,
+ 		memcpy(bh->b_data, data, size);
+ 		if (rest)
+ 			memset(bh->b_data + size, 0, rest);
+-		es = (struct ext4_super_block *) bh->b_data;
+-		es->s_block_group_nr = cpu_to_le16(group);
+-		if (ext4_has_metadata_csum(sb))
+-			es->s_checksum = ext4_superblock_csum(sb, es);
++		if (has_super && (backup_block == first_block))
++			ext4_set_block_group_nr(sb, bh->b_data, group);
+ 		set_buffer_uptodate(bh);
+ 		unlock_buffer(bh);
+ 		err = ext4_handle_dirty_metadata(handle, NULL, bh);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 334052f665ec724d4ef41fe81f39cad23bbf36cb Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Thu, 17 Nov 2022 12:03:41 +0800
+Subject: [PATCH 33/57] ext4: fix corruption when online resizing a 1K bigalloc
+ fs
+
+When a backup superblock is updated in update_backups(), the primary
+superblock's offset in the group (that is, sbi->s_sbh->b_blocknr) is used
+as the backup superblock's offset in its group. However, when the block
+size is 1K and bigalloc is enabled, the two offsets are not equal. This
+causes the backup group descriptors to be overwritten by the superblock
+in update_backups(). Moreover, if meta_bg is enabled, the file system will
+be corrupted because this feature uses backup group descriptors.
+
+To solve this issue, we use a more accurate ext4_group_first_block_no() as
+the offset of the backup superblock in its group.
+
+Fixes: d77147ff443b ("ext4: add support for online resizing with bigalloc")
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: stable@kernel.org
+Link: https://lore.kernel.org/r/20221117040341.1380702-4-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/resize.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ext4/resize.c b/fs/ext4/resize.c
+index d460440d6..6b91443d6 100644
+--- a/fs/ext4/resize.c
++++ b/fs/ext4/resize.c
+@@ -1604,8 +1604,8 @@ static int ext4_flex_group_add(struct super_block *sb,
+ 		int meta_bg = ext4_has_feature_meta_bg(sb);
+ 		sector_t old_gdb = 0;
+ 
+-		update_backups(sb, sbi->s_sbh->b_blocknr, (char *)es,
+-			       sizeof(struct ext4_super_block), 0);
++		update_backups(sb, ext4_group_first_block_no(sb, 0),
++			       (char *)es, sizeof(struct ext4_super_block), 0);
+ 		for (; gdb_num <= gdb_num_end; gdb_num++) {
+ 			struct buffer_head *gdb_bh;
+ 
+@@ -1816,7 +1816,7 @@ static int ext4_group_extend_no_check(struct super_block *sb,
+ 		if (test_opt(sb, DEBUG))
+ 			printk(KERN_DEBUG "EXT4-fs: extended group to %llu "
+ 			       "blocks\n", ext4_blocks_count(es));
+-		update_backups(sb, EXT4_SB(sb)->s_sbh->b_blocknr,
++		update_backups(sb, ext4_group_first_block_no(sb, 0),
+ 			       (char *)es, sizeof(struct ext4_super_block), 0);
+ 	}
+ 	return err;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 40f638fd794098a370ea48d7c80f6a19e730d814 Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Thu, 17 Nov 2022 15:36:03 +0800
+Subject: [PATCH 34/57] ext4: fix uninititialized value in 'ext4_evict_inode'
+
+Syzbot found the following issue:
+=====================================================
+BUG: KMSAN: uninit-value in ext4_evict_inode+0xdd/0x26b0 fs/ext4/inode.c:180
+ ext4_evict_inode+0xdd/0x26b0 fs/ext4/inode.c:180
+ evict+0x365/0x9a0 fs/inode.c:664
+ iput_final fs/inode.c:1747 [inline]
+ iput+0x985/0xdd0 fs/inode.c:1773
+ __ext4_new_inode+0xe54/0x7ec0 fs/ext4/ialloc.c:1361
+ ext4_mknod+0x376/0x840 fs/ext4/namei.c:2844
+ vfs_mknod+0x79d/0x830 fs/namei.c:3914
+ do_mknodat+0x47d/0xaa0
+ __do_sys_mknodat fs/namei.c:3992 [inline]
+ __se_sys_mknodat fs/namei.c:3989 [inline]
+ __ia32_sys_mknodat+0xeb/0x150 fs/namei.c:3989
+ do_syscall_32_irqs_on arch/x86/entry/common.c:112 [inline]
+ __do_fast_syscall_32+0xa2/0x100 arch/x86/entry/common.c:178
+ do_fast_syscall_32+0x33/0x70 arch/x86/entry/common.c:203
+ do_SYSENTER_32+0x1b/0x20 arch/x86/entry/common.c:246
+ entry_SYSENTER_compat_after_hwframe+0x70/0x82
+
+Uninit was created at:
+ __alloc_pages+0x9f1/0xe80 mm/page_alloc.c:5578
+ alloc_pages+0xaae/0xd80 mm/mempolicy.c:2285
+ alloc_slab_page mm/slub.c:1794 [inline]
+ allocate_slab+0x1b5/0x1010 mm/slub.c:1939
+ new_slab mm/slub.c:1992 [inline]
+ ___slab_alloc+0x10c3/0x2d60 mm/slub.c:3180
+ __slab_alloc mm/slub.c:3279 [inline]
+ slab_alloc_node mm/slub.c:3364 [inline]
+ slab_alloc mm/slub.c:3406 [inline]
+ __kmem_cache_alloc_lru mm/slub.c:3413 [inline]
+ kmem_cache_alloc_lru+0x6f3/0xb30 mm/slub.c:3429
+ alloc_inode_sb include/linux/fs.h:3117 [inline]
+ ext4_alloc_inode+0x5f/0x860 fs/ext4/super.c:1321
+ alloc_inode+0x83/0x440 fs/inode.c:259
+ new_inode_pseudo fs/inode.c:1018 [inline]
+ new_inode+0x3b/0x430 fs/inode.c:1046
+ __ext4_new_inode+0x2a7/0x7ec0 fs/ext4/ialloc.c:959
+ ext4_mkdir+0x4d5/0x1560 fs/ext4/namei.c:2992
+ vfs_mkdir+0x62a/0x870 fs/namei.c:4035
+ do_mkdirat+0x466/0x7b0 fs/namei.c:4060
+ __do_sys_mkdirat fs/namei.c:4075 [inline]
+ __se_sys_mkdirat fs/namei.c:4073 [inline]
+ __ia32_sys_mkdirat+0xc4/0x120 fs/namei.c:4073
+ do_syscall_32_irqs_on arch/x86/entry/common.c:112 [inline]
+ __do_fast_syscall_32+0xa2/0x100 arch/x86/entry/common.c:178
+ do_fast_syscall_32+0x33/0x70 arch/x86/entry/common.c:203
+ do_SYSENTER_32+0x1b/0x20 arch/x86/entry/common.c:246
+ entry_SYSENTER_compat_after_hwframe+0x70/0x82
+
+CPU: 1 PID: 4625 Comm: syz-executor.2 Not tainted 6.1.0-rc4-syzkaller-62821-gcb231e2f67ec #0
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 10/26/2022
+=====================================================
+
+Now, 'ext4_alloc_inode()' didn't init 'ei->i_flags'. If new inode failed
+before set 'ei->i_flags' in '__ext4_new_inode()', then do 'iput()'. As after
+6bc0d63dad7f commit will access 'ei->i_flags' in 'ext4_evict_inode()' which
+will lead to access uninit-value.
+To solve above issue just init 'ei->i_flags' in 'ext4_alloc_inode()'.
+
+Reported-by: syzbot+57b25da729eb0b88177d@syzkaller.appspotmail.com
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Fixes: 6bc0d63dad7f ("ext4: remove EA inode entry from mbcache on inode eviction")
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221117073603.2598882-1-yebin@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/super.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 878be47fa..28d009151 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1324,6 +1324,7 @@ static struct inode *ext4_alloc_inode(struct super_block *sb)
+ 		return NULL;
+ 
+ 	inode_set_iversion(&ei->vfs_inode, 1);
++	ei->i_flags = 0;
+ 	spin_lock_init(&ei->i_raw_lock);
+ 	INIT_LIST_HEAD(&ei->i_prealloc_list);
+ 	atomic_set(&ei->i_prealloc_active, 0);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From dca24815ef5755c55da0199fac16e3065bbd7af0 Mon Sep 17 00:00:00 2001
+From: Eric Whitney <enwlinux@gmail.com>
+Date: Thu, 17 Nov 2022 10:22:07 -0500
+Subject: [PATCH 35/57] ext4: fix delayed allocation bug in ext4_clu_mapped for
+ bigalloc + inline
+
+When converting files with inline data to extents, delayed allocations
+made on a file system created with both the bigalloc and inline options
+can result in invalid extent status cache content, incorrect reserved
+cluster counts, kernel memory leaks, and potential kernel panics.
+
+With bigalloc, the code that determines whether a block must be
+delayed allocated searches the extent tree to see if that block maps
+to a previously allocated cluster.  If not, the block is delayed
+allocated, and otherwise, it isn't.  However, if the inline option is
+also used, and if the file containing the block is marked as able to
+store data inline, there isn't a valid extent tree associated with
+the file.  The current code in ext4_clu_mapped() calls
+ext4_find_extent() to search the non-existent tree for a previously
+allocated cluster anyway, which typically finds nothing, as desired.
+However, a side effect of the search can be to cache invalid content
+from the non-existent tree (garbage) in the extent status tree,
+including bogus entries in the pending reservation tree.
+
+To fix this, avoid searching the extent tree when allocating blocks
+for bigalloc + inline files that are being converted from inline to
+extent mapped.
+
+Signed-off-by: Eric Whitney <enwlinux@gmail.com>
+Link: https://lore.kernel.org/r/20221117152207.2424-1-enwlinux@gmail.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/extents.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index ec008278d..9de1c9d1a 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -5797,6 +5797,14 @@ int ext4_clu_mapped(struct inode *inode, ext4_lblk_t lclu)
+ 	struct ext4_extent *extent;
+ 	ext4_lblk_t first_lblk, first_lclu, last_lclu;
+ 
++	/*
++	 * if data can be stored inline, the logical cluster isn't
++	 * mapped - no physical clusters have been allocated, and the
++	 * file has no extents
++	 */
++	if (ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA))
++		return 0;
++
+ 	/* search for the extent closest to the first block in the cluster */
+ 	path = ext4_find_extent(inode, EXT4_C2B(sbi, lclu), NULL, 0);
+ 	if (IS_ERR(path)) {
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 89de9231c75029dc6729a74c4006541026a691f4 Mon Sep 17 00:00:00 2001
+From: Alexander Potapenko <glider@google.com>
+Date: Mon, 21 Nov 2022 12:21:30 +0100
+Subject: [PATCH 36/57] fs: ext4: initialize fsdata in pagecache_write()
+
+When aops->write_begin() does not initialize fsdata, KMSAN reports
+an error passing the latter to aops->write_end().
+
+Fix this by unconditionally initializing fsdata.
+
+Cc: Eric Biggers <ebiggers@kernel.org>
+Fixes: c93d8f885809 ("ext4: add basic fs-verity support")
+Reported-by: syzbot+9767be679ef5016b6082@syzkaller.appspotmail.com
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Reviewed-by: Eric Biggers <ebiggers@google.com>
+Link: https://lore.kernel.org/r/20221121112134.407362-1-glider@google.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/verity.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/verity.c b/fs/ext4/verity.c
+index 3c640bd7e..30e3b6579 100644
+--- a/fs/ext4/verity.c
++++ b/fs/ext4/verity.c
+@@ -79,7 +79,7 @@ static int pagecache_write(struct inode *inode, const void *buf, size_t count,
+ 		size_t n = min_t(size_t, count,
+ 				 PAGE_SIZE - offset_in_page(pos));
+ 		struct page *page;
+-		void *fsdata;
++		void *fsdata = NULL;
+ 		int res;
+ 
+ 		res = aops->write_begin(NULL, mapping, pos, n, &page, &fsdata);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 9fa23b5c3fa314a1179ea0e14bd6b1a89e316bb6 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Mon, 21 Nov 2022 14:09:29 +0100
+Subject: [PATCH 37/57] ext4: avoid BUG_ON when creating xattrs
+
+Commit fb0a387dcdcd ("ext4: limit block allocations for indirect-block
+files to < 2^32") added code to try to allocate xattr block with 32-bit
+block number for indirect block based files on the grounds that these
+files cannot use larger block numbers. It also added BUG_ON when
+allocated block could not fit into 32 bits. This is however bogus
+reasoning because xattr block is stored in inode->i_file_acl and
+inode->i_file_acl_hi and as such even indirect block based files can
+happily use full 48 bits for xattr block number. The proper handling
+seems to be there basically since 64-bit block number support was added.
+So remove the bogus limitation and BUG_ON.
+
+Cc: Eric Sandeen <sandeen@redhat.com>
+Fixes: fb0a387dcdcd ("ext4: limit block allocations for indirect-block files to < 2^32")
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221121130929.32031-1-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/xattr.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 718ef3987..4d1c701f0 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -2071,19 +2071,11 @@ ext4_xattr_block_set(handle_t *handle, struct inode *inode,
+ 
+ 			goal = ext4_group_first_block_no(sb,
+ 						EXT4_I(inode)->i_block_group);
+-
+-			/* non-extent files can't have physical blocks past 2^32 */
+-			if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)))
+-				goal = goal & EXT4_MAX_BLOCK_FILE_PHYS;
+-
+ 			block = ext4_new_meta_blocks(handle, inode, goal, 0,
+ 						     NULL, &error);
+ 			if (error)
+ 				goto cleanup;
+ 
+-			if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)))
+-				BUG_ON(block > EXT4_MAX_BLOCK_FILE_PHYS);
+-
+ 			ea_idebug(inode, "creating block %llu",
+ 				  (unsigned long long)block);
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 76191d28c78e9108fd0b3d722d9e0da78bbf93e6 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 23 Nov 2022 20:39:50 +0100
+Subject: [PATCH 38/57] ext4: fix deadlock due to mbcache entry corruption
+
+When manipulating xattr blocks, we can deadlock infinitely looping
+inside ext4_xattr_block_set() where we constantly keep finding xattr
+block for reuse in mbcache but we are unable to reuse it because its
+reference count is too big. This happens because cache entry for the
+xattr block is marked as reusable (e_reusable set) although its
+reference count is too big. When this inconsistency happens, this
+inconsistent state is kept indefinitely and so ext4_xattr_block_set()
+keeps retrying indefinitely.
+
+The inconsistent state is caused by non-atomic update of e_reusable bit.
+e_reusable is part of a bitfield and e_reusable update can race with
+update of e_referenced bit in the same bitfield resulting in loss of one
+of the updates. Fix the problem by using atomic bitops instead.
+
+This bug has been around for many years, but it became *much* easier
+to hit after commit 65f8b80053a1 ("ext4: fix race when reusing xattr
+blocks").
+
+Cc: stable@vger.kernel.org
+Fixes: 6048c64b2609 ("mbcache: add reusable flag to cache entries")
+Fixes: 65f8b80053a1 ("ext4: fix race when reusing xattr blocks")
+Reported-and-tested-by: Jeremi Piotrowski <jpiotrowski@linux.microsoft.com>
+Reported-by: Thilo Fromm <t-lo@linux.microsoft.com>
+Link: https://lore.kernel.org/r/c77bf00f-4618-7149-56f1-b8d1664b9d07@linux.microsoft.com/
+Signed-off-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Andreas Dilger <adilger@dilger.ca>
+Link: https://lore.kernel.org/r/20221123193950.16758-1-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/xattr.c         |  4 ++--
+ fs/mbcache.c            | 14 ++++++++------
+ include/linux/mbcache.h |  9 +++++++--
+ 3 files changed, 17 insertions(+), 10 deletions(-)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 4d1c701f0..6bdd50252 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -1281,7 +1281,7 @@ ext4_xattr_release_block(handle_t *handle, struct inode *inode,
+ 				ce = mb_cache_entry_get(ea_block_cache, hash,
+ 							bh->b_blocknr);
+ 				if (ce) {
+-					ce->e_reusable = 1;
++					set_bit(MBE_REUSABLE_B, &ce->e_flags);
+ 					mb_cache_entry_put(ea_block_cache, ce);
+ 				}
+ 			}
+@@ -2043,7 +2043,7 @@ ext4_xattr_block_set(handle_t *handle, struct inode *inode,
+ 				}
+ 				BHDR(new_bh)->h_refcount = cpu_to_le32(ref);
+ 				if (ref == EXT4_XATTR_REFCOUNT_MAX)
+-					ce->e_reusable = 0;
++					clear_bit(MBE_REUSABLE_B, &ce->e_flags);
+ 				ea_bdebug(new_bh, "reusing; refcount now=%d",
+ 					  ref);
+ 				ext4_xattr_block_csum_set(inode, new_bh);
+diff --git a/fs/mbcache.c b/fs/mbcache.c
+index e272ad738..2a4b8b549 100644
+--- a/fs/mbcache.c
++++ b/fs/mbcache.c
+@@ -100,8 +100,9 @@ int mb_cache_entry_create(struct mb_cache *cache, gfp_t mask, u32 key,
+ 	atomic_set(&entry->e_refcnt, 2);
+ 	entry->e_key = key;
+ 	entry->e_value = value;
+-	entry->e_reusable = reusable;
+-	entry->e_referenced = 0;
++	entry->e_flags = 0;
++	if (reusable)
++		set_bit(MBE_REUSABLE_B, &entry->e_flags);
+ 	head = mb_cache_entry_head(cache, key);
+ 	hlist_bl_lock(head);
+ 	hlist_bl_for_each_entry(dup, dup_node, head, e_hash_list) {
+@@ -165,7 +166,8 @@ static struct mb_cache_entry *__entry_find(struct mb_cache *cache,
+ 	while (node) {
+ 		entry = hlist_bl_entry(node, struct mb_cache_entry,
+ 				       e_hash_list);
+-		if (entry->e_key == key && entry->e_reusable &&
++		if (entry->e_key == key &&
++		    test_bit(MBE_REUSABLE_B, &entry->e_flags) &&
+ 		    atomic_inc_not_zero(&entry->e_refcnt))
+ 			goto out;
+ 		node = node->next;
+@@ -284,7 +286,7 @@ EXPORT_SYMBOL(mb_cache_entry_delete_or_get);
+ void mb_cache_entry_touch(struct mb_cache *cache,
+ 			  struct mb_cache_entry *entry)
+ {
+-	entry->e_referenced = 1;
++	set_bit(MBE_REFERENCED_B, &entry->e_flags);
+ }
+ EXPORT_SYMBOL(mb_cache_entry_touch);
+ 
+@@ -309,9 +311,9 @@ static unsigned long mb_cache_shrink(struct mb_cache *cache,
+ 		entry = list_first_entry(&cache->c_list,
+ 					 struct mb_cache_entry, e_list);
+ 		/* Drop initial hash reference if there is no user */
+-		if (entry->e_referenced ||
++		if (test_bit(MBE_REFERENCED_B, &entry->e_flags) ||
+ 		    atomic_cmpxchg(&entry->e_refcnt, 1, 0) != 1) {
+-			entry->e_referenced = 0;
++			clear_bit(MBE_REFERENCED_B, &entry->e_flags);
+ 			list_move_tail(&entry->e_list, &cache->c_list);
+ 			continue;
+ 		}
+diff --git a/include/linux/mbcache.h b/include/linux/mbcache.h
+index 2da63fd7b..97e641847 100644
+--- a/include/linux/mbcache.h
++++ b/include/linux/mbcache.h
+@@ -10,6 +10,12 @@
+ 
+ struct mb_cache;
+ 
++/* Cache entry flags */
++enum {
++	MBE_REFERENCED_B = 0,
++	MBE_REUSABLE_B
++};
++
+ struct mb_cache_entry {
+ 	/* List of entries in cache - protected by cache->c_list_lock */
+ 	struct list_head	e_list;
+@@ -26,8 +32,7 @@ struct mb_cache_entry {
+ 	atomic_t		e_refcnt;
+ 	/* Key in hash - stable during lifetime of the entry */
+ 	u32			e_key;
+-	u32			e_referenced:1;
+-	u32			e_reusable:1;
++	unsigned long		e_flags;
+ 	/* User provided value - stable during lifetime of the entry */
+ 	u64			e_value;
+ };
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From da2182d91dc3e21c47646f6ba9e8cd05345b3d65 Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@linux.dev>
+Date: Fri, 2 Dec 2022 20:04:09 +0800
+Subject: [PATCH 39/57] ext4: make ext4_mb_initialize_context return void
+
+Change the return type to void since it always return 0, and no need
+to do the checking in ext4_mb_new_blocks.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@linux.dev>
+Reviewed-by: Ojaswin Mujoo <ojaswin@linux.ibm.com>
+Link: https://lore.kernel.org/r/20221202120409.24098-1-guoqing.jiang@linux.dev
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/mballoc.c | 10 ++--------
+ 1 file changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index 9dad93059..5b2ae37a8 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -5204,7 +5204,7 @@ static void ext4_mb_group_or_file(struct ext4_allocation_context *ac)
+ 	mutex_lock(&ac->ac_lg->lg_mutex);
+ }
+ 
+-static noinline_for_stack int
++static noinline_for_stack void
+ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
+ 				struct ext4_allocation_request *ar)
+ {
+@@ -5253,8 +5253,6 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
+ 			(unsigned) ar->lleft, (unsigned) ar->pleft,
+ 			(unsigned) ar->lright, (unsigned) ar->pright,
+ 			inode_is_open_for_write(ar->inode) ? "" : "non-");
+-	return 0;
+-
+ }
+ 
+ static noinline_for_stack void
+@@ -5591,11 +5589,7 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
+ 		goto out;
+ 	}
+ 
+-	*errp = ext4_mb_initialize_context(ac, ar);
+-	if (*errp) {
+-		ar->len = 0;
+-		goto out;
+-	}
++	ext4_mb_initialize_context(ac, ar);
+ 
+ 	ac->ac_op = EXT4_MB_HISTORY_PREALLOC;
+ 	seq = this_cpu_read(discard_pa_seq);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 4bd2d0607de0a7c619c3bc25832b7e1dcbc79ff5 Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Tue, 6 Dec 2022 22:41:34 +0800
+Subject: [PATCH 40/57] ext4: fix kernel BUG in 'ext4_write_inline_data_end()'
+
+Syzbot report follow issue:
+------------[ cut here ]------------
+kernel BUG at fs/ext4/inline.c:227!
+invalid opcode: 0000 [#1] PREEMPT SMP KASAN
+CPU: 1 PID: 3629 Comm: syz-executor212 Not tainted 6.1.0-rc5-syzkaller-00018-g59d0d52c30d4 #0
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 10/26/2022
+RIP: 0010:ext4_write_inline_data+0x344/0x3e0 fs/ext4/inline.c:227
+RSP: 0018:ffffc90003b3f368 EFLAGS: 00010293
+RAX: 0000000000000000 RBX: ffff8880704e16c0 RCX: 0000000000000000
+RDX: ffff888021763a80 RSI: ffffffff821e31a4 RDI: 0000000000000006
+RBP: 000000000006818e R08: 0000000000000006 R09: 0000000000068199
+R10: 0000000000000079 R11: 0000000000000000 R12: 000000000000000b
+R13: 0000000000068199 R14: ffffc90003b3f408 R15: ffff8880704e1c82
+FS:  000055555723e3c0(0000) GS:ffff8880b9b00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007fffe8ac9080 CR3: 0000000079f81000 CR4: 0000000000350ee0
+Call Trace:
+ <TASK>
+ ext4_write_inline_data_end+0x2a3/0x12f0 fs/ext4/inline.c:768
+ ext4_write_end+0x242/0xdd0 fs/ext4/inode.c:1313
+ ext4_da_write_end+0x3ed/0xa30 fs/ext4/inode.c:3063
+ generic_perform_write+0x316/0x570 mm/filemap.c:3764
+ ext4_buffered_write_iter+0x15b/0x460 fs/ext4/file.c:285
+ ext4_file_write_iter+0x8bc/0x16e0 fs/ext4/file.c:700
+ call_write_iter include/linux/fs.h:2191 [inline]
+ do_iter_readv_writev+0x20b/0x3b0 fs/read_write.c:735
+ do_iter_write+0x182/0x700 fs/read_write.c:861
+ vfs_iter_write+0x74/0xa0 fs/read_write.c:902
+ iter_file_splice_write+0x745/0xc90 fs/splice.c:686
+ do_splice_from fs/splice.c:764 [inline]
+ direct_splice_actor+0x114/0x180 fs/splice.c:931
+ splice_direct_to_actor+0x335/0x8a0 fs/splice.c:886
+ do_splice_direct+0x1ab/0x280 fs/splice.c:974
+ do_sendfile+0xb19/0x1270 fs/read_write.c:1255
+ __do_sys_sendfile64 fs/read_write.c:1323 [inline]
+ __se_sys_sendfile64 fs/read_write.c:1309 [inline]
+ __x64_sys_sendfile64+0x1d0/0x210 fs/read_write.c:1309
+ do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+ do_syscall_64+0x39/0xb0 arch/x86/entry/common.c:80
+ entry_SYSCALL_64_after_hwframe+0x63/0xcd
+---[ end trace 0000000000000000 ]---
+
+Above issue may happens as follows:
+ext4_da_write_begin
+  ext4_da_write_inline_data_begin
+    ext4_da_convert_inline_data_to_extent
+      ext4_clear_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA);
+ext4_da_write_end
+
+ext4_run_li_request
+  ext4_mb_prefetch
+    ext4_read_block_bitmap_nowait
+      ext4_validate_block_bitmap
+        ext4_mark_group_bitmap_corrupted(sb, block_group, EXT4_GROUP_INFO_BBITMAP_CORRUPT)
+	 percpu_counter_sub(&sbi->s_freeclusters_counter,grp->bb_free);
+	  -> sbi->s_freeclusters_counter become zero
+ext4_da_write_begin
+  if (ext4_nonda_switch(inode->i_sb)) -> As freeclusters_counter is zero will return true
+    *fsdata = (void *)FALL_BACK_TO_NONDELALLOC;
+    ext4_write_begin
+ext4_da_write_end
+  if (write_mode == FALL_BACK_TO_NONDELALLOC)
+    ext4_write_end
+      if (inline_data)
+        ext4_write_inline_data_end
+	  ext4_write_inline_data
+	    BUG_ON(pos + len > EXT4_I(inode)->i_inline_size);
+           -> As inode is already convert to extent, so 'pos + len' > inline_size
+	   -> then trigger BUG.
+
+To solve this issue, instead of checking ext4_has_inline_data() which
+is only cleared after data has been written back, check the
+EXT4_STATE_MAY_INLINE_DATA flag in ext4_write_end().
+
+Fixes: f19d5870cbf7 ("ext4: add normal write support for inline data")
+Reported-by: syzbot+4faa160fa96bfba639f8@syzkaller.appspotmail.com
+Reported-by: Jun Nie <jun.nie@linaro.org>
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Link: https://lore.kernel.org/r/20221206144134.1919987-1-yebin@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/inode.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 181bc161b..a0f4d4197 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1315,7 +1315,8 @@ static int ext4_write_end(struct file *file,
+ 
+ 	trace_ext4_write_end(inode, pos, len, copied);
+ 
+-	if (ext4_has_inline_data(inode))
++	if (ext4_has_inline_data(inode) &&
++	    ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA))
+ 		return ext4_write_inline_data_end(inode, pos, len, copied, page);
+ 
+ 	copied = block_write_end(file, mapping, pos, len, copied, page, fsdata);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From fc526524b4254273dd90931d6ad45b4ef0f2da03 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:04 +0100
+Subject: [PATCH 41/57] ext4: handle redirtying in ext4_bio_write_page()
+
+Since we want to transition transaction commits to use ext4_writepages()
+for writing back ordered, add handling of page redirtying into
+ext4_bio_write_page(). Also move buffer dirty bit clearing into the same
+place other buffer state handling.
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-1-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/page-io.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 97fa7b4c6..4e68ace86 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -482,6 +482,13 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			/* A hole? We can safely clear the dirty bit */
+ 			if (!buffer_mapped(bh))
+ 				clear_buffer_dirty(bh);
++			/*
++			 * Keeping dirty some buffer we cannot write? Make
++			 * sure to redirty the page. This happens e.g. when
++			 * doing writeout for transaction commit.
++			 */
++			if (buffer_dirty(bh) && !PageDirty(page))
++				redirty_page_for_writepage(wbc, page);
+ 			if (io->io_bio)
+ 				ext4_io_submit(io);
+ 			continue;
+@@ -489,6 +496,7 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 		if (buffer_new(bh))
+ 			clear_buffer_new(bh);
+ 		set_buffer_async_write(bh);
++		clear_buffer_dirty(bh);
+ 		nr_to_submit++;
+ 	} while ((bh = bh->b_this_page) != head);
+ 
+@@ -532,7 +540,10 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			printk_ratelimited(KERN_ERR "%s: ret = %d\n", __func__, ret);
+ 			redirty_page_for_writepage(wbc, page);
+ 			do {
+-				clear_buffer_async_write(bh);
++				if (buffer_async_write(bh)) {
++					clear_buffer_async_write(bh);
++					set_buffer_dirty(bh);
++				}
+ 				bh = bh->b_this_page;
+ 			} while (bh != head);
+ 			goto unlock;
+@@ -546,7 +557,6 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 		io_submit_add_bh(io, inode,
+ 				 bounce_page ? bounce_page : page, bh);
+ 		nr_submitted++;
+-		clear_buffer_dirty(bh);
+ 	} while ((bh = bh->b_this_page) != head);
+ 
+ unlock:
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From f03a127210467a2cbbab81ea38e44609d7c5ac27 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:05 +0100
+Subject: [PATCH 42/57] ext4: move keep_towrite handling to
+ ext4_bio_write_page()
+
+When we are writing back page but we cannot for some reason write all
+its buffers (e.g. because we cannot allocate blocks in current context) we
+have to keep TOWRITE tag set in the mapping as otherwise racing
+WB_SYNC_ALL writeback that could write these buffers can skip the page
+and result in data loss.  We will need this logic for writeback during
+transaction commit so move the logic from ext4_writepage() to
+ext4_bio_write_page().
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-2-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/ext4.h    |  3 +--
+ fs/ext4/inode.c   |  6 ++----
+ fs/ext4/page-io.c | 36 +++++++++++++++++++++---------------
+ 3 files changed, 24 insertions(+), 21 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 4e739902d..054092963 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -3757,8 +3757,7 @@ extern void ext4_end_io_rsv_work(struct work_struct *work);
+ extern void ext4_io_submit(struct ext4_io_submit *io);
+ extern int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			       struct page *page,
+-			       int len,
+-			       bool keep_towrite);
++			       int len);
+ extern struct ext4_io_end_vec *ext4_alloc_io_end_vec(ext4_io_end_t *io_end);
+ extern struct ext4_io_end_vec *ext4_last_io_end_vec(ext4_io_end_t *io_end);
+ 
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index a0f4d4197..4c70cc525 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2016,7 +2016,6 @@ static int ext4_writepage(struct page *page,
+ 	struct buffer_head *page_bufs = NULL;
+ 	struct inode *inode = page->mapping->host;
+ 	struct ext4_io_submit io_submit;
+-	bool keep_towrite = false;
+ 
+ 	if (unlikely(ext4_forced_shutdown(EXT4_SB(inode->i_sb)))) {
+ 		folio_invalidate(folio, 0, folio_size(folio));
+@@ -2074,7 +2073,6 @@ static int ext4_writepage(struct page *page,
+ 			unlock_page(page);
+ 			return 0;
+ 		}
+-		keep_towrite = true;
+ 	}
+ 
+ 	if (PageChecked(page) && ext4_should_journal_data(inode))
+@@ -2091,7 +2089,7 @@ static int ext4_writepage(struct page *page,
+ 		unlock_page(page);
+ 		return -ENOMEM;
+ 	}
+-	ret = ext4_bio_write_page(&io_submit, page, len, keep_towrite);
++	ret = ext4_bio_write_page(&io_submit, page, len);
+ 	ext4_io_submit(&io_submit);
+ 	/* Drop io_end reference we got from init */
+ 	ext4_put_io_end_defer(io_submit.io_end);
+@@ -2125,7 +2123,7 @@ static int mpage_submit_page(struct mpage_da_data *mpd, struct page *page)
+ 		len = size & ~PAGE_MASK;
+ 	else
+ 		len = PAGE_SIZE;
+-	err = ext4_bio_write_page(&mpd->io_submit, page, len, false);
++	err = ext4_bio_write_page(&mpd->io_submit, page, len);
+ 	if (!err)
+ 		mpd->wbc->nr_to_write--;
+ 	mpd->first_page++;
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 4e68ace86..4f9ecacd1 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -430,8 +430,7 @@ static void io_submit_add_bh(struct ext4_io_submit *io,
+ 
+ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			struct page *page,
+-			int len,
+-			bool keep_towrite)
++			int len)
+ {
+ 	struct page *bounce_page = NULL;
+ 	struct inode *inode = page->mapping->host;
+@@ -441,14 +440,11 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 	int nr_submitted = 0;
+ 	int nr_to_submit = 0;
+ 	struct writeback_control *wbc = io->io_wbc;
++	bool keep_towrite = false;
+ 
+ 	BUG_ON(!PageLocked(page));
+ 	BUG_ON(PageWriteback(page));
+ 
+-	if (keep_towrite)
+-		set_page_writeback_keepwrite(page);
+-	else
+-		set_page_writeback(page);
+ 	ClearPageError(page);
+ 
+ 	/*
+@@ -483,12 +479,17 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			if (!buffer_mapped(bh))
+ 				clear_buffer_dirty(bh);
+ 			/*
+-			 * Keeping dirty some buffer we cannot write? Make
+-			 * sure to redirty the page. This happens e.g. when
+-			 * doing writeout for transaction commit.
++			 * Keeping dirty some buffer we cannot write? Make sure
++			 * to redirty the page and keep TOWRITE tag so that
++			 * racing WB_SYNC_ALL writeback does not skip the page.
++			 * This happens e.g. when doing writeout for
++			 * transaction commit.
+ 			 */
+-			if (buffer_dirty(bh) && !PageDirty(page))
+-				redirty_page_for_writepage(wbc, page);
++			if (buffer_dirty(bh)) {
++				if (!PageDirty(page))
++					redirty_page_for_writepage(wbc, page);
++				keep_towrite = true;
++			}
+ 			if (io->io_bio)
+ 				ext4_io_submit(io);
+ 			continue;
+@@ -500,6 +501,10 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 		nr_to_submit++;
+ 	} while ((bh = bh->b_this_page) != head);
+ 
++	/* Nothing to submit? Just unlock the page... */
++	if (!nr_to_submit)
++		goto unlock;
++
+ 	bh = head = page_buffers(page);
+ 
+ 	/*
+@@ -550,6 +555,11 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 		}
+ 	}
+ 
++	if (keep_towrite)
++		set_page_writeback_keepwrite(page);
++	else
++		set_page_writeback(page);
++
+ 	/* Now submit buffers to write */
+ 	do {
+ 		if (!buffer_async_write(bh))
+@@ -558,11 +568,7 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 				 bounce_page ? bounce_page : page, bh);
+ 		nr_submitted++;
+ 	} while ((bh = bh->b_this_page) != head);
+-
+ unlock:
+ 	unlock_page(page);
+-	/* Nothing submitted - we have to end page writeback */
+-	if (!nr_submitted)
+-		end_page_writeback(page);
+ 	return ret;
+ }
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 4de3563b6b1319cdc24d3030dceda3e541b0043d Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:06 +0100
+Subject: [PATCH 43/57] ext4: remove nr_submitted from ext4_bio_write_page()
+
+nr_submitted is the same as nr_to_submit.  Drop one of them.
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-3-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/page-io.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 4f9ecacd1..2bdfb8a04 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -437,7 +437,6 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 	unsigned block_start;
+ 	struct buffer_head *bh, *head;
+ 	int ret = 0;
+-	int nr_submitted = 0;
+ 	int nr_to_submit = 0;
+ 	struct writeback_control *wbc = io->io_wbc;
+ 	bool keep_towrite = false;
+@@ -566,7 +565,6 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			continue;
+ 		io_submit_add_bh(io, inode,
+ 				 bounce_page ? bounce_page : page, bh);
+-		nr_submitted++;
+ 	} while ((bh = bh->b_this_page) != head);
+ unlock:
+ 	unlock_page(page);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 269a08709b99ae9cd987eb8afa25fb163f3ff725 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:07 +0100
+Subject: [PATCH 44/57] ext4: drop pointless IO submission from
+ ext4_bio_write_page()
+
+We submit outstanding IO in ext4_bio_write_page() if we find a buffer we
+are not going to write. This is however pointless because we already
+handle submission of previous IO in case we detect newly added buffer
+head is discontiguous. So just delete the pointless IO submission call.
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-4-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/page-io.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 2bdfb8a04..beaec6d81 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -489,8 +489,6 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 					redirty_page_for_writepage(wbc, page);
+ 				keep_towrite = true;
+ 			}
+-			if (io->io_bio)
+-				ext4_io_submit(io);
+ 			continue;
+ 		}
+ 		if (buffer_new(bh))
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 495b05acfe6499b1bed119c8890b936ca4352e8f Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:08 +0100
+Subject: [PATCH 45/57] ext4: add support for writepages calls that cannot map
+ blocks
+
+Add support for calls to ext4_writepages() than cannot map blocks. These
+will be issued from jbd2 transaction commit code.
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-5-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 62 ++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 48 insertions(+), 14 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 4c70cc525..186635cb1 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1564,6 +1564,7 @@ struct mpage_da_data {
+ 	struct ext4_map_blocks map;
+ 	struct ext4_io_submit io_submit;	/* IO submission data */
+ 	unsigned int do_map:1;
++	unsigned int can_map:1;	/* Can writepages call map blocks? */
+ 	unsigned int scanned_until_end:1;
+ };
+ 
+@@ -2556,18 +2557,33 @@ static int ext4_da_writepages_trans_blocks(struct inode *inode)
+ 				MAX_WRITEPAGES_EXTENT_LEN + bpp - 1, bpp);
+ }
+ 
++/* Return true if the page needs to be written as part of transaction commit */
++static bool ext4_page_nomap_can_writeout(struct page *page)
++{
++	struct buffer_head *bh, *head;
++
++	bh = head = page_buffers(page);
++	do {
++		if (buffer_dirty(bh) && buffer_mapped(bh) && !buffer_delay(bh))
++			return true;
++	} while ((bh = bh->b_this_page) != head);
++	return false;
++}
++
+ /*
+  * mpage_prepare_extent_to_map - find & lock contiguous range of dirty pages
+- * 				 and underlying extent to map
++ * 				 needing mapping, submit mapped pages
+  *
+  * @mpd - where to look for pages
+  *
+  * Walk dirty pages in the mapping. If they are fully mapped, submit them for
+- * IO immediately. When we find a page which isn't mapped we start accumulating
+- * extent of buffers underlying these pages that needs mapping (formed by
+- * either delayed or unwritten buffers). We also lock the pages containing
+- * these buffers. The extent found is returned in @mpd structure (starting at
+- * mpd->lblk with length mpd->len blocks).
++ * IO immediately. If we cannot map blocks, we submit just already mapped
++ * buffers in the page for IO and keep page dirty. When we can map blocks and
++ * we find a page which isn't mapped we start accumulating extent of buffers
++ * underlying these pages that needs mapping (formed by either delayed or
++ * unwritten buffers). We also lock the pages containing these buffers. The
++ * extent found is returned in @mpd structure (starting at mpd->lblk with
++ * length mpd->len blocks).
+  *
+  * Note that this function can attach bios to one io_end structure which are
+  * neither logically nor physically contiguous. Although it may seem as an
+@@ -2658,14 +2674,30 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 			if (mpd->map.m_len == 0)
+ 				mpd->first_page = page->index;
+ 			mpd->next_page = page->index + 1;
+-			/* Add all dirty buffers to mpd */
+-			lblk = ((ext4_lblk_t)page->index) <<
+-				(PAGE_SHIFT - blkbits);
+-			head = page_buffers(page);
+-			err = mpage_process_page_bufs(mpd, head, head, lblk);
+-			if (err <= 0)
+-				goto out;
+-			err = 0;
++			/*
++			 * Writeout for transaction commit where we cannot
++			 * modify metadata is simple. Just submit the page.
++			 */
++			if (!mpd->can_map) {
++				if (ext4_page_nomap_can_writeout(page)) {
++					err = mpage_submit_page(mpd, page);
++					if (err < 0)
++						goto out;
++				} else {
++					unlock_page(page);
++					mpd->first_page++;
++				}
++			} else {
++				/* Add all dirty buffers to mpd */
++				lblk = ((ext4_lblk_t)page->index) <<
++					(PAGE_SHIFT - blkbits);
++				head = page_buffers(page);
++				err = mpage_process_page_bufs(mpd, head, head,
++							      lblk);
++				if (err <= 0)
++					goto out;
++				err = 0;
++			}
+ 			left--;
+ 		}
+ 		pagevec_release(&pvec);
+@@ -2785,6 +2817,7 @@ static int ext4_writepages(struct address_space *mapping,
+ 	 */
+ 	mpd.do_map = 0;
+ 	mpd.scanned_until_end = 0;
++	mpd.can_map = 1;
+ 	mpd.io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
+ 	if (!mpd.io_submit.io_end) {
+ 		ret = -ENOMEM;
+@@ -2808,6 +2841,7 @@ static int ext4_writepages(struct address_space *mapping,
+ 			break;
+ 		}
+ 
++		WARN_ON_ONCE(!mpd->can_map);
+ 		/*
+ 		 * We have two constraints: We find one extent to map and we
+ 		 * must always write out whole page (makes a difference when
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 52400cbbbc46bcf9cff64b32f9b69c17d3ddeb7b Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:09 +0100
+Subject: [PATCH 46/57] ext4: provide ext4_do_writepages()
+
+Provide ext4_do_writepages() function that takes mpage_da_data as an
+argument and make ext4_writepages() just a simple wrapper around it. No
+functional changes.
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-6-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 96 +++++++++++++++++++++++++++----------------------
+ 1 file changed, 54 insertions(+), 42 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 186635cb1..a023cca4b 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1550,9 +1550,12 @@ void ext4_da_release_space(struct inode *inode, int to_free)
+  */
+ 
+ struct mpage_da_data {
++	/* These are input fields for ext4_do_writepages() */
+ 	struct inode *inode;
+ 	struct writeback_control *wbc;
++	unsigned int can_map:1;	/* Can writepages call map blocks? */
+ 
++	/* These are internal state of ext4_do_writepages() */
+ 	pgoff_t first_page;	/* The first page to write */
+ 	pgoff_t next_page;	/* Current page to examine */
+ 	pgoff_t last_page;	/* Last page to examine */
+@@ -1564,7 +1567,6 @@ struct mpage_da_data {
+ 	struct ext4_map_blocks map;
+ 	struct ext4_io_submit io_submit;	/* IO submission data */
+ 	unsigned int do_map:1;
+-	unsigned int can_map:1;	/* Can writepages call map blocks? */
+ 	unsigned int scanned_until_end:1;
+ };
+ 
+@@ -2710,16 +2712,16 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 	return err;
+ }
+ 
+-static int ext4_writepages(struct address_space *mapping,
+-			   struct writeback_control *wbc)
++static int ext4_do_writepages(struct mpage_da_data *mpd)
+ {
++	struct writeback_control *wbc = mpd->wbc;
+ 	pgoff_t	writeback_index = 0;
+ 	long nr_to_write = wbc->nr_to_write;
+ 	int range_whole = 0;
+ 	int cycled = 1;
+ 	handle_t *handle = NULL;
+-	struct mpage_da_data mpd;
+-	struct inode *inode = mapping->host;
++	struct inode *inode = mpd->inode;
++	struct address_space *mapping = inode->i_mapping;
+ 	int needed_blocks, rsv_blocks = 0, ret = 0;
+ 	struct ext4_sb_info *sbi = EXT4_SB(mapping->host->i_sb);
+ 	struct blk_plug plug;
+@@ -2794,19 +2796,18 @@ static int ext4_writepages(struct address_space *mapping,
+ 		writeback_index = mapping->writeback_index;
+ 		if (writeback_index)
+ 			cycled = 0;
+-		mpd.first_page = writeback_index;
+-		mpd.last_page = -1;
++		mpd->first_page = writeback_index;
++		mpd->last_page = -1;
+ 	} else {
+-		mpd.first_page = wbc->range_start >> PAGE_SHIFT;
+-		mpd.last_page = wbc->range_end >> PAGE_SHIFT;
++		mpd->first_page = wbc->range_start >> PAGE_SHIFT;
++		mpd->last_page = wbc->range_end >> PAGE_SHIFT;
+ 	}
+ 
+-	mpd.inode = inode;
+-	mpd.wbc = wbc;
+-	ext4_io_submit_init(&mpd.io_submit, wbc);
++	ext4_io_submit_init(&mpd->io_submit, wbc);
+ retry:
+ 	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+-		tag_pages_for_writeback(mapping, mpd.first_page, mpd.last_page);
++		tag_pages_for_writeback(mapping, mpd->first_page,
++					mpd->last_page);
+ 	blk_start_plug(&plug);
+ 
+ 	/*
+@@ -2815,28 +2816,27 @@ static int ext4_writepages(struct address_space *mapping,
+ 	 * in the block layer on device congestion while having transaction
+ 	 * started.
+ 	 */
+-	mpd.do_map = 0;
+-	mpd.scanned_until_end = 0;
+-	mpd.can_map = 1;
+-	mpd.io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
+-	if (!mpd.io_submit.io_end) {
++	mpd->do_map = 0;
++	mpd->scanned_until_end = 0;
++	mpd->io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
++	if (!mpd->io_submit.io_end) {
+ 		ret = -ENOMEM;
+ 		goto unplug;
+ 	}
+-	ret = mpage_prepare_extent_to_map(&mpd);
++	ret = mpage_prepare_extent_to_map(mpd);
+ 	/* Unlock pages we didn't use */
+-	mpage_release_unused_pages(&mpd, false);
++	mpage_release_unused_pages(mpd, false);
+ 	/* Submit prepared bio */
+-	ext4_io_submit(&mpd.io_submit);
+-	ext4_put_io_end_defer(mpd.io_submit.io_end);
+-	mpd.io_submit.io_end = NULL;
++	ext4_io_submit(&mpd->io_submit);
++	ext4_put_io_end_defer(mpd->io_submit.io_end);
++	mpd->io_submit.io_end = NULL;
+ 	if (ret < 0)
+ 		goto unplug;
+ 
+-	while (!mpd.scanned_until_end && wbc->nr_to_write > 0) {
++	while (!mpd->scanned_until_end && wbc->nr_to_write > 0) {
+ 		/* For each extent of pages we use new io_end */
+-		mpd.io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
+-		if (!mpd.io_submit.io_end) {
++		mpd->io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
++		if (!mpd->io_submit.io_end) {
+ 			ret = -ENOMEM;
+ 			break;
+ 		}
+@@ -2861,16 +2861,16 @@ static int ext4_writepages(struct address_space *mapping,
+ 			       "%ld pages, ino %lu; err %d", __func__,
+ 				wbc->nr_to_write, inode->i_ino, ret);
+ 			/* Release allocated io_end */
+-			ext4_put_io_end(mpd.io_submit.io_end);
+-			mpd.io_submit.io_end = NULL;
++			ext4_put_io_end(mpd->io_submit.io_end);
++			mpd->io_submit.io_end = NULL;
+ 			break;
+ 		}
+-		mpd.do_map = 1;
++		mpd->do_map = 1;
+ 
+-		trace_ext4_da_write_pages(inode, mpd.first_page, mpd.wbc);
+-		ret = mpage_prepare_extent_to_map(&mpd);
+-		if (!ret && mpd.map.m_len)
+-			ret = mpage_map_and_submit_extent(handle, &mpd,
++		trace_ext4_da_write_pages(inode, mpd->first_page, wbc);
++		ret = mpage_prepare_extent_to_map(mpd);
++		if (!ret && mpd->map.m_len)
++			ret = mpage_map_and_submit_extent(handle, mpd,
+ 					&give_up_on_write);
+ 		/*
+ 		 * Caution: If the handle is synchronous,
+@@ -2885,12 +2885,12 @@ static int ext4_writepages(struct address_space *mapping,
+ 		if (!ext4_handle_valid(handle) || handle->h_sync == 0) {
+ 			ext4_journal_stop(handle);
+ 			handle = NULL;
+-			mpd.do_map = 0;
++			mpd->do_map = 0;
+ 		}
+ 		/* Unlock pages we didn't use */
+-		mpage_release_unused_pages(&mpd, give_up_on_write);
++		mpage_release_unused_pages(mpd, give_up_on_write);
+ 		/* Submit prepared bio */
+-		ext4_io_submit(&mpd.io_submit);
++		ext4_io_submit(&mpd->io_submit);
+ 
+ 		/*
+ 		 * Drop our io_end reference we got from init. We have
+@@ -2900,11 +2900,11 @@ static int ext4_writepages(struct address_space *mapping,
+ 		 * up doing unwritten extent conversion.
+ 		 */
+ 		if (handle) {
+-			ext4_put_io_end_defer(mpd.io_submit.io_end);
++			ext4_put_io_end_defer(mpd->io_submit.io_end);
+ 			ext4_journal_stop(handle);
+ 		} else
+-			ext4_put_io_end(mpd.io_submit.io_end);
+-		mpd.io_submit.io_end = NULL;
++			ext4_put_io_end(mpd->io_submit.io_end);
++		mpd->io_submit.io_end = NULL;
+ 
+ 		if (ret == -ENOSPC && sbi->s_journal) {
+ 			/*
+@@ -2924,8 +2924,8 @@ static int ext4_writepages(struct address_space *mapping,
+ 	blk_finish_plug(&plug);
+ 	if (!ret && !cycled && wbc->nr_to_write > 0) {
+ 		cycled = 1;
+-		mpd.last_page = writeback_index - 1;
+-		mpd.first_page = 0;
++		mpd->last_page = writeback_index - 1;
++		mpd->first_page = 0;
+ 		goto retry;
+ 	}
+ 
+@@ -2935,7 +2935,7 @@ static int ext4_writepages(struct address_space *mapping,
+ 		 * Set the writeback_index so that range_cyclic
+ 		 * mode will write it back later
+ 		 */
+-		mapping->writeback_index = mpd.first_page;
++		mapping->writeback_index = mpd->first_page;
+ 
+ out_writepages:
+ 	trace_ext4_writepages_result(inode, wbc, ret,
+@@ -2944,6 +2944,18 @@ static int ext4_writepages(struct address_space *mapping,
+ 	return ret;
+ }
+ 
++static int ext4_writepages(struct address_space *mapping,
++			   struct writeback_control *wbc)
++{
++	struct mpage_da_data mpd = {
++		.inode = mapping->host,
++		.wbc = wbc,
++		.can_map = 1,
++	};
++
++	return ext4_do_writepages(&mpd);
++}
++
+ static int ext4_dax_writepages(struct address_space *mapping,
+ 			       struct writeback_control *wbc)
+ {
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From aa8adf9affe4f4011db21a2c3eabf6e03a6edb86 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:10 +0100
+Subject: [PATCH 47/57] ext4: move percpu_rwsem protection into
+ ext4_writepages()
+
+Move protection by percpu_rwsem from ext4_do_writepages() to
+ext4_writepages(). We will not want to grab this protection during
+transaction commits as that would be prone to deadlocks and the
+protection is not needed. Move the shutdown state checking as well since
+we want to be able to complete commit while the shutdown is in progress.
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-7-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index a023cca4b..3aa01a9d4 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2727,10 +2727,6 @@ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ 	struct blk_plug plug;
+ 	bool give_up_on_write = false;
+ 
+-	if (unlikely(ext4_forced_shutdown(EXT4_SB(inode->i_sb))))
+-		return -EIO;
+-
+-	percpu_down_read(&sbi->s_writepages_rwsem);
+ 	trace_ext4_writepages(inode, wbc);
+ 
+ 	/*
+@@ -2940,20 +2936,28 @@ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ out_writepages:
+ 	trace_ext4_writepages_result(inode, wbc, ret,
+ 				     nr_to_write - wbc->nr_to_write);
+-	percpu_up_read(&sbi->s_writepages_rwsem);
+ 	return ret;
+ }
+ 
+ static int ext4_writepages(struct address_space *mapping,
+ 			   struct writeback_control *wbc)
+ {
++	struct super_block *sb = mapping->host->i_sb;
+ 	struct mpage_da_data mpd = {
+ 		.inode = mapping->host,
+ 		.wbc = wbc,
+ 		.can_map = 1,
+ 	};
++	int ret;
++
++	if (unlikely(ext4_forced_shutdown(EXT4_SB(sb))))
++		return -EIO;
+ 
+-	return ext4_do_writepages(&mpd);
++	percpu_down_read(&EXT4_SB(sb)->s_writepages_rwsem);
++	ret = ext4_do_writepages(&mpd);
++	percpu_up_read(&EXT4_SB(sb)->s_writepages_rwsem);
++
++	return ret;
+ }
+ 
+ static int ext4_dax_writepages(struct address_space *mapping,
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 61a7c42e849de80262237a41c08c9ca4ac18fcc0 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:11 +0100
+Subject: [PATCH 48/57] ext4: switch to using ext4_do_writepages() for ordered
+ data writeout
+
+Use the standard writepages method (ext4_do_writepages()) to perform
+writeout of ordered data during journal commit.
+
+Reviewed-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-8-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/ext4.h  |  1 +
+ fs/ext4/inode.c | 16 ++++++++++++++++
+ fs/ext4/super.c |  3 +--
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 054092963..140e1eb30 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -3000,6 +3000,7 @@ extern void ext4_set_inode_flags(struct inode *, bool init);
+ extern int ext4_alloc_da_blocks(struct inode *inode);
+ extern void ext4_set_aops(struct inode *inode);
+ extern int ext4_writepage_trans_blocks(struct inode *);
++extern int ext4_normal_submit_inode_data_buffers(struct jbd2_inode *jinode);
+ extern int ext4_chunk_trans_blocks(struct inode *, int nrblocks);
+ extern int ext4_zero_partial_blocks(handle_t *handle, struct inode *inode,
+ 			     loff_t lstart, loff_t lend);
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 3aa01a9d4..56f6ef52f 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2960,6 +2960,22 @@ static int ext4_writepages(struct address_space *mapping,
+ 	return ret;
+ }
+ 
++int ext4_normal_submit_inode_data_buffers(struct jbd2_inode *jinode)
++{
++	struct writeback_control wbc = {
++		.sync_mode = WB_SYNC_ALL,
++		.nr_to_write = LONG_MAX,
++		.range_start = jinode->i_dirty_start,
++		.range_end = jinode->i_dirty_end,
++	};
++	struct mpage_da_data mpd = {
++		.inode = jinode->i_vfs_inode,
++		.wbc = &wbc,
++		.can_map = 0,
++	};
++	return ext4_do_writepages(&mpd);
++}
++
+ static int ext4_dax_writepages(struct address_space *mapping,
+ 			       struct writeback_control *wbc)
+ {
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 28d009151..72ead3b56 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -540,8 +540,7 @@ static int ext4_journal_submit_inode_data_buffers(struct jbd2_inode *jinode)
+ 	if (ext4_should_journal_data(jinode->i_vfs_inode))
+ 		ret = ext4_journalled_submit_inode_data_buffers(jinode);
+ 	else
+-		ret = jbd2_journal_submit_inode_data_buffers(jinode);
+-
++		ret = ext4_normal_submit_inode_data_buffers(jinode);
+ 	return ret;
+ }
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 73bebb4be06ac3e68f2968d8a4dbf1399c236463 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:12 +0100
+Subject: [PATCH 49/57] jbd2: switch jbd2_submit_inode_data() to use
+ fs-provided hook for data writeout
+
+jbd2_submit_inode_data() hardcoded use of
+jbd2_journal_submit_inode_data_buffers() for submission of data pages.
+Make it use j_submit_inode_data_buffers hook instead. This effectively
+switches ext4 fastcommits to use ext4_writepages() for data writeout
+instead of generic_writepages().
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-9-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c | 2 +-
+ fs/jbd2/commit.c      | 5 ++---
+ include/linux/jbd2.h  | 2 +-
+ 3 files changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index 1da85f626..4594b62f1 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -981,7 +981,7 @@ static int ext4_fc_submit_inode_data_all(journal_t *journal)
+ 			finish_wait(&ei->i_fc_wait, &wait);
+ 		}
+ 		spin_unlock(&sbi->s_fc_lock);
+-		ret = jbd2_submit_inode_data(ei->jinode);
++		ret = jbd2_submit_inode_data(journal, ei->jinode);
+ 		if (ret)
+ 			return ret;
+ 		spin_lock(&sbi->s_fc_lock);
+diff --git a/fs/jbd2/commit.c b/fs/jbd2/commit.c
+index 885a7a6cc..4810438b7 100644
+--- a/fs/jbd2/commit.c
++++ b/fs/jbd2/commit.c
+@@ -207,14 +207,13 @@ int jbd2_journal_submit_inode_data_buffers(struct jbd2_inode *jinode)
+ }
+ 
+ /* Send all the data buffers related to an inode */
+-int jbd2_submit_inode_data(struct jbd2_inode *jinode)
++int jbd2_submit_inode_data(journal_t *journal, struct jbd2_inode *jinode)
+ {
+-
+ 	if (!jinode || !(jinode->i_flags & JI_WRITE_DATA))
+ 		return 0;
+ 
+ 	trace_jbd2_submit_inode_data(jinode->i_vfs_inode);
+-	return jbd2_journal_submit_inode_data_buffers(jinode);
++	return journal->j_submit_inode_data_buffers(jinode);
+ 
+ }
+ EXPORT_SYMBOL(jbd2_submit_inode_data);
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index 0b7242370..2170e0cc2 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -1662,7 +1662,7 @@ int jbd2_fc_begin_commit(journal_t *journal, tid_t tid);
+ int jbd2_fc_end_commit(journal_t *journal);
+ int jbd2_fc_end_commit_fallback(journal_t *journal);
+ int jbd2_fc_get_buf(journal_t *journal, struct buffer_head **bh_out);
+-int jbd2_submit_inode_data(struct jbd2_inode *jinode);
++int jbd2_submit_inode_data(journal_t *journal, struct jbd2_inode *jinode);
+ int jbd2_wait_inode_data(journal_t *journal, struct jbd2_inode *jinode);
+ int jbd2_fc_wait_bufs(journal_t *journal, int num_blks);
+ int jbd2_fc_release_bufs(journal_t *journal);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From da2be07ebcc460f0abb2b1b1dfd20fb7d3d945c5 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:13 +0100
+Subject: [PATCH 50/57] ext4: switch to using write_cache_pages() for
+ data=journal writeout
+
+Instead of using generic_writepages(), let's use write_cache_pages() for
+writeout of journalled data. It will allow us to stop providing
+.writepage callback. Our data=journal writeback path would benefit from
+a larger cleanup and refactoring but that's for a separate cleanup
+series.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-10-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 56f6ef52f..fd9a335d1 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2712,6 +2712,12 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 	return err;
+ }
+ 
++static int ext4_writepage_cb(struct page *page, struct writeback_control *wbc,
++			     void *data)
++{
++	return ext4_writepage(page, wbc);
++}
++
+ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ {
+ 	struct writeback_control *wbc = mpd->wbc;
+@@ -2738,7 +2744,9 @@ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ 		goto out_writepages;
+ 
+ 	if (ext4_should_journal_data(inode)) {
+-		ret = generic_writepages(mapping, wbc);
++		blk_start_plug(&plug);
++		ret = write_cache_pages(mapping, wbc, ext4_writepage_cb, NULL);
++		blk_finish_plug(&plug);
+ 		goto out_writepages;
+ 	}
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 081e97cfb799b06cdfc212f126bde67cac01d064 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:14 +0100
+Subject: [PATCH 51/57] mm: export buffer_migrate_folio_norefs()
+
+Ext4 needs this function to allow safe migration for journalled data
+pages.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20221207112722.22220-11-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ mm/migrate.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/mm/migrate.c b/mm/migrate.c
+index dff333593..5e4ca21da 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -820,6 +820,7 @@ int buffer_migrate_folio_norefs(struct address_space *mapping,
+ {
+ 	return __buffer_migrate_folio(mapping, dst, src, mode, true);
+ }
++EXPORT_SYMBOL_GPL(buffer_migrate_folio_norefs);
+ #endif
+ 
+ int filemap_migrate_folio(struct address_space *mapping,
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 2a2f478930f1023b20a8d8ce065ea7c40c924e53 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:27:15 +0100
+Subject: [PATCH 52/57] ext4: stop providing .writepage hook
+
+Now we don't need .writepage hook for anything anymore. Reclaim is
+fine with relying on .writepages to clean pages and we often couldn't
+do much from the .writepage callback anyway. We only need to provide
+.migrate_folio callback for the ext4_journalled_aops - let's use
+buffer_migrate_page_norefs() there so that buffers cannot be modified
+under jdb2's hands as that can cause data corruption. For example when
+commit code does writeout of transaction buffers in
+jbd2_journal_write_metadata_buffer(), we don't hold page lock or have
+page writeback bit set or have the buffer locked. So page migration
+code would go and happily migrate the page elsewhere while the copy is
+running thus corrupting data.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221207112722.22220-12-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index fd9a335d1..38b7db452 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -3725,7 +3725,6 @@ static int ext4_iomap_swap_activate(struct swap_info_struct *sis,
+ static const struct address_space_operations ext4_aops = {
+ 	.read_folio		= ext4_read_folio,
+ 	.readahead		= ext4_readahead,
+-	.writepage		= ext4_writepage,
+ 	.writepages		= ext4_writepages,
+ 	.write_begin		= ext4_write_begin,
+ 	.write_end		= ext4_write_end,
+@@ -3743,7 +3742,6 @@ static const struct address_space_operations ext4_aops = {
+ static const struct address_space_operations ext4_journalled_aops = {
+ 	.read_folio		= ext4_read_folio,
+ 	.readahead		= ext4_readahead,
+-	.writepage		= ext4_writepage,
+ 	.writepages		= ext4_writepages,
+ 	.write_begin		= ext4_write_begin,
+ 	.write_end		= ext4_journalled_write_end,
+@@ -3752,6 +3750,7 @@ static const struct address_space_operations ext4_journalled_aops = {
+ 	.invalidate_folio	= ext4_journalled_invalidate_folio,
+ 	.release_folio		= ext4_release_folio,
+ 	.direct_IO		= noop_direct_IO,
++	.migrate_folio		= buffer_migrate_folio_norefs,
+ 	.is_partially_uptodate  = block_is_partially_uptodate,
+ 	.error_remove_page	= generic_error_remove_page,
+ 	.swap_activate		= ext4_iomap_swap_activate,
+@@ -3760,7 +3759,6 @@ static const struct address_space_operations ext4_journalled_aops = {
+ static const struct address_space_operations ext4_da_aops = {
+ 	.read_folio		= ext4_read_folio,
+ 	.readahead		= ext4_readahead,
+-	.writepage		= ext4_writepage,
+ 	.writepages		= ext4_writepages,
+ 	.write_begin		= ext4_da_write_begin,
+ 	.write_end		= ext4_da_write_end,
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From bf7f05582c328cd013df7523b5b31e8f8bd50fa1 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:59:27 +0100
+Subject: [PATCH 53/57] ext4: initialize quota before expanding inode in
+ setproject ioctl
+
+Make sure we initialize quotas before possibly expanding inode space
+(and thus maybe needing to allocate external xattr block) in
+ext4_ioctl_setproject(). This prevents not accounting the necessary
+block allocation.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Cc: stable@kernel.org
+Link: https://lore.kernel.org/r/20221207115937.26601-1-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/ioctl.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index 202953b5d..8067ccda3 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -732,6 +732,10 @@ static int ext4_ioctl_setproject(struct inode *inode, __u32 projid)
+ 	if (ext4_is_quota_file(inode))
+ 		return err;
+ 
++	err = dquot_initialize(inode);
++	if (err)
++		return err;
++
+ 	err = ext4_get_inode_loc(inode, &iloc);
+ 	if (err)
+ 		return err;
+@@ -747,10 +751,6 @@ static int ext4_ioctl_setproject(struct inode *inode, __u32 projid)
+ 		brelse(iloc.bh);
+ 	}
+ 
+-	err = dquot_initialize(inode);
+-	if (err)
+-		return err;
+-
+ 	handle = ext4_journal_start(inode, EXT4_HT_QUOTA,
+ 		EXT4_QUOTA_INIT_BLOCKS(sb) +
+ 		EXT4_QUOTA_DEL_BLOCKS(sb) + 3);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 6f2f05a47226c90bc61ddd0fdea3e5ba4a5bbaab Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 7 Dec 2022 12:59:28 +0100
+Subject: [PATCH 54/57] ext4: avoid unaccounted block allocation when expanding
+ inode
+
+When expanding inode space in ext4_expand_extra_isize_ea() we may need
+to allocate external xattr block. If quota is not initialized for the
+inode, the block allocation will not be accounted into quota usage. Make
+sure the quota is initialized before we try to expand inode space.
+
+Reported-by: Pengfei Xu <pengfei.xu@intel.com>
+Link: https://lore.kernel.org/all/Y5BT+k6xWqthZc1P@xpf.sh.intel.com
+Signed-off-by: Jan Kara <jack@suse.cz>
+Cc: stable@kernel.org
+Link: https://lore.kernel.org/r/20221207115937.26601-2-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 38b7db452..5a92e5186 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5945,6 +5945,14 @@ static int __ext4_expand_extra_isize(struct inode *inode,
+ 		return 0;
+ 	}
+ 
++	/*
++	 * We may need to allocate external xattr block so we need quotas
++	 * initialized. Here we can be called with various locks held so we
++	 * cannot affort to initialize quotas ourselves. So just bail.
++	 */
++	if (dquot_initialize_needed(inode))
++		return -EAGAIN;
++
+ 	/* try to expand with EAs present */
+ 	error = ext4_expand_extra_isize_ea(inode, new_extra_isize,
+ 					   raw_inode, handle);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 8bc048966d9ae818055e96f95a45e536138d0ef6 Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Thu, 8 Dec 2022 10:32:31 +0800
+Subject: [PATCH 55/57] ext4: allocate extended attribute value in vmalloc area
+
+Now, extended attribute value maximum length is 64K. The memory
+requested here does not need continuous physical addresses, so it is
+appropriate to use kvmalloc to request memory. At the same time, it
+can also cope with the situation that the extended attribute will
+become longer in the future.
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221208023233.1231330-3-yebin@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/xattr.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 6bdd50252..b666d3bf8 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -2548,7 +2548,7 @@ static int ext4_xattr_move_to_block(handle_t *handle, struct inode *inode,
+ 
+ 	is = kzalloc(sizeof(struct ext4_xattr_ibody_find), GFP_NOFS);
+ 	bs = kzalloc(sizeof(struct ext4_xattr_block_find), GFP_NOFS);
+-	buffer = kmalloc(value_size, GFP_NOFS);
++	buffer = kvmalloc(value_size, GFP_NOFS);
+ 	b_entry_name = kmalloc(entry->e_name_len + 1, GFP_NOFS);
+ 	if (!is || !bs || !buffer || !b_entry_name) {
+ 		error = -ENOMEM;
+@@ -2600,7 +2600,7 @@ static int ext4_xattr_move_to_block(handle_t *handle, struct inode *inode,
+ 	error = 0;
+ out:
+ 	kfree(b_entry_name);
+-	kfree(buffer);
++	kvfree(buffer);
+ 	if (is)
+ 		brelse(is->iloc.bh);
+ 	if (bs)
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 9f2e9d7de3c989e9aebdf4513670065ed9d07e68 Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Thu, 8 Dec 2022 10:32:33 +0800
+Subject: [PATCH 56/57] ext4: fix inode leak in ext4_xattr_inode_create() on an
+ error path
+
+There is issue as follows when do setxattr with inject fault:
+
+[localhost]# fsck.ext4  -fn  /dev/sda
+e2fsck 1.46.6-rc1 (12-Sep-2022)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Unattached zero-length inode 15.  Clear? no
+
+Unattached inode 15
+Connect to /lost+found? no
+
+Pass 5: Checking group summary information
+
+/dev/sda: ********** WARNING: Filesystem still has errors **********
+
+/dev/sda: 15/655360 files (0.0% non-contiguous), 66755/2621440 blocks
+
+This occurs in 'ext4_xattr_inode_create()'. If 'ext4_mark_inode_dirty()'
+fails, dropping i_nlink of the inode is needed. Or will lead to inode leak.
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221208023233.1231330-5-yebin@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/xattr.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index b666d3bf8..7decaaf27 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -1441,6 +1441,9 @@ static struct inode *ext4_xattr_inode_create(handle_t *handle,
+ 		if (!err)
+ 			err = ext4_inode_attach_jinode(ea_inode);
+ 		if (err) {
++			if (ext4_xattr_inode_dec_ref(handle, ea_inode))
++				ext4_warning_inode(ea_inode,
++					"cleanup dec ref error %d", err);
+ 			iput(ea_inode);
+ 			return ERR_PTR(err);
+ 		}
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
+
+From 45dc24e5b1f8479ea0b57274b671a8b2955e52a7 Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Thu, 8 Dec 2022 11:34:24 +0800
+Subject: [PATCH 57/57] ext4: fix reserved cluster accounting in
+ __es_remove_extent()
+
+When bigalloc is enabled, reserved cluster accounting for delayed
+allocation is handled in extent_status.c.  With a corrupted file
+system, it's possible for this accounting to be incorrect,
+dsicovered by Syzbot:
+
+EXT4-fs error (device loop0): ext4_validate_block_bitmap:398: comm rep:
+	bg 0: block 5: invalid block bitmap
+EXT4-fs (loop0): Delayed block allocation failed for inode 18 at logical
+	offset 0 with max blocks 32 with error 28
+EXT4-fs (loop0): This should not happen!! Data will be lost
+
+EXT4-fs (loop0): Total free blocks count 0
+EXT4-fs (loop0): Free/Dirty block details
+EXT4-fs (loop0): free_blocks=0
+EXT4-fs (loop0): dirty_blocks=32
+EXT4-fs (loop0): Block reservation details
+EXT4-fs (loop0): i_reserved_data_blocks=2
+EXT4-fs (loop0): Inode 18 (00000000845cd634):
+	i_reserved_data_blocks (1) not cleared!
+
+Above issue happens as follows:
+Assume:
+sbi->s_cluster_ratio = 16
+Step1:
+Insert delay block [0, 31] -> ei->i_reserved_data_blocks=2
+Step2:
+ext4_writepages
+  mpage_map_and_submit_extent -> return failed
+  mpage_release_unused_pages -> to release [0, 30]
+    ext4_es_remove_extent -> remove lblk=0 end=30
+      __es_remove_extent -> len1=0 len2=31-30=1
+ __es_remove_extent:
+ ...
+ if (len2 > 0) {
+  ...
+	  if (len1 > 0) {
+		  ...
+	  } else {
+		es->es_lblk = end + 1;
+		es->es_len = len2;
+		...
+	  }
+  	if (count_reserved)
+		count_rsvd(inode, lblk, ...);
+	goto out; -> will return but didn't calculate 'reserved'
+ ...
+Step3:
+ext4_destroy_inode -> trigger "i_reserved_data_blocks (1) not cleared!"
+
+To solve above issue if 'len2>0' call 'get_rsvd()' before goto out.
+
+Reported-by: syzbot+05a0f0ccab4a25626e38@syzkaller.appspotmail.com
+Fixes: 8fcc3a580651 ("ext4: rework reserved cluster accounting when invalidating pages")
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Eric Whitney <enwlinux@gmail.com>
+Link: https://lore.kernel.org/r/20221208033426.1832460-2-yebin@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+---
+ fs/ext4/extents_status.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/extents_status.c b/fs/ext4/extents_status.c
+index 97eccc002..7bc221038 100644
+--- a/fs/ext4/extents_status.c
++++ b/fs/ext4/extents_status.c
+@@ -1369,7 +1369,7 @@ static int __es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
+ 		if (count_reserved)
+ 			count_rsvd(inode, lblk, orig_es.es_len - len1 - len2,
+ 				   &orig_es, &rc);
+-		goto out;
++		goto out_get_reserved;
+ 	}
+ 
+ 	if (len1 > 0) {
+@@ -1411,6 +1411,7 @@ static int __es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
+ 		}
+ 	}
+ 
++out_get_reserved:
+ 	if (count_reserved)
+ 		*reserved = get_rsvd(inode, end, es, &rc);
+ out:
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
