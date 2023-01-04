@@ -1,0 +1,170 @@
+From 1e27d7eef080751d840613ec14c20fd9e81b0fa8 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Fri, 11 Nov 2022 11:50:32 +0000
+Subject: [PATCH 215/245] btrfs: allow passing a cached state record to
+ count_range_bits()
+
+An inode's io_tree can be quite large and there are cases where due to
+delalloc it can have thousands of extent state records, which makes the
+red black tree have a depth of 10 or more, making the operation of
+count_range_bits() slow if we repeatedly call it for a range that starts
+where, or after, the previous one we called it for. Such use cases are
+when searching for delalloc in a file range that corresponds to a hole or
+a prealloc extent, which is done during lseek SEEK_HOLE/DATA and fiemap.
+
+So introduce a cached state parameter to count_range_bits() which we use
+to store the last extent state record we visited, and then allow the
+caller to pass it again on its next call to count_range_bits(). The next
+patches in the series will make fiemap and lseek use the new parameter.
+
+This change is part of a patchset that has the goal to make performance
+better for applications that use lseek's SEEK_HOLE and SEEK_DATA modes to
+iterate over the extents of a file. Two examples are the cp program from
+coreutils 9.0+ and the tar program (when using its --sparse / -S option).
+A sample test and results are listed in the changelog of the last patch
+in the series:
+
+  1/9 btrfs: remove leftover setting of EXTENT_UPTODATE state in an inode's io_tree
+  2/9 btrfs: add an early exit when searching for delalloc range for lseek/fiemap
+  3/9 btrfs: skip unnecessary delalloc searches during lseek/fiemap
+  4/9 btrfs: search for delalloc more efficiently during lseek/fiemap
+  5/9 btrfs: remove no longer used btrfs_next_extent_map()
+  6/9 btrfs: allow passing a cached state record to count_range_bits()
+  7/9 btrfs: update stale comment for count_range_bits()
+  8/9 btrfs: use cached state when looking for delalloc ranges with fiemap
+  9/9 btrfs: use cached state when looking for delalloc ranges with lseek
+
+Reported-by: Wang Yugui <wangyugui@e16-tech.com>
+Link: https://lore.kernel.org/linux-btrfs/20221106073028.71F9.409509F4@e16-tech.com/
+Link: https://lore.kernel.org/linux-btrfs/CAL3q7H5NSVicm7nYBJ7x8fFkDpno8z3PYt5aPU43Bajc1H0h1Q@mail.gmail.com/
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent-io-tree.c | 47 ++++++++++++++++++++++++++++++++++++---
+ fs/btrfs/extent-io-tree.h |  3 ++-
+ fs/btrfs/file.c           |  3 ++-
+ fs/btrfs/inode.c          |  2 +-
+ 4 files changed, 49 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/extent-io-tree.c b/fs/btrfs/extent-io-tree.c
+index 25215667a..fbe462710 100644
+--- a/fs/btrfs/extent-io-tree.c
++++ b/fs/btrfs/extent-io-tree.c
+@@ -1521,9 +1521,11 @@ void find_first_clear_extent_bit(struct extent_io_tree *tree, u64 start,
+  */
+ u64 count_range_bits(struct extent_io_tree *tree,
+ 		     u64 *start, u64 search_end, u64 max_bytes,
+-		     u32 bits, int contig)
++		     u32 bits, int contig,
++		     struct extent_state **cached_state)
+ {
+-	struct extent_state *state;
++	struct extent_state *state = NULL;
++	struct extent_state *cached;
+ 	u64 cur_start = *start;
+ 	u64 total_bytes = 0;
+ 	u64 last = 0;
+@@ -1534,11 +1536,41 @@ u64 count_range_bits(struct extent_io_tree *tree,
+ 
+ 	spin_lock(&tree->lock);
+ 
++	if (!cached_state || !*cached_state)
++		goto search;
++
++	cached = *cached_state;
++
++	if (!extent_state_in_tree(cached))
++		goto search;
++
++	if (cached->start <= cur_start && cur_start <= cached->end) {
++		state = cached;
++	} else if (cached->start > cur_start) {
++		struct extent_state *prev;
++
++		/*
++		 * The cached state starts after our search range's start. Check
++		 * if the previous state record starts at or before the range we
++		 * are looking for, and if so, use it - this is a common case
++		 * when there are holes between records in the tree. If there is
++		 * no previous state record, we can start from our cached state.
++		 */
++		prev = prev_state(cached);
++		if (!prev)
++			state = cached;
++		else if (prev->start <= cur_start && cur_start <= prev->end)
++			state = prev;
++	}
++
+ 	/*
+ 	 * This search will find all the extents that end after our range
+ 	 * starts.
+ 	 */
+-	state = tree_search(tree, cur_start);
++search:
++	if (!state)
++		state = tree_search(tree, cur_start);
++
+ 	while (state) {
+ 		if (state->start > search_end)
+ 			break;
+@@ -1559,7 +1591,16 @@ u64 count_range_bits(struct extent_io_tree *tree,
+ 		}
+ 		state = next_state(state);
+ 	}
++
++	if (cached_state) {
++		free_extent_state(*cached_state);
++		*cached_state = state;
++		if (state)
++			refcount_inc(&state->refs);
++	}
++
+ 	spin_unlock(&tree->lock);
++
+ 	return total_bytes;
+ }
+ 
+diff --git a/fs/btrfs/extent-io-tree.h b/fs/btrfs/extent-io-tree.h
+index 18ab82f62..e3eeec380 100644
+--- a/fs/btrfs/extent-io-tree.h
++++ b/fs/btrfs/extent-io-tree.h
+@@ -119,7 +119,8 @@ void __cold extent_state_free_cachep(void);
+ 
+ u64 count_range_bits(struct extent_io_tree *tree,
+ 		     u64 *start, u64 search_end,
+-		     u64 max_bytes, u32 bits, int contig);
++		     u64 max_bytes, u32 bits, int contig,
++		     struct extent_state **cached_state);
+ 
+ void free_extent_state(struct extent_state *state);
+ int test_range_bit(struct extent_io_tree *tree, u64 start, u64 end,
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 70902d17f..4f2f13ecf 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -3241,7 +3241,8 @@ static bool find_delalloc_subrange(struct btrfs_inode *inode, u64 start, u64 end
+ 			*delalloc_start_ret = start;
+ 			delalloc_len = count_range_bits(&inode->io_tree,
+ 							delalloc_start_ret, end,
+-							len, EXTENT_DELALLOC, 1);
++							len, EXTENT_DELALLOC, 1,
++							NULL);
+ 		} else {
+ 			spin_unlock(&inode->lock);
+ 		}
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index aec1b232a..83898bca3 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -1769,7 +1769,7 @@ static int fallback_to_cow(struct btrfs_inode *inode, struct page *locked_page,
+ 	 * when starting writeback.
+ 	 */
+ 	count = count_range_bits(io_tree, &range_start, end, range_bytes,
+-				 EXTENT_NORESERVE, 0);
++				 EXTENT_NORESERVE, 0, NULL);
+ 	if (count > 0 || is_space_ino || is_reloc_ino) {
+ 		u64 bytes = count;
+ 		struct btrfs_fs_info *fs_info = inode->root->fs_info;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
