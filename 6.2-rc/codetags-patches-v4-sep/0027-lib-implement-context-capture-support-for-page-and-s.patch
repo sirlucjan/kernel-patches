@@ -1,0 +1,543 @@
+From dc342b710fe336f6701ac2faca13288e946b9320 Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Sun, 31 Jul 2022 14:31:54 -0700
+Subject: [PATCH 27/42] lib: implement context capture support for page and
+ slab allocators
+
+Implement mechanisms for capturing allocation call context which consists
+of:
+- allocation size
+- pid, tgid and name of the allocating task
+- allocation timestamp
+- allocation call stack
+The patch creates alloc_tags.ctx file which can be written to
+enable/disable context capture for a specific code tag. Captured context
+can be obtained by reading alloc_tags.ctx file.
+Usage example:
+
+echo "file include/asm-generic/pgalloc.h line 63 enable" > \
+    /sys/kernel/debug/alloc_tags.ctx
+cat alloc_tags.ctx
+ 91.0MiB      212 include/asm-generic/pgalloc.h:63 module:pgtable func:__pte_alloc_one
+    size: 4096
+    pid: 1551
+    tgid: 1551
+    comm: cat
+    ts: 670109646361
+    call stack:
+         pte_alloc_one+0xfe/0x130
+         __pte_alloc+0x22/0x90
+         move_page_tables.part.0+0x994/0xa60
+         shift_arg_pages+0xa4/0x180
+         setup_arg_pages+0x286/0x2d0
+         load_elf_binary+0x4e1/0x18d0
+         bprm_execve+0x26b/0x660
+         do_execveat_common.isra.0+0x19d/0x220
+         __x64_sys_execve+0x2e/0x40
+         do_syscall_64+0x38/0x90
+         entry_SYSCALL_64_after_hwframe+0x63/0xcd
+
+    size: 4096
+    pid: 1551
+    tgid: 1551
+    comm: cat
+    ts: 670109711801
+    call stack:
+         pte_alloc_one+0xfe/0x130
+         __do_fault+0x52/0xc0
+         __handle_mm_fault+0x7d9/0xdd0
+         handle_mm_fault+0xc0/0x2b0
+         do_user_addr_fault+0x1c3/0x660
+         exc_page_fault+0x62/0x150
+         asm_exc_page_fault+0x22/0x30
+...
+
+echo "file include/asm-generic/pgalloc.h line 63 disable" > \
+    /sys/kernel/debug/alloc_tags.ctx
+
+Note that disabling context capture will not clear already captured
+context but no new context will be captured.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ include/linux/alloc_tag.h   |  25 +++-
+ include/linux/codetag.h     |   3 +-
+ include/linux/page_ext.h    |   3 +-
+ include/linux/pgalloc_tag.h |   4 +-
+ lib/Kconfig.debug           |   1 +
+ lib/alloc_tag.c             | 239 +++++++++++++++++++++++++++++++++++-
+ lib/codetag.c               |  20 +--
+ 7 files changed, 275 insertions(+), 20 deletions(-)
+
+diff --git a/include/linux/alloc_tag.h b/include/linux/alloc_tag.h
+index 20bd0d1..c59ccee 100644
+--- a/include/linux/alloc_tag.h
++++ b/include/linux/alloc_tag.h
+@@ -17,20 +17,29 @@
+  * an array of these. Embedded codetag utilizes codetag framework.
+  */
+ struct alloc_tag {
+-	struct codetag			ct;
++	struct codetag_with_ctx		ctc;
+ 	struct lazy_percpu_counter	bytes_allocated;
+ } __aligned(8);
+ 
+ #ifdef CONFIG_ALLOC_TAGGING
+ 
++static inline struct alloc_tag *ctc_to_alloc_tag(struct codetag_with_ctx *ctc)
++{
++	return container_of(ctc, struct alloc_tag, ctc);
++}
++
+ static inline struct alloc_tag *ct_to_alloc_tag(struct codetag *ct)
+ {
+-	return container_of(ct, struct alloc_tag, ct);
++	return container_of(ct_to_ctc(ct), struct alloc_tag, ctc);
+ }
+ 
++struct codetag_ctx *alloc_tag_create_ctx(struct alloc_tag *tag, size_t size);
++void alloc_tag_free_ctx(struct codetag_ctx *ctx, struct alloc_tag **ptag);
++bool alloc_tag_enable_ctx(struct alloc_tag *tag, bool enable);
++
+ #define DEFINE_ALLOC_TAG(_alloc_tag, _old)				\
+ 	static struct alloc_tag _alloc_tag __used __aligned(8)		\
+-	__section("alloc_tags") = { .ct = CODE_TAG_INIT };		\
++	__section("alloc_tags") = { .ctc.ct = CODE_TAG_INIT };		\
+ 	struct alloc_tag * __maybe_unused _old = alloc_tag_save(&_alloc_tag)
+ 
+ extern struct static_key_true alloc_tagging_key;
+@@ -53,7 +62,10 @@ static inline void alloc_tag_sub(union codetag_ref *ref, size_t bytes)
+ 	if (!ref || !ref->ct)
+ 		return;
+ 
+-	tag = ct_to_alloc_tag(ref->ct);
++	if (is_codetag_ctx_ref(ref))
++		alloc_tag_free_ctx(ref->ctx, &tag);
++	else
++		tag = ct_to_alloc_tag(ref->ct);
+ 	lazy_percpu_counter_add(&tag->bytes_allocated, -bytes);
+ 	ref->ct = NULL;
+ }
+@@ -73,7 +85,10 @@ static inline void alloc_tag_add(union codetag_ref *ref, struct alloc_tag *tag,
+ 	if (!ref || !tag)
+ 		return;
+ 
+-	ref->ct = &tag->ct;
++	if (codetag_ctx_enabled(&tag->ctc))
++		ref->ctx = alloc_tag_create_ctx(tag, bytes);
++	else
++		ref->ct = &tag->ctc.ct;
+ 	lazy_percpu_counter_add(&tag->bytes_allocated, bytes);
+ }
+ 
+diff --git a/include/linux/codetag.h b/include/linux/codetag.h
+index 57736ec..a10c5fc 100644
+--- a/include/linux/codetag.h
++++ b/include/linux/codetag.h
+@@ -104,7 +104,8 @@ struct codetag_with_ctx *ct_to_ctc(struct codetag *ct)
+ }
+ 
+ void codetag_lock_module_list(struct codetag_type *cttype, bool lock);
+-struct codetag_iterator codetag_get_ct_iter(struct codetag_type *cttype);
++void codetag_init_iter(struct codetag_iterator *iter,
++		       struct codetag_type *cttype);
+ struct codetag *codetag_next_ct(struct codetag_iterator *iter);
+ struct codetag_ctx *codetag_next_ctx(struct codetag_iterator *iter);
+ 
+diff --git a/include/linux/page_ext.h b/include/linux/page_ext.h
+index 22be458..44207a9 100644
+--- a/include/linux/page_ext.h
++++ b/include/linux/page_ext.h
+@@ -4,7 +4,6 @@
+ 
+ #include <linux/types.h>
+ #include <linux/stacktrace.h>
+-#include <linux/stackdepot.h>
+ 
+ struct pglist_data;
+ struct page_ext_operations {
+@@ -14,6 +13,8 @@ struct page_ext_operations {
+ 	void (*init)(void);
+ };
+ 
++#include <linux/stackdepot.h>
++
+ #ifdef CONFIG_PAGE_EXTENSION
+ 
+ enum page_ext_flags {
+diff --git a/include/linux/pgalloc_tag.h b/include/linux/pgalloc_tag.h
+index 0621586..d1bcdb9 100644
+--- a/include/linux/pgalloc_tag.h
++++ b/include/linux/pgalloc_tag.h
+@@ -6,6 +6,7 @@
+ #define _LINUX_PGALLOC_TAG_H
+ 
+ #include <linux/alloc_tag.h>
++#include <linux/codetag_ctx.h>
+ 
+ #ifdef CONFIG_ALLOC_TAGGING
+ 
+@@ -59,7 +60,8 @@ static inline void pgalloc_tag_split(struct page *page, unsigned int nr)
+ 		return;
+ 
+ 	ref = codetag_ref_from_page_ext(page_ext);
+-	tag = ct_to_alloc_tag(ref->ct);
++	tag = is_codetag_ctx_ref(ref) ? ctc_to_alloc_tag(ref->ctx->ctc)
++				      : ct_to_alloc_tag(ref->ct);
+ 	page_ext = page_ext_next(page_ext);
+ 	for (i = 1; i < nr; i++) {
+ 		/* New reference with 0 bytes accounted */
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index a4742a5..6ce454a 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -1019,6 +1019,7 @@ config ALLOC_TAGGING
+ 	select LAZY_PERCPU_COUNTER
+ 	select PAGE_EXTENSION
+ 	select SLAB_OBJ_EXT
++	select STACKDEPOT
+ 	help
+ 	  Track allocation source code and record total allocation size
+ 	  initiated at that code location. The mechanism can be used to track
+diff --git a/lib/alloc_tag.c b/lib/alloc_tag.c
+index 8bb1a22..9901374 100644
+--- a/lib/alloc_tag.c
++++ b/lib/alloc_tag.c
+@@ -1,12 +1,18 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/alloc_tag.h>
++#include <linux/codetag_ctx.h>
+ #include <linux/debugfs.h>
+ #include <linux/fs.h>
+ #include <linux/gfp.h>
+ #include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/sched/clock.h>
+ #include <linux/seq_buf.h>
++#include <linux/stackdepot.h>
+ #include <linux/uaccess.h>
+ 
++#define STACK_BUF_SIZE 1024
++
+ DEFINE_STATIC_KEY_TRUE(alloc_tagging_key);
+ 
+ /*
+@@ -22,6 +28,63 @@ static int __init mem_profiling_disable(char *s)
+ }
+ __setup("nomem_profiling", mem_profiling_disable);
+ 
++struct alloc_call_ctx {
++	struct codetag_ctx ctx;
++	size_t size;
++	pid_t pid;
++	pid_t tgid;
++	char comm[TASK_COMM_LEN];
++	u64 ts_nsec;
++	depot_stack_handle_t stack_handle;
++} __aligned(8);
++
++static void alloc_tag_ops_free_ctx(struct kref *refcount)
++{
++	kfree(container_of(kref_to_ctx(refcount), struct alloc_call_ctx, ctx));
++}
++
++struct codetag_ctx *alloc_tag_create_ctx(struct alloc_tag *tag, size_t size)
++{
++	struct alloc_call_ctx *ac_ctx;
++
++	/* TODO: use a dedicated kmem_cache */
++	ac_ctx = kmalloc(sizeof(struct alloc_call_ctx), GFP_KERNEL);
++	if (WARN_ON(!ac_ctx))
++		return NULL;
++
++	ac_ctx->size = size;
++	ac_ctx->pid = current->pid;
++	ac_ctx->tgid = current->tgid;
++	strscpy(ac_ctx->comm, current->comm, sizeof(ac_ctx->comm));
++	ac_ctx->ts_nsec = local_clock();
++	ac_ctx->stack_handle =
++			stack_depot_capture_stack(GFP_NOWAIT | __GFP_NOWARN);
++	add_ctx(&ac_ctx->ctx, &tag->ctc);
++
++	return &ac_ctx->ctx;
++}
++EXPORT_SYMBOL_GPL(alloc_tag_create_ctx);
++
++void alloc_tag_free_ctx(struct codetag_ctx *ctx, struct alloc_tag **ptag)
++{
++	*ptag = ctc_to_alloc_tag(ctx->ctc);
++	rem_ctx(ctx, alloc_tag_ops_free_ctx);
++}
++EXPORT_SYMBOL_GPL(alloc_tag_free_ctx);
++
++bool alloc_tag_enable_ctx(struct alloc_tag *tag, bool enable)
++{
++	static bool stack_depot_ready;
++
++	if (enable && !stack_depot_ready) {
++		stack_depot_init();
++		stack_depot_capture_init();
++		stack_depot_ready = true;
++	}
++
++	return codetag_enable_ctx(&tag->ctc, enable);
++}
++
+ #ifdef CONFIG_DEBUG_FS
+ 
+ struct alloc_tag_file_iterator {
+@@ -65,7 +128,7 @@ static int alloc_tag_file_open(struct inode *inode, struct file *file)
+ 		return -ENOMEM;
+ 
+ 	codetag_lock_module_list(cttype, true);
+-	iter->ct_iter = codetag_get_ct_iter(cttype);
++	codetag_init_iter(&iter->ct_iter, cttype);
+ 	codetag_lock_module_list(cttype, false);
+ 	seq_buf_init(&iter->buf, iter->rawbuf, sizeof(iter->rawbuf));
+ 	file->private_data = iter;
+@@ -126,14 +189,182 @@ static const struct file_operations alloc_tag_file_ops = {
+ 	.read	= alloc_tag_file_read,
+ };
+ 
++static void alloc_tag_ctx_to_text(struct seq_buf *out, struct codetag_ctx *ctx)
++{
++	struct alloc_call_ctx *ac_ctx;
++	char *buf;
++
++	ac_ctx = container_of(ctx, struct alloc_call_ctx, ctx);
++	seq_buf_printf(out, "    size: %zu\n", ac_ctx->size);
++	seq_buf_printf(out, "    pid: %d\n", ac_ctx->pid);
++	seq_buf_printf(out, "    tgid: %d\n", ac_ctx->tgid);
++	seq_buf_printf(out, "    comm: %s\n", ac_ctx->comm);
++	seq_buf_printf(out, "    ts: %llu\n", ac_ctx->ts_nsec);
++
++	buf = kmalloc(STACK_BUF_SIZE, GFP_KERNEL);
++	if (buf) {
++		int bytes_read = stack_depot_snprint(ac_ctx->stack_handle, buf,
++						     STACK_BUF_SIZE - 1, 8);
++		buf[bytes_read] = '\0';
++		seq_buf_printf(out, "    call stack:\n%s\n", buf);
++	}
++	kfree(buf);
++}
++
++static ssize_t alloc_tag_ctx_file_read(struct file *file, char __user *ubuf,
++				       size_t size, loff_t *ppos)
++{
++	struct alloc_tag_file_iterator *iter = file->private_data;
++	struct codetag_iterator *ct_iter = &iter->ct_iter;
++	struct user_buf	buf = { .buf = ubuf, .size = size };
++	struct codetag_ctx *ctx;
++	struct codetag *prev_ct;
++	int err = 0;
++
++	codetag_lock_module_list(ct_iter->cttype, true);
++	while (1) {
++		err = flush_ubuf(&buf, &iter->buf);
++		if (err || !buf.size)
++			break;
++
++		prev_ct = ct_iter->ct;
++		ctx = codetag_next_ctx(ct_iter);
++		if (!ctx)
++			break;
++
++		if (prev_ct != &ctx->ctc->ct)
++			alloc_tag_to_text(&iter->buf, &ctx->ctc->ct);
++		alloc_tag_ctx_to_text(&iter->buf, ctx);
++	}
++	codetag_lock_module_list(ct_iter->cttype, false);
++
++	return err ? : buf.ret;
++}
++
++#define CTX_CAPTURE_TOKENS()	\
++	x(disable,	0)	\
++	x(enable,	0)
++
++static const char * const ctx_capture_token_strs[] = {
++#define x(name, nr_args)	#name,
++	CTX_CAPTURE_TOKENS()
++#undef x
++	NULL
++};
++
++enum ctx_capture_token {
++#define x(name, nr_args)	TOK_##name,
++	CTX_CAPTURE_TOKENS()
++#undef x
++};
++
++static int enable_ctx_capture(struct codetag_type *cttype,
++			      struct codetag_query *query, bool enable)
++{
++	struct codetag_iterator ct_iter;
++	struct codetag_with_ctx *ctc;
++	struct codetag *ct;
++	unsigned int nfound = 0;
++
++	codetag_lock_module_list(cttype, true);
++
++	codetag_init_iter(&ct_iter, cttype);
++	while ((ct = codetag_next_ct(&ct_iter))) {
++		if (!codetag_matches_query(query, ct, ct_iter.cmod, NULL))
++			continue;
++
++		ctc = ct_to_ctc(ct);
++		if (codetag_ctx_enabled(ctc) == enable)
++			continue;
++
++		if (!alloc_tag_enable_ctx(ctc_to_alloc_tag(ctc), enable)) {
++			pr_warn("Failed to toggle context capture\n");
++			continue;
++		}
++
++		nfound++;
++	}
++
++	codetag_lock_module_list(cttype, false);
++
++	return nfound ? 0 : -ENOENT;
++}
++
++static int parse_command(struct codetag_type *cttype, char *buf)
++{
++	struct codetag_query query = { NULL };
++	char *cmd;
++	int ret;
++	int tok;
++
++	buf = codetag_query_parse(&query, buf);
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++
++	cmd = strsep_no_empty(&buf, " \t\r\n");
++	if (!cmd)
++		return -EINVAL;	/* no command */
++
++	tok = match_string(ctx_capture_token_strs,
++			   ARRAY_SIZE(ctx_capture_token_strs), cmd);
++	if (tok < 0)
++		return -EINVAL;	/* unknown command */
++
++	ret = enable_ctx_capture(cttype, &query, tok == TOK_enable);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++static ssize_t alloc_tag_ctx_file_write(struct file *file, const char __user *ubuf,
++					size_t len, loff_t *offp)
++{
++	struct alloc_tag_file_iterator *iter = file->private_data;
++	char tmpbuf[256];
++
++	if (len == 0)
++		return 0;
++	/* we don't check *offp -- multiple writes() are allowed */
++	if (len > sizeof(tmpbuf) - 1)
++		return -E2BIG;
++
++	if (copy_from_user(tmpbuf, ubuf, len))
++		return -EFAULT;
++
++	tmpbuf[len] = '\0';
++	parse_command(iter->ct_iter.cttype, tmpbuf);
++
++	*offp += len;
++	return len;
++}
++
++static const struct file_operations alloc_tag_ctx_file_ops = {
++	.owner	= THIS_MODULE,
++	.open	= alloc_tag_file_open,
++	.release = alloc_tag_file_release,
++	.read	= alloc_tag_ctx_file_read,
++	.write	= alloc_tag_ctx_file_write,
++};
++
+ static int dbgfs_init(struct codetag_type *cttype)
+ {
+ 	struct dentry *file;
++	struct dentry *ctx_file;
+ 
+ 	file = debugfs_create_file("alloc_tags", 0444, NULL, cttype,
+ 				   &alloc_tag_file_ops);
++	if (IS_ERR(file))
++		return PTR_ERR(file);
++
++	ctx_file = debugfs_create_file("alloc_tags.ctx", 0666, NULL, cttype,
++				       &alloc_tag_ctx_file_ops);
++	if (IS_ERR(ctx_file)) {
++		debugfs_remove(file);
++		return PTR_ERR(ctx_file);
++	}
+ 
+-	return IS_ERR(file) ? PTR_ERR(file) : 0;
++	return 0;
+ }
+ 
+ #else /* CONFIG_DEBUG_FS */
+@@ -144,9 +375,10 @@ static int dbgfs_init(struct codetag_type *) { return 0; }
+ 
+ static void alloc_tag_module_unload(struct codetag_type *cttype, struct codetag_module *cmod)
+ {
+-	struct codetag_iterator iter = codetag_get_ct_iter(cttype);
++	struct codetag_iterator iter;
+ 	struct codetag *ct;
+ 
++	codetag_init_iter(&iter, cttype);
+ 	for (ct = codetag_next_ct(&iter); ct; ct = codetag_next_ct(&iter)) {
+ 		struct alloc_tag *tag = ct_to_alloc_tag(ct);
+ 
+@@ -161,6 +393,7 @@ static int __init alloc_tag_init(void)
+ 		.section	= "alloc_tags",
+ 		.tag_size	= sizeof(struct alloc_tag),
+ 		.module_unload	= alloc_tag_module_unload,
++		.free_ctx	= alloc_tag_ops_free_ctx,
+ 	};
+ 
+ 	cttype = codetag_register_type(&desc);
+diff --git a/lib/codetag.c b/lib/codetag.c
+index 2762fda..a936d29 100644
+--- a/lib/codetag.c
++++ b/lib/codetag.c
+@@ -26,16 +26,14 @@ void codetag_lock_module_list(struct codetag_type *cttype, bool lock)
+ 		up_read(&cttype->mod_lock);
+ }
+ 
+-struct codetag_iterator codetag_get_ct_iter(struct codetag_type *cttype)
++void codetag_init_iter(struct codetag_iterator *iter,
++		       struct codetag_type *cttype)
+ {
+-	struct codetag_iterator iter = {
+-		.cttype = cttype,
+-		.cmod = NULL,
+-		.mod_id = 0,
+-		.ct = NULL,
+-	};
+-
+-	return iter;
++	iter->cttype = cttype;
++	iter->cmod = NULL;
++	iter->mod_id = 0;
++	iter->ct = NULL;
++	iter->ctx = NULL;
+ }
+ 
+ static inline struct codetag *get_first_module_ct(struct codetag_module *cmod)
+@@ -127,6 +125,10 @@ struct codetag_ctx *codetag_next_ctx(struct codetag_iterator *iter)
+ 
+ 	lockdep_assert_held(&iter->cttype->mod_lock);
+ 
++	/* Move to the first codetag if search just started */
++	if (!iter->ct)
++		codetag_next_ct(iter);
++
+ 	if (!ctx)
+ 		return next_ctx_from_ct(iter);
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
