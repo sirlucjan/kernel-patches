@@ -1,0 +1,212 @@
+From 6666737fb4b35f0e70602ced8c148b4a79edddff Mon Sep 17 00:00:00 2001
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Fri, 30 Sep 2022 16:45:12 -0400
+Subject: [PATCH 005/246] btrfs: cache the failed state when locking extents
+
+Currently if we fail to lock a range we'll return the start of the range
+that we failed to lock.  We'll then search down to this range and wait
+on any extent states in this range.
+
+However we can avoid this search altogether if we simply cache the
+extent_state that had the contention.  We can pass this into
+wait_extent_bit() and start from that extent_state without doing the
+search.  In the most optimistic case we can avoid all searches, more
+likely we'll avoid the initial search and have to perform the search
+after we wait on the failed state, or worst case we must search both
+times which is what currently happens.
+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent-io-tree.c | 52 +++++++++++++++++++++++++++++----------
+ fs/btrfs/extent-io-tree.h |  3 ++-
+ fs/btrfs/extent_io.c      |  3 ++-
+ 3 files changed, 43 insertions(+), 15 deletions(-)
+
+diff --git a/fs/btrfs/extent-io-tree.c b/fs/btrfs/extent-io-tree.c
+index 38fe2e17f..d0c637cd3 100644
+--- a/fs/btrfs/extent-io-tree.c
++++ b/fs/btrfs/extent-io-tree.c
+@@ -716,7 +716,8 @@ static void wait_on_state(struct extent_io_tree *tree,
+  * The range [start, end] is inclusive.
+  * The tree lock is taken by this function
+  */
+-void wait_extent_bit(struct extent_io_tree *tree, u64 start, u64 end, u32 bits)
++void wait_extent_bit(struct extent_io_tree *tree, u64 start, u64 end, u32 bits,
++		     struct extent_state **cached_state)
+ {
+ 	struct extent_state *state;
+ 
+@@ -724,6 +725,16 @@ void wait_extent_bit(struct extent_io_tree *tree, u64 start, u64 end, u32 bits)
+ 
+ 	spin_lock(&tree->lock);
+ again:
++	/*
++	 * Maintain cached_state, as we may not remove it from the tree if there
++	 * are more bits than the bits we're waiting on set on this state.
++	 */
++	if (cached_state && *cached_state) {
++		state = *cached_state;
++		if (extent_state_in_tree(state) &&
++		    state->start <= start && start < state->end)
++			goto process_node;
++	}
+ 	while (1) {
+ 		/*
+ 		 * This search will find all the extents that end after our
+@@ -754,6 +765,12 @@ void wait_extent_bit(struct extent_io_tree *tree, u64 start, u64 end, u32 bits)
+ 		}
+ 	}
+ out:
++	/* This state is no longer useful, clear it and free it up. */
++	if (cached_state && *cached_state) {
++		state = *cached_state;
++		*cached_state = NULL;
++		free_extent_state(state);
++	}
+ 	spin_unlock(&tree->lock);
+ }
+ 
+@@ -941,13 +958,17 @@ bool btrfs_find_delalloc_range(struct extent_io_tree *tree, u64 *start,
+  * sleeping, so the gfp mask is used to indicate what is allowed.
+  *
+  * If any of the exclusive bits are set, this will fail with -EEXIST if some
+- * part of the range already has the desired bits set.  The start of the
+- * existing range is returned in failed_start in this case.
++ * part of the range already has the desired bits set.  The extent_state of the
++ * existing range is returned in failed_state in this case, and the start of the
++ * existing range is returned in failed_start.  failed_state is used as an
++ * optimization for wait_extent_bit, failed_start must be used as the source of
++ * truth as failed_state may have changed since we returned.
+  *
+  * [start, end] is inclusive This takes the tree lock.
+  */
+ static int __set_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
+ 			    u32 bits, u64 *failed_start,
++			    struct extent_state **failed_state,
+ 			    struct extent_state **cached_state,
+ 			    struct extent_changeset *changeset, gfp_t mask)
+ {
+@@ -966,7 +987,7 @@ static int __set_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
+ 	if (exclusive_bits)
+ 		ASSERT(failed_start);
+ 	else
+-		ASSERT(failed_start == NULL);
++		ASSERT(failed_start == NULL && failed_state == NULL);
+ again:
+ 	if (!prealloc) {
+ 		/*
+@@ -1015,6 +1036,7 @@ static int __set_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
+ 	if (state->start == start && state->end <= end) {
+ 		if (state->state & exclusive_bits) {
+ 			*failed_start = state->start;
++			cache_state(state, failed_state);
+ 			err = -EEXIST;
+ 			goto out;
+ 		}
+@@ -1050,6 +1072,7 @@ static int __set_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
+ 	if (state->start < start) {
+ 		if (state->state & exclusive_bits) {
+ 			*failed_start = start;
++			cache_state(state, failed_state);
+ 			err = -EEXIST;
+ 			goto out;
+ 		}
+@@ -1130,6 +1153,7 @@ static int __set_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
+ 	if (state->start <= end && state->end > end) {
+ 		if (state->state & exclusive_bits) {
+ 			*failed_start = start;
++			cache_state(state, failed_state);
+ 			err = -EEXIST;
+ 			goto out;
+ 		}
+@@ -1168,8 +1192,8 @@ static int __set_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
+ int set_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
+ 		   u32 bits, struct extent_state **cached_state, gfp_t mask)
+ {
+-	return __set_extent_bit(tree, start, end, bits, NULL, cached_state,
+-				NULL, mask);
++	return __set_extent_bit(tree, start, end, bits, NULL, NULL,
++				cached_state, NULL, mask);
+ }
+ 
+ /*
+@@ -1604,8 +1628,8 @@ int set_record_extent_bits(struct extent_io_tree *tree, u64 start, u64 end,
+ 	 */
+ 	ASSERT(!(bits & EXTENT_LOCKED));
+ 
+-	return __set_extent_bit(tree, start, end, bits, NULL, NULL, changeset,
+-				GFP_NOFS);
++	return __set_extent_bit(tree, start, end, bits, NULL, NULL, NULL,
++				changeset, GFP_NOFS);
+ }
+ 
+ int clear_record_extent_bits(struct extent_io_tree *tree, u64 start, u64 end,
+@@ -1628,7 +1652,7 @@ int try_lock_extent(struct extent_io_tree *tree, u64 start, u64 end,
+ 	u64 failed_start;
+ 
+ 	err = __set_extent_bit(tree, start, end, EXTENT_LOCKED, &failed_start,
+-			       cached, NULL, GFP_NOFS);
++			       NULL, cached, NULL, GFP_NOFS);
+ 	if (err == -EEXIST) {
+ 		if (failed_start > start)
+ 			clear_extent_bit(tree, start, failed_start - 1,
+@@ -1645,20 +1669,22 @@ int try_lock_extent(struct extent_io_tree *tree, u64 start, u64 end,
+ int lock_extent(struct extent_io_tree *tree, u64 start, u64 end,
+ 		struct extent_state **cached_state)
+ {
++	struct extent_state *failed_state = NULL;
+ 	int err;
+ 	u64 failed_start;
+ 
+ 	err = __set_extent_bit(tree, start, end, EXTENT_LOCKED, &failed_start,
+-			       cached_state, NULL, GFP_NOFS);
++			       &failed_state, cached_state, NULL, GFP_NOFS);
+ 	while (err == -EEXIST) {
+ 		if (failed_start != start)
+ 			clear_extent_bit(tree, start, failed_start - 1,
+ 					 EXTENT_LOCKED, cached_state);
+ 
+-		wait_extent_bit(tree, failed_start, end, EXTENT_LOCKED);
++		wait_extent_bit(tree, failed_start, end, EXTENT_LOCKED,
++				&failed_state);
+ 		err = __set_extent_bit(tree, start, end, EXTENT_LOCKED,
+-				       &failed_start, cached_state, NULL,
+-				       GFP_NOFS);
++				       &failed_start, &failed_state,
++				       cached_state, NULL, GFP_NOFS);
+ 	}
+ 	return err;
+ }
+diff --git a/fs/btrfs/extent-io-tree.h b/fs/btrfs/extent-io-tree.h
+index 786be8f38..c71aa29f7 100644
+--- a/fs/btrfs/extent-io-tree.h
++++ b/fs/btrfs/extent-io-tree.h
+@@ -235,6 +235,7 @@ int find_contiguous_extent_bit(struct extent_io_tree *tree, u64 start,
+ bool btrfs_find_delalloc_range(struct extent_io_tree *tree, u64 *start,
+ 			       u64 *end, u64 max_bytes,
+ 			       struct extent_state **cached_state);
+-void wait_extent_bit(struct extent_io_tree *tree, u64 start, u64 end, u32 bits);
++void wait_extent_bit(struct extent_io_tree *tree, u64 start, u64 end, u32 bits,
++		     struct extent_state **cached_state);
+ 
+ #endif /* BTRFS_EXTENT_IO_TREE_H */
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index c7e94a0e6..836851233 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -5001,7 +5001,8 @@ static int read_extent_buffer_subpage(struct extent_buffer *eb, int wait,
+ 	if (ret || wait != WAIT_COMPLETE)
+ 		return ret;
+ 
+-	wait_extent_bit(io_tree, eb->start, eb->start + eb->len - 1, EXTENT_LOCKED);
++	wait_extent_bit(io_tree, eb->start, eb->start + eb->len - 1,
++			EXTENT_LOCKED, NULL);
+ 	if (!test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))
+ 		ret = -EIO;
+ 	return ret;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
