@@ -1,0 +1,203 @@
+From ab205e4bab3c6943c9ffeb7f4ed2caba29b64887 Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Fri, 13 Jan 2023 15:12:31 +0100
+Subject: [PATCH 10/13] sched/fair: Add sched group latency support
+
+Task can set its latency priority with sched_setattr(), which is then used
+to set the latency offset of its sched_enity, but sched group entities
+still have the default latency offset value.
+
+Add a latency.nice field in cpu cgroup controller to set the latency
+priority of the group similarly to sched_setattr(). The latency priority
+is then used to set the offset of the sched_entities of the group.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Tested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+---
+ Documentation/admin-guide/cgroup-v2.rst | 10 +++++
+ kernel/sched/core.c                     | 52 +++++++++++++++++++++++++
+ kernel/sched/fair.c                     | 33 ++++++++++++++++
+ kernel/sched/sched.h                    |  4 ++
+ 4 files changed, 99 insertions(+)
+
+diff --git a/Documentation/admin-guide/cgroup-v2.rst b/Documentation/admin-guide/cgroup-v2.rst
+index c8ae7c897..88cbf4254 100644
+--- a/Documentation/admin-guide/cgroup-v2.rst
++++ b/Documentation/admin-guide/cgroup-v2.rst
+@@ -1118,6 +1118,16 @@ All time durations are in microseconds.
+         values similar to the sched_setattr(2). This maximum utilization
+         value is used to clamp the task specific maximum utilization clamp.
+ 
++  cpu.latency.nice
++	A read-write single value file which exists on non-root
++	cgroups.  The default is "0".
++
++	The nice value is in the range [-20, 19].
++
++	This interface file allows reading and setting latency using the
++	same values used by sched_setattr(2). The latency_nice of a group is
++	used to limit the impact of the latency_nice of a task outside the
++	group.
+ 
+ 
+ Memory
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index f952c953b..c66863a66 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -11055,6 +11055,47 @@ static int cpu_idle_write_s64(struct cgroup_subsys_state *css,
+ {
+ 	return sched_group_set_idle(css_tg(css), idle);
+ }
++
++static s64 cpu_latency_nice_read_s64(struct cgroup_subsys_state *css,
++				    struct cftype *cft)
++{
++	int prio, delta, last_delta = INT_MAX;
++	s64 weight;
++
++	weight = css_tg(css)->latency_offset * NICE_LATENCY_WEIGHT_MAX;
++	weight = div_s64(weight, get_sleep_latency(false));
++
++	/* Find the closest nice value to the current weight */
++	for (prio = 0; prio < ARRAY_SIZE(sched_latency_to_weight); prio++) {
++		delta = abs(sched_latency_to_weight[prio] - weight);
++		if (delta >= last_delta)
++			break;
++		last_delta = delta;
++	}
++
++	return LATENCY_TO_NICE(prio-1);
++}
++
++static int cpu_latency_nice_write_s64(struct cgroup_subsys_state *css,
++				     struct cftype *cft, s64 nice)
++{
++	s64 latency_offset;
++	long weight;
++	int idx;
++
++	if (nice < MIN_LATENCY_NICE || nice > MAX_LATENCY_NICE)
++		return -ERANGE;
++
++	idx = NICE_TO_LATENCY(nice);
++	idx = array_index_nospec(idx, LATENCY_NICE_WIDTH);
++	weight = sched_latency_to_weight[idx];
++
++	latency_offset = weight * get_sleep_latency(false);
++	latency_offset = div_s64(latency_offset, NICE_LATENCY_WEIGHT_MAX);
++
++	return sched_group_set_latency(css_tg(css), latency_offset);
++}
++
+ #endif
+ 
+ static struct cftype cpu_legacy_files[] = {
+@@ -11069,6 +11110,11 @@ static struct cftype cpu_legacy_files[] = {
+ 		.read_s64 = cpu_idle_read_s64,
+ 		.write_s64 = cpu_idle_write_s64,
+ 	},
++	{
++		.name = "latency.nice",
++		.read_s64 = cpu_latency_nice_read_s64,
++		.write_s64 = cpu_latency_nice_write_s64,
++	},
+ #endif
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	{
+@@ -11286,6 +11332,12 @@ static struct cftype cpu_files[] = {
+ 		.read_s64 = cpu_idle_read_s64,
+ 		.write_s64 = cpu_idle_write_s64,
+ 	},
++	{
++		.name = "latency.nice",
++		.flags = CFTYPE_NOT_ON_ROOT,
++		.read_s64 = cpu_latency_nice_read_s64,
++		.write_s64 = cpu_latency_nice_write_s64,
++	},
+ #endif
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	{
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d6aa3d5cf..c8e623c53 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -12176,6 +12176,7 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+ 		goto err;
+ 
+ 	tg->shares = NICE_0_LOAD;
++	tg->latency_offset = 0;
+ 
+ 	init_cfs_bandwidth(tg_cfs_bandwidth(tg));
+ 
+@@ -12274,6 +12275,9 @@ void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+ 	}
+ 
+ 	se->my_q = cfs_rq;
++
++	se->latency_offset = tg->latency_offset;
++
+ 	/* guarantee group entities always have weight */
+ 	update_load_set(&se->load, NICE_0_LOAD);
+ 	se->parent = parent;
+@@ -12404,6 +12408,35 @@ int sched_group_set_idle(struct task_group *tg, long idle)
+ 	return 0;
+ }
+ 
++int sched_group_set_latency(struct task_group *tg, s64 latency)
++{
++	int i;
++
++	if (tg == &root_task_group)
++		return -EINVAL;
++
++	if (abs(latency) > sysctl_sched_latency)
++		return -EINVAL;
++
++	mutex_lock(&shares_mutex);
++
++	if (tg->latency_offset == latency) {
++		mutex_unlock(&shares_mutex);
++		return 0;
++	}
++
++	tg->latency_offset = latency;
++
++	for_each_possible_cpu(i) {
++		struct sched_entity *se = tg->se[i];
++
++		WRITE_ONCE(se->latency_offset, latency);
++	}
++
++	mutex_unlock(&shares_mutex);
++	return 0;
++}
++
+ #else /* CONFIG_FAIR_GROUP_SCHED */
+ 
+ void free_fair_sched_group(struct task_group *tg) { }
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 729265273..c3735a34d 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -383,6 +383,8 @@ struct task_group {
+ 
+ 	/* A positive value indicates that this is a SCHED_IDLE group. */
+ 	int			idle;
++	/* latency constraint of the group. */
++	int			latency_offset;
+ 
+ #ifdef	CONFIG_SMP
+ 	/*
+@@ -493,6 +495,8 @@ extern int sched_group_set_shares(struct task_group *tg, unsigned long shares);
+ 
+ extern int sched_group_set_idle(struct task_group *tg, long idle);
+ 
++extern int sched_group_set_latency(struct task_group *tg, s64 latency);
++
+ #ifdef CONFIG_SMP
+ extern void set_task_rq_fair(struct sched_entity *se,
+ 			     struct cfs_rq *prev, struct cfs_rq *next);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

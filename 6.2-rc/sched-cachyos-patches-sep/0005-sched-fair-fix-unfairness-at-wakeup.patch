@@ -1,0 +1,156 @@
+From 727acf604e4d0e89019304667c036a27527bd7b8 Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Fri, 13 Jan 2023 15:12:26 +0100
+Subject: [PATCH 05/13] sched/fair: fix unfairness at wakeup
+
+At wake up, the vruntime of a task is updated to not be more older than
+a sched_latency period behind the min_vruntime. This prevents long sleeping
+task to get unlimited credit at wakeup.
+Such waking task should preempt current one to use its CPU bandwidth but
+wakeup_gran() can be larger than sched_latency, filter out the
+wakeup preemption and as a results steals some CPU bandwidth to
+the waking task.
+
+Make sure that a task, which vruntime has been capped, will preempt current
+task and use its CPU bandwidth even if wakeup_gran() is in the same range
+as sched_latency.
+
+If the waking task failed to preempt current it could to wait up to
+sysctl_sched_min_granularity before preempting it during next tick.
+
+Strictly speaking, we should use cfs->min_vruntime instead of
+curr->vruntime but it doesn't worth the additional overhead and complexity
+as the vruntime of current should be close to min_vruntime if not equal.
+
+Reported-by: Youssef Esmat <youssefesmat@chromium.org>
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+Tested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+---
+ kernel/sched/fair.c  | 46 ++++++++++++++++++++------------------------
+ kernel/sched/sched.h | 34 +++++++++++++++++++++++++++++++-
+ 2 files changed, 54 insertions(+), 26 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 1490597cd..0fe0c1bfa 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4657,33 +4657,17 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+ {
+ 	u64 vruntime = cfs_rq->min_vruntime;
+ 
+-	/*
+-	 * The 'current' period is already promised to the current tasks,
+-	 * however the extra weight of the new task will slow them down a
+-	 * little, place the new task so that it fits in the slot that
+-	 * stays open at the end.
+-	 */
+-	if (initial && sched_feat(START_DEBIT))
+-		vruntime += sched_vslice(cfs_rq, se);
+-
+-	/* sleeps up to a single latency don't count. */
+-	if (!initial) {
+-		unsigned long thresh;
+-
+-		if (se_is_idle(se))
+-			thresh = sysctl_sched_min_granularity;
+-		else
+-			thresh = sysctl_sched_latency;
+-
++	if (!initial)
++		/* sleeps up to a single latency don't count. */
++		vruntime -= get_sleep_latency(se_is_idle(se));
++	else if (sched_feat(START_DEBIT))
+ 		/*
+-		 * Halve their sleep time's effect, to allow
+-		 * for a gentler effect of sleepers:
++		 * The 'current' period is already promised to the current tasks,
++		 * however the extra weight of the new task will slow them down a
++		 * little, place the new task so that it fits in the slot that
++		 * stays open at the end.
+ 		 */
+-		if (sched_feat(GENTLE_FAIR_SLEEPERS))
+-			thresh >>= 1;
+-
+-		vruntime -= thresh;
+-	}
++		vruntime += sched_vslice(cfs_rq, se);
+ 
+ 	/* ensure we never gain time by being placed backwards. */
+ 	se->vruntime = max_vruntime(se->vruntime, vruntime);
+@@ -7538,6 +7522,18 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
+ 		return -1;
+ 
+ 	gran = wakeup_gran(se);
++
++	/*
++	 * At wake up, the vruntime of a task is capped to not be older than
++	 * a sched_latency period compared to min_vruntime. This prevents long
++	 * sleeping task to get unlimited credit at wakeup. Such waking up task
++	 * has to preempt current in order to not lose its share of CPU
++	 * bandwidth but wakeup_gran() can become higher than scheduling period
++	 * for low priority task. Make sure that long sleeping task will get a
++	 * chance to preempt current.
++	 */
++	gran = min_t(s64, gran, get_latency_max());
++
+ 	if (vdiff > gran)
+ 		return 1;
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 771f8ddb7..842ce0094 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2453,9 +2453,9 @@ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
+ extern const_debug unsigned int sysctl_sched_nr_migrate;
+ extern const_debug unsigned int sysctl_sched_migration_cost;
+ 
+-#ifdef CONFIG_SCHED_DEBUG
+ extern unsigned int sysctl_sched_latency;
+ extern unsigned int sysctl_sched_min_granularity;
++#ifdef CONFIG_SCHED_DEBUG
+ extern unsigned int sysctl_sched_idle_min_granularity;
+ extern unsigned int sysctl_sched_wakeup_granularity;
+ extern int sysctl_resched_latency_warn_ms;
+@@ -2470,6 +2470,38 @@ extern unsigned int sysctl_numa_balancing_scan_size;
+ extern unsigned int sysctl_numa_balancing_hot_threshold;
+ #endif
+ 
++static inline unsigned long get_sleep_latency(bool idle)
++{
++	unsigned long thresh;
++
++	if (idle)
++		thresh = sysctl_sched_min_granularity;
++	else
++		thresh = sysctl_sched_latency;
++
++	/*
++	 * Halve their sleep time's effect, to allow
++	 * for a gentler effect of sleepers:
++	 */
++	if (sched_feat(GENTLE_FAIR_SLEEPERS))
++		thresh >>= 1;
++
++	return thresh;
++}
++
++static inline unsigned long get_latency_max(void)
++{
++	unsigned long thresh = get_sleep_latency(false);
++
++	 /*
++	  * If the waking task failed to preempt current it could to wait up to
++	  * sysctl_sched_min_granularity before preempting it during next tick.
++	  */
++	thresh -= sysctl_sched_min_granularity;
++
++	return thresh;
++}
++
+ #ifdef CONFIG_SCHED_HRTICK
+ 
+ /*
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
