@@ -1,0 +1,357 @@
+From f5f8780cb9ca544922d065f9ce6a6cfdd6f6dc9c Mon Sep 17 00:00:00 2001
+From: Yann Sionneau <ysionneau@kalray.eu>
+Date: Fri, 20 Jan 2023 15:09:57 +0100
+Subject: [PATCH 26/31] kvx: Add multi-processor (SMP) support
+
+Coolidge v1 SoC has 5 clusters of 17 kvx cores:
+ - 16 application cores aka PE
+ - 1 privileged core, the Resource Manager, aka RM.
+
+Linux can run in SMP config on the 16 cores of a Cluster.
+
+Memory coherency between all cores is guarenteed by the L2 cache.
+
+Co-developed-by: Clement Leger <clement@clement-leger.fr>
+Signed-off-by: Clement Leger <clement@clement-leger.fr>
+Co-developed-by: Julian Vetter <jvetter@kalray.eu>
+Signed-off-by: Julian Vetter <jvetter@kalray.eu>
+Co-developed-by: Julien Hascoet <jhascoet@kalray.eu>
+Signed-off-by: Julien Hascoet <jhascoet@kalray.eu>
+Co-developed-by: Louis Morhet <lmorhet@kalray.eu>
+Signed-off-by: Louis Morhet <lmorhet@kalray.eu>
+Co-developed-by: Luc Michel <lmichel@kalray.eu>
+Signed-off-by: Luc Michel <lmichel@kalray.eu>
+Co-developed-by: Marius Gligor <mgligor@kalray.eu>
+Signed-off-by: Marius Gligor <mgligor@kalray.eu>
+Co-developed-by: Yann Sionneau <ysionneau@kalray.eu>
+Signed-off-by: Yann Sionneau <ysionneau@kalray.eu>
+---
+ arch/kvx/include/asm/smp.h |  42 ++++++++++++
+ arch/kvx/kernel/smp.c      | 110 ++++++++++++++++++++++++++++++++
+ arch/kvx/kernel/smpboot.c  | 127 +++++++++++++++++++++++++++++++++++++
+ include/linux/cpuhotplug.h |   2 +
+ 4 files changed, 281 insertions(+)
+ create mode 100644 arch/kvx/include/asm/smp.h
+ create mode 100644 arch/kvx/kernel/smp.c
+ create mode 100644 arch/kvx/kernel/smpboot.c
+
+diff --git a/arch/kvx/include/asm/smp.h b/arch/kvx/include/asm/smp.h
+new file mode 100644
+index 000000000..e4fd4d001
+--- /dev/null
++++ b/arch/kvx/include/asm/smp.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2017-2023 Kalray Inc.
++ * Author(s): Clement Leger
++ */
++
++#ifndef _ASM_KVX_SMP_H
++#define _ASM_KVX_SMP_H
++
++#include <linux/cpumask.h>
++#include <linux/irqreturn.h>
++
++#include <asm/sfr.h>
++
++#ifdef CONFIG_SMP
++
++/* Hook for the generic smp_call_function_many() routine. */
++void arch_send_call_function_ipi_mask(struct cpumask *mask);
++
++/* Hook for the generic smp_call_function_single() routine. */
++void arch_send_call_function_single_ipi(int cpu);
++
++void __init setup_processor(void);
++
++void smp_init_cpus(void);
++
++irqreturn_t ipi_call_interrupt(int irq, void *dev_id);
++
++#define raw_smp_processor_id() ((int) \
++	((kvx_sfr_get(PCR) & KVX_SFR_PCR_PID_MASK) \
++					>> KVX_SFR_PCR_PID_SHIFT))
++
++#define flush_cache_vmap(start, end)		do { } while (0)
++#define flush_cache_vunmap(start, end)		do { } while (0)
++
++#else
++
++void smp_init_cpus(void) {}
++
++#endif /* CONFIG_SMP */
++
++#endif
+diff --git a/arch/kvx/kernel/smp.c b/arch/kvx/kernel/smp.c
+new file mode 100644
+index 000000000..ed4c35a8c
+--- /dev/null
++++ b/arch/kvx/kernel/smp.c
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2017-2023 Kalray Inc.
++ * Author(s): Clement Leger
++ */
++
++#include <linux/smp.h>
++#include <linux/cpu.h>
++#include <linux/of_irq.h>
++#include <linux/cpumask.h>
++#include <linux/irq_work.h>
++#include <linux/mm_types.h>
++#include <linux/interrupt.h>
++
++#include <asm/ipi.h>
++#include <asm/tlbflush.h>
++
++enum ipi_message_type {
++	IPI_RESCHEDULE,
++	IPI_CALL_FUNC,
++	IPI_IRQ_WORK,
++	IPI_MAX
++};
++
++/* A collection of single bit ipi messages.  */
++static struct {
++	unsigned long bits ____cacheline_aligned;
++} ipi_data[NR_CPUS] __cacheline_aligned;
++
++static void send_ipi_message(const struct cpumask *mask,
++			     enum ipi_message_type operation)
++{
++	unsigned long flags;
++	int cpu;
++
++	/* Set operation that must be done by receiver */
++	for_each_cpu(cpu, mask)
++		set_bit(operation, &ipi_data[cpu].bits);
++
++	/* Commit the write before sending IPI */
++	smp_wmb();
++
++	local_irq_save(flags);
++
++	kvx_ipi_send(mask);
++
++	local_irq_restore(flags);
++}
++
++void arch_send_call_function_ipi_mask(struct cpumask *mask)
++{
++	send_ipi_message(mask, IPI_CALL_FUNC);
++}
++
++void arch_send_call_function_single_ipi(int cpu)
++{
++	send_ipi_message(cpumask_of(cpu), IPI_CALL_FUNC);
++}
++
++#ifdef CONFIG_IRQ_WORK
++void arch_irq_work_raise(void)
++{
++	send_ipi_message(cpumask_of(smp_processor_id()), IPI_IRQ_WORK);
++}
++#endif
++
++static void ipi_stop(void *unused)
++{
++	local_cpu_stop();
++}
++
++void smp_send_stop(void)
++{
++	struct cpumask targets;
++
++	cpumask_copy(&targets, cpu_online_mask);
++	cpumask_clear_cpu(smp_processor_id(), &targets);
++
++	smp_call_function_many(&targets, ipi_stop, NULL, 0);
++}
++
++void smp_send_reschedule(int cpu)
++{
++	send_ipi_message(cpumask_of(cpu), IPI_RESCHEDULE);
++}
++
++irqreturn_t ipi_call_interrupt(int irq, void *dev_id)
++{
++	unsigned long *pending_ipis = &ipi_data[smp_processor_id()].bits;
++
++	while (true) {
++		unsigned long ops = xchg(pending_ipis, 0);
++
++		if (ops == 0)
++			return IRQ_HANDLED;
++
++		if (ops & (1 << IPI_RESCHEDULE))
++			scheduler_ipi();
++
++		if (ops & (1 << IPI_CALL_FUNC))
++			generic_smp_call_function_interrupt();
++
++		if (ops & (1 << IPI_IRQ_WORK))
++			irq_work_run();
++
++		BUG_ON((ops >> IPI_MAX) != 0);
++	}
++
++	return IRQ_HANDLED;
++}
+diff --git a/arch/kvx/kernel/smpboot.c b/arch/kvx/kernel/smpboot.c
+new file mode 100644
+index 000000000..987a6f014
+--- /dev/null
++++ b/arch/kvx/kernel/smpboot.c
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2017-2023 Kalray Inc.
++ * Author(s): Clement Leger
++ *            Julian Vetter
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/smp.h>
++#include <linux/cpu.h>
++#include <linux/sched.h>
++#include <linux/cpumask.h>
++#include <linux/sched/mm.h>
++#include <linux/mm_types.h>
++#include <linux/of_platform.h>
++#include <linux/sched/task_stack.h>
++
++#include <asm/pwr_ctrl.h>
++#include <asm/tlbflush.h>
++#include <asm/ipi.h>
++
++void *__cpu_up_stack_pointer[NR_CPUS];
++void *__cpu_up_task_pointer[NR_CPUS];
++
++void __init smp_prepare_boot_cpu(void)
++{
++}
++
++int __cpu_up(unsigned int cpu, struct task_struct *tidle)
++{
++	__cpu_up_stack_pointer[cpu] = task_stack_page(tidle) + THREAD_SIZE;
++	__cpu_up_task_pointer[cpu] = tidle;
++	/* We need to be sure writes are committed */
++	smp_mb();
++
++	kvx_pwr_ctrl_cpu_poweron(cpu);
++	while (!cpu_online(cpu))
++		cpu_relax();
++
++	return 0;
++}
++
++void __init smp_cpus_done(unsigned int max_cpus)
++{
++}
++
++void __init smp_init_cpus(void)
++{
++	struct cpumask cpumask;
++	struct device_node *cpu;
++	const __be32 *reg;
++	u32 cpu_num;
++	unsigned int nr_cpus = 0;
++
++	cpumask_clear(&cpumask);
++
++	for_each_of_cpu_node(cpu) {
++		if (!of_device_is_available(cpu))
++			continue;
++
++		reg = of_get_property(cpu, "reg", NULL);
++		if (!reg)
++			continue;
++
++		cpu_num = be32_to_cpup(reg);
++		if (cpu_num >= nr_cpu_ids)
++			continue;
++
++		nr_cpus++;
++		cpumask_set_cpu(cpu_num, &cpumask);
++	}
++
++	pr_info("%d possible cpus\n", nr_cpus);
++	init_cpu_possible(&cpumask);
++}
++
++void __init smp_prepare_cpus(unsigned int max_cpus)
++{
++	if (num_present_cpus() <= 1)
++		init_cpu_present(cpu_possible_mask);
++}
++
++int __init setup_smp(void)
++{
++	int ret;
++
++	ret = kvx_pwr_ctrl_probe();
++	if (ret)
++		panic("Failed to probe power controller !");
++
++	ret = kvx_ipi_ctrl_probe(ipi_call_interrupt);
++	if (ret)
++		panic("Failed to probe IPI controller !");
++
++	return 0;
++}
++
++early_initcall(setup_smp);
++
++/*
++ * C entry point for a secondary processor.
++ */
++void __init start_kernel_secondary(void)
++{
++	struct mm_struct *mm = &init_mm;
++	unsigned int cpu = smp_processor_id();
++
++	setup_processor();
++	kvx_mmu_early_setup();
++
++	/* All kernel threads share the same mm context.  */
++	mmgrab(mm);
++	current->active_mm = mm;
++	cpumask_set_cpu(cpu, mm_cpumask(mm));
++
++	notify_cpu_starting(cpu);
++	set_cpu_online(cpu, true);
++	trace_hardirqs_off();
++
++	local_flush_tlb_all();
++
++	local_irq_enable();
++	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
++}
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 6c6859bfc..2b16c5e87 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -154,6 +154,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_IRQ_RISCV_STARTING,
+ 	CPUHP_AP_IRQ_LOONGARCH_STARTING,
+ 	CPUHP_AP_IRQ_SIFIVE_PLIC_STARTING,
++	CPUHP_AP_IRQ_KVX_STARTING,
+ 	CPUHP_AP_ARM_MVEBU_COHERENCY,
+ 	CPUHP_AP_MICROCODE_LOADER,
+ 	CPUHP_AP_PERF_X86_AMD_UNCORE_STARTING,
+@@ -191,6 +192,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_KVM_ARM_VGIC_INIT_STARTING,
+ 	CPUHP_AP_KVM_ARM_VGIC_STARTING,
+ 	CPUHP_AP_KVM_ARM_TIMER_STARTING,
++	CPUHP_AP_KVX_TIMER_STARTING,
+ 	/* Must be the last timer callback */
+ 	CPUHP_AP_DUMMY_TIMER_STARTING,
+ 	CPUHP_AP_ARM_XEN_STARTING,
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
