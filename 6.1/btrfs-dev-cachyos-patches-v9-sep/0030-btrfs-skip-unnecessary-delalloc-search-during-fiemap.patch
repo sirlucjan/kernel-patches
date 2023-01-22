@@ -1,0 +1,187 @@
+From fa262af9d6e60bbb81e40161f71d37855364dd48 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Tue, 11 Oct 2022 13:16:56 +0100
+Subject: [PATCH 030/246] btrfs: skip unnecessary delalloc search during fiemap
+ and lseek
+
+During fiemap and lseek (hole and data seeking), there's no point in
+iterating the inode's io tree to count delalloc bits if the inode's
+delalloc bytes counter has a value of zero, as that counter is updated
+whenever we set a range for delalloc or clear a range from delalloc.
+
+So skip the counting and io tree iteration if the inode's delalloc bytes
+counter has a value of zero. This helps save time when processing a file
+range corresponding to a hole or prealloc (unwritten) extent.
+
+This patch is part of a series comprised of the following patches:
+
+  btrfs: get the next extent map during fiemap/lseek more efficiently
+  btrfs: skip unnecessary extent map searches during fiemap and lseek
+  btrfs: skip unnecessary delalloc search during fiemap and lseek
+
+The following test was performed on a release kernel (Debian's default
+kernel config) before and after applying those 3 patches.
+
+   # Wrapper to call fiemap in extent count only mode.
+   # (struct fiemap::fm_extent_count set to 0)
+   $ cat fiemap.c
+   #include <stdio.h>
+   #include <unistd.h>
+   #include <stdlib.h>
+   #include <fcntl.h>
+   #include <errno.h>
+   #include <string.h>
+   #include <sys/ioctl.h>
+   #include <linux/fs.h>
+   #include <linux/fiemap.h>
+
+   int main(int argc, char **argv)
+   {
+            struct fiemap fiemap = { 0 };
+            int fd;
+
+            if (argc != 2) {
+                    printf("usage: %s <path>\n", argv[0]);
+                    return 1;
+            }
+            fd = open(argv[1], O_RDONLY);
+            if (fd < 0) {
+                    fprintf(stderr, "error opening file: %s\n",
+                            strerror(errno));
+                    return 1;
+            }
+
+            /* fiemap.fm_extent_count set to 0, to count extents only. */
+            fiemap.fm_length = FIEMAP_MAX_OFFSET;
+            if (ioctl(fd, FS_IOC_FIEMAP, &fiemap) < 0) {
+                    fprintf(stderr, "fiemap error: %s\n",
+                            strerror(errno));
+                    return 1;
+            }
+            close(fd);
+            printf("fm_mapped_extents = %d\n", fiemap.fm_mapped_extents);
+
+            return 0;
+   }
+
+   $ gcc -o fiemap fiemap.c
+
+And the wrapper shell script that creates a file with many holes and runs
+fiemap against it:
+
+   $ cat test.sh
+   #!/bin/bash
+
+   DEV=/dev/sdi
+   MNT=/mnt/sdi
+
+   mkfs.btrfs -f $DEV
+   mount $DEV $MNT
+
+   FILE_SIZE=$((1 * 1024 * 1024 * 1024))
+   echo -n > $MNT/foobar
+   for ((off = 0; off < $FILE_SIZE; off += 8192)); do
+           xfs_io -c "pwrite -S 0xab $off 4K" $MNT/foobar > /dev/null
+   done
+
+   # flush all delalloc
+   sync
+
+   start=$(date +%s%N)
+   ./fiemap $MNT/foobar
+   end=$(date +%s%N)
+   dur=$(( (end - start) / 1000000 ))
+   echo "fiemap took $dur milliseconds"
+
+   umount $MNT
+
+Result before applying patchset:
+
+   fm_mapped_extents = 131072
+   fiemap took 63 milliseconds
+
+Result after applying patchset:
+
+   fm_mapped_extents = 131072
+   fiemap took 39 milliseconds   (-38.1%)
+
+Running the same test for a 512M file instead of a 1G file, gave the
+following results.
+
+Result before applying patchset:
+
+   fm_mapped_extents = 65536
+   fiemap took 29 milliseconds
+
+Result after applying patchset:
+
+   fm_mapped_extents = 65536
+   fiemap took 20 milliseconds    (-31.0%)
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/file.c | 33 ++++++++++++++++++++-------------
+ 1 file changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index db48e6d24..ac6f13ae2 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -3543,15 +3543,27 @@ static bool find_delalloc_subrange(struct btrfs_inode *inode, u64 start, u64 end
+ 	struct extent_map *em;
+ 	u64 em_end;
+ 	u64 delalloc_len;
++	unsigned int outstanding_extents;
+ 
+ 	/*
+ 	 * Search the io tree first for EXTENT_DELALLOC. If we find any, it
+ 	 * means we have delalloc (dirty pages) for which writeback has not
+ 	 * started yet.
+ 	 */
+-	*delalloc_start_ret = start;
+-	delalloc_len = count_range_bits(&inode->io_tree, delalloc_start_ret, end,
+-					len, EXTENT_DELALLOC, 1);
++	spin_lock(&inode->lock);
++	outstanding_extents = inode->outstanding_extents;
++
++	if (inode->delalloc_bytes > 0) {
++		spin_unlock(&inode->lock);
++		*delalloc_start_ret = start;
++		delalloc_len = count_range_bits(&inode->io_tree,
++						delalloc_start_ret, end,
++						len, EXTENT_DELALLOC, 1);
++	} else {
++		spin_unlock(&inode->lock);
++		delalloc_len = 0;
++	}
++
+ 	/*
+ 	 * If delalloc was found then *delalloc_start_ret has a sector size
+ 	 * aligned value (rounded down).
+@@ -3559,17 +3571,12 @@ static bool find_delalloc_subrange(struct btrfs_inode *inode, u64 start, u64 end
+ 	if (delalloc_len > 0)
+ 		*delalloc_end_ret = *delalloc_start_ret + delalloc_len - 1;
+ 
+-	spin_lock(&inode->lock);
+-	if (inode->outstanding_extents == 0) {
+-		/*
+-		 * No outstanding extents means we don't have any delalloc that
+-		 * is flushing, so return the unflushed range found in the io
+-		 * tree (if any).
+-		 */
+-		spin_unlock(&inode->lock);
++	/*
++	 * No outstanding extents means we don't have any delalloc that is
++	 * flushing, so return the unflushed range found in the io tree (if any).
++	 */
++	if (outstanding_extents == 0)
+ 		return (delalloc_len > 0);
+-	}
+-	spin_unlock(&inode->lock);
+ 
+ 	/*
+ 	 * Now also check if there's any extent map in the range that does not
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
