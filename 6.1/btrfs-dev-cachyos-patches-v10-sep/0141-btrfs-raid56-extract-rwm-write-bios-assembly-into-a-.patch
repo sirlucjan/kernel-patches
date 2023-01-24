@@ -1,0 +1,205 @@
+From deec169ba61404ee7eb665db87b1a909cb1f8c20 Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Tue, 1 Nov 2022 19:16:07 +0800
+Subject: [PATCH 141/248] btrfs: raid56: extract rwm write bios assembly into a
+ helper
+
+The helper will be later used to refactor the rmw write path.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/raid56.c | 135 +++++++++++++++++++++++++++-------------------
+ 1 file changed, 79 insertions(+), 56 deletions(-)
+
+diff --git a/fs/btrfs/raid56.c b/fs/btrfs/raid56.c
+index 88e2204c9..5e5bfc2c2 100644
+--- a/fs/btrfs/raid56.c
++++ b/fs/btrfs/raid56.c
+@@ -1237,65 +1237,23 @@ static void generate_pq_vertical(struct btrfs_raid_bio *rbio, int sectornr)
+ 		kunmap_local(pointers[stripe]);
+ }
+ 
+-/*
+- * this is called from one of two situations.  We either
+- * have a full stripe from the higher layers, or we've read all
+- * the missing bits off disk.
+- *
+- * This will calculate the parity and then send down any
+- * changed blocks.
+- */
+-static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
++static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
++				   struct bio_list *bio_list)
+ {
+-	struct btrfs_io_context *bioc = rbio->bioc;
++	struct bio *bio;
+ 	/* The total sector number inside the full stripe. */
+ 	int total_sector_nr;
+-	int stripe;
+-	/* Sector number inside a stripe. */
+ 	int sectornr;
+-	struct bio_list bio_list;
+-	struct bio *bio;
++	int stripe;
+ 	int ret;
+ 
+-	bio_list_init(&bio_list);
++	ASSERT(bio_list_size(bio_list) == 0);
+ 
+ 	/* We should have at least one data sector. */
+ 	ASSERT(bitmap_weight(&rbio->dbitmap, rbio->stripe_nsectors));
+ 
+-	/* at this point we either have a full stripe,
+-	 * or we've read the full stripe from the drive.
+-	 * recalculate the parity and write the new results.
+-	 *
+-	 * We're not allowed to add any new bios to the
+-	 * bio list here, anyone else that wants to
+-	 * change this stripe needs to do their own rmw.
+-	 */
+-	spin_lock_irq(&rbio->bio_list_lock);
+-	set_bit(RBIO_RMW_LOCKED_BIT, &rbio->flags);
+-	spin_unlock_irq(&rbio->bio_list_lock);
+-
+-	atomic_set(&rbio->error, 0);
+-
+ 	/*
+-	 * now that we've set rmw_locked, run through the
+-	 * bio list one last time and map the page pointers
+-	 *
+-	 * We don't cache full rbios because we're assuming
+-	 * the higher layers are unlikely to use this area of
+-	 * the disk again soon.  If they do use it again,
+-	 * hopefully they will send another full bio.
+-	 */
+-	index_rbio_pages(rbio);
+-	if (!rbio_is_full(rbio))
+-		cache_rbio_pages(rbio);
+-	else
+-		clear_bit(RBIO_CACHE_READY_BIT, &rbio->flags);
+-
+-	for (sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++)
+-		generate_pq_vertical(rbio, sectornr);
+-
+-	/*
+-	 * Start writing.  Make bios for everything from the higher layers (the
++	 * Start assembly.  Make bios for everything from the higher layers (the
+ 	 * bio_list in our rbio) and our P/Q.  Ignore everything else.
+ 	 */
+ 	for (total_sector_nr = 0; total_sector_nr < rbio->nr_sectors;
+@@ -1317,15 +1275,16 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
+ 			sector = rbio_stripe_sector(rbio, stripe, sectornr);
+ 		}
+ 
+-		ret = rbio_add_io_sector(rbio, &bio_list, sector, stripe,
++		ret = rbio_add_io_sector(rbio, bio_list, sector, stripe,
+ 					 sectornr, REQ_OP_WRITE);
+ 		if (ret)
+-			goto cleanup;
++			goto error;
+ 	}
+ 
+-	if (likely(!bioc->num_tgtdevs))
+-		goto write_data;
++	if (likely(!rbio->bioc->num_tgtdevs))
++		return 0;
+ 
++	/* Make a copy for the replace target device. */
+ 	for (total_sector_nr = 0; total_sector_nr < rbio->nr_sectors;
+ 	     total_sector_nr++) {
+ 		struct sector_ptr *sector;
+@@ -1333,7 +1292,7 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
+ 		stripe = total_sector_nr / rbio->stripe_nsectors;
+ 		sectornr = total_sector_nr % rbio->stripe_nsectors;
+ 
+-		if (!bioc->tgtdev_map[stripe]) {
++		if (!rbio->bioc->tgtdev_map[stripe]) {
+ 			/*
+ 			 * We can skip the whole stripe completely, note
+ 			 * total_sector_nr will be increased by one anyway.
+@@ -1355,14 +1314,78 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
+ 			sector = rbio_stripe_sector(rbio, stripe, sectornr);
+ 		}
+ 
+-		ret = rbio_add_io_sector(rbio, &bio_list, sector,
++		ret = rbio_add_io_sector(rbio, bio_list, sector,
+ 					 rbio->bioc->tgtdev_map[stripe],
+ 					 sectornr, REQ_OP_WRITE);
+ 		if (ret)
+-			goto cleanup;
++			goto error;
+ 	}
+ 
+-write_data:
++	return 0;
++error:
++	while ((bio = bio_list_pop(bio_list)))
++		bio_put(bio);
++	return -EIO;
++}
++
++/*
++ * this is called from one of two situations.  We either
++ * have a full stripe from the higher layers, or we've read all
++ * the missing bits off disk.
++ *
++ * This will calculate the parity and then send down any
++ * changed blocks.
++ */
++static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
++{
++	/* The total sector number inside the full stripe. */
++	/* Sector number inside a stripe. */
++	int sectornr;
++	struct bio_list bio_list;
++	struct bio *bio;
++	int ret;
++
++	bio_list_init(&bio_list);
++
++	/* We should have at least one data sector. */
++	ASSERT(bitmap_weight(&rbio->dbitmap, rbio->stripe_nsectors));
++
++	/* at this point we either have a full stripe,
++	 * or we've read the full stripe from the drive.
++	 * recalculate the parity and write the new results.
++	 *
++	 * We're not allowed to add any new bios to the
++	 * bio list here, anyone else that wants to
++	 * change this stripe needs to do their own rmw.
++	 */
++	spin_lock_irq(&rbio->bio_list_lock);
++	set_bit(RBIO_RMW_LOCKED_BIT, &rbio->flags);
++	spin_unlock_irq(&rbio->bio_list_lock);
++
++	atomic_set(&rbio->error, 0);
++
++	/*
++	 * now that we've set rmw_locked, run through the
++	 * bio list one last time and map the page pointers
++	 *
++	 * We don't cache full rbios because we're assuming
++	 * the higher layers are unlikely to use this area of
++	 * the disk again soon.  If they do use it again,
++	 * hopefully they will send another full bio.
++	 */
++	index_rbio_pages(rbio);
++	if (!rbio_is_full(rbio))
++		cache_rbio_pages(rbio);
++	else
++		clear_bit(RBIO_CACHE_READY_BIT, &rbio->flags);
++
++	for (sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++)
++		generate_pq_vertical(rbio, sectornr);
++
++	ret = rmw_assemble_write_bios(rbio, &bio_list);
++	if (ret < 0)
++		goto cleanup;
++
+ 	atomic_set(&rbio->stripes_pending, bio_list_size(&bio_list));
+ 	BUG_ON(atomic_read(&rbio->stripes_pending) == 0);
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
