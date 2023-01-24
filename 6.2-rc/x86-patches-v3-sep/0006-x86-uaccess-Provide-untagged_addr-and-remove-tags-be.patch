@@ -1,0 +1,216 @@
+From 8a81344b171444ab8c001839286efed89e2b21a6 Mon Sep 17 00:00:00 2001
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Date: Tue, 24 Jan 2023 01:04:49 +0300
+Subject: [PATCH 06/17] x86/uaccess: Provide untagged_addr() and remove tags
+ before address check
+
+untagged_addr() is a helper used by the core-mm to strip tag bits and
+get the address to the canonical shape based on rules of the current
+thread. It only handles userspace addresses.
+
+The untagging mask is stored in per-CPU variable and set on context
+switching to the task.
+
+The tags must not be included into check whether it's okay to access the
+userspace address. Strip tags in access_ok().
+
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/mmu.h         |  3 +++
+ arch/x86/include/asm/mmu_context.h | 11 +++++++++
+ arch/x86/include/asm/tlbflush.h    | 10 ++++++++
+ arch/x86/include/asm/uaccess.h     | 39 ++++++++++++++++++++++++++++--
+ arch/x86/kernel/process.c          |  3 +++
+ arch/x86/mm/init.c                 |  5 ++++
+ 6 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/mmu.h b/arch/x86/include/asm/mmu.h
+index 22fc9fbf1..9cac8c45a 100644
+--- a/arch/x86/include/asm/mmu.h
++++ b/arch/x86/include/asm/mmu.h
+@@ -45,6 +45,9 @@ typedef struct {
+ #ifdef CONFIG_ADDRESS_MASKING
+ 	/* Active LAM mode:  X86_CR3_LAM_U48 or X86_CR3_LAM_U57 or 0 (disabled) */
+ 	unsigned long lam_cr3_mask;
++
++	/* Significant bits of the virtual address. Excludes tag bits. */
++	u64 untag_mask;
+ #endif
+ 
+ 	struct mutex lock;
+diff --git a/arch/x86/include/asm/mmu_context.h b/arch/x86/include/asm/mmu_context.h
+index a62e70801..ca2e2ffdd 100644
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@ -100,6 +100,12 @@ static inline unsigned long mm_lam_cr3_mask(struct mm_struct *mm)
+ static inline void dup_lam(struct mm_struct *oldmm, struct mm_struct *mm)
+ {
+ 	mm->context.lam_cr3_mask = oldmm->context.lam_cr3_mask;
++	mm->context.untag_mask = oldmm->context.untag_mask;
++}
++
++static inline void mm_reset_untag_mask(struct mm_struct *mm)
++{
++	mm->context.untag_mask = -1UL;
+ }
+ 
+ #else
+@@ -112,6 +118,10 @@ static inline unsigned long mm_lam_cr3_mask(struct mm_struct *mm)
+ static inline void dup_lam(struct mm_struct *oldmm, struct mm_struct *mm)
+ {
+ }
++
++static inline void mm_reset_untag_mask(struct mm_struct *mm)
++{
++}
+ #endif
+ 
+ #define enter_lazy_tlb enter_lazy_tlb
+@@ -138,6 +148,7 @@ static inline int init_new_context(struct task_struct *tsk,
+ 		mm->context.execute_only_pkey = -1;
+ 	}
+ #endif
++	mm_reset_untag_mask(mm);
+ 	init_new_context_ldt(mm);
+ 	return 0;
+ }
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index e8b47f57b..75bfaa421 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -54,6 +54,15 @@ static inline void cr4_clear_bits(unsigned long mask)
+ 	local_irq_restore(flags);
+ }
+ 
++#ifdef CONFIG_ADDRESS_MASKING
++DECLARE_PER_CPU(u64, tlbstate_untag_mask);
++
++static inline u64 current_untag_mask(void)
++{
++	return this_cpu_read(tlbstate_untag_mask);
++}
++#endif
++
+ #ifndef MODULE
+ /*
+  * 6 because 6 should be plenty and struct tlb_state will fit in two cache
+@@ -380,6 +389,7 @@ static inline void set_tlbstate_lam_mode(struct mm_struct *mm)
+ {
+ 	this_cpu_write(cpu_tlbstate.lam,
+ 		       mm->context.lam_cr3_mask >> X86_CR3_LAM_U57_BIT);
++	this_cpu_write(tlbstate_untag_mask, mm->context.untag_mask);
+ }
+ 
+ #else
+diff --git a/arch/x86/include/asm/uaccess.h b/arch/x86/include/asm/uaccess.h
+index 1cc756eaf..fd9182951 100644
+--- a/arch/x86/include/asm/uaccess.h
++++ b/arch/x86/include/asm/uaccess.h
+@@ -7,11 +7,13 @@
+ #include <linux/compiler.h>
+ #include <linux/instrumented.h>
+ #include <linux/kasan-checks.h>
++#include <linux/mm_types.h>
+ #include <linux/string.h>
+ #include <asm/asm.h>
+ #include <asm/page.h>
+ #include <asm/smap.h>
+ #include <asm/extable.h>
++#include <asm/tlbflush.h>
+ 
+ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+ static inline bool pagefault_disabled(void);
+@@ -21,6 +23,39 @@ static inline bool pagefault_disabled(void);
+ # define WARN_ON_IN_IRQ()
+ #endif
+ 
++#ifdef CONFIG_ADDRESS_MASKING
++/*
++ * Mask out tag bits from the address.
++ *
++ * Magic with the 'sign' allows to untag userspace pointer without any branches
++ * while leaving kernel addresses intact.
++ */
++static inline unsigned long __untagged_addr(unsigned long addr,
++					    unsigned long mask)
++{
++	long sign = addr >> 63;
++
++	addr &= mask | sign;
++	return addr;
++}
++
++#define untagged_addr(addr)	({					\
++	u64 __addr = (__force u64)(addr);				\
++	__addr = __untagged_addr(__addr, current_untag_mask());		\
++	(__force __typeof__(addr))__addr;				\
++})
++
++#define untagged_addr_remote(mm, addr)	({				\
++	u64 __addr = (__force u64)(addr);				\
++	mmap_assert_locked(mm);						\
++	__addr = __untagged_addr(__addr, (mm)->context.untag_mask);	\
++	(__force __typeof__(addr))__addr;				\
++})
++
++#else
++#define untagged_addr(addr)    (addr)
++#endif
++
+ /**
+  * access_ok - Checks if a user space pointer is valid
+  * @addr: User space pointer to start of block to check
+@@ -38,10 +73,10 @@ static inline bool pagefault_disabled(void);
+  * Return: true (nonzero) if the memory block may be valid, false (zero)
+  * if it is definitely invalid.
+  */
+-#define access_ok(addr, size)					\
++#define access_ok(addr, size)						\
+ ({									\
+ 	WARN_ON_IN_IRQ();						\
+-	likely(__access_ok(addr, size));				\
++	likely(__access_ok(untagged_addr(addr), size));			\
+ })
+ 
+ #include <asm-generic/access_ok.h>
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 40d156a31..ef6bde1d4 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -47,6 +47,7 @@
+ #include <asm/frame.h>
+ #include <asm/unwind.h>
+ #include <asm/tdx.h>
++#include <asm/mmu_context.h>
+ 
+ #include "process.h"
+ 
+@@ -367,6 +368,8 @@ void arch_setup_new_exec(void)
+ 		task_clear_spec_ssb_noexec(current);
+ 		speculation_ctrl_update(read_thread_flags());
+ 	}
++
++	mm_reset_untag_mask(current->mm);
+ }
+ 
+ #ifdef CONFIG_X86_IOPL_IOPERM
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index cb258f58f..659b6c0f7 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -1048,6 +1048,11 @@ __visible DEFINE_PER_CPU_ALIGNED(struct tlb_state, cpu_tlbstate) = {
+ 	.cr4 = ~0UL,	/* fail hard if we screw up cr4 shadow initialization */
+ };
+ 
++#ifdef CONFIG_ADDRESS_MASKING
++DEFINE_PER_CPU(u64, tlbstate_untag_mask);
++EXPORT_PER_CPU_SYMBOL(tlbstate_untag_mask);
++#endif
++
+ void update_cache_mode_entry(unsigned entry, enum page_cache_mode cache)
+ {
+ 	/* entry 0 MUST be WB (hardwired to speed up translations) */
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

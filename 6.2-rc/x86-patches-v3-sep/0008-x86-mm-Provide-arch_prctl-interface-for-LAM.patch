@@ -1,0 +1,142 @@
+From 6811e1f5516ea00f6f8e6b55d9bd4fe5f4e2ad0e Mon Sep 17 00:00:00 2001
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Date: Tue, 24 Jan 2023 01:04:51 +0300
+Subject: [PATCH 08/17] x86/mm: Provide arch_prctl() interface for LAM
+
+Add a few of arch_prctl() handles:
+
+ - ARCH_ENABLE_TAGGED_ADDR enabled LAM. The argument is required number
+   of tag bits. It is rounded up to the nearest LAM mode that can
+   provide it. For now only LAM_U57 is supported, with 6 tag bits.
+
+ - ARCH_GET_UNTAG_MASK returns untag mask. It can indicates where tag
+   bits located in the address.
+
+ - ARCH_GET_MAX_TAG_BITS returns the maximum tag bits user can request.
+   Zero if LAM is not supported.
+
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/mmu.h        |  2 ++
+ arch/x86/include/uapi/asm/prctl.h |  4 +++
+ arch/x86/kernel/process.c         |  3 ++
+ arch/x86/kernel/process_64.c      | 55 ++++++++++++++++++++++++++++++-
+ 4 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/mmu.h b/arch/x86/include/asm/mmu.h
+index 9cac8c45a..e80762e99 100644
+--- a/arch/x86/include/asm/mmu.h
++++ b/arch/x86/include/asm/mmu.h
+@@ -12,6 +12,8 @@
+ #define MM_CONTEXT_UPROBE_IA32		0
+ /* vsyscall page is accessible on this MM */
+ #define MM_CONTEXT_HAS_VSYSCALL		1
++/* Do not allow changing LAM mode */
++#define MM_CONTEXT_LOCK_LAM		2
+ 
+ /*
+  * x86 has arch-specific MMU state beyond what lives in mm_struct.
+diff --git a/arch/x86/include/uapi/asm/prctl.h b/arch/x86/include/uapi/asm/prctl.h
+index 500b96e71..a31e27b95 100644
+--- a/arch/x86/include/uapi/asm/prctl.h
++++ b/arch/x86/include/uapi/asm/prctl.h
+@@ -20,4 +20,8 @@
+ #define ARCH_MAP_VDSO_32		0x2002
+ #define ARCH_MAP_VDSO_64		0x2003
+ 
++#define ARCH_GET_UNTAG_MASK		0x4001
++#define ARCH_ENABLE_TAGGED_ADDR		0x4002
++#define ARCH_GET_MAX_TAG_BITS		0x4003
++
+ #endif /* _ASM_X86_PRCTL_H */
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index ef6bde1d4..cc0677f58 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -162,6 +162,9 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 
+ 	savesegment(es, p->thread.es);
+ 	savesegment(ds, p->thread.ds);
++
++	if (p->mm && (clone_flags & (CLONE_VM | CLONE_VFORK)) == CLONE_VM)
++		set_bit(MM_CONTEXT_LOCK_LAM, &p->mm->context.flags);
+ #else
+ 	p->thread.sp0 = (unsigned long) (childregs + 1);
+ 	savesegment(gs, p->thread.gs);
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 8b06034e8..88aae519c 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -743,6 +743,48 @@ static long prctl_map_vdso(const struct vdso_image *image, unsigned long addr)
+ }
+ #endif
+ 
++#ifdef CONFIG_ADDRESS_MASKING
++
++#define LAM_U57_BITS 6
++
++static int prctl_enable_tagged_addr(struct mm_struct *mm, unsigned long nr_bits)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_LAM))
++		return -ENODEV;
++
++	/* PTRACE_ARCH_PRCTL */
++	if (current->mm != mm)
++		return -EINVAL;
++
++	if (mmap_write_lock_killable(mm))
++		return -EINTR;
++
++	if (test_bit(MM_CONTEXT_LOCK_LAM, &mm->context.flags)) {
++		mmap_write_unlock(mm);
++		return -EBUSY;
++	}
++
++	if (!nr_bits) {
++		mmap_write_unlock(mm);
++		return -EINVAL;
++	} else if (nr_bits <= LAM_U57_BITS) {
++		mm->context.lam_cr3_mask = X86_CR3_LAM_U57;
++		mm->context.untag_mask =  ~GENMASK(62, 57);
++	} else {
++		mmap_write_unlock(mm);
++		return -EINVAL;
++	}
++
++	write_cr3(__read_cr3() | mm->context.lam_cr3_mask);
++	set_tlbstate_lam_mode(mm);
++	set_bit(MM_CONTEXT_LOCK_LAM, &mm->context.flags);
++
++	mmap_write_unlock(mm);
++
++	return 0;
++}
++#endif
++
+ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
+ {
+ 	int ret = 0;
+@@ -830,7 +872,18 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
+ 	case ARCH_MAP_VDSO_64:
+ 		return prctl_map_vdso(&vdso_image_64, arg2);
+ #endif
+-
++#ifdef CONFIG_ADDRESS_MASKING
++	case ARCH_GET_UNTAG_MASK:
++		return put_user(task->mm->context.untag_mask,
++				(unsigned long __user *)arg2);
++	case ARCH_ENABLE_TAGGED_ADDR:
++		return prctl_enable_tagged_addr(task->mm, arg2);
++	case ARCH_GET_MAX_TAG_BITS:
++		if (!cpu_feature_enabled(X86_FEATURE_LAM))
++			return put_user(0, (unsigned long __user *)arg2);
++		else
++			return put_user(LAM_U57_BITS, (unsigned long __user *)arg2);
++#endif
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
