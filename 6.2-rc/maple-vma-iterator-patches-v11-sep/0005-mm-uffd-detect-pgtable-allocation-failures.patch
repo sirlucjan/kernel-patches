@@ -1,0 +1,299 @@
+From 6d6fd0ccb041d61cb591de95adba94ca540c7f8c Mon Sep 17 00:00:00 2001
+From: Peter Xu <peterx@redhat.com>
+Date: Wed, 4 Jan 2023 17:52:07 -0500
+Subject: [PATCH 05/90] mm/uffd: detect pgtable allocation failures
+
+Before this patch, when there's any pgtable allocation issues happened
+during change_protection(), the error will be ignored from the syscall.
+For shmem, there will be an error dumped into the host dmesg.  Two issues
+with that:
+
+  (1) Doing a trace dump when allocation fails is not anything close to
+      grace.
+
+  (2) The user should be notified with any kind of such error, so the user
+      can trap it and decide what to do next, either by retrying, or stop
+      the process properly, or anything else.
+
+For userfault users, this will change the API of UFFDIO_WRITEPROTECT when
+pgtable allocation failure happened.  It should not normally break anyone,
+though.  If it breaks, then in good ways.
+
+One man-page update will be on the way to introduce the new -ENOMEM for
+UFFDIO_WRITEPROTECT.  Not marking stable so we keep the old behavior on
+the 5.19-till-now kernels.
+
+[akpm@linux-foundation.org: coding-style cleanups]
+Link: https://lkml.kernel.org/r/20230104225207.1066932-4-peterx@redhat.com
+Signed-off-by: Peter Xu <peterx@redhat.com>
+Reported-by: James Houghton <jthoughton@google.com>
+Acked-by: James Houghton <jthoughton@google.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ include/linux/userfaultfd_k.h |  2 +-
+ mm/hugetlb.c                  |  6 ++--
+ mm/mempolicy.c                |  2 +-
+ mm/mprotect.c                 | 63 +++++++++++++++++++++++------------
+ mm/userfaultfd.c              | 16 ++++++---
+ 5 files changed, 59 insertions(+), 30 deletions(-)
+
+diff --git a/include/linux/userfaultfd_k.h b/include/linux/userfaultfd_k.h
+index 9df0b9a76..3767f1811 100644
+--- a/include/linux/userfaultfd_k.h
++++ b/include/linux/userfaultfd_k.h
+@@ -73,7 +73,7 @@ extern ssize_t mcopy_continue(struct mm_struct *dst_mm, unsigned long dst_start,
+ extern int mwriteprotect_range(struct mm_struct *dst_mm,
+ 			       unsigned long start, unsigned long len,
+ 			       bool enable_wp, atomic_t *mmap_changing);
+-extern void uffd_wp_range(struct mm_struct *dst_mm, struct vm_area_struct *vma,
++extern long uffd_wp_range(struct mm_struct *dst_mm, struct vm_area_struct *vma,
+ 			  unsigned long start, unsigned long len, bool enable_wp);
+ 
+ /* mm helpers */
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index f38e6bed0..aa32e83c1 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -6669,8 +6669,10 @@ long hugetlb_change_protection(struct vm_area_struct *vma,
+ 			 * pre-allocations to install pte markers.
+ 			 */
+ 			ptep = huge_pte_alloc(mm, vma, address, psize);
+-			if (!ptep)
++			if (!ptep) {
++				pages = -ENOMEM;
+ 				break;
++			}
+ 		}
+ 		ptl = huge_pte_lock(h, mm, ptep);
+ 		if (huge_pmd_unshare(mm, vma, address, ptep)) {
+@@ -6760,7 +6762,7 @@ long hugetlb_change_protection(struct vm_area_struct *vma,
+ 	hugetlb_vma_unlock_write(vma);
+ 	mmu_notifier_invalidate_range_end(&range);
+ 
+-	return pages << h->order;
++	return pages > 0 ? (pages << h->order) : pages;
+ }
+ 
+ /* Return true if reservation was successful, false otherwise.  */
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 534632e5b..e11868d2f 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -636,7 +636,7 @@ unsigned long change_prot_numa(struct vm_area_struct *vma,
+ 	tlb_gather_mmu(&tlb, vma->vm_mm);
+ 
+ 	nr_updated = change_protection(&tlb, vma, addr, end, MM_CP_PROT_NUMA);
+-	if (nr_updated)
++	if (nr_updated > 0)
+ 		count_vm_numa_events(NUMA_PTE_UPDATES, nr_updated);
+ 
+ 	tlb_finish_mmu(&tlb);
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index ad99bd818..a8336b5ec 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -326,28 +326,34 @@ uffd_wp_protect_file(struct vm_area_struct *vma, unsigned long cp_flags)
+ /*
+  * If wr-protecting the range for file-backed, populate pgtable for the case
+  * when pgtable is empty but page cache exists.  When {pte|pmd|...}_alloc()
+- * failed it means no memory, we don't have a better option but stop.
++ * failed we treat it the same way as pgtable allocation failures during
++ * page faults by kicking OOM and returning error.
+  */
+ #define  change_pmd_prepare(vma, pmd, cp_flags)				\
+-	do {								\
++	({								\
++		long err = 0;						\
+ 		if (unlikely(uffd_wp_protect_file(vma, cp_flags))) {	\
+-			if (WARN_ON_ONCE(pte_alloc(vma->vm_mm, pmd)))	\
+-				break;					\
++			if (pte_alloc(vma->vm_mm, pmd))			\
++				err = -ENOMEM;				\
+ 		}							\
+-	} while (0)
++		err;							\
++	})
++
+ /*
+  * This is the general pud/p4d/pgd version of change_pmd_prepare(). We need to
+  * have separate change_pmd_prepare() because pte_alloc() returns 0 on success,
+  * while {pmd|pud|p4d}_alloc() returns the valid pointer on success.
+  */
+ #define  change_prepare(vma, high, low, addr, cp_flags)			\
+-	do {								\
++	  ({								\
++		long err = 0;						\
+ 		if (unlikely(uffd_wp_protect_file(vma, cp_flags))) {	\
+ 			low##_t *p = low##_alloc(vma->vm_mm, high, addr); \
+-			if (WARN_ON_ONCE(p == NULL))			\
+-				break;					\
++			if (p == NULL)					\
++				err = -ENOMEM;				\
+ 		}							\
+-	} while (0)
++		err;							\
++	})
+ 
+ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 		struct vm_area_struct *vma, pud_t *pud, unsigned long addr,
+@@ -363,11 +369,15 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 
+ 	pmd = pmd_offset(pud, addr);
+ 	do {
+-		long this_pages;
++		long ret;
+ 
+ 		next = pmd_addr_end(addr, end);
+ 
+-		change_pmd_prepare(vma, pmd, cp_flags);
++		ret = change_pmd_prepare(vma, pmd, cp_flags);
++		if (ret) {
++			pages = ret;
++			break;
++		}
+ 		/*
+ 		 * Automatic NUMA balancing walks the tables with mmap_lock
+ 		 * held for read. It's possible a parallel update to occur
+@@ -397,7 +407,11 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 				 * cleared; make sure pmd populated if
+ 				 * necessary, then fall-through to pte level.
+ 				 */
+-				change_pmd_prepare(vma, pmd, cp_flags);
++				ret = change_pmd_prepare(vma, pmd, cp_flags);
++				if (ret) {
++					pages = ret;
++					break;
++				}
+ 			} else {
+ 				/*
+ 				 * change_huge_pmd() does not defer TLB flushes,
+@@ -418,9 +432,8 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 			}
+ 			/* fall through, the trans huge pmd just split */
+ 		}
+-		this_pages = change_pte_range(tlb, vma, pmd, addr, next,
+-					      newprot, cp_flags);
+-		pages += this_pages;
++		pages += change_pte_range(tlb, vma, pmd, addr, next,
++					  newprot, cp_flags);
+ next:
+ 		cond_resched();
+ 	} while (pmd++, addr = next, addr != end);
+@@ -439,12 +452,14 @@ static inline long change_pud_range(struct mmu_gather *tlb,
+ {
+ 	pud_t *pud;
+ 	unsigned long next;
+-	long pages = 0;
++	long pages = 0, ret;
+ 
+ 	pud = pud_offset(p4d, addr);
+ 	do {
+ 		next = pud_addr_end(addr, end);
+-		change_prepare(vma, pud, pmd, addr, cp_flags);
++		ret = change_prepare(vma, pud, pmd, addr, cp_flags);
++		if (ret)
++			return ret;
+ 		if (pud_none_or_clear_bad(pud))
+ 			continue;
+ 		pages += change_pmd_range(tlb, vma, pud, addr, next, newprot,
+@@ -460,12 +475,14 @@ static inline long change_p4d_range(struct mmu_gather *tlb,
+ {
+ 	p4d_t *p4d;
+ 	unsigned long next;
+-	long pages = 0;
++	long pages = 0, ret;
+ 
+ 	p4d = p4d_offset(pgd, addr);
+ 	do {
+ 		next = p4d_addr_end(addr, end);
+-		change_prepare(vma, p4d, pud, addr, cp_flags);
++		ret = change_prepare(vma, p4d, pud, addr, cp_flags);
++		if (ret)
++			return ret;
+ 		if (p4d_none_or_clear_bad(p4d))
+ 			continue;
+ 		pages += change_pud_range(tlb, vma, p4d, addr, next, newprot,
+@@ -482,14 +499,18 @@ static long change_protection_range(struct mmu_gather *tlb,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pgd_t *pgd;
+ 	unsigned long next;
+-	long pages = 0;
++	long pages = 0, ret;
+ 
+ 	BUG_ON(addr >= end);
+ 	pgd = pgd_offset(mm, addr);
+ 	tlb_start_vma(tlb, vma);
+ 	do {
+ 		next = pgd_addr_end(addr, end);
+-		change_prepare(vma, pgd, p4d, addr, cp_flags);
++		ret = change_prepare(vma, pgd, p4d, addr, cp_flags);
++		if (ret) {
++			pages = ret;
++			break;
++		}
+ 		if (pgd_none_or_clear_bad(pgd))
+ 			continue;
+ 		pages += change_p4d_range(tlb, vma, pgd, addr, next, newprot,
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 1ac1de527..37e4eb495 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -724,11 +724,12 @@ ssize_t mcopy_continue(struct mm_struct *dst_mm, unsigned long start,
+ 			      mmap_changing, 0);
+ }
+ 
+-void uffd_wp_range(struct mm_struct *dst_mm, struct vm_area_struct *dst_vma,
++long uffd_wp_range(struct mm_struct *dst_mm, struct vm_area_struct *dst_vma,
+ 		   unsigned long start, unsigned long len, bool enable_wp)
+ {
+ 	unsigned int mm_cp_flags;
+ 	struct mmu_gather tlb;
++	long ret;
+ 
+ 	if (enable_wp)
+ 		mm_cp_flags = MM_CP_UFFD_WP;
+@@ -744,8 +745,10 @@ void uffd_wp_range(struct mm_struct *dst_mm, struct vm_area_struct *dst_vma,
+ 	if (!enable_wp && vma_wants_manual_pte_write_upgrade(dst_vma))
+ 		mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
+ 	tlb_gather_mmu(&tlb, dst_mm);
+-	change_protection(&tlb, dst_vma, start, start + len, mm_cp_flags);
++	ret = change_protection(&tlb, dst_vma, start, start + len, mm_cp_flags);
+ 	tlb_finish_mmu(&tlb);
++
++	return ret;
+ }
+ 
+ int mwriteprotect_range(struct mm_struct *dst_mm, unsigned long start,
+@@ -754,7 +757,7 @@ int mwriteprotect_range(struct mm_struct *dst_mm, unsigned long start,
+ {
+ 	struct vm_area_struct *dst_vma;
+ 	unsigned long page_mask;
+-	int err;
++	long err;
+ 
+ 	/*
+ 	 * Sanitize the command parameters:
+@@ -793,9 +796,12 @@ int mwriteprotect_range(struct mm_struct *dst_mm, unsigned long start,
+ 			goto out_unlock;
+ 	}
+ 
+-	uffd_wp_range(dst_mm, dst_vma, start, len, enable_wp);
++	err = uffd_wp_range(dst_mm, dst_vma, start, len, enable_wp);
++
++	/* Return 0 on success, <0 on failures */
++	if (err > 0)
++		err = 0;
+ 
+-	err = 0;
+ out_unlock:
+ 	mmap_read_unlock(dst_mm);
+ 	return err;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
