@@ -1,0 +1,2306 @@
+From 0fab646ecffbd17498a3051da736ecf30df30fe6 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Sun, 29 Jan 2023 12:50:00 +0100
+Subject: [PATCH] sched-6.1: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ arch/s390/include/asm/hardirq.h  |   6 +
+ include/linux/interrupt.h        |  20 ++
+ include/linux/psi_types.h        |   4 +
+ include/linux/sched.h            |   3 -
+ init/Kconfig                     |  10 +
+ kernel/sched/core.c              | 319 +++++++++++++++++-----------
+ kernel/sched/cpufreq_schedutil.c |  43 ++--
+ kernel/sched/deadline.c          |   7 +-
+ kernel/sched/fair.c              | 348 ++++++++++++++++++++++++++-----
+ kernel/sched/pelt.c              |  60 ++++++
+ kernel/sched/pelt.h              |  42 +++-
+ kernel/sched/psi.c               |  92 ++++++--
+ kernel/sched/rt.c                |  49 ++++-
+ kernel/sched/sched.h             |  50 ++++-
+ kernel/sched/stats.h             |  22 +-
+ kernel/sched/topology.c          |   2 +-
+ kernel/softirq.c                 |  46 +++-
+ 17 files changed, 872 insertions(+), 251 deletions(-)
+
+diff --git a/arch/s390/include/asm/hardirq.h b/arch/s390/include/asm/hardirq.h
+index 58668ffb5..cd9cc1158 100644
+--- a/arch/s390/include/asm/hardirq.h
++++ b/arch/s390/include/asm/hardirq.h
+@@ -16,6 +16,12 @@
+ #define local_softirq_pending() (S390_lowcore.softirq_pending)
+ #define set_softirq_pending(x) (S390_lowcore.softirq_pending = (x))
+ #define or_softirq_pending(x)  (S390_lowcore.softirq_pending |= (x))
++/*
++ *  Not sure what the right thing is here  for s390,
++ *  but returning 0 will result in no logical change
++ *  from what happens now
++ */
++#define __cpu_softirq_pending(x) (0)
+ 
+ #define __ARCH_IRQ_STAT
+ #define __ARCH_IRQ_EXIT_IRQS_DISABLED
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index a92bce40b..7d09eb998 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -527,6 +527,17 @@ DECLARE_STATIC_KEY_FALSE(force_irqthreads_key);
+ #define set_softirq_pending(x)	(__this_cpu_write(local_softirq_pending_ref, (x)))
+ #define or_softirq_pending(x)	(__this_cpu_or(local_softirq_pending_ref, (x)))
+ 
++/**
++ * __cpu_softirq_pending() - Checks to see if softirq is pending on a cpu
++ *
++ * This helper is inherently racy, as we're accessing per-cpu data w/o locks.
++ * But peeking at the flag can still be useful when deciding where to place a
++ * task.
++ */
++static inline u32 __cpu_softirq_pending(int cpu)
++{
++	return (u32)per_cpu(local_softirq_pending_ref, cpu);
++}
+ #endif /* local_softirq_pending */
+ 
+ /* Some architectures might implement lazy enabling/disabling of
+@@ -571,6 +582,11 @@ enum
+  * _ IRQ_POLL: irq_poll_cpu_dead() migrates the queue
+  */
+ #define SOFTIRQ_HOTPLUG_SAFE_MASK (BIT(RCU_SOFTIRQ) | BIT(IRQ_POLL_SOFTIRQ))
++/* Softirq's where the handling might be long: */
++#define LONG_SOFTIRQ_MASK (BIT(NET_TX_SOFTIRQ)    | \
++			   BIT(NET_RX_SOFTIRQ)    | \
++			   BIT(BLOCK_SOFTIRQ)     | \
++			   BIT(IRQ_POLL_SOFTIRQ))
+ 
+ /* map softirq index to softirq name. update 'softirq_to_name' in
+  * kernel/softirq.c when adding a new softirq.
+@@ -607,6 +623,10 @@ extern void raise_softirq(unsigned int nr);
+ 
+ DECLARE_PER_CPU(struct task_struct *, ksoftirqd);
+ 
++#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
++DECLARE_PER_CPU(u32, active_softirqs);
++#endif
++
+ static inline struct task_struct *this_cpu_ksoftirqd(void)
+ {
+ 	return this_cpu_read(ksoftirqd);
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+index 6e4372735..1e0a0d7ac 100644
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@ -72,6 +72,9 @@ enum psi_states {
+ /* Use one bit in the state mask to track TSK_ONCPU */
+ #define PSI_ONCPU	(1 << NR_PSI_STATES)
+ 
++/* Flag whether to re-arm avgs_work, see details in get_recent_times() */
++#define PSI_STATE_RESCHEDULE	(1 << (NR_PSI_STATES + 1))
++
+ enum psi_aggregators {
+ 	PSI_AVGS = 0,
+ 	PSI_POLL,
+@@ -177,6 +180,7 @@ struct psi_group {
+ 	struct timer_list poll_timer;
+ 	wait_queue_head_t poll_wait;
+ 	atomic_t poll_wakeup;
++	atomic_t poll_scheduled;
+ 
+ 	/* Protects data used by the monitor */
+ 	struct mutex trigger_lock;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ffb6eb55c..23de7fe86 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -888,9 +888,6 @@ struct task_struct {
+ 	unsigned			sched_reset_on_fork:1;
+ 	unsigned			sched_contributes_to_load:1;
+ 	unsigned			sched_migrated:1;
+-#ifdef CONFIG_PSI
+-	unsigned			sched_psi_wake_requeue:1;
+-#endif
+ 
+ 	/* Force alignment to the next boundary: */
+ 	unsigned			:0;
+diff --git a/init/Kconfig b/init/Kconfig
+index 0c214af99..88a9a22c9 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1295,6 +1295,16 @@ config SCHED_AUTOGROUP
+ 	  desktop applications.  Task group autogeneration is currently based
+ 	  upon task session.
+ 
++config RT_SOFTIRQ_AWARE_SCHED
++	bool "Improve RT scheduling during long softirq execution"
++	depends on SMP && !PREEMPT_RT
++	default n
++	help
++	  Enable an optimization which tries to avoid placing RT tasks on CPUs
++	  occupied by nonpreemptible tasks, such as a long softirq or CPUs
++	  which may soon block preemptions, such as a CPU running a ksoftirq
++	  thread which handles slow softirqs.
++
+ config SYSFS_DEPRECATED
+ 	bool "Enable deprecated sysfs features to support old userspace tools"
+ 	depends on SYSFS
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index f730b6fe9..407ca74e4 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -722,7 +722,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
+ 	if ((irq_delta + steal) && sched_feat(NONTASK_CAPACITY))
+ 		update_irq_load_avg(rq, irq_delta + steal);
+ #endif
+-	update_rq_clock_pelt(rq, delta);
++	update_rq_clock_task_mult(rq, delta);
+ }
+ 
+ void update_rq_clock(struct rq *rq)
+@@ -2053,7 +2053,7 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+ 
+ 	if (!(flags & ENQUEUE_RESTORE)) {
+ 		sched_info_enqueue(rq, p);
+-		psi_enqueue(p, flags & ENQUEUE_WAKEUP);
++		psi_enqueue(p, (flags & ENQUEUE_WAKEUP) && !(flags & ENQUEUE_MIGRATED));
+ 	}
+ 
+ 	uclamp_rq_inc(rq, p);
+@@ -2189,14 +2189,18 @@ void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
+ #ifdef CONFIG_SMP
+ 
+ static void
+-__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
++__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx);
+ 
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+-				  const struct cpumask *new_mask,
+-				  u32 flags);
++				  struct affinity_context *ctx);
+ 
+ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+ {
++	struct affinity_context ac = {
++		.new_mask  = cpumask_of(rq->cpu),
++		.flags     = SCA_MIGRATE_DISABLE,
++	};
++
+ 	if (likely(!p->migration_disabled))
+ 		return;
+ 
+@@ -2206,7 +2210,7 @@ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+ 	/*
+ 	 * Violates locking rules! see comment in __do_set_cpus_allowed().
+ 	 */
+-	__do_set_cpus_allowed(p, cpumask_of(rq->cpu), SCA_MIGRATE_DISABLE);
++	__do_set_cpus_allowed(p, &ac);
+ }
+ 
+ void migrate_disable(void)
+@@ -2228,6 +2232,10 @@ EXPORT_SYMBOL_GPL(migrate_disable);
+ void migrate_enable(void)
+ {
+ 	struct task_struct *p = current;
++	struct affinity_context ac = {
++		.new_mask  = &p->cpus_mask,
++		.flags     = SCA_MIGRATE_ENABLE,
++	};
+ 
+ 	if (p->migration_disabled > 1) {
+ 		p->migration_disabled--;
+@@ -2243,7 +2251,7 @@ void migrate_enable(void)
+ 	 */
+ 	preempt_disable();
+ 	if (p->cpus_ptr != &p->cpus_mask)
+-		__set_cpus_allowed_ptr(p, &p->cpus_mask, SCA_MIGRATE_ENABLE);
++		__set_cpus_allowed_ptr(p, &ac);
+ 	/*
+ 	 * Mustn't clear migration_disabled() until cpus_ptr points back at the
+ 	 * regular cpus_mask, otherwise things that race (eg.
+@@ -2523,19 +2531,25 @@ int push_cpu_stop(void *arg)
+  * sched_class::set_cpus_allowed must do the below, but is not required to
+  * actually call this function.
+  */
+-void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
++void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx)
+ {
+-	if (flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
+-		p->cpus_ptr = new_mask;
++	if (ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
++		p->cpus_ptr = ctx->new_mask;
+ 		return;
+ 	}
+ 
+-	cpumask_copy(&p->cpus_mask, new_mask);
+-	p->nr_cpus_allowed = cpumask_weight(new_mask);
++	cpumask_copy(&p->cpus_mask, ctx->new_mask);
++	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
++
++	/*
++	 * Swap in a new user_cpus_ptr if SCA_USER flag set
++	 */
++	if (ctx->flags & SCA_USER)
++		swap(p->user_cpus_ptr, ctx->user_mask);
+ }
+ 
+ static void
+-__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
++__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
+ {
+ 	struct rq *rq = task_rq(p);
+ 	bool queued, running;
+@@ -2552,7 +2566,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+ 	 *
+ 	 * XXX do further audits, this smells like something putrid.
+ 	 */
+-	if (flags & SCA_MIGRATE_DISABLE)
++	if (ctx->flags & SCA_MIGRATE_DISABLE)
+ 		SCHED_WARN_ON(!p->on_cpu);
+ 	else
+ 		lockdep_assert_held(&p->pi_lock);
+@@ -2571,7 +2585,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+ 	if (running)
+ 		put_prev_task(rq, p);
+ 
+-	p->sched_class->set_cpus_allowed(p, new_mask, flags);
++	p->sched_class->set_cpus_allowed(p, ctx);
+ 
+ 	if (queued)
+ 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
+@@ -2579,9 +2593,20 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+ 		set_next_task(rq, p);
+ }
+ 
++/*
++ * Used for kthread_bind() and select_fallback_rq(), in both cases the user
++ * affinity (if any) should be destroyed too.
++ */
+ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+ {
+-	__do_set_cpus_allowed(p, new_mask, 0);
++	struct affinity_context ac = {
++		.new_mask  = new_mask,
++		.user_mask = NULL,
++		.flags     = SCA_USER,	/* clear the user requested mask */
++	};
++
++	__do_set_cpus_allowed(p, &ac);
++	kfree(ac.user_mask);
+ }
+ 
+ int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
+@@ -2719,6 +2744,8 @@ void release_user_cpus_ptr(struct task_struct *p)
+  */
+ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
+ 			    int dest_cpu, unsigned int flags)
++	__releases(rq->lock)
++	__releases(p->pi_lock)
+ {
+ 	struct set_affinity_pending my_pending = { }, *pending = NULL;
+ 	bool stop_pending, complete = false;
+@@ -2861,8 +2888,7 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
+  * Called with both p->pi_lock and rq->lock held; drops both before returning.
+  */
+ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+-					 const struct cpumask *new_mask,
+-					 u32 flags,
++					 struct affinity_context *ctx,
+ 					 struct rq *rq,
+ 					 struct rq_flags *rf)
+ 	__releases(rq->lock)
+@@ -2871,7 +2897,6 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	const struct cpumask *cpu_allowed_mask = task_cpu_possible_mask(p);
+ 	const struct cpumask *cpu_valid_mask = cpu_active_mask;
+ 	bool kthread = p->flags & PF_KTHREAD;
+-	struct cpumask *user_mask = NULL;
+ 	unsigned int dest_cpu;
+ 	int ret = 0;
+ 
+@@ -2891,7 +2916,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 		cpu_valid_mask = cpu_online_mask;
+ 	}
+ 
+-	if (!kthread && !cpumask_subset(new_mask, cpu_allowed_mask)) {
++	if (!kthread && !cpumask_subset(ctx->new_mask, cpu_allowed_mask)) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+@@ -2900,18 +2925,18 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	 * Must re-check here, to close a race against __kthread_bind(),
+ 	 * sched_setaffinity() is not guaranteed to observe the flag.
+ 	 */
+-	if ((flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
++	if ((ctx->flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
+-	if (!(flags & SCA_MIGRATE_ENABLE)) {
+-		if (cpumask_equal(&p->cpus_mask, new_mask))
++	if (!(ctx->flags & SCA_MIGRATE_ENABLE)) {
++		if (cpumask_equal(&p->cpus_mask, ctx->new_mask))
+ 			goto out;
+ 
+ 		if (WARN_ON_ONCE(p == current &&
+ 				 is_migration_disabled(p) &&
+-				 !cpumask_test_cpu(task_cpu(p), new_mask))) {
++				 !cpumask_test_cpu(task_cpu(p), ctx->new_mask))) {
+ 			ret = -EBUSY;
+ 			goto out;
+ 		}
+@@ -2922,22 +2947,15 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	 * for groups of tasks (ie. cpuset), so that load balancing is not
+ 	 * immediately required to distribute the tasks within their new mask.
+ 	 */
+-	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, new_mask);
++	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, ctx->new_mask);
+ 	if (dest_cpu >= nr_cpu_ids) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
+-	__do_set_cpus_allowed(p, new_mask, flags);
+-
+-	if (flags & SCA_USER)
+-		user_mask = clear_user_cpus_ptr(p);
+-
+-	ret = affine_move_task(rq, p, rf, dest_cpu, flags);
++	__do_set_cpus_allowed(p, ctx);
+ 
+-	kfree(user_mask);
+-
+-	return ret;
++	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
+ 
+ out:
+ 	task_rq_unlock(rq, p, rf);
+@@ -2955,25 +2973,41 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+  * call is not atomic; no spinlocks may be held.
+  */
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+-				  const struct cpumask *new_mask, u32 flags)
++				  struct affinity_context *ctx)
+ {
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 
+ 	rq = task_rq_lock(p, &rf);
+-	return __set_cpus_allowed_ptr_locked(p, new_mask, flags, rq, &rf);
++	/*
++	 * Masking should be skipped if SCA_USER or any of the SCA_MIGRATE_*
++	 * flags are set.
++	 */
++	if (p->user_cpus_ptr &&
++	    !(ctx->flags & (SCA_USER | SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) &&
++	    cpumask_and(rq->scratch_mask, ctx->new_mask, p->user_cpus_ptr))
++		ctx->new_mask = rq->scratch_mask;
++
++	return __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
+ }
+ 
+ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ {
+-	return __set_cpus_allowed_ptr(p, new_mask, 0);
++	struct affinity_context ac = {
++		.new_mask  = new_mask,
++		.flags     = 0,
++	};
++
++	return __set_cpus_allowed_ptr(p, &ac);
+ }
+ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+ 
+ /*
+  * Change a given task's CPU affinity to the intersection of its current
+- * affinity mask and @subset_mask, writing the resulting mask to @new_mask
+- * and pointing @p->user_cpus_ptr to a copy of the old mask.
++ * affinity mask and @subset_mask, writing the resulting mask to @new_mask.
++ * If user_cpus_ptr is defined, use it as the basis for restricting CPU
++ * affinity or use cpu_online_mask instead.
++ *
+  * If the resulting mask is empty, leave the affinity unchanged and return
+  * -EINVAL.
+  */
+@@ -2981,17 +3015,14 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ 				     struct cpumask *new_mask,
+ 				     const struct cpumask *subset_mask)
+ {
+-	struct cpumask *user_mask = NULL;
++	struct affinity_context ac = {
++		.new_mask  = new_mask,
++		.flags     = 0,
++	};
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 	int err;
+ 
+-	if (!p->user_cpus_ptr) {
+-		user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
+-		if (!user_mask)
+-			return -ENOMEM;
+-	}
+-
+ 	rq = task_rq_lock(p, &rf);
+ 
+ 	/*
+@@ -3004,31 +3035,21 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ 		goto err_unlock;
+ 	}
+ 
+-	if (!cpumask_and(new_mask, &p->cpus_mask, subset_mask)) {
++	if (!cpumask_and(new_mask, task_user_cpus(p), subset_mask)) {
+ 		err = -EINVAL;
+ 		goto err_unlock;
+ 	}
+ 
+-	/*
+-	 * We're about to butcher the task affinity, so keep track of what
+-	 * the user asked for in case we're able to restore it later on.
+-	 */
+-	if (user_mask) {
+-		cpumask_copy(user_mask, p->cpus_ptr);
+-		p->user_cpus_ptr = user_mask;
+-	}
+-
+-	return __set_cpus_allowed_ptr_locked(p, new_mask, 0, rq, &rf);
++	return __set_cpus_allowed_ptr_locked(p, &ac, rq, &rf);
+ 
+ err_unlock:
+ 	task_rq_unlock(rq, p, &rf);
+-	kfree(user_mask);
+ 	return err;
+ }
+ 
+ /*
+  * Restrict the CPU affinity of task @p so that it is a subset of
+- * task_cpu_possible_mask() and point @p->user_cpu_ptr to a copy of the
++ * task_cpu_possible_mask() and point @p->user_cpus_ptr to a copy of the
+  * old affinity mask. If the resulting mask is empty, we warn and walk
+  * up the cpuset hierarchy until we find a suitable mask.
+  */
+@@ -3072,34 +3093,29 @@ void force_compatible_cpus_allowed_ptr(struct task_struct *p)
+ }
+ 
+ static int
+-__sched_setaffinity(struct task_struct *p, const struct cpumask *mask);
++__sched_setaffinity(struct task_struct *p, struct affinity_context *ctx);
+ 
+ /*
+  * Restore the affinity of a task @p which was previously restricted by a
+- * call to force_compatible_cpus_allowed_ptr(). This will clear (and free)
+- * @p->user_cpus_ptr.
++ * call to force_compatible_cpus_allowed_ptr().
+  *
+  * It is the caller's responsibility to serialise this with any calls to
+  * force_compatible_cpus_allowed_ptr(@p).
+  */
+ void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
+ {
+-	struct cpumask *user_mask = p->user_cpus_ptr;
+-	unsigned long flags;
++	struct affinity_context ac = {
++		.new_mask  = task_user_cpus(p),
++		.flags     = 0,
++	};
++	int ret;
+ 
+ 	/*
+-	 * Try to restore the old affinity mask. If this fails, then
+-	 * we free the mask explicitly to avoid it being inherited across
+-	 * a subsequent fork().
++	 * Try to restore the old affinity mask with __sched_setaffinity().
++	 * Cpuset masking will be done there too.
+ 	 */
+-	if (!user_mask || !__sched_setaffinity(p, user_mask))
+-		return;
+-
+-	raw_spin_lock_irqsave(&p->pi_lock, flags);
+-	user_mask = clear_user_cpus_ptr(p);
+-	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+-
+-	kfree(user_mask);
++	ret = __sched_setaffinity(p, &ac);
++	WARN_ON_ONCE(ret);
+ }
+ 
+ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+@@ -3577,10 +3593,9 @@ void sched_set_stop_task(int cpu, struct task_struct *stop)
+ #else /* CONFIG_SMP */
+ 
+ static inline int __set_cpus_allowed_ptr(struct task_struct *p,
+-					 const struct cpumask *new_mask,
+-					 u32 flags)
++					 struct affinity_context *ctx)
+ {
+-	return set_cpus_allowed_ptr(p, new_mask);
++	return set_cpus_allowed_ptr(p, ctx->new_mask);
+ }
+ 
+ static inline void migrate_disable_switch(struct rq *rq, struct task_struct *p) { }
+@@ -3632,14 +3647,39 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
+ }
+ 
+ /*
+- * Mark the task runnable and perform wakeup-preemption.
++ * Mark the task runnable.
+  */
+-static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+-			   struct rq_flags *rf)
++static inline void ttwu_do_wakeup(struct task_struct *p)
+ {
+-	check_preempt_curr(rq, p, wake_flags);
+ 	WRITE_ONCE(p->__state, TASK_RUNNING);
+ 	trace_sched_wakeup(p);
++}
++
++static void
++ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
++		 struct rq_flags *rf)
++{
++	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
++
++	lockdep_assert_rq_held(rq);
++
++	if (p->sched_contributes_to_load)
++		rq->nr_uninterruptible--;
++
++#ifdef CONFIG_SMP
++	if (wake_flags & WF_MIGRATED)
++		en_flags |= ENQUEUE_MIGRATED;
++	else
++#endif
++	if (p->in_iowait) {
++		delayacct_blkio_end(p);
++		atomic_dec(&task_rq(p)->nr_iowait);
++	}
++
++	activate_task(rq, p, en_flags);
++	check_preempt_curr(rq, p, wake_flags);
++
++	ttwu_do_wakeup(p);
+ 
+ #ifdef CONFIG_SMP
+ 	if (p->sched_class->task_woken) {
+@@ -3669,31 +3709,6 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+ #endif
+ }
+ 
+-static void
+-ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
+-		 struct rq_flags *rf)
+-{
+-	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
+-
+-	lockdep_assert_rq_held(rq);
+-
+-	if (p->sched_contributes_to_load)
+-		rq->nr_uninterruptible--;
+-
+-#ifdef CONFIG_SMP
+-	if (wake_flags & WF_MIGRATED)
+-		en_flags |= ENQUEUE_MIGRATED;
+-	else
+-#endif
+-	if (p->in_iowait) {
+-		delayacct_blkio_end(p);
+-		atomic_dec(&task_rq(p)->nr_iowait);
+-	}
+-
+-	activate_task(rq, p, en_flags);
+-	ttwu_do_wakeup(rq, p, wake_flags, rf);
+-}
+-
+ /*
+  * Consider @p being inside a wait loop:
+  *
+@@ -3727,9 +3742,15 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
+ 
+ 	rq = __task_rq_lock(p, &rf);
+ 	if (task_on_rq_queued(p)) {
+-		/* check_preempt_curr() may use rq clock */
+-		update_rq_clock(rq);
+-		ttwu_do_wakeup(rq, p, wake_flags, &rf);
++		if (!task_on_cpu(rq, p)) {
++			/*
++			 * When on_rq && !on_cpu the task is preempted, see if
++			 * it should preempt the task that is current now.
++			 */
++			update_rq_clock(rq);
++			check_preempt_curr(rq, p, wake_flags);
++		}
++		ttwu_do_wakeup(p);
+ 		ret = 1;
+ 	}
+ 	__task_rq_unlock(rq, &rf);
+@@ -3748,13 +3769,6 @@ void sched_ttwu_pending(void *arg)
+ 	if (!llist)
+ 		return;
+ 
+-	/*
+-	 * rq::ttwu_pending racy indication of out-standing wakeups.
+-	 * Races such that false-negatives are possible, since they
+-	 * are shorter lived that false-positives would be.
+-	 */
+-	WRITE_ONCE(rq->ttwu_pending, 0);
+-
+ 	rq_lock_irqsave(rq, &rf);
+ 	update_rq_clock(rq);
+ 
+@@ -3768,6 +3782,17 @@ void sched_ttwu_pending(void *arg)
+ 		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+ 	}
+ 
++	/*
++	 * Must be after enqueueing at least once task such that
++	 * idle_cpu() does not observe a false-negative -- if it does,
++	 * it is possible for select_idle_siblings() to stack a number
++	 * of tasks on this CPU during that window.
++	 *
++	 * It is ok to clear ttwu_pending when another task pending.
++	 * We will receive IPI after local irq enabled and then enqueue it.
++	 * Since now nr_running > 0, idle_cpu() will always get correct result.
++	 */
++	WRITE_ONCE(rq->ttwu_pending, 0);
+ 	rq_unlock_irqrestore(rq, &rf);
+ }
+ 
+@@ -4091,8 +4116,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 			goto out;
+ 
+ 		trace_sched_waking(p);
+-		WRITE_ONCE(p->__state, TASK_RUNNING);
+-		trace_sched_wakeup(p);
++		ttwu_do_wakeup(p);
+ 		goto out;
+ 	}
+ 
+@@ -8136,7 +8160,7 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
+ #endif
+ 
+ static int
+-__sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
++__sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
+ {
+ 	int retval;
+ 	cpumask_var_t cpus_allowed, new_mask;
+@@ -8150,13 +8174,16 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 	}
+ 
+ 	cpuset_cpus_allowed(p, cpus_allowed);
+-	cpumask_and(new_mask, mask, cpus_allowed);
++	cpumask_and(new_mask, ctx->new_mask, cpus_allowed);
++
++	ctx->new_mask = new_mask;
++	ctx->flags |= SCA_CHECK;
+ 
+ 	retval = dl_task_check_affinity(p, new_mask);
+ 	if (retval)
+ 		goto out_free_new_mask;
+-again:
+-	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK | SCA_USER);
++
++	retval = __set_cpus_allowed_ptr(p, ctx);
+ 	if (retval)
+ 		goto out_free_new_mask;
+ 
+@@ -8167,7 +8194,24 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 		 * Just reset the cpumask to the cpuset's cpus_allowed.
+ 		 */
+ 		cpumask_copy(new_mask, cpus_allowed);
+-		goto again;
++
++		/*
++		 * If SCA_USER is set, a 2nd call to __set_cpus_allowed_ptr()
++		 * will restore the previous user_cpus_ptr value.
++		 *
++		 * In the unlikely event a previous user_cpus_ptr exists,
++		 * we need to further restrict the mask to what is allowed
++		 * by that old user_cpus_ptr.
++		 */
++		if (unlikely((ctx->flags & SCA_USER) && ctx->user_mask)) {
++			bool empty = !cpumask_and(new_mask, new_mask,
++						  ctx->user_mask);
++
++			if (WARN_ON_ONCE(empty))
++				cpumask_copy(new_mask, cpus_allowed);
++		}
++		__set_cpus_allowed_ptr(p, ctx);
++		retval = -EINVAL;
+ 	}
+ 
+ out_free_new_mask:
+@@ -8179,6 +8223,8 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+ 
+ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ {
++	struct affinity_context ac;
++	struct cpumask *user_mask;
+ 	struct task_struct *p;
+ 	int retval;
+ 
+@@ -8213,7 +8259,21 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ 	if (retval)
+ 		goto out_put_task;
+ 
+-	retval = __sched_setaffinity(p, in_mask);
++	user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
++	if (!user_mask) {
++		retval = -ENOMEM;
++		goto out_put_task;
++	}
++	cpumask_copy(user_mask, in_mask);
++	ac = (struct affinity_context){
++		.new_mask  = in_mask,
++		.user_mask = user_mask,
++		.flags     = SCA_USER,
++	};
++
++	retval = __sched_setaffinity(p, &ac);
++	kfree(ac.user_mask);
++
+ out_put_task:
+ 	put_task_struct(p);
+ 	return retval;
+@@ -8994,6 +9054,12 @@ void show_state_filter(unsigned int state_filter)
+  */
+ void __init init_idle(struct task_struct *idle, int cpu)
+ {
++#ifdef CONFIG_SMP
++	struct affinity_context ac = (struct affinity_context) {
++		.new_mask  = cpumask_of(cpu),
++		.flags     = 0,
++	};
++#endif
+ 	struct rq *rq = cpu_rq(cpu);
+ 	unsigned long flags;
+ 
+@@ -9018,7 +9084,7 @@ void __init init_idle(struct task_struct *idle, int cpu)
+ 	 *
+ 	 * And since this is boot we can forgo the serialization.
+ 	 */
+-	set_cpus_allowed_common(idle, cpumask_of(cpu), 0);
++	set_cpus_allowed_common(idle, &ac);
+ #endif
+ 	/*
+ 	 * We're having a chicken and egg problem, even though we are
+@@ -9805,6 +9871,7 @@ void __init sched_init(void)
+ 
+ 		rq->core_cookie = 0UL;
+ #endif
++		zalloc_cpumask_var_node(&rq->scratch_mask, GFP_KERNEL, cpu_to_node(i));
+ 	}
+ 
+ 	set_load_weight(&init_task, false);
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 1207c78f8..5c840151f 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -48,7 +48,6 @@ struct sugov_cpu {
+ 
+ 	unsigned long		util;
+ 	unsigned long		bw_dl;
+-	unsigned long		max;
+ 
+ 	/* The field below is for single-CPU policies only: */
+ #ifdef CONFIG_NO_HZ_COMMON
+@@ -158,7 +157,6 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu)
+ {
+ 	struct rq *rq = cpu_rq(sg_cpu->cpu);
+ 
+-	sg_cpu->max = arch_scale_cpu_capacity(sg_cpu->cpu);
+ 	sg_cpu->bw_dl = cpu_bw_dl(rq);
+ 	sg_cpu->util = effective_cpu_util(sg_cpu->cpu, cpu_util_cfs(sg_cpu->cpu),
+ 					  FREQUENCY_UTIL, NULL);
+@@ -238,6 +236,7 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
+  * sugov_iowait_apply() - Apply the IO boost to a CPU.
+  * @sg_cpu: the sugov data for the cpu to boost
+  * @time: the update time from the caller
++ * @max_cap: the max CPU capacity
+  *
+  * A CPU running a task which woken up after an IO operation can have its
+  * utilization boosted to speed up the completion of those IO operations.
+@@ -251,7 +250,8 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
+  * This mechanism is designed to boost high frequently IO waiting tasks, while
+  * being more conservative on tasks which does sporadic IO operations.
+  */
+-static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
++static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
++			       unsigned long max_cap)
+ {
+ 	unsigned long boost;
+ 
+@@ -280,7 +280,7 @@ static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
+ 	 * sg_cpu->util is already in capacity scale; convert iowait_boost
+ 	 * into the same scale so we can compare.
+ 	 */
+-	boost = (sg_cpu->iowait_boost * sg_cpu->max) >> SCHED_CAPACITY_SHIFT;
++	boost = (sg_cpu->iowait_boost * max_cap) >> SCHED_CAPACITY_SHIFT;
+ 	boost = uclamp_rq_util_with(cpu_rq(sg_cpu->cpu), boost, NULL);
+ 	if (sg_cpu->util < boost)
+ 		sg_cpu->util = boost;
+@@ -310,7 +310,8 @@ static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
+ }
+ 
+ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
+-					      u64 time, unsigned int flags)
++					      u64 time, unsigned long max_cap,
++					      unsigned int flags)
+ {
+ 	sugov_iowait_boost(sg_cpu, time, flags);
+ 	sg_cpu->last_update = time;
+@@ -321,7 +322,7 @@ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
+ 		return false;
+ 
+ 	sugov_get_util(sg_cpu);
+-	sugov_iowait_apply(sg_cpu, time);
++	sugov_iowait_apply(sg_cpu, time, max_cap);
+ 
+ 	return true;
+ }
+@@ -332,12 +333,15 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
+ 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+ 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+ 	unsigned int cached_freq = sg_policy->cached_raw_freq;
++	unsigned long max_cap;
+ 	unsigned int next_f;
+ 
+-	if (!sugov_update_single_common(sg_cpu, time, flags))
++	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
++
++	if (!sugov_update_single_common(sg_cpu, time, max_cap, flags))
+ 		return;
+ 
+-	next_f = get_next_freq(sg_policy, sg_cpu->util, sg_cpu->max);
++	next_f = get_next_freq(sg_policy, sg_cpu->util, max_cap);
+ 	/*
+ 	 * Do not reduce the frequency if the CPU has not been idle
+ 	 * recently, as the reduction is likely to be premature then.
+@@ -374,6 +378,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
+ {
+ 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+ 	unsigned long prev_util = sg_cpu->util;
++	unsigned long max_cap;
+ 
+ 	/*
+ 	 * Fall back to the "frequency" path if frequency invariance is not
+@@ -385,7 +390,9 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
+ 		return;
+ 	}
+ 
+-	if (!sugov_update_single_common(sg_cpu, time, flags))
++	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
++
++	if (!sugov_update_single_common(sg_cpu, time, max_cap, flags))
+ 		return;
+ 
+ 	/*
+@@ -399,7 +406,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
+ 		sg_cpu->util = prev_util;
+ 
+ 	cpufreq_driver_adjust_perf(sg_cpu->cpu, map_util_perf(sg_cpu->bw_dl),
+-				   map_util_perf(sg_cpu->util), sg_cpu->max);
++				   map_util_perf(sg_cpu->util), max_cap);
+ 
+ 	sg_cpu->sg_policy->last_freq_update_time = time;
+ }
+@@ -408,25 +415,21 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
+ {
+ 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+ 	struct cpufreq_policy *policy = sg_policy->policy;
+-	unsigned long util = 0, max = 1;
++	unsigned long util = 0, max_cap;
+ 	unsigned int j;
+ 
++	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
++
+ 	for_each_cpu(j, policy->cpus) {
+ 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
+-		unsigned long j_util, j_max;
+ 
+ 		sugov_get_util(j_sg_cpu);
+-		sugov_iowait_apply(j_sg_cpu, time);
+-		j_util = j_sg_cpu->util;
+-		j_max = j_sg_cpu->max;
++		sugov_iowait_apply(j_sg_cpu, time, max_cap);
+ 
+-		if (j_util * max > j_max * util) {
+-			util = j_util;
+-			max = j_max;
+-		}
++		util = max(j_sg_cpu->util, util);
+ 	}
+ 
+-	return get_next_freq(sg_policy, util, max);
++	return get_next_freq(sg_policy, util, max_cap);
+ }
+ 
+ static void
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 9ae8f41e3..0d97d5427 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2485,8 +2485,7 @@ static void task_woken_dl(struct rq *rq, struct task_struct *p)
+ }
+ 
+ static void set_cpus_allowed_dl(struct task_struct *p,
+-				const struct cpumask *new_mask,
+-				u32 flags)
++				struct affinity_context *ctx)
+ {
+ 	struct root_domain *src_rd;
+ 	struct rq *rq;
+@@ -2501,7 +2500,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
+ 	 * update. We already made space for us in the destination
+ 	 * domain (see cpuset_can_attach()).
+ 	 */
+-	if (!cpumask_intersects(src_rd->span, new_mask)) {
++	if (!cpumask_intersects(src_rd->span, ctx->new_mask)) {
+ 		struct dl_bw *src_dl_b;
+ 
+ 		src_dl_b = dl_bw_of(cpu_of(rq));
+@@ -2515,7 +2514,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
+ 		raw_spin_unlock(&src_dl_b->lock);
+ 	}
+ 
+-	set_cpus_allowed_common(p, new_mask, flags);
++	set_cpus_allowed_common(p, ctx);
+ }
+ 
+ /* Assumes rq->lock is held */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 2c3d0d49c..add690f6d 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4465,12 +4465,16 @@ static inline int util_fits_cpu(unsigned long util,
+ 	 * For uclamp_max, we can tolerate a drop in performance level as the
+ 	 * goal is to cap the task. So it's okay if it's getting less.
+ 	 *
+-	 * In case of capacity inversion, which is not handled yet, we should
+-	 * honour the inverted capacity for both uclamp_min and uclamp_max all
+-	 * the time.
++	 * In case of capacity inversion we should honour the inverted capacity
++	 * for both uclamp_min and uclamp_max all the time.
+ 	 */
+-	capacity_orig = capacity_orig_of(cpu);
+-	capacity_orig_thermal = capacity_orig - arch_scale_thermal_pressure(cpu);
++	capacity_orig = cpu_in_capacity_inversion(cpu);
++	if (capacity_orig) {
++		capacity_orig_thermal = capacity_orig;
++	} else {
++		capacity_orig = capacity_orig_of(cpu);
++		capacity_orig_thermal = capacity_orig - arch_scale_thermal_pressure(cpu);
++	}
+ 
+ 	/*
+ 	 * We want to force a task to fit a cpu as implied by uclamp_max.
+@@ -4509,8 +4513,7 @@ static inline int util_fits_cpu(unsigned long util,
+ 	 *     2. The system is being saturated when we're operating near
+ 	 *        max capacity, it doesn't make sense to block overutilized.
+ 	 */
+-	uclamp_max_fits = (capacity_orig == SCHED_CAPACITY_SCALE) && (uclamp_max == SCHED_CAPACITY_SCALE);
+-	uclamp_max_fits = !uclamp_max_fits && (uclamp_max <= capacity_orig);
++	uclamp_max_fits = (uclamp_max <= capacity_orig) || (capacity_orig == SCHED_CAPACITY_SCALE);
+ 	fits = fits || uclamp_max_fits;
+ 
+ 	/*
+@@ -4545,8 +4548,8 @@ static inline int util_fits_cpu(unsigned long util,
+ 	 * handle the case uclamp_min > uclamp_max.
+ 	 */
+ 	uclamp_min = min(uclamp_min, uclamp_max);
+-	if (util < uclamp_min && capacity_orig != SCHED_CAPACITY_SCALE)
+-		fits = fits && (uclamp_min <= capacity_orig_thermal);
++	if (fits && (util < uclamp_min) && (uclamp_min > capacity_orig_thermal))
++		return -1;
+ 
+ 	return fits;
+ }
+@@ -4556,7 +4559,11 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
+ 	unsigned long uclamp_min = uclamp_eff_value(p, UCLAMP_MIN);
+ 	unsigned long uclamp_max = uclamp_eff_value(p, UCLAMP_MAX);
+ 	unsigned long util = task_util_est(p);
+-	return util_fits_cpu(util, uclamp_min, uclamp_max, cpu);
++	/*
++	 * Return true only if the cpu fully fits the task requirements, which
++	 * include the utilization but also the performance.
++	 */
++	return (util_fits_cpu(util, uclamp_min, uclamp_max, cpu) > 0);
+ }
+ 
+ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
+@@ -4880,7 +4887,13 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	struct sched_entity *se;
+ 	s64 delta;
+ 
+-	ideal_runtime = sched_slice(cfs_rq, curr);
++	/*
++	 * When many tasks blow up the sched_period; it is possible that
++	 * sched_slice() reports unusually large results (when many tasks are
++	 * very light for example). Therefore impose a maximum.
++	 */
++	ideal_runtime = min_t(u64, sched_slice(cfs_rq, curr), sysctl_sched_latency);
++
+ 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+ 	if (delta_exec > ideal_runtime) {
+ 		resched_curr(rq_of(cfs_rq));
+@@ -5445,22 +5458,105 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ 		resched_curr(rq);
+ }
+ 
+-static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
++#ifdef CONFIG_SMP
++static void __cfsb_csd_unthrottle(void *arg)
+ {
+-	struct cfs_rq *cfs_rq;
++	struct cfs_rq *cursor, *tmp;
++	struct rq *rq = arg;
++	struct rq_flags rf;
++
++	rq_lock(rq, &rf);
++
++	/*
++	 * Since we hold rq lock we're safe from concurrent manipulation of
++	 * the CSD list. However, this RCU critical section annotates the
++	 * fact that we pair with sched_free_group_rcu(), so that we cannot
++	 * race with group being freed in the window between removing it
++	 * from the list and advancing to the next entry in the list.
++	 */
++	rcu_read_lock();
++
++	list_for_each_entry_safe(cursor, tmp, &rq->cfsb_csd_list,
++				 throttled_csd_list) {
++		list_del_init(&cursor->throttled_csd_list);
++
++		if (cfs_rq_throttled(cursor))
++			unthrottle_cfs_rq(cursor);
++	}
++
++	rcu_read_unlock();
++
++	rq_unlock(rq, &rf);
++}
++
++static inline void __unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
++{
++	struct rq *rq = rq_of(cfs_rq);
++	bool first;
++
++	if (rq == this_rq()) {
++		unthrottle_cfs_rq(cfs_rq);
++		return;
++	}
++
++	/* Already enqueued */
++	if (SCHED_WARN_ON(!list_empty(&cfs_rq->throttled_csd_list)))
++		return;
++
++	first = list_empty(&rq->cfsb_csd_list);
++	list_add_tail(&cfs_rq->throttled_csd_list, &rq->cfsb_csd_list);
++	if (first)
++		smp_call_function_single_async(cpu_of(rq), &rq->cfsb_csd);
++}
++#else
++static inline void __unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
++{
++	unthrottle_cfs_rq(cfs_rq);
++}
++#endif
++
++static void unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
++{
++	lockdep_assert_rq_held(rq_of(cfs_rq));
++
++	if (SCHED_WARN_ON(!cfs_rq_throttled(cfs_rq) ||
++	    cfs_rq->runtime_remaining <= 0))
++		return;
++
++	__unthrottle_cfs_rq_async(cfs_rq);
++}
++
++static bool distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
++{
++	struct cfs_rq *local_unthrottle = NULL;
++	int this_cpu = smp_processor_id();
+ 	u64 runtime, remaining = 1;
++	bool throttled = false;
++	struct cfs_rq *cfs_rq;
++	struct rq_flags rf;
++	struct rq *rq;
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
+ 				throttled_list) {
+-		struct rq *rq = rq_of(cfs_rq);
+-		struct rq_flags rf;
++		rq = rq_of(cfs_rq);
++
++		if (!remaining) {
++			throttled = true;
++			break;
++		}
+ 
+ 		rq_lock_irqsave(rq, &rf);
+ 		if (!cfs_rq_throttled(cfs_rq))
+ 			goto next;
+ 
+-		/* By the above check, this should never be true */
++#ifdef CONFIG_SMP
++		/* Already queued for async unthrottle */
++		if (!list_empty(&cfs_rq->throttled_csd_list))
++			goto next;
++#endif
++
++		/* By the above checks, this should never be true */
+ 		SCHED_WARN_ON(cfs_rq->runtime_remaining > 0);
+ 
+ 		raw_spin_lock(&cfs_b->lock);
+@@ -5474,16 +5570,30 @@ static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
+ 		cfs_rq->runtime_remaining += runtime;
+ 
+ 		/* we check whether we're throttled above */
+-		if (cfs_rq->runtime_remaining > 0)
+-			unthrottle_cfs_rq(cfs_rq);
++		if (cfs_rq->runtime_remaining > 0) {
++			if (cpu_of(rq) != this_cpu ||
++			    SCHED_WARN_ON(local_unthrottle))
++				unthrottle_cfs_rq_async(cfs_rq);
++			else
++				local_unthrottle = cfs_rq;
++		} else {
++			throttled = true;
++		}
+ 
+ next:
+ 		rq_unlock_irqrestore(rq, &rf);
+-
+-		if (!remaining)
+-			break;
+ 	}
+ 	rcu_read_unlock();
++
++	if (local_unthrottle) {
++		rq = cpu_rq(this_cpu);
++		rq_lock_irqsave(rq, &rf);
++		if (cfs_rq_throttled(local_unthrottle))
++			unthrottle_cfs_rq(local_unthrottle);
++		rq_unlock_irqrestore(rq, &rf);
++	}
++
++	return throttled;
+ }
+ 
+ /*
+@@ -5528,10 +5638,8 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
+ 	while (throttled && cfs_b->runtime > 0) {
+ 		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+ 		/* we can't nest cfs_b->lock while distributing bandwidth */
+-		distribute_cfs_runtime(cfs_b);
++		throttled = distribute_cfs_runtime(cfs_b);
+ 		raw_spin_lock_irqsave(&cfs_b->lock, flags);
+-
+-		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
+ 	}
+ 
+ 	/*
+@@ -5808,6 +5916,9 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->runtime_enabled = 0;
+ 	INIT_LIST_HEAD(&cfs_rq->throttled_list);
++#ifdef CONFIG_SMP
++	INIT_LIST_HEAD(&cfs_rq->throttled_csd_list);
++#endif
+ }
+ 
+ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+@@ -5824,12 +5935,38 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ 
+ static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ {
++	int __maybe_unused i;
++
+ 	/* init_cfs_bandwidth() was not called */
+ 	if (!cfs_b->throttled_cfs_rq.next)
+ 		return;
+ 
+ 	hrtimer_cancel(&cfs_b->period_timer);
+ 	hrtimer_cancel(&cfs_b->slack_timer);
++
++	/*
++	 * It is possible that we still have some cfs_rq's pending on a CSD
++	 * list, though this race is very rare. In order for this to occur, we
++	 * must have raced with the last task leaving the group while there
++	 * exist throttled cfs_rq(s), and the period_timer must have queued the
++	 * CSD item but the remote cpu has not yet processed it. To handle this,
++	 * we can simply flush all pending CSD work inline here. We're
++	 * guaranteed at this point that no additional cfs_rq of this group can
++	 * join a CSD list.
++	 */
++#ifdef CONFIG_SMP
++	for_each_possible_cpu(i) {
++		struct rq *rq = cpu_rq(i);
++		unsigned long flags;
++
++		if (list_empty(&rq->cfsb_csd_list))
++			continue;
++
++		local_irq_save(flags);
++		__cfsb_csd_unthrottle(rq);
++		local_irq_restore(flags);
++	}
++#endif
+ }
+ 
+ /*
+@@ -5992,6 +6129,7 @@ static inline bool cpu_overutilized(int cpu)
+ 	unsigned long rq_util_min = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
+ 	unsigned long rq_util_max = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
+ 
++	/* Return true only if the utlization doesn't fit its capacity */
+ 	return !util_fits_cpu(cpu_util_cfs(cpu), rq_util_min, rq_util_max, cpu);
+ }
+ 
+@@ -6785,6 +6923,7 @@ static int
+ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+ {
+ 	unsigned long task_util, util_min, util_max, best_cap = 0;
++	int fits, best_fits = 0;
+ 	int cpu, best_cpu = -1;
+ 	struct cpumask *cpus;
+ 
+@@ -6800,12 +6939,28 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+ 
+ 		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
+ 			continue;
+-		if (util_fits_cpu(task_util, util_min, util_max, cpu))
++
++		fits = util_fits_cpu(task_util, util_min, util_max, cpu);
++
++		/* This CPU fits with all capacity and performance requirements */
++		if (fits > 0)
+ 			return cpu;
++		/*
++		 * Only the min performance (i.e. uclamp_min) doesn't fit. Look
++		 * for the CPU with highest performance capacity.
++		 */
++		else if (fits < 0)
++			cpu_cap = capacity_orig_of(cpu) - thermal_load_avg(cpu_rq(cpu));
+ 
+-		if (cpu_cap > best_cap) {
++		/*
++		 * First, select cpu which fits better (-1 being better than 0).
++		 * Then, select the one with largest capacity at same level.
++		 */
++		if ((fits < best_fits) ||
++		    ((fits == best_fits) && (cpu_cap > best_cap))) {
+ 			best_cap = cpu_cap;
+ 			best_cpu = cpu;
++			best_fits = fits;
+ 		}
+ 	}
+ 
+@@ -6818,7 +6973,11 @@ static inline bool asym_fits_cpu(unsigned long util,
+ 				 int cpu)
+ {
+ 	if (sched_asym_cpucap_active())
+-		return util_fits_cpu(util, util_min, util_max, cpu);
++		/*
++		 * Return true only if the cpu fully fits the task requirements
++		 * which include the utilization but also the performance.
++		 */
++		return (util_fits_cpu(util, util_min, util_max, cpu) > 0);
+ 
+ 	return true;
+ }
+@@ -7185,6 +7344,9 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 	unsigned long p_util_max = uclamp_is_used() ? uclamp_eff_value(p, UCLAMP_MAX) : 1024;
+ 	struct root_domain *rd = this_rq()->rd;
+ 	int cpu, best_energy_cpu, target = -1;
++	int prev_fits = -1, best_fits = -1;
++	unsigned long best_thermal_cap = 0;
++	unsigned long prev_thermal_cap = 0;
+ 	struct sched_domain *sd;
+ 	struct perf_domain *pd;
+ 	struct energy_env eenv;
+@@ -7220,6 +7382,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 		unsigned long prev_spare_cap = 0;
+ 		int max_spare_cap_cpu = -1;
+ 		unsigned long base_energy;
++		int fits, max_fits = -1;
+ 
+ 		cpumask_and(cpus, perf_domain_span(pd), cpu_online_mask);
+ 
+@@ -7269,7 +7432,9 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 				util_min = max(rq_util_min, p_util_min);
+ 				util_max = max(rq_util_max, p_util_max);
+ 			}
+-			if (!util_fits_cpu(util, util_min, util_max, cpu))
++
++			fits = util_fits_cpu(util, util_min, util_max, cpu);
++			if (!fits)
+ 				continue;
+ 
+ 			lsub_positive(&cpu_cap, util);
+@@ -7277,7 +7442,9 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 			if (cpu == prev_cpu) {
+ 				/* Always use prev_cpu as a candidate. */
+ 				prev_spare_cap = cpu_cap;
+-			} else if (cpu_cap > max_spare_cap) {
++				prev_fits = fits;
++			} else if ((fits > max_fits) ||
++				   ((fits == max_fits) && (cpu_cap > max_spare_cap))) {
+ 				/*
+ 				 * Find the CPU with the maximum spare capacity
+ 				 * among the remaining CPUs in the performance
+@@ -7285,6 +7452,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 				 */
+ 				max_spare_cap = cpu_cap;
+ 				max_spare_cap_cpu = cpu;
++				max_fits = fits;
+ 			}
+ 		}
+ 
+@@ -7303,26 +7471,50 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 			if (prev_delta < base_energy)
+ 				goto unlock;
+ 			prev_delta -= base_energy;
++			prev_thermal_cap = cpu_thermal_cap;
+ 			best_delta = min(best_delta, prev_delta);
+ 		}
+ 
+ 		/* Evaluate the energy impact of using max_spare_cap_cpu. */
+ 		if (max_spare_cap_cpu >= 0 && max_spare_cap > prev_spare_cap) {
++			/* Current best energy cpu fits better */
++			if (max_fits < best_fits)
++				continue;
++
++			/*
++			 * Both don't fit performance (i.e. uclamp_min) but
++			 * best energy cpu has better performance.
++			 */
++			if ((max_fits < 0) &&
++			    (cpu_thermal_cap <= best_thermal_cap))
++				continue;
++
+ 			cur_delta = compute_energy(&eenv, pd, cpus, p,
+ 						   max_spare_cap_cpu);
+ 			/* CPU utilization has changed */
+ 			if (cur_delta < base_energy)
+ 				goto unlock;
+ 			cur_delta -= base_energy;
+-			if (cur_delta < best_delta) {
+-				best_delta = cur_delta;
+-				best_energy_cpu = max_spare_cap_cpu;
+-			}
++
++			/*
++			 * Both fit for the task but best energy cpu has lower
++			 * energy impact.
++			 */
++			if ((max_fits > 0) && (best_fits > 0) &&
++			    (cur_delta >= best_delta))
++				continue;
++
++			best_delta = cur_delta;
++			best_energy_cpu = max_spare_cap_cpu;
++			best_fits = max_fits;
++			best_thermal_cap = cpu_thermal_cap;
+ 		}
+ 	}
+ 	rcu_read_unlock();
+ 
+-	if (best_delta < prev_delta)
++	if ((best_fits > prev_fits) ||
++	    ((best_fits > 0) && (best_delta < prev_delta)) ||
++	    ((best_fits < 0) && (best_thermal_cap > prev_thermal_cap)))
+ 		target = best_energy_cpu;
+ 
+ 	return target;
+@@ -8822,16 +9014,73 @@ static unsigned long scale_rt_capacity(int cpu)
+ 
+ static void update_cpu_capacity(struct sched_domain *sd, int cpu)
+ {
++	unsigned long capacity_orig = arch_scale_cpu_capacity(cpu);
+ 	unsigned long capacity = scale_rt_capacity(cpu);
+ 	struct sched_group *sdg = sd->groups;
++	struct rq *rq = cpu_rq(cpu);
+ 
+-	cpu_rq(cpu)->cpu_capacity_orig = arch_scale_cpu_capacity(cpu);
++	rq->cpu_capacity_orig = capacity_orig;
+ 
+ 	if (!capacity)
+ 		capacity = 1;
+ 
+-	cpu_rq(cpu)->cpu_capacity = capacity;
+-	trace_sched_cpu_capacity_tp(cpu_rq(cpu));
++	rq->cpu_capacity = capacity;
++
++	/*
++	 * Detect if the performance domain is in capacity inversion state.
++	 *
++	 * Capacity inversion happens when another perf domain with equal or
++	 * lower capacity_orig_of() ends up having higher capacity than this
++	 * domain after subtracting thermal pressure.
++	 *
++	 * We only take into account thermal pressure in this detection as it's
++	 * the only metric that actually results in *real* reduction of
++	 * capacity due to performance points (OPPs) being dropped/become
++	 * unreachable due to thermal throttling.
++	 *
++	 * We assume:
++	 *   * That all cpus in a perf domain have the same capacity_orig
++	 *     (same uArch).
++	 *   * Thermal pressure will impact all cpus in this perf domain
++	 *     equally.
++	 */
++	if (static_branch_unlikely(&sched_asym_cpucapacity)) {
++		unsigned long inv_cap = capacity_orig - thermal_load_avg(rq);
++		struct perf_domain *pd = rcu_dereference(rq->rd->pd);
++
++		rq->cpu_capacity_inverted = 0;
++
++		for (; pd; pd = pd->next) {
++			struct cpumask *pd_span = perf_domain_span(pd);
++			unsigned long pd_cap_orig, pd_cap;
++
++			cpu = cpumask_any(pd_span);
++			pd_cap_orig = arch_scale_cpu_capacity(cpu);
++
++			if (capacity_orig < pd_cap_orig)
++				continue;
++
++			/*
++			 * handle the case of multiple perf domains have the
++			 * same capacity_orig but one of them is under higher
++			 * thermal pressure. We record it as capacity
++			 * inversion.
++			 */
++			if (capacity_orig == pd_cap_orig) {
++				pd_cap = pd_cap_orig - thermal_load_avg(cpu_rq(cpu));
++
++				if (pd_cap > inv_cap) {
++					rq->cpu_capacity_inverted = inv_cap;
++					break;
++				}
++			} else if (pd_cap_orig > inv_cap) {
++				rq->cpu_capacity_inverted = inv_cap;
++				break;
++			}
++		}
++	}
++
++	trace_sched_cpu_capacity_tp(rq);
+ 
+ 	sdg->sgc->capacity = capacity;
+ 	sdg->sgc->min_capacity = capacity;
+@@ -10059,24 +10308,23 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+ 	 */
+ 	update_sd_lb_stats(env, &sds);
+ 
+-	if (sched_energy_enabled()) {
+-		struct root_domain *rd = env->dst_rq->rd;
+-
+-		if (rcu_dereference(rd->pd) && !READ_ONCE(rd->overutilized))
+-			goto out_balanced;
+-	}
+-
+-	local = &sds.local_stat;
+-	busiest = &sds.busiest_stat;
+-
+ 	/* There is no busy sibling group to pull tasks from */
+ 	if (!sds.busiest)
+ 		goto out_balanced;
+ 
++	busiest = &sds.busiest_stat;
++
+ 	/* Misfit tasks should be dealt with regardless of the avg load */
+ 	if (busiest->group_type == group_misfit_task)
+ 		goto force_balance;
+ 
++	if (sched_energy_enabled()) {
++		struct root_domain *rd = env->dst_rq->rd;
++
++		if (rcu_dereference(rd->pd) && !READ_ONCE(rd->overutilized))
++			goto out_balanced;
++	}
++
+ 	/* ASYM feature bypasses nice load balance check */
+ 	if (busiest->group_type == group_asym_packing)
+ 		goto force_balance;
+@@ -10089,6 +10337,7 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+ 	if (busiest->group_type == group_imbalanced)
+ 		goto force_balance;
+ 
++	local = &sds.local_stat;
+ 	/*
+ 	 * If the local group is busier than the selected busiest group
+ 	 * don't try and pull any tasks.
+@@ -12398,6 +12647,11 @@ __init void init_sched_fair_class(void)
+ 	for_each_possible_cpu(i) {
+ 		zalloc_cpumask_var_node(&per_cpu(load_balance_mask, i), GFP_KERNEL, cpu_to_node(i));
+ 		zalloc_cpumask_var_node(&per_cpu(select_rq_mask,    i), GFP_KERNEL, cpu_to_node(i));
++
++#ifdef CONFIG_CFS_BANDWIDTH
++		INIT_CSD(&cpu_rq(i)->cfsb_csd, __cfsb_csd_unthrottle, cpu_rq(i));
++		INIT_LIST_HEAD(&cpu_rq(i)->cfsb_csd_list);
++#endif
+ 	}
+ 
+ 	open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
+diff --git a/kernel/sched/pelt.c b/kernel/sched/pelt.c
+index 0f3107682..036b0e2cd 100644
+--- a/kernel/sched/pelt.c
++++ b/kernel/sched/pelt.c
+@@ -467,3 +467,63 @@ int update_irq_load_avg(struct rq *rq, u64 running)
+ 	return ret;
+ }
+ #endif
++
++__read_mostly unsigned int sched_pelt_lshift;
++
++#ifdef CONFIG_SYSCTL
++static unsigned int sysctl_sched_pelt_multiplier = 1;
++
++int sched_pelt_multiplier(struct ctl_table *table, int write, void *buffer,
++			  size_t *lenp, loff_t *ppos)
++{
++	static DEFINE_MUTEX(mutex);
++	unsigned int old;
++	int ret;
++
++	mutex_lock(&mutex);
++	old = sysctl_sched_pelt_multiplier;
++	ret = proc_dointvec(table, write, buffer, lenp, ppos);
++	if (ret)
++		goto undo;
++	if (!write)
++		goto done;
++
++	switch (sysctl_sched_pelt_multiplier)  {
++	case 1:
++		fallthrough;
++	case 2:
++		fallthrough;
++	case 4:
++		WRITE_ONCE(sched_pelt_lshift,
++			   sysctl_sched_pelt_multiplier >> 1);
++		goto done;
++	default:
++		ret = -EINVAL;
++	}
++
++undo:
++	sysctl_sched_pelt_multiplier = old;
++done:
++	mutex_unlock(&mutex);
++
++	return ret;
++}
++
++static struct ctl_table sched_pelt_sysctls[] = {
++	{
++		.procname       = "sched_pelt_multiplier",
++		.data           = &sysctl_sched_pelt_multiplier,
++		.maxlen         = sizeof(unsigned int),
++		.mode           = 0644,
++		.proc_handler   = sched_pelt_multiplier,
++	},
++	{}
++};
++
++static int __init sched_pelt_sysctl_init(void)
++{
++	register_sysctl_init("kernel", sched_pelt_sysctls);
++	return 0;
++}
++late_initcall(sched_pelt_sysctl_init);
++#endif
+diff --git a/kernel/sched/pelt.h b/kernel/sched/pelt.h
+index 3a0e0dc28..9b35b5072 100644
+--- a/kernel/sched/pelt.h
++++ b/kernel/sched/pelt.h
+@@ -61,6 +61,14 @@ static inline void cfs_se_util_change(struct sched_avg *avg)
+ 	WRITE_ONCE(avg->util_est.enqueued, enqueued);
+ }
+ 
++static inline u64 rq_clock_task_mult(struct rq *rq)
++{
++	lockdep_assert_rq_held(rq);
++	assert_clock_updated(rq);
++
++	return rq->clock_task_mult;
++}
++
+ static inline u64 rq_clock_pelt(struct rq *rq)
+ {
+ 	lockdep_assert_rq_held(rq);
+@@ -72,7 +80,7 @@ static inline u64 rq_clock_pelt(struct rq *rq)
+ /* The rq is idle, we can sync to clock_task */
+ static inline void _update_idle_rq_clock_pelt(struct rq *rq)
+ {
+-	rq->clock_pelt  = rq_clock_task(rq);
++	rq->clock_pelt = rq_clock_task_mult(rq);
+ 
+ 	u64_u32_store(rq->clock_idle, rq_clock(rq));
+ 	/* Paired with smp_rmb in migrate_se_pelt_lag() */
+@@ -121,6 +129,27 @@ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
+ 	rq->clock_pelt += delta;
+ }
+ 
++extern unsigned int sched_pelt_lshift;
++
++/*
++ * absolute time   |1      |2      |3      |4      |5      |6      |
++ * @ mult = 1      --------****************--------****************-
++ * @ mult = 2      --------********----------------********---------
++ * @ mult = 4      --------****--------------------****-------------
++ * clock task mult
++ * @ mult = 2      |   |   |2  |3  |   |   |   |   |5  |6  |   |   |
++ * @ mult = 4      | | | | |2|3| | | | | | | | | | |5|6| | | | | | |
++ *
++ */
++static inline void update_rq_clock_task_mult(struct rq *rq, s64 delta)
++{
++	delta <<= READ_ONCE(sched_pelt_lshift);
++
++	rq->clock_task_mult += delta;
++
++	update_rq_clock_pelt(rq, delta);
++}
++
+ /*
+  * When rq becomes idle, we have to check if it has lost idle time
+  * because it was fully busy. A rq is fully used when the /Sum util_sum
+@@ -147,7 +176,7 @@ static inline void update_idle_rq_clock_pelt(struct rq *rq)
+ 	 * rq's clock_task.
+ 	 */
+ 	if (util_sum >= divider)
+-		rq->lost_idle_time += rq_clock_task(rq) - rq->clock_pelt;
++		rq->lost_idle_time += rq_clock_task_mult(rq) - rq->clock_pelt;
+ 
+ 	_update_idle_rq_clock_pelt(rq);
+ }
+@@ -218,13 +247,18 @@ update_irq_load_avg(struct rq *rq, u64 running)
+ 	return 0;
+ }
+ 
+-static inline u64 rq_clock_pelt(struct rq *rq)
++static inline u64 rq_clock_task_mult(struct rq *rq)
+ {
+ 	return rq_clock_task(rq);
+ }
+ 
++static inline u64 rq_clock_pelt(struct rq *rq)
++{
++	return rq_clock_task_mult(rq);
++}
++
+ static inline void
+-update_rq_clock_pelt(struct rq *rq, s64 delta) { }
++update_rq_clock_task_mult(struct rq *rq, s64 delta) { }
+ 
+ static inline void
+ update_idle_rq_clock_pelt(struct rq *rq) { }
+diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
+index 7f40d87e8..8ac8b81bf 100644
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@ -189,6 +189,7 @@ static void group_init(struct psi_group *group)
+ 	INIT_DELAYED_WORK(&group->avgs_work, psi_avgs_work);
+ 	mutex_init(&group->avgs_lock);
+ 	/* Init trigger-related members */
++	atomic_set(&group->poll_scheduled, 0);
+ 	mutex_init(&group->trigger_lock);
+ 	INIT_LIST_HEAD(&group->triggers);
+ 	group->poll_min_period = U32_MAX;
+@@ -242,6 +243,8 @@ static void get_recent_times(struct psi_group *group, int cpu,
+ 			     u32 *pchanged_states)
+ {
+ 	struct psi_group_cpu *groupc = per_cpu_ptr(group->pcpu, cpu);
++	int current_cpu = raw_smp_processor_id();
++	unsigned int tasks[NR_PSI_TASK_COUNTS];
+ 	u64 now, state_start;
+ 	enum psi_states s;
+ 	unsigned int seq;
+@@ -256,6 +259,8 @@ static void get_recent_times(struct psi_group *group, int cpu,
+ 		memcpy(times, groupc->times, sizeof(groupc->times));
+ 		state_mask = groupc->state_mask;
+ 		state_start = groupc->state_start;
++		if (cpu == current_cpu)
++			memcpy(tasks, groupc->tasks, sizeof(groupc->tasks));
+ 	} while (read_seqcount_retry(&groupc->seq, seq));
+ 
+ 	/* Calculate state time deltas against the previous snapshot */
+@@ -280,6 +285,28 @@ static void get_recent_times(struct psi_group *group, int cpu,
+ 		if (delta)
+ 			*pchanged_states |= (1 << s);
+ 	}
++
++	/*
++	 * When collect_percpu_times() from the avgs_work, we don't want to
++	 * re-arm avgs_work when all CPUs are IDLE. But the current CPU running
++	 * this avgs_work is never IDLE, cause avgs_work can't be shut off.
++	 * So for the current CPU, we need to re-arm avgs_work only when
++	 * (NR_RUNNING > 1 || NR_IOWAIT > 0 || NR_MEMSTALL > 0), for other CPUs
++	 * we can just check PSI_NONIDLE delta.
++	 */
++	if (current_work() == &group->avgs_work.work) {
++		bool reschedule;
++
++		if (cpu == current_cpu)
++			reschedule = tasks[NR_RUNNING] +
++				     tasks[NR_IOWAIT] +
++				     tasks[NR_MEMSTALL] > 1;
++		else
++			reschedule = *pchanged_states & (1 << PSI_NONIDLE);
++
++		if (reschedule)
++			*pchanged_states |= PSI_STATE_RESCHEDULE;
++	}
+ }
+ 
+ static void calc_avgs(unsigned long avg[3], int missed_periods,
+@@ -415,7 +442,6 @@ static void psi_avgs_work(struct work_struct *work)
+ 	struct delayed_work *dwork;
+ 	struct psi_group *group;
+ 	u32 changed_states;
+-	bool nonidle;
+ 	u64 now;
+ 
+ 	dwork = to_delayed_work(work);
+@@ -426,7 +452,6 @@ static void psi_avgs_work(struct work_struct *work)
+ 	now = sched_clock();
+ 
+ 	collect_percpu_times(group, PSI_AVGS, &changed_states);
+-	nonidle = changed_states & (1 << PSI_NONIDLE);
+ 	/*
+ 	 * If there is task activity, periodically fold the per-cpu
+ 	 * times and feed samples into the running averages. If things
+@@ -437,7 +462,7 @@ static void psi_avgs_work(struct work_struct *work)
+ 	if (now >= group->avg_next_update)
+ 		group->avg_next_update = update_averages(group, now);
+ 
+-	if (nonidle) {
++	if (changed_states & PSI_STATE_RESCHEDULE) {
+ 		schedule_delayed_work(dwork, nsecs_to_jiffies(
+ 				group->avg_next_update - now) + 1);
+ 	}
+@@ -565,18 +590,17 @@ static u64 update_triggers(struct psi_group *group, u64 now)
+ 	return now + group->poll_min_period;
+ }
+ 
+-/* Schedule polling if it's not already scheduled. */
+-static void psi_schedule_poll_work(struct psi_group *group, unsigned long delay)
++/* Schedule polling if it's not already scheduled or forced. */
++static void psi_schedule_poll_work(struct psi_group *group, unsigned long delay,
++				   bool force)
+ {
+ 	struct task_struct *task;
+ 
+ 	/*
+-	 * Do not reschedule if already scheduled.
+-	 * Possible race with a timer scheduled after this check but before
+-	 * mod_timer below can be tolerated because group->polling_next_update
+-	 * will keep updates on schedule.
++	 * atomic_xchg should be called even when !force to provide a
++	 * full memory barrier (see the comment inside psi_poll_work).
+ 	 */
+-	if (timer_pending(&group->poll_timer))
++	if (atomic_xchg(&group->poll_scheduled, 1) && !force)
+ 		return;
+ 
+ 	rcu_read_lock();
+@@ -588,12 +612,15 @@ static void psi_schedule_poll_work(struct psi_group *group, unsigned long delay)
+ 	 */
+ 	if (likely(task))
+ 		mod_timer(&group->poll_timer, jiffies + delay);
++	else
++		atomic_set(&group->poll_scheduled, 0);
+ 
+ 	rcu_read_unlock();
+ }
+ 
+ static void psi_poll_work(struct psi_group *group)
+ {
++	bool force_reschedule = false;
+ 	u32 changed_states;
+ 	u64 now;
+ 
+@@ -601,6 +628,43 @@ static void psi_poll_work(struct psi_group *group)
+ 
+ 	now = sched_clock();
+ 
++	if (now > group->polling_until) {
++		/*
++		 * We are either about to start or might stop polling if no
++		 * state change was recorded. Resetting poll_scheduled leaves
++		 * a small window for psi_group_change to sneak in and schedule
++		 * an immediate poll_work before we get to rescheduling. One
++		 * potential extra wakeup at the end of the polling window
++		 * should be negligible and polling_next_update still keeps
++		 * updates correctly on schedule.
++		 */
++		atomic_set(&group->poll_scheduled, 0);
++		/*
++		 * A task change can race with the poll worker that is supposed to
++		 * report on it. To avoid missing events, ensure ordering between
++		 * poll_scheduled and the task state accesses, such that if the poll
++		 * worker misses the state update, the task change is guaranteed to
++		 * reschedule the poll worker:
++		 *
++		 * poll worker:
++		 *   atomic_set(poll_scheduled, 0)
++		 *   smp_mb()
++		 *   LOAD states
++		 *
++		 * task change:
++		 *   STORE states
++		 *   if atomic_xchg(poll_scheduled, 1) == 0:
++		 *     schedule poll worker
++		 *
++		 * The atomic_xchg() implies a full barrier.
++		 */
++		smp_mb();
++	} else {
++		/* Polling window is not over, keep rescheduling */
++		force_reschedule = true;
++	}
++
++
+ 	collect_percpu_times(group, PSI_POLL, &changed_states);
+ 
+ 	if (changed_states & group->poll_states) {
+@@ -626,7 +690,8 @@ static void psi_poll_work(struct psi_group *group)
+ 		group->polling_next_update = update_triggers(group, now);
+ 
+ 	psi_schedule_poll_work(group,
+-		nsecs_to_jiffies(group->polling_next_update - now) + 1);
++		nsecs_to_jiffies(group->polling_next_update - now) + 1,
++		force_reschedule);
+ 
+ out:
+ 	mutex_unlock(&group->trigger_lock);
+@@ -787,7 +852,7 @@ static void psi_group_change(struct psi_group *group, int cpu,
+ 	write_seqcount_end(&groupc->seq);
+ 
+ 	if (state_mask & group->poll_states)
+-		psi_schedule_poll_work(group, 1);
++		psi_schedule_poll_work(group, 1, false);
+ 
+ 	if (wake_clock && !delayed_work_pending(&group->avgs_work))
+ 		schedule_delayed_work(&group->avgs_work, PSI_FREQ);
+@@ -941,7 +1006,7 @@ void psi_account_irqtime(struct task_struct *task, u32 delta)
+ 		write_seqcount_end(&groupc->seq);
+ 
+ 		if (group->poll_states & (1 << PSI_IRQ_FULL))
+-			psi_schedule_poll_work(group, 1);
++			psi_schedule_poll_work(group, 1, false);
+ 	} while ((group = group->parent));
+ }
+ #endif
+@@ -1327,6 +1392,7 @@ void psi_trigger_destroy(struct psi_trigger *t)
+ 		 * can no longer be found through group->poll_task.
+ 		 */
+ 		kthread_stop(task_to_destroy);
++		atomic_set(&group->poll_scheduled, 0);
+ 	}
+ 	kfree(t);
+ }
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index ed2a47e4d..152347c43 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1595,6 +1595,32 @@ static void yield_task_rt(struct rq *rq)
+ #ifdef CONFIG_SMP
+ static int find_lowest_rq(struct task_struct *task);
+ 
++#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
++/*
++ * Return whether the given cpu is currently non-preemptible
++ * while handling a potentially long softirq, or if the current
++ * task is likely to block preemptions soon because it is a
++ * ksoftirq thread that is handling softirqs.
++ */
++static bool cpu_busy_with_softirqs(int cpu)
++{
++	u32 softirqs = per_cpu(active_softirqs, cpu) |
++		       __cpu_softirq_pending(cpu);
++
++	return softirqs & LONG_SOFTIRQ_MASK;
++}
++#else
++static bool cpu_busy_with_softirqs(int cpu)
++{
++	return false;
++}
++#endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
++
++static bool rt_task_fits_cpu(struct task_struct *p, int cpu)
++{
++	return rt_task_fits_capacity(p, cpu) && !cpu_busy_with_softirqs(cpu);
++}
++
+ static int
+ select_task_rq_rt(struct task_struct *p, int cpu, int flags)
+ {
+@@ -1633,22 +1659,24 @@ select_task_rq_rt(struct task_struct *p, int cpu, int flags)
+ 	 * This test is optimistic, if we get it wrong the load-balancer
+ 	 * will have to sort it out.
+ 	 *
+-	 * We take into account the capacity of the CPU to ensure it fits the
+-	 * requirement of the task - which is only important on heterogeneous
+-	 * systems like big.LITTLE.
++	 * We use rt_task_fits_cpu() to evaluate if the CPU is busy with
++	 * potentially long-running softirq work, as well as take into
++	 * account the capacity of the CPU to ensure it fits the
++	 * requirement of the task - which is only important on
++	 * heterogeneous systems like big.LITTLE.
+ 	 */
+ 	test = curr &&
+ 	       unlikely(rt_task(curr)) &&
+ 	       (curr->nr_cpus_allowed < 2 || curr->prio <= p->prio);
+ 
+-	if (test || !rt_task_fits_capacity(p, cpu)) {
++	if (test || !rt_task_fits_cpu(p, cpu)) {
+ 		int target = find_lowest_rq(p);
+ 
+ 		/*
+ 		 * Bail out if we were forcing a migration to find a better
+ 		 * fitting CPU but our search failed.
+ 		 */
+-		if (!test && target != -1 && !rt_task_fits_capacity(p, target))
++		if (!test && target != -1 && !rt_task_fits_cpu(p, target))
+ 			goto out_unlock;
+ 
+ 		/*
+@@ -1890,14 +1918,17 @@ static int find_lowest_rq(struct task_struct *task)
+ 		return -1; /* No other targets possible */
+ 
+ 	/*
+-	 * If we're on asym system ensure we consider the different capacities
+-	 * of the CPUs when searching for the lowest_mask.
++	 * If we're using the softirq optimization or if we are
++	 * on asym system, ensure we consider the softirq processing
++	 * or different capacities of the CPUs when searching for the
++	 * lowest_mask.
+ 	 */
+-	if (sched_asym_cpucap_active()) {
++	if (IS_ENABLED(CONFIG_RT_SOFTIRQ_AWARE_SCHED) ||
++	    sched_asym_cpucap_active()) {
+ 
+ 		ret = cpupri_find_fitness(&task_rq(task)->rd->cpupri,
+ 					  task, lowest_mask,
+-					  rt_task_fits_capacity);
++					  rt_task_fits_cpu);
+ 	} else {
+ 
+ 		ret = cpupri_find(&task_rq(task)->rd->cpupri,
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index d6d488e8e..96dc9d4ef 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -645,6 +645,9 @@ struct cfs_rq {
+ 	int			throttled;
+ 	int			throttle_count;
+ 	struct list_head	throttled_list;
++#ifdef CONFIG_SMP
++	struct list_head	throttled_csd_list;
++#endif
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ };
+@@ -1015,6 +1018,7 @@ struct rq {
+ 	u64			clock;
+ 	/* Ensure that all clocks are in the same cache line */
+ 	u64			clock_task ____cacheline_aligned;
++	u64			clock_task_mult;
+ 	u64			clock_pelt;
+ 	unsigned long		lost_idle_time;
+ 	u64			clock_pelt_idle;
+@@ -1041,6 +1045,7 @@ struct rq {
+ 
+ 	unsigned long		cpu_capacity;
+ 	unsigned long		cpu_capacity_orig;
++	unsigned long		cpu_capacity_inverted;
+ 
+ 	struct balance_callback *balance_callback;
+ 
+@@ -1150,6 +1155,14 @@ struct rq {
+ 	unsigned int		core_forceidle_occupation;
+ 	u64			core_forceidle_start;
+ #endif
++
++	/* Scratch cpumask to be temporarily used under rq_lock */
++	cpumask_var_t		scratch_mask;
++
++#if defined(CONFIG_CFS_BANDWIDTH) && defined(CONFIG_SMP)
++	call_single_data_t	cfsb_csd;
++	struct list_head	cfsb_csd_list;
++#endif
+ };
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+@@ -1877,6 +1890,13 @@ static inline void dirty_sched_domain_sysctl(int cpu)
+ #endif
+ 
+ extern int sched_update_scaling(void);
++
++static inline const struct cpumask *task_user_cpus(struct task_struct *p)
++{
++	if (!p->user_cpus_ptr)
++		return cpu_possible_mask; /* &init_task.cpus_mask */
++	return p->user_cpus_ptr;
++}
+ #endif /* CONFIG_SMP */
+ 
+ #include "stats.h"
+@@ -2144,6 +2164,12 @@ extern const u32		sched_prio_to_wmult[40];
+ 
+ #define RETRY_TASK		((void *)-1UL)
+ 
++struct affinity_context {
++	const struct cpumask *new_mask;
++	struct cpumask *user_mask;
++	unsigned int flags;
++};
++
+ struct sched_class {
+ 
+ #ifdef CONFIG_UCLAMP_TASK
+@@ -2172,9 +2198,7 @@ struct sched_class {
+ 
+ 	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
+ 
+-	void (*set_cpus_allowed)(struct task_struct *p,
+-				 const struct cpumask *newmask,
+-				 u32 flags);
++	void (*set_cpus_allowed)(struct task_struct *p, struct affinity_context *ctx);
+ 
+ 	void (*rq_online)(struct rq *rq);
+ 	void (*rq_offline)(struct rq *rq);
+@@ -2285,7 +2309,7 @@ extern void update_group_capacity(struct sched_domain *sd, int cpu);
+ 
+ extern void trigger_load_balance(struct rq *rq);
+ 
+-extern void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
++extern void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx);
+ 
+ static inline struct task_struct *get_push_task(struct rq *rq)
+ {
+@@ -2878,6 +2902,24 @@ static inline unsigned long capacity_orig_of(int cpu)
+ 	return cpu_rq(cpu)->cpu_capacity_orig;
+ }
+ 
++/*
++ * Returns inverted capacity if the CPU is in capacity inversion state.
++ * 0 otherwise.
++ *
++ * Capacity inversion detection only considers thermal impact where actual
++ * performance points (OPPs) gets dropped.
++ *
++ * Capacity inversion state happens when another performance domain that has
++ * equal or lower capacity_orig_of() becomes effectively larger than the perf
++ * domain this CPU belongs to due to thermal pressure throttling it hard.
++ *
++ * See comment in update_cpu_capacity().
++ */
++static inline unsigned long cpu_in_capacity_inversion(int cpu)
++{
++	return cpu_rq(cpu)->cpu_capacity_inverted;
++}
++
+ /**
+  * enum cpu_util_type - CPU utilization type
+  * @FREQUENCY_UTIL:	Utilization used to select frequency
+diff --git a/kernel/sched/stats.h b/kernel/sched/stats.h
+index 84a188913..38f3698f5 100644
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -128,11 +128,9 @@ static inline void psi_enqueue(struct task_struct *p, bool wakeup)
+ 	if (p->in_memstall)
+ 		set |= TSK_MEMSTALL_RUNNING;
+ 
+-	if (!wakeup || p->sched_psi_wake_requeue) {
++	if (!wakeup) {
+ 		if (p->in_memstall)
+ 			set |= TSK_MEMSTALL;
+-		if (p->sched_psi_wake_requeue)
+-			p->sched_psi_wake_requeue = 0;
+ 	} else {
+ 		if (p->in_iowait)
+ 			clear |= TSK_IOWAIT;
+@@ -143,8 +141,6 @@ static inline void psi_enqueue(struct task_struct *p, bool wakeup)
+ 
+ static inline void psi_dequeue(struct task_struct *p, bool sleep)
+ {
+-	int clear = TSK_RUNNING;
+-
+ 	if (static_branch_likely(&psi_disabled))
+ 		return;
+ 
+@@ -157,10 +153,7 @@ static inline void psi_dequeue(struct task_struct *p, bool sleep)
+ 	if (sleep)
+ 		return;
+ 
+-	if (p->in_memstall)
+-		clear |= (TSK_MEMSTALL | TSK_MEMSTALL_RUNNING);
+-
+-	psi_task_change(p, clear, 0);
++	psi_task_change(p, p->psi_flags, 0);
+ }
+ 
+ static inline void psi_ttwu_dequeue(struct task_struct *p)
+@@ -172,19 +165,12 @@ static inline void psi_ttwu_dequeue(struct task_struct *p)
+ 	 * deregister its sleep-persistent psi states from the old
+ 	 * queue, and let psi_enqueue() know it has to requeue.
+ 	 */
+-	if (unlikely(p->in_iowait || p->in_memstall)) {
++	if (unlikely(p->psi_flags)) {
+ 		struct rq_flags rf;
+ 		struct rq *rq;
+-		int clear = 0;
+-
+-		if (p->in_iowait)
+-			clear |= TSK_IOWAIT;
+-		if (p->in_memstall)
+-			clear |= TSK_MEMSTALL;
+ 
+ 		rq = __task_rq_lock(p, &rf);
+-		psi_task_change(p, clear, 0);
+-		p->sched_psi_wake_requeue = 1;
++		psi_task_change(p, p->psi_flags, 0);
+ 		__task_rq_unlock(rq, &rf);
+ 	}
+ }
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 8739c2a5a..dea9fa39e 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -578,7 +578,7 @@ static int init_rootdomain(struct root_domain *rd)
+  */
+ struct root_domain def_root_domain;
+ 
+-void init_defrootdomain(void)
++void __init init_defrootdomain(void)
+ {
+ 	init_rootdomain(&def_root_domain);
+ 
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index c8a6913c0..5db2afd0b 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -60,6 +60,21 @@ static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp
+ 
+ DEFINE_PER_CPU(struct task_struct *, ksoftirqd);
+ 
++#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
++/*
++ * active_softirqs -- per cpu, a mask of softirqs that are being handled,
++ * with the expectation that approximate answers are acceptable and therefore
++ * no synchronization.
++ */
++DEFINE_PER_CPU(u32, active_softirqs);
++static inline void set_active_softirqs(u32 pending)
++{
++	__this_cpu_write(active_softirqs, pending);
++}
++#else /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
++static inline void set_active_softirqs(u32 pending) {};
++#endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
++
+ const char * const softirq_to_name[NR_SOFTIRQS] = {
+ 	"HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL",
+ 	"TASKLET", "SCHED", "HRTIMER", "RCU"
+@@ -80,6 +95,7 @@ static void wakeup_softirqd(void)
+ 		wake_up_process(tsk);
+ }
+ 
++#ifndef CONFIG_RT_SOFTIRQ_AWARE_SCHED
+ /*
+  * If ksoftirqd is scheduled, we do not want to process pending softirqs
+  * right now. Let ksoftirqd handle this at its own rate, to get fairness,
+@@ -94,6 +110,9 @@ static bool ksoftirqd_running(unsigned long pending)
+ 		return false;
+ 	return tsk && task_is_running(tsk) && !__kthread_should_park(tsk);
+ }
++#else
++#define ksoftirqd_running(pending) (false)
++#endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
+ 
+ #ifdef CONFIG_TRACE_IRQFLAGS
+ DEFINE_PER_CPU(int, hardirqs_enabled);
+@@ -525,6 +544,21 @@ static inline bool lockdep_softirq_start(void) { return false; }
+ static inline void lockdep_softirq_end(bool in_hardirq) { }
+ #endif
+ 
++#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
++static __u32 softirq_deferred_for_rt(__u32 *pending)
++{
++	__u32 deferred = 0;
++
++	if (rt_task(current)) {
++		deferred = *pending & LONG_SOFTIRQ_MASK;
++		*pending &= ~LONG_SOFTIRQ_MASK;
++	}
++	return deferred;
++}
++#else
++#define softirq_deferred_for_rt(x) (0)
++#endif
++
+ asmlinkage __visible void __softirq_entry __do_softirq(void)
+ {
+ 	unsigned long end = jiffies + MAX_SOFTIRQ_TIME;
+@@ -532,6 +566,7 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
+ 	int max_restart = MAX_SOFTIRQ_RESTART;
+ 	struct softirq_action *h;
+ 	bool in_hardirq;
++	__u32 deferred;
+ 	__u32 pending;
+ 	int softirq_bit;
+ 
+@@ -543,14 +578,17 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
+ 	current->flags &= ~PF_MEMALLOC;
+ 
+ 	pending = local_softirq_pending();
++	deferred = softirq_deferred_for_rt(&pending);
+ 
+ 	softirq_handle_begin();
++
+ 	in_hardirq = lockdep_softirq_start();
+ 	account_softirq_enter(current);
+ 
+ restart:
+ 	/* Reset the pending bitmask before enabling irqs */
+-	set_softirq_pending(0);
++	set_softirq_pending(deferred);
++	set_active_softirqs(pending);
+ 
+ 	local_irq_enable();
+ 
+@@ -580,6 +618,7 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
+ 		pending >>= softirq_bit;
+ 	}
+ 
++	set_active_softirqs(0);
+ 	if (!IS_ENABLED(CONFIG_PREEMPT_RT) &&
+ 	    __this_cpu_read(ksoftirqd) == current)
+ 		rcu_softirq_qs();
+@@ -587,13 +626,16 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
+ 	local_irq_disable();
+ 
+ 	pending = local_softirq_pending();
++	deferred = softirq_deferred_for_rt(&pending);
++
+ 	if (pending) {
+ 		if (time_before(jiffies, end) && !need_resched() &&
+ 		    --max_restart)
+ 			goto restart;
++	}
+ 
++	if (pending | deferred)
+ 		wakeup_softirqd();
+-	}
+ 
+ 	account_softirq_exit(current);
+ 	lockdep_softirq_end(in_hardirq);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
