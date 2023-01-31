@@ -1,0 +1,221 @@
+From 80bd08e81b8f256a687409025c7e03a058d5714d Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kent.overstreet@linux.dev>
+Date: Fri, 4 Nov 2022 18:23:15 -0400
+Subject: [PATCH 22/51] mm: percpu: Alloc tagging
+
+Signed-off-by: Kent Overstreet <kent.overstreet@linux.dev>
+---
+ include/linux/percpu.h | 25 +++++++++---
+ mm/percpu-internal.h   |  5 ++-
+ mm/percpu.c            | 91 +++++++++++++++---------------------------
+ 3 files changed, 57 insertions(+), 64 deletions(-)
+
+diff --git a/include/linux/percpu.h b/include/linux/percpu.h
+index 1338ea2aa..84c41fd32 100644
+--- a/include/linux/percpu.h
++++ b/include/linux/percpu.h
+@@ -2,6 +2,7 @@
+ #ifndef __LINUX_PERCPU_H
+ #define __LINUX_PERCPU_H
+ 
++#include <linux/alloc_tag.h>
+ #include <linux/mmdebug.h>
+ #include <linux/preempt.h>
+ #include <linux/smp.h>
+@@ -116,7 +117,6 @@ extern int __init pcpu_page_first_chunk(size_t reserved_size,
+ 				pcpu_fc_cpu_to_node_fn_t cpu_to_nd_fn);
+ #endif
+ 
+-extern void __percpu *__alloc_reserved_percpu(size_t size, size_t align) __alloc_size(1);
+ extern bool __is_kernel_percpu_address(unsigned long addr, unsigned long *can_addr);
+ extern bool is_kernel_percpu_address(unsigned long addr);
+ 
+@@ -124,10 +124,22 @@ extern bool is_kernel_percpu_address(unsigned long addr);
+ extern void __init setup_per_cpu_areas(void);
+ #endif
+ 
+-extern void __percpu *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp) __alloc_size(1);
+-extern void __percpu *__alloc_percpu(size_t size, size_t align) __alloc_size(1);
+-extern void free_percpu(void __percpu *__pdata);
+-extern phys_addr_t per_cpu_ptr_to_phys(void *addr);
++extern void __percpu *__pcpu_alloc(size_t size, size_t align, bool reserved,
++				   gfp_t gfp) __alloc_size(1);
++
++#define pcpu_alloc(_size, _align, _reserved, _gfp)			\
++({									\
++	void __percpu *_res;						\
++	DEFINE_ALLOC_TAG(_alloc_tag, _old);				\
++									\
++	_res = __pcpu_alloc(_size, _align, _reserved, _gfp);		\
++	alloc_tag_restore(&_alloc_tag, _old);				\
++	_res;								\
++})
++
++#define __alloc_percpu_gfp(_size, _align, _gfp)	pcpu_alloc(_size, _align, false, _gfp)
++#define __alloc_percpu(_size, _align)		pcpu_alloc(_size, _align, false, GFP_KERNEL)
++#define __alloc_reserved_percpu(_size, _align)	pcpu_alloc(_size, _align, true, GFP_KERNEL)
+ 
+ #define alloc_percpu_gfp(type, gfp)					\
+ 	(typeof(type) __percpu *)__alloc_percpu_gfp(sizeof(type),	\
+@@ -136,6 +148,9 @@ extern phys_addr_t per_cpu_ptr_to_phys(void *addr);
+ 	(typeof(type) __percpu *)__alloc_percpu(sizeof(type),		\
+ 						__alignof__(type))
+ 
++extern void free_percpu(void __percpu *__pdata);
++extern phys_addr_t per_cpu_ptr_to_phys(void *addr);
++
+ extern unsigned long pcpu_nr_pages(void);
+ 
+ #endif /* __LINUX_PERCPU_H */
+diff --git a/mm/percpu-internal.h b/mm/percpu-internal.h
+index 510f6c55d..1c9dc97de 100644
+--- a/mm/percpu-internal.h
++++ b/mm/percpu-internal.h
+@@ -35,9 +35,12 @@ struct pcpuobj_ext {
+ #ifdef CONFIG_MEMCG_KMEM
+ 	struct obj_cgroup	*cgroup;
+ #endif
++#ifdef CONFIG_ALLOC_TAGGING
++	union codetag_ref	tag;
++#endif
+ };
+ 
+-#ifdef CONFIG_MEMCG_KMEM
++#if defined(CONFIG_MEMCG_KMEM) || defined(CONFIG_ALLOC_TAGGING)
+ #define NEED_PCPUOBJ_EXT
+ #endif
+ 
+diff --git a/mm/percpu.c b/mm/percpu.c
+index 578202671..377870ff2 100644
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@ -1701,8 +1701,33 @@ static void pcpu_memcg_free_hook(struct pcpu_chunk *chunk, int off, size_t size)
+ }
+ #endif /* CONFIG_MEMCG_KMEM */
+ 
++#ifdef CONFIG_ALLOC_TAGGING
++static void pcpu_alloc_tag_alloc_hook(struct pcpu_chunk *chunk, int off,
++				      size_t size)
++{
++	if (likely(chunk->obj_exts))
++		alloc_tag_add(&chunk->obj_exts[off >> PCPU_MIN_ALLOC_SHIFT].tag,
++			      current->alloc_tag, size);
++}
++
++static void pcpu_alloc_tag_free_hook(struct pcpu_chunk *chunk, int off, size_t size)
++{
++	if (likely(chunk->obj_exts))
++		alloc_tag_sub(&chunk->obj_exts[off >> PCPU_MIN_ALLOC_SHIFT].tag, size);
++}
++#else
++static void pcpu_alloc_tag_alloc_hook(struct pcpu_chunk *chunk, int off,
++				      size_t size)
++{
++}
++
++static void pcpu_alloc_tag_free_hook(struct pcpu_chunk *chunk, int off, size_t size)
++{
++}
++#endif
++
+ /**
+- * pcpu_alloc - the percpu allocator
++ * __pcpu_alloc - the percpu allocator
+  * @size: size of area to allocate in bytes
+  * @align: alignment of area (max PAGE_SIZE)
+  * @reserved: allocate from the reserved chunk if available
+@@ -1716,8 +1741,8 @@ static void pcpu_memcg_free_hook(struct pcpu_chunk *chunk, int off, size_t size)
+  * RETURNS:
+  * Percpu pointer to the allocated area on success, NULL on failure.
+  */
+-static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+-				 gfp_t gfp)
++void __percpu *__pcpu_alloc(size_t size, size_t align, bool reserved,
++			    gfp_t gfp)
+ {
+ 	gfp_t pcpu_gfp;
+ 	bool is_atomic;
+@@ -1883,6 +1908,8 @@ static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+ 
+ 	pcpu_memcg_post_alloc_hook(objcg, chunk, off, size);
+ 
++	pcpu_alloc_tag_alloc_hook(chunk, off, size);
++
+ 	return ptr;
+ 
+ fail_unlock:
+@@ -1909,61 +1936,7 @@ static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+ 
+ 	return NULL;
+ }
+-
+-/**
+- * __alloc_percpu_gfp - allocate dynamic percpu area
+- * @size: size of area to allocate in bytes
+- * @align: alignment of area (max PAGE_SIZE)
+- * @gfp: allocation flags
+- *
+- * Allocate zero-filled percpu area of @size bytes aligned at @align.  If
+- * @gfp doesn't contain %GFP_KERNEL, the allocation doesn't block and can
+- * be called from any context but is a lot more likely to fail. If @gfp
+- * has __GFP_NOWARN then no warning will be triggered on invalid or failed
+- * allocation requests.
+- *
+- * RETURNS:
+- * Percpu pointer to the allocated area on success, NULL on failure.
+- */
+-void __percpu *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp)
+-{
+-	return pcpu_alloc(size, align, false, gfp);
+-}
+-EXPORT_SYMBOL_GPL(__alloc_percpu_gfp);
+-
+-/**
+- * __alloc_percpu - allocate dynamic percpu area
+- * @size: size of area to allocate in bytes
+- * @align: alignment of area (max PAGE_SIZE)
+- *
+- * Equivalent to __alloc_percpu_gfp(size, align, %GFP_KERNEL).
+- */
+-void __percpu *__alloc_percpu(size_t size, size_t align)
+-{
+-	return pcpu_alloc(size, align, false, GFP_KERNEL);
+-}
+-EXPORT_SYMBOL_GPL(__alloc_percpu);
+-
+-/**
+- * __alloc_reserved_percpu - allocate reserved percpu area
+- * @size: size of area to allocate in bytes
+- * @align: alignment of area (max PAGE_SIZE)
+- *
+- * Allocate zero-filled percpu area of @size bytes aligned at @align
+- * from reserved percpu area if arch has set it up; otherwise,
+- * allocation is served from the same dynamic area.  Might sleep.
+- * Might trigger writeouts.
+- *
+- * CONTEXT:
+- * Does GFP_KERNEL allocation.
+- *
+- * RETURNS:
+- * Percpu pointer to the allocated area on success, NULL on failure.
+- */
+-void __percpu *__alloc_reserved_percpu(size_t size, size_t align)
+-{
+-	return pcpu_alloc(size, align, true, GFP_KERNEL);
+-}
++EXPORT_SYMBOL_GPL(__pcpu_alloc);
+ 
+ /**
+  * pcpu_balance_free - manage the amount of free chunks
+@@ -2273,6 +2246,8 @@ void free_percpu(void __percpu *ptr)
+ 
+ 	size = pcpu_free_area(chunk, off);
+ 
++	pcpu_alloc_tag_free_hook(chunk, off, size);
++
+ 	pcpu_memcg_free_hook(chunk, off, size);
+ 
+ 	/*
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

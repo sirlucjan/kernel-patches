@@ -1,0 +1,231 @@
+From 5013acccbd1015f25eeb1853e28f38e20f15e146 Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Sun, 31 Jul 2022 11:22:55 -0700
+Subject: [PATCH 25/51] move stack capture functionality into a separate
+ function for reuse
+
+Make save_stack() function part of stackdepot API to be used outside of
+page_owner. Also rename task_struct's in_page_owner to in_capture_stack
+flag to better convey the wider use of this flag.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ include/linux/sched.h      |  6 ++--
+ include/linux/stackdepot.h |  3 ++
+ lib/stackdepot.c           | 68 ++++++++++++++++++++++++++++++++++++++
+ mm/page_owner.c            | 52 ++---------------------------
+ 4 files changed, 77 insertions(+), 52 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 017173a34..a1c5e395a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -940,9 +940,9 @@ struct task_struct {
+ 	/* Stalled due to lack of memory */
+ 	unsigned			in_memstall:1;
+ #endif
+-#ifdef CONFIG_PAGE_OWNER
+-	/* Used by page_owner=on to detect recursion in page tracking. */
+-	unsigned			in_page_owner:1;
++#ifdef CONFIG_STACKDEPOT
++	/* Used by stack_depot_capture_stack to detect recursion. */
++	unsigned			in_capture_stack:1;
+ #endif
+ #ifdef CONFIG_EVENTFD
+ 	/* Recursion prevention for eventfd_signal() */
+diff --git a/include/linux/stackdepot.h b/include/linux/stackdepot.h
+index 9ca7798d7..bff66ca49 100644
+--- a/include/linux/stackdepot.h
++++ b/include/linux/stackdepot.h
+@@ -72,4 +72,7 @@ int stack_depot_snprint(depot_stack_handle_t handle, char *buf, size_t size,
+ 
+ void stack_depot_print(depot_stack_handle_t stack);
+ 
++bool stack_depot_capture_init(void);
++depot_stack_handle_t stack_depot_capture_stack(gfp_t flags);
++
+ #endif
+diff --git a/lib/stackdepot.c b/lib/stackdepot.c
+index 79e894cf8..72ed07141 100644
+--- a/lib/stackdepot.c
++++ b/lib/stackdepot.c
+@@ -533,3 +533,71 @@ depot_stack_handle_t stack_depot_save(unsigned long *entries,
+ 	return __stack_depot_save(entries, nr_entries, 0, alloc_flags, true);
+ }
+ EXPORT_SYMBOL_GPL(stack_depot_save);
++
++static depot_stack_handle_t recursion_handle;
++static depot_stack_handle_t failure_handle;
++
++static __always_inline depot_stack_handle_t create_custom_stack(void)
++{
++	unsigned long entries[4];
++	unsigned int nr_entries;
++
++	nr_entries = stack_trace_save(entries, ARRAY_SIZE(entries), 0);
++	return stack_depot_save(entries, nr_entries, GFP_KERNEL);
++}
++
++static noinline void register_recursion_stack(void)
++{
++	recursion_handle = create_custom_stack();
++}
++
++static noinline void register_failure_stack(void)
++{
++	failure_handle = create_custom_stack();
++}
++
++bool stack_depot_capture_init(void)
++{
++	static DEFINE_MUTEX(stack_depot_capture_init_mutex);
++	static bool utility_stacks_ready;
++
++	mutex_lock(&stack_depot_capture_init_mutex);
++	if (!utility_stacks_ready) {
++		register_recursion_stack();
++		register_failure_stack();
++		utility_stacks_ready = true;
++	}
++	mutex_unlock(&stack_depot_capture_init_mutex);
++
++	return utility_stacks_ready;
++}
++
++/* TODO: teach stack_depot_capture_stack to use off stack temporal storage */
++#define CAPTURE_STACK_DEPTH (16)
++
++depot_stack_handle_t stack_depot_capture_stack(gfp_t flags)
++{
++	unsigned long entries[CAPTURE_STACK_DEPTH];
++	depot_stack_handle_t handle;
++	unsigned int nr_entries;
++
++	/*
++	 * Avoid recursion.
++	 *
++	 * Sometimes page metadata allocation tracking requires more
++	 * memory to be allocated:
++	 * - when new stack trace is saved to stack depot
++	 * - when backtrace itself is calculated (ia64)
++	 */
++	if (current->in_capture_stack)
++		return recursion_handle;
++	current->in_capture_stack = 1;
++
++	nr_entries = stack_trace_save(entries, ARRAY_SIZE(entries), 2);
++	handle = stack_depot_save(entries, nr_entries, flags);
++	if (!handle)
++		handle = failure_handle;
++
++	current->in_capture_stack = 0;
++	return handle;
++}
+diff --git a/mm/page_owner.c b/mm/page_owner.c
+index 8f99081c7..d740f36ae 100644
+--- a/mm/page_owner.c
++++ b/mm/page_owner.c
+@@ -15,12 +15,6 @@
+ 
+ #include "internal.h"
+ 
+-/*
+- * TODO: teach PAGE_OWNER_STACK_DEPTH (__dump_page_owner and save_stack)
+- * to use off stack temporal storage
+- */
+-#define PAGE_OWNER_STACK_DEPTH (16)
+-
+ struct page_owner {
+ 	unsigned short order;
+ 	short last_migrate_reason;
+@@ -37,8 +31,6 @@ struct page_owner {
+ static bool page_owner_enabled __initdata;
+ DEFINE_STATIC_KEY_FALSE(page_owner_inited);
+ 
+-static depot_stack_handle_t dummy_handle;
+-static depot_stack_handle_t failure_handle;
+ static depot_stack_handle_t early_handle;
+ 
+ static void init_early_allocated_pages(void);
+@@ -68,16 +60,6 @@ static __always_inline depot_stack_handle_t create_dummy_stack(void)
+ 	return stack_depot_save(entries, nr_entries, GFP_KERNEL);
+ }
+ 
+-static noinline void register_dummy_stack(void)
+-{
+-	dummy_handle = create_dummy_stack();
+-}
+-
+-static noinline void register_failure_stack(void)
+-{
+-	failure_handle = create_dummy_stack();
+-}
+-
+ static noinline void register_early_stack(void)
+ {
+ 	early_handle = create_dummy_stack();
+@@ -88,8 +70,7 @@ static __init void init_page_owner(void)
+ 	if (!page_owner_enabled)
+ 		return;
+ 
+-	register_dummy_stack();
+-	register_failure_stack();
++	stack_depot_capture_init();
+ 	register_early_stack();
+ 	static_branch_enable(&page_owner_inited);
+ 	init_early_allocated_pages();
+@@ -106,33 +87,6 @@ static inline struct page_owner *get_page_owner(struct page_ext *page_ext)
+ 	return (void *)page_ext + page_owner_ops.offset;
+ }
+ 
+-static noinline depot_stack_handle_t save_stack(gfp_t flags)
+-{
+-	unsigned long entries[PAGE_OWNER_STACK_DEPTH];
+-	depot_stack_handle_t handle;
+-	unsigned int nr_entries;
+-
+-	/*
+-	 * Avoid recursion.
+-	 *
+-	 * Sometimes page metadata allocation tracking requires more
+-	 * memory to be allocated:
+-	 * - when new stack trace is saved to stack depot
+-	 * - when backtrace itself is calculated (ia64)
+-	 */
+-	if (current->in_page_owner)
+-		return dummy_handle;
+-	current->in_page_owner = 1;
+-
+-	nr_entries = stack_trace_save(entries, ARRAY_SIZE(entries), 2);
+-	handle = stack_depot_save(entries, nr_entries, flags);
+-	if (!handle)
+-		handle = failure_handle;
+-
+-	current->in_page_owner = 0;
+-	return handle;
+-}
+-
+ void __reset_page_owner(struct page *page, unsigned short order)
+ {
+ 	int i;
+@@ -145,7 +99,7 @@ void __reset_page_owner(struct page *page, unsigned short order)
+ 	if (unlikely(!page_ext))
+ 		return;
+ 
+-	handle = save_stack(GFP_NOWAIT | __GFP_NOWARN);
++	handle = stack_depot_capture_stack(GFP_NOWAIT | __GFP_NOWARN);
+ 	for (i = 0; i < (1 << order); i++) {
+ 		__clear_bit(PAGE_EXT_OWNER_ALLOCATED, &page_ext->flags);
+ 		page_owner = get_page_owner(page_ext);
+@@ -187,7 +141,7 @@ noinline void __set_page_owner(struct page *page, unsigned short order,
+ 	struct page_ext *page_ext;
+ 	depot_stack_handle_t handle;
+ 
+-	handle = save_stack(gfp_mask);
++	handle = stack_depot_capture_stack(gfp_mask);
+ 
+ 	page_ext = page_ext_get(page);
+ 	if (unlikely(!page_ext))
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
