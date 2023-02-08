@@ -1,0 +1,113 @@
+From b6a17299349b76b6faa37df6a82bdebb112dc0f2 Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@techsingularity.net>
+Date: Wed, 25 Jan 2023 13:44:34 +0000
+Subject: [PATCH 21/28] mm, compaction: Finish pageblocks on complete migration
+ failure
+
+Commit 7efc3b726103 ("mm/compaction: fix set skip in
+fast_find_migrateblock") address an issue where a pageblock selected
+by fast_find_migrateblock() was ignored. Unfortunately, the same fix
+resulted in numerous reports of khugepaged or kcompactd stalling for
+long periods of time or consuming 100% of CPU.
+
+Tracing showed that there was a lot of rescanning between a small subset
+of pageblocks because the conditions for marking the block skip are not
+met. The scan is not reaching the end of the pageblock because enough
+pages were isolated but none were migrated successfully. Eventually it
+circles back to the same block.
+
+Pageblock skip tracking tries to minimise both latency and excessive
+scanning but tracking exactly when a block is fully scanned requires an
+excessive amount of state. This patch forcibly rescans a pageblock when
+all isolated pages fail to migrate even though it could be for transient
+reasons such as page writeback or page dirty. This will sometimes migrate
+too many pages but pageblocks will be marked skip and forward progress
+will be made.
+
+"Usemen" from the mmtests configuration
+workload-usemem-stress-numa-compact was used to stress compaction.
+The compaction trace events were recorded using a 6.2-rc5 kernel that
+includes commit 7efc3b726103 and count of unique ranges were measured. The
+top 5 ranges were
+
+   3076 range=(0x10ca00-0x10cc00)
+   3076 range=(0x110a00-0x110c00)
+   3098 range=(0x13b600-0x13b800)
+   3104 range=(0x141c00-0x141e00)
+  11424 range=(0x11b600-0x11b800)
+
+While this workload is very different than what the bugs reported,
+the pattern of the same subset of blocks being repeatedly scanned is
+observed. At one point, *only* the range range=(0x11b600 ~ 0x11b800)
+was scanned for 2 seconds. 14 seconds passed between the first
+migration-related event and the last.
+
+With the series applied including this patch, the top 5 ranges were
+
+      1 range=(0x11607e-0x116200)
+      1 range=(0x116200-0x116278)
+      1 range=(0x116278-0x116400)
+      1 range=(0x116400-0x116424)
+      1 range=(0x116424-0x116600)
+
+Only unique ranges were scanned and the time between the first
+migration-related event was 0.11 milliseconds.
+
+Fixes: 7efc3b726103 ("mm/compaction: fix set skip in fast_find_migrateblock")
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+---
+ mm/compaction.c | 30 ++++++++++++++++++++++--------
+ 1 file changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 35d812ef5..b4398527b 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -2394,6 +2394,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ 			cc->finish_pageblock = true;
+ 		}
+ 
++rescan:
+ 		switch (isolate_migratepages(cc)) {
+ 		case ISOLATE_ABORT:
+ 			ret = COMPACT_CONTENDED;
+@@ -2436,15 +2437,28 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ 				goto out;
+ 			}
+ 			/*
+-			 * We failed to migrate at least one page in the current
+-			 * order-aligned block, so skip the rest of it.
++			 * If an ASYNC or SYNC_LIGHT fails to migrate a page
++			 * within the current order-aligned block, scan the
++			 * remainder of the pageblock. This will mark the
++			 * pageblock "skip" to avoid rescanning in the near
++			 * future. This will isolate more pages than necessary
++			 * for the request but avoid loops due to
++			 * fast_find_migrateblock revisiting blocks that were
++			 * recently partially scanned.
+ 			 */
+-			if (cc->direct_compaction &&
+-						(cc->mode == MIGRATE_ASYNC)) {
+-				cc->migrate_pfn = block_end_pfn(
+-						cc->migrate_pfn - 1, cc->order);
+-				/* Draining pcplists is useless in this case */
+-				last_migrated_pfn = 0;
++			if (cc->direct_compaction && !cc->finish_pageblock &&
++						(cc->mode < MIGRATE_SYNC)) {
++				cc->finish_pageblock = true;
++
++				/*
++				 * Draining pcplists does not help THP if
++				 * any page failed to migrate. Even after
++				 * drain, the pageblock will not be free.
++				 */
++				if (cc->order == COMPACTION_HPAGE_ORDER)
++					last_migrated_pfn = 0;
++
++				goto rescan;
+ 			}
+ 		}
+ 
+-- 
+2.39.1.388.g2fc9e9ca3c
+
