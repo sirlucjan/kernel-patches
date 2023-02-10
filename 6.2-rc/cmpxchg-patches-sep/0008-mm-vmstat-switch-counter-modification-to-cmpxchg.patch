@@ -1,0 +1,379 @@
+From fb67d39798404bcefc0ed2e150d3de50a1deff22 Mon Sep 17 00:00:00 2001
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Date: Thu, 9 Feb 2023 12:01:58 -0300
+Subject: [PATCH 08/11] mm/vmstat: switch counter modification to cmpxchg
+
+In preparation to switch vmstat shepherd to flush
+per-CPU counters remotely, switch all functions that
+modify the counters to use cmpxchg.
+
+To test the performance difference, a page allocator microbenchmark:
+https://github.com/netoptimizer/prototype-kernel/blob/master/kernel/mm/bench/page_bench01.c
+with loops=1000000 was used, on Intel Core i7-11850H @ 2.50GHz.
+
+For the single_page_alloc_free test, which does
+
+        /** Loop to measure **/
+        for (i = 0; i < rec->loops; i++) {
+                my_page = alloc_page(gfp_mask);
+                if (unlikely(my_page == NULL))
+                        return 0;
+                __free_page(my_page);
+        }
+
+Unit is cycles.
+
+Vanilla			Patched		Diff
+159			165		3.7%
+
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+---
+ mm/vmstat.c | 325 +++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 182 insertions(+), 143 deletions(-)
+
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 04674f666..1c3d479a9 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -334,6 +334,188 @@ void set_pgdat_percpu_threshold(pg_data_t *pgdat,
+ 	}
+ }
+ 
++#ifdef CONFIG_HAVE_CMPXCHG_LOCAL
++/*
++ * If we have cmpxchg_local support then we do not need to incur the overhead
++ * that comes with local_irq_save/restore if we use this_cpu_cmpxchg.
++ *
++ * mod_state() modifies the zone counter state through atomic per cpu
++ * operations.
++ *
++ * Overstep mode specifies how overstep should handled:
++ *     0       No overstepping
++ *     1       Overstepping half of threshold
++ *     -1      Overstepping minus half of threshold
++ */
++static inline void mod_zone_state(struct zone *zone, enum zone_stat_item item,
++				  long delta, int overstep_mode)
++{
++	struct per_cpu_zonestat __percpu *pcp = zone->per_cpu_zonestats;
++	s8 __percpu *p = pcp->vm_stat_diff + item;
++	long o, n, t, z;
++
++	do {
++		z = 0;  /* overflow to zone counters */
++
++		/*
++		 * The fetching of the stat_threshold is racy. We may apply
++		 * a counter threshold to the wrong the cpu if we get
++		 * rescheduled while executing here. However, the next
++		 * counter update will apply the threshold again and
++		 * therefore bring the counter under the threshold again.
++		 *
++		 * Most of the time the thresholds are the same anyways
++		 * for all cpus in a zone.
++		 */
++		t = this_cpu_read(pcp->stat_threshold);
++
++		o = this_cpu_read(*p);
++		n = delta + o;
++
++		if (abs(n) > t) {
++			int os = overstep_mode * (t >> 1);
++
++			/* Overflow must be added to zone counters */
++			z = n + os;
++			n = -os;
++		}
++	} while (this_cpu_cmpxchg(*p, o, n) != o);
++
++	if (z)
++		zone_page_state_add(z, zone, item);
++}
++
++void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
++			 long delta)
++{
++	mod_zone_state(zone, item, delta, 0);
++}
++EXPORT_SYMBOL(mod_zone_page_state);
++
++void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
++			   long delta)
++{
++	mod_zone_state(zone, item, delta, 0);
++}
++EXPORT_SYMBOL(__mod_zone_page_state);
++
++void inc_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	mod_zone_state(page_zone(page), item, 1, 1);
++}
++EXPORT_SYMBOL(inc_zone_page_state);
++
++void __inc_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	mod_zone_state(page_zone(page), item, 1, 1);
++}
++EXPORT_SYMBOL(__inc_zone_page_state);
++
++void dec_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	mod_zone_state(page_zone(page), item, -1, -1);
++}
++EXPORT_SYMBOL(dec_zone_page_state);
++
++void __dec_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	mod_zone_state(page_zone(page), item, -1, -1);
++}
++EXPORT_SYMBOL(__dec_zone_page_state);
++
++static inline void mod_node_state(struct pglist_data *pgdat,
++				  enum node_stat_item item,
++				  int delta, int overstep_mode)
++{
++	struct per_cpu_nodestat __percpu *pcp = pgdat->per_cpu_nodestats;
++	s8 __percpu *p = pcp->vm_node_stat_diff + item;
++	long o, n, t, z;
++
++	if (vmstat_item_in_bytes(item)) {
++		/*
++		 * Only cgroups use subpage accounting right now; at
++		 * the global level, these items still change in
++		 * multiples of whole pages. Store them as pages
++		 * internally to keep the per-cpu counters compact.
++		 */
++		VM_WARN_ON_ONCE(delta & (PAGE_SIZE - 1));
++		delta >>= PAGE_SHIFT;
++	}
++
++	do {
++		z = 0;  /* overflow to node counters */
++
++		/*
++		 * The fetching of the stat_threshold is racy. We may apply
++		 * a counter threshold to the wrong the cpu if we get
++		 * rescheduled while executing here. However, the next
++		 * counter update will apply the threshold again and
++		 * therefore bring the counter under the threshold again.
++		 *
++		 * Most of the time the thresholds are the same anyways
++		 * for all cpus in a node.
++		 */
++		t = this_cpu_read(pcp->stat_threshold);
++
++		o = this_cpu_read(*p);
++		n = delta + o;
++
++		if (abs(n) > t) {
++			int os = overstep_mode * (t >> 1);
++
++			/* Overflow must be added to node counters */
++			z = n + os;
++			n = -os;
++		}
++	} while (this_cpu_cmpxchg(*p, o, n) != o);
++
++	if (z)
++		node_page_state_add(z, pgdat, item);
++}
++
++void mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
++					long delta)
++{
++	mod_node_state(pgdat, item, delta, 0);
++}
++EXPORT_SYMBOL(mod_node_page_state);
++
++void __mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
++					long delta)
++{
++	mod_node_state(pgdat, item, delta, 0);
++}
++EXPORT_SYMBOL(__mod_node_page_state);
++
++void inc_node_state(struct pglist_data *pgdat, enum node_stat_item item)
++{
++	mod_node_state(pgdat, item, 1, 1);
++}
++
++void inc_node_page_state(struct page *page, enum node_stat_item item)
++{
++	mod_node_state(page_pgdat(page), item, 1, 1);
++}
++EXPORT_SYMBOL(inc_node_page_state);
++
++void __inc_node_page_state(struct page *page, enum node_stat_item item)
++{
++	mod_node_state(page_pgdat(page), item, 1, 1);
++}
++EXPORT_SYMBOL(__inc_node_page_state);
++
++void dec_node_page_state(struct page *page, enum node_stat_item item)
++{
++	mod_node_state(page_pgdat(page), item, -1, -1);
++}
++EXPORT_SYMBOL(dec_node_page_state);
++
++void __dec_node_page_state(struct page *page, enum node_stat_item item)
++{
++	mod_node_state(page_pgdat(page), item, -1, -1);
++}
++EXPORT_SYMBOL(__dec_node_page_state);
++#else
+ /*
+  * For use when we know that interrupts are disabled,
+  * or when we know that preemption is disabled and that
+@@ -541,149 +723,6 @@ void __dec_node_page_state(struct page *page, enum node_stat_item item)
+ }
+ EXPORT_SYMBOL(__dec_node_page_state);
+ 
+-#ifdef CONFIG_HAVE_CMPXCHG_LOCAL
+-/*
+- * If we have cmpxchg_local support then we do not need to incur the overhead
+- * that comes with local_irq_save/restore if we use this_cpu_cmpxchg.
+- *
+- * mod_state() modifies the zone counter state through atomic per cpu
+- * operations.
+- *
+- * Overstep mode specifies how overstep should handled:
+- *     0       No overstepping
+- *     1       Overstepping half of threshold
+- *     -1      Overstepping minus half of threshold
+-*/
+-static inline void mod_zone_state(struct zone *zone,
+-       enum zone_stat_item item, long delta, int overstep_mode)
+-{
+-	struct per_cpu_zonestat __percpu *pcp = zone->per_cpu_zonestats;
+-	s8 __percpu *p = pcp->vm_stat_diff + item;
+-	long o, n, t, z;
+-
+-	do {
+-		z = 0;  /* overflow to zone counters */
+-
+-		/*
+-		 * The fetching of the stat_threshold is racy. We may apply
+-		 * a counter threshold to the wrong the cpu if we get
+-		 * rescheduled while executing here. However, the next
+-		 * counter update will apply the threshold again and
+-		 * therefore bring the counter under the threshold again.
+-		 *
+-		 * Most of the time the thresholds are the same anyways
+-		 * for all cpus in a zone.
+-		 */
+-		t = this_cpu_read(pcp->stat_threshold);
+-
+-		o = this_cpu_read(*p);
+-		n = delta + o;
+-
+-		if (abs(n) > t) {
+-			int os = overstep_mode * (t >> 1) ;
+-
+-			/* Overflow must be added to zone counters */
+-			z = n + os;
+-			n = -os;
+-		}
+-	} while (this_cpu_cmpxchg(*p, o, n) != o);
+-
+-	if (z)
+-		zone_page_state_add(z, zone, item);
+-}
+-
+-void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
+-			 long delta)
+-{
+-	mod_zone_state(zone, item, delta, 0);
+-}
+-EXPORT_SYMBOL(mod_zone_page_state);
+-
+-void inc_zone_page_state(struct page *page, enum zone_stat_item item)
+-{
+-	mod_zone_state(page_zone(page), item, 1, 1);
+-}
+-EXPORT_SYMBOL(inc_zone_page_state);
+-
+-void dec_zone_page_state(struct page *page, enum zone_stat_item item)
+-{
+-	mod_zone_state(page_zone(page), item, -1, -1);
+-}
+-EXPORT_SYMBOL(dec_zone_page_state);
+-
+-static inline void mod_node_state(struct pglist_data *pgdat,
+-       enum node_stat_item item, int delta, int overstep_mode)
+-{
+-	struct per_cpu_nodestat __percpu *pcp = pgdat->per_cpu_nodestats;
+-	s8 __percpu *p = pcp->vm_node_stat_diff + item;
+-	long o, n, t, z;
+-
+-	if (vmstat_item_in_bytes(item)) {
+-		/*
+-		 * Only cgroups use subpage accounting right now; at
+-		 * the global level, these items still change in
+-		 * multiples of whole pages. Store them as pages
+-		 * internally to keep the per-cpu counters compact.
+-		 */
+-		VM_WARN_ON_ONCE(delta & (PAGE_SIZE - 1));
+-		delta >>= PAGE_SHIFT;
+-	}
+-
+-	do {
+-		z = 0;  /* overflow to node counters */
+-
+-		/*
+-		 * The fetching of the stat_threshold is racy. We may apply
+-		 * a counter threshold to the wrong the cpu if we get
+-		 * rescheduled while executing here. However, the next
+-		 * counter update will apply the threshold again and
+-		 * therefore bring the counter under the threshold again.
+-		 *
+-		 * Most of the time the thresholds are the same anyways
+-		 * for all cpus in a node.
+-		 */
+-		t = this_cpu_read(pcp->stat_threshold);
+-
+-		o = this_cpu_read(*p);
+-		n = delta + o;
+-
+-		if (abs(n) > t) {
+-			int os = overstep_mode * (t >> 1) ;
+-
+-			/* Overflow must be added to node counters */
+-			z = n + os;
+-			n = -os;
+-		}
+-	} while (this_cpu_cmpxchg(*p, o, n) != o);
+-
+-	if (z)
+-		node_page_state_add(z, pgdat, item);
+-}
+-
+-void mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
+-					long delta)
+-{
+-	mod_node_state(pgdat, item, delta, 0);
+-}
+-EXPORT_SYMBOL(mod_node_page_state);
+-
+-void inc_node_state(struct pglist_data *pgdat, enum node_stat_item item)
+-{
+-	mod_node_state(pgdat, item, 1, 1);
+-}
+-
+-void inc_node_page_state(struct page *page, enum node_stat_item item)
+-{
+-	mod_node_state(page_pgdat(page), item, 1, 1);
+-}
+-EXPORT_SYMBOL(inc_node_page_state);
+-
+-void dec_node_page_state(struct page *page, enum node_stat_item item)
+-{
+-	mod_node_state(page_pgdat(page), item, -1, -1);
+-}
+-EXPORT_SYMBOL(dec_node_page_state);
+-#else
+ /*
+  * Use interrupt disable to serialize counter updates
+  */
+-- 
+2.39.1.418.g7876265d61
+
