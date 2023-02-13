@@ -1,0 +1,138 @@
+From aad5ddf18e6e91b50d9aea89bbc00b4c2ef23972 Mon Sep 17 00:00:00 2001
+From: Andreas Gruenbacher <agruenba@redhat.com>
+Date: Sun, 15 Jan 2023 08:49:12 -0800
+Subject: [PATCH 18/21] iomap/gfs2: Get page in page_prepare handler
+
+Change the iomap ->page_prepare() handler to get and return a locked
+folio instead of doing that in iomap_write_begin().  This allows to
+recover from out-of-memory situations in ->page_prepare(), which
+eliminates the corresponding error handling code in iomap_write_begin().
+The ->put_folio() handler now also isn't called with NULL as the folio
+value anymore.
+
+Filesystems are expected to use the iomap_get_folio() helper for getting
+locked folios in their ->page_prepare() handlers.
+
+Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+---
+ fs/gfs2/bmap.c         | 21 +++++++++++++--------
+ fs/iomap/buffered-io.c | 17 ++++++-----------
+ include/linux/iomap.h  |  9 +++++----
+ 3 files changed, 24 insertions(+), 23 deletions(-)
+
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 0c0414596..41349e095 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -956,15 +956,25 @@ static int __gfs2_iomap_get(struct inode *inode, loff_t pos, loff_t length,
+ 	goto out;
+ }
+ 
+-static int gfs2_iomap_page_prepare(struct inode *inode, loff_t pos,
+-				   unsigned len)
++static struct folio *
++gfs2_iomap_page_prepare(struct iomap_iter *iter, loff_t pos, unsigned len)
+ {
++	struct inode *inode = iter->inode;
+ 	unsigned int blockmask = i_blocksize(inode) - 1;
+ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ 	unsigned int blocks;
++	struct folio *folio;
++	int status;
+ 
+ 	blocks = ((pos & blockmask) + len + blockmask) >> inode->i_blkbits;
+-	return gfs2_trans_begin(sdp, RES_DINODE + blocks, 0);
++	status = gfs2_trans_begin(sdp, RES_DINODE + blocks, 0);
++	if (status)
++		return ERR_PTR(status);
++
++	folio = iomap_get_folio(iter, pos);
++	if (IS_ERR(folio))
++		gfs2_trans_end(sdp);
++	return folio;
+ }
+ 
+ static void gfs2_iomap_put_folio(struct inode *inode, loff_t pos,
+@@ -974,11 +984,6 @@ static void gfs2_iomap_put_folio(struct inode *inode, loff_t pos,
+ 	struct gfs2_inode *ip = GFS2_I(inode);
+ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ 
+-	if (!folio) {
+-		gfs2_trans_end(sdp);
+-		return;
+-	}
+-
+ 	if (!gfs2_is_stuffed(ip))
+ 		gfs2_page_add_databufs(ip, &folio->page, offset_in_page(pos),
+ 				       copied);
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index de4a8e5f7..418519dea 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -609,7 +609,7 @@ static void __iomap_put_folio(struct iomap_iter *iter, loff_t pos, size_t ret,
+ 
+ 	if (page_ops && page_ops->put_folio) {
+ 		page_ops->put_folio(iter->inode, pos, ret, folio);
+-	} else if (folio) {
++	} else {
+ 		folio_unlock(folio);
+ 		folio_put(folio);
+ 	}
+@@ -642,17 +642,12 @@ static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
+ 	if (!mapping_large_folio_support(iter->inode->i_mapping))
+ 		len = min_t(size_t, len, PAGE_SIZE - offset_in_page(pos));
+ 
+-	if (page_ops && page_ops->page_prepare) {
+-		status = page_ops->page_prepare(iter->inode, pos, len);
+-		if (status)
+-			return status;
+-	}
+-
+-	folio = iomap_get_folio(iter, pos);
+-	if (IS_ERR(folio)) {
+-		__iomap_put_folio(iter, pos, 0, NULL);
++	if (page_ops && page_ops->page_prepare)
++		folio = page_ops->page_prepare(iter, pos, len);
++	else
++		folio = iomap_get_folio(iter, pos);
++	if (IS_ERR(folio))
+ 		return PTR_ERR(folio);
+-	}
+ 
+ 	/*
+ 	 * Now we have a locked folio, before we do anything with it we need to
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index 188d14e78..d50501781 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -13,6 +13,7 @@
+ struct address_space;
+ struct fiemap_extent_info;
+ struct inode;
++struct iomap_iter;
+ struct iomap_dio;
+ struct iomap_writepage_ctx;
+ struct iov_iter;
+@@ -131,12 +132,12 @@ static inline bool iomap_inline_data_valid(const struct iomap *iomap)
+  * associated with them.
+  *
+  * When page_prepare succeeds, put_folio will always be called to do any
+- * cleanup work necessary.  In that put_folio call, @folio will be NULL if the
+- * associated folio could not be obtained.  When folio is not NULL, put_folio
+- * is responsible for unlocking and putting the folio.
++ * cleanup work necessary.  put_folio is responsible for unlocking and putting
++ * @folio.
+  */
+ struct iomap_page_ops {
+-	int (*page_prepare)(struct inode *inode, loff_t pos, unsigned len);
++	struct folio *(*page_prepare)(struct iomap_iter *iter, loff_t pos,
++			unsigned len);
+ 	void (*put_folio)(struct inode *inode, loff_t pos, unsigned copied,
+ 			struct folio *folio);
+ 
+-- 
+2.39.1.418.g7876265d61
+
