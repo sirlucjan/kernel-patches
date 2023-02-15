@@ -1,0 +1,209 @@
+From 95b69f22ea1697e3dd6af5d59f456089e44a8c95 Mon Sep 17 00:00:00 2001
+From: David Sterba <dsterba@suse.com>
+Date: Thu, 27 Oct 2022 02:22:19 +0200
+Subject: [PATCH 166/247] btrfs: change how submit bio callback is passed to
+ btrfs_wq_submit_bio
+
+There's a callback function parameter for btrfs_wq_submit_bio that can
+be one of: metadata, buffered data, direct io data. The callback
+abstraction is unnecessary as we have all functions available.
+
+Replace the parameter with a command that leads to a direct call in
+run_one_async_start. The called functions can be then simplified and we
+can also remove the extent_submit_bio_start_t typedef.
+
+Reviewed-by: Anand Jain <anand.jain@oracle.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/btrfs_inode.h |  5 +++++
+ fs/btrfs/disk-io.c     | 33 +++++++++++++++++++++++----------
+ fs/btrfs/disk-io.h     | 12 ++++++++++--
+ fs/btrfs/extent_io.h   |  3 ---
+ fs/btrfs/inode.c       | 15 +++++++--------
+ 5 files changed, 45 insertions(+), 23 deletions(-)
+
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index 62019d7c1..72cf235b7 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -415,6 +415,11 @@ void btrfs_submit_data_write_bio(struct inode *inode, struct bio *bio, int mirro
+ void btrfs_submit_data_read_bio(struct inode *inode, struct bio *bio,
+ 			int mirror_num, enum btrfs_compression_type compress_type);
+ void btrfs_submit_dio_repair_bio(struct inode *inode, struct bio *bio, int mirror_num);
++blk_status_t btrfs_submit_bio_start(struct inode *inode, struct bio *bio,
++				    u64 dio_file_offset);
++blk_status_t btrfs_submit_bio_start_direct_io(struct inode *inode,
++					      struct bio *bio,
++					      u64 dio_file_offset);
+ int btrfs_check_sector_csum(struct btrfs_fs_info *fs_info, struct page *page,
+ 			    u32 pgoff, u8 *csum, const u8 * const csum_expected);
+ int btrfs_check_data_csum(struct inode *inode, struct btrfs_bio *bbio,
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index c0632194a..96a0ecf00 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -86,10 +86,10 @@ static void btrfs_free_csum_hash(struct btrfs_fs_info *fs_info)
+ struct async_submit_bio {
+ 	struct inode *inode;
+ 	struct bio *bio;
+-	extent_submit_bio_start_t *submit_bio_start;
++	enum btrfs_wq_submit_cmd submit_cmd;
+ 	int mirror_num;
+ 
+-	/* Optional parameter for submit_bio_start used by direct io */
++	/* Optional parameter for used by direct io */
+ 	u64 dio_file_offset;
+ 	struct btrfs_work work;
+ 	blk_status_t status;
+@@ -644,8 +644,22 @@ static void run_one_async_start(struct btrfs_work *work)
+ 	blk_status_t ret;
+ 
+ 	async = container_of(work, struct  async_submit_bio, work);
+-	ret = async->submit_bio_start(async->inode, async->bio,
+-				      async->dio_file_offset);
++	switch (async->submit_cmd) {
++	case WQ_SUBMIT_METADATA:
++		ret = btree_submit_bio_start(async->inode, async->bio,
++					     async->dio_file_offset);
++		break;
++	case WQ_SUBMIT_DATA:
++		ret = btrfs_submit_bio_start(async->inode, async->bio,
++					     async->dio_file_offset);
++
++		break;
++	case WQ_SUBMIT_DATA_DIO:
++		ret = btrfs_submit_bio_start_direct_io(async->inode, async->bio,
++						       async->dio_file_offset);
++
++		break;
++	}
+ 	if (ret)
+ 		async->status = ret;
+ }
+@@ -696,8 +710,7 @@ static void run_one_async_free(struct btrfs_work *work)
+  * - false in case of error
+  */
+ bool btrfs_wq_submit_bio(struct inode *inode, struct bio *bio, int mirror_num,
+-			 u64 dio_file_offset,
+-			 extent_submit_bio_start_t *submit_bio_start)
++			 u64 dio_file_offset, enum btrfs_wq_submit_cmd cmd)
+ {
+ 	struct btrfs_fs_info *fs_info = BTRFS_I(inode)->root->fs_info;
+ 	struct async_submit_bio *async;
+@@ -709,7 +722,7 @@ bool btrfs_wq_submit_bio(struct inode *inode, struct bio *bio, int mirror_num,
+ 	async->inode = inode;
+ 	async->bio = bio;
+ 	async->mirror_num = mirror_num;
+-	async->submit_bio_start = submit_bio_start;
++	async->submit_cmd = cmd;
+ 
+ 	btrfs_init_work(&async->work, run_one_async_start, run_one_async_done,
+ 			run_one_async_free);
+@@ -743,8 +756,8 @@ static blk_status_t btree_csum_one_bio(struct bio *bio)
+ 	return errno_to_blk_status(ret);
+ }
+ 
+-static blk_status_t btree_submit_bio_start(struct inode *inode, struct bio *bio,
+-					   u64 dio_file_offset)
++blk_status_t btree_submit_bio_start(struct inode *inode, struct bio *bio,
++				    u64 dio_file_offset)
+ {
+ 	/*
+ 	 * when we're called for a write, we're already in the async
+@@ -783,7 +796,7 @@ void btrfs_submit_metadata_bio(struct inode *inode, struct bio *bio, int mirror_
+ 	 * happen in parallel across all CPUs.
+ 	 */
+ 	if (should_async_write(fs_info, BTRFS_I(inode)) &&
+-	    btrfs_wq_submit_bio(inode, bio, mirror_num, 0, btree_submit_bio_start))
++	    btrfs_wq_submit_bio(inode, bio, mirror_num, 0, WQ_SUBMIT_METADATA))
+ 		return;
+ 
+ 	ret = btree_csum_one_bio(bio);
+diff --git a/fs/btrfs/disk-io.h b/fs/btrfs/disk-io.h
+index 2fdfdf61a..5765c617e 100644
+--- a/fs/btrfs/disk-io.h
++++ b/fs/btrfs/disk-io.h
+@@ -113,9 +113,17 @@ int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid,
+ 			  int atomic);
+ int btrfs_read_extent_buffer(struct extent_buffer *buf, u64 parent_transid,
+ 			     int level, struct btrfs_key *first_key);
++
++enum btrfs_wq_submit_cmd {
++	WQ_SUBMIT_METADATA,
++	WQ_SUBMIT_DATA,
++	WQ_SUBMIT_DATA_DIO,
++};
++
+ bool btrfs_wq_submit_bio(struct inode *inode, struct bio *bio, int mirror_num,
+-			 u64 dio_file_offset,
+-			 extent_submit_bio_start_t *submit_bio_start);
++			 u64 dio_file_offset, enum btrfs_wq_submit_cmd cmd);
++blk_status_t btree_submit_bio_start(struct inode *inode, struct bio *bio,
++				    u64 dio_file_offset);
+ int btrfs_alloc_log_tree_node(struct btrfs_trans_handle *trans,
+ 			      struct btrfs_root *root);
+ int btrfs_init_log_root_tree(struct btrfs_trans_handle *trans,
+diff --git a/fs/btrfs/extent_io.h b/fs/btrfs/extent_io.h
+index 321680f22..b3d4b568f 100644
+--- a/fs/btrfs/extent_io.h
++++ b/fs/btrfs/extent_io.h
+@@ -70,9 +70,6 @@ struct extent_io_tree;
+ int __init extent_buffer_init_cachep(void);
+ void __cold extent_buffer_free_cachep(void);
+ 
+-typedef blk_status_t (extent_submit_bio_start_t)(struct inode *inode,
+-		struct bio *bio, u64 dio_file_offset);
+-
+ #define INLINE_EXTENT_BUFFER_PAGES     (BTRFS_MAX_METADATA_BLOCKSIZE / PAGE_SIZE)
+ struct extent_buffer {
+ 	u64 start;
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 74ed0afe4..06931c20e 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -2550,8 +2550,8 @@ void btrfs_clear_delalloc_extent(struct inode *vfs_inode,
+  * At IO completion time the cums attached on the ordered extent record
+  * are inserted into the btree
+  */
+-static blk_status_t btrfs_submit_bio_start(struct inode *inode, struct bio *bio,
+-					   u64 dio_file_offset)
++blk_status_t btrfs_submit_bio_start(struct inode *inode, struct bio *bio,
++				    u64 dio_file_offset)
+ {
+ 	return btrfs_csum_one_bio(BTRFS_I(inode), bio, (u64)-1, false);
+ }
+@@ -2758,8 +2758,7 @@ void btrfs_submit_data_write_bio(struct inode *inode, struct bio *bio, int mirro
+ 	    !test_bit(BTRFS_FS_STATE_NO_CSUMS, &fs_info->fs_state) &&
+ 	    !btrfs_is_data_reloc_root(bi->root)) {
+ 		if (!atomic_read(&bi->sync_writers) &&
+-		    btrfs_wq_submit_bio(inode, bio, mirror_num, 0,
+-					btrfs_submit_bio_start))
++		    btrfs_wq_submit_bio(inode, bio, mirror_num, 0, WQ_SUBMIT_DATA))
+ 			return;
+ 
+ 		ret = btrfs_csum_one_bio(bi, bio, (u64)-1, false);
+@@ -7967,9 +7966,9 @@ static blk_status_t btrfs_check_read_dio_bio(struct btrfs_dio_private *dip,
+ 	return err;
+ }
+ 
+-static blk_status_t btrfs_submit_bio_start_direct_io(struct inode *inode,
+-						     struct bio *bio,
+-						     u64 dio_file_offset)
++blk_status_t btrfs_submit_bio_start_direct_io(struct inode *inode,
++					      struct bio *bio,
++					      u64 dio_file_offset)
+ {
+ 	return btrfs_csum_one_bio(BTRFS_I(inode), bio, dio_file_offset, false);
+ }
+@@ -8017,7 +8016,7 @@ static void btrfs_submit_dio_bio(struct bio *bio, struct inode *inode,
+ 		/* Check btrfs_submit_data_write_bio() for async submit rules */
+ 		if (async_submit && !atomic_read(&BTRFS_I(inode)->sync_writers) &&
+ 		    btrfs_wq_submit_bio(inode, bio, 0, file_offset,
+-					btrfs_submit_bio_start_direct_io))
++					WQ_SUBMIT_DATA_DIO))
+ 			return;
+ 
+ 		/*
+-- 
+2.39.1.418.g7876265d61
+
