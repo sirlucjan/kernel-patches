@@ -1,0 +1,227 @@
+From fd817d1c18a178da6667a43e15402e277608c39f Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 17 Feb 2023 12:25:16 +0100
+Subject: [PATCH 113/113] sched/fair: Wake short task on current CPU
+
+The main purpose is to avoid too many cross CPU wake up when it is
+unnecessary. The frequent cross CPU wake up brings significant damage
+to some workloads, especially on high core count systems.
+
+Inhibits the cross CPU wake-up by placing the wakee on waking CPU,
+if both the waker and wakee are short-duration tasks. The short
+duration task could become a trouble maker on high-load system,
+because it could bring frequent context switch. So this strategy
+only takes effect when the system is busy.  Besides, it is unreasonable
+to inhibit the idle CPU scan when there are still idle CPUs.
+
+First, introduce the definition of a short-duration task. Then
+leverages the first patch to choose a local CPU for wakee.
+
+Overall there is significant performance improvement on Intel
+2 x 56C/112T platform.  Such as will-it-scale (1200+%),
+netperf(600+%) in some cases. And no noticeable impact on
+schbench, hackbench, tbench and a OLTP workload with a commercial RDBMS.
+
+Seeking for test results on other platforms, such as Zen3 and Kunpeng
+Arm64. Appreciated Prateek and Yicong if you can have a try on this
+version.
+
+Changes since v4:
+1. Dietmar has commented on the task duration calculation. So refined
+   the commit log to reduce confusion.
+2. Change [PATCH 1/2] to only record the average duration of a task.
+   So this change could benefit UTIL_EST_FASTER[1].
+3. As v4 reported regression on Zen3 and Kunpeng Arm64, add back
+   the system average utilization restriction that, if the system
+   is not busy, do not enable the short wake up. Above logic has
+   shown improvment on Zen3[2].
+4. Restrict the wakeup target to be current CPU, rather than both
+   current CPU and task's previous CPU. This could also benefit
+   wakeup optimization from interrupt in the future, which is
+   suggested by Yicong.
+
+Changes since v3:
+1. Honglei and Josh have concern that the threshold of short
+   task duration could be too long. Decreased the threshold from
+   sysctl_sched_min_granularity to (sysctl_sched_min_granularity / 8),
+   and the '8' comes from get_update_sysctl_factor().
+2. Export p->se.dur_avg to /proc/{pid}/sched per Yicong's suggestion.
+3. Move the calculation of average duration from put_prev_task_fair()
+   to dequeue_task_fair(). Because there is an issue in v3 that,
+   put_prev_task_fair() will not be invoked by pick_next_task_fair()
+   in fast path, thus the dur_avg could not be updated timely.
+4. Fix the comment in PATCH 2/2, that "WRITE_ONCE(CPU1->ttwu_pending, 1);"
+   on CPU0 is earlier than CPU1 getting "ttwu_list->p0", per Tianchen.
+5. Move the scan for CPU with short duration task from select_idle_cpu()
+   to select_idle_siblings(), because there is no CPU scan involved, per
+   Yicong.
+
+Changes since v2:
+
+1. Peter suggested comparing the duration of waker and the cost to
+   scan for an idle CPU: If the cost is higher than the task duration,
+   do not waste time finding an idle CPU, choose the local or previous
+   CPU directly. A prototype was created based on this suggestion.
+   However, according to the test result, this prototype does not inhibit
+   the cross CPU wakeup and did not bring improvement. Because the cost
+   to find an idle CPU is small in the problematic scenario. The root
+   cause of the problem is a race condition between scanning for an idle
+   CPU and task enqueue(please refer to the commit log in PATCH 2/2).
+   So v3 does not change the core logic of v2, with some refinement based
+   on Peter's suggestion.
+
+2. Simplify the logic to record the task duration per Peter and Abel's suggestion.
+
+[1] https://lore.kernel.org/lkml/c56855a7-14fd-4737-fc8b-8ea21487c5f6@arm.com/
+[2] https://lore.kernel.org/all/cover.1666531576.git.yu.c.chen@intel.com/
+
+v4: https://lore.kernel.org/lkml/cover.1671158588.git.yu.c.chen@intel.com/
+v3: https://lore.kernel.org/lkml/cover.1669862147.git.yu.c.chen@intel.com/
+v2: https://lore.kernel.org/all/cover.1666531576.git.yu.c.chen@intel.com/
+v1: https://lore.kernel.org/lkml/20220915165407.1776363-1-yu.c.chen@intel.com/
+
+Chen Yu (2):
+  sched/fair: Record the average duration of a task
+  sched/fair: Introduce SIS_SHORT to wake up short task on current CPU
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ include/linux/sched.h   |  3 +++
+ kernel/sched/core.c     |  2 ++
+ kernel/sched/debug.c    |  1 +
+ kernel/sched/fair.c     | 39 +++++++++++++++++++++++++++++++++++++++
+ kernel/sched/features.h |  1 +
+ 5 files changed, 46 insertions(+)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 4df2b3e76..e21709402 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -557,6 +557,9 @@ struct sched_entity {
+ 	u64				prev_sum_exec_runtime;
+ 
+ 	u64				nr_migrations;
++	u64				prev_sleep_sum_runtime;
++	/* average duration of a task */
++	u64				dur_avg;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	int				depth;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index b81b88f52..14a58bc2f 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4431,6 +4431,8 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->se.prev_sum_exec_runtime	= 0;
+ 	p->se.nr_migrations		= 0;
+ 	p->se.vruntime			= 0;
++	p->se.dur_avg			= 0;
++	p->se.prev_sleep_sum_runtime	= 0;
+ 	INIT_LIST_HEAD(&p->se.group_node);
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 1637b65ba..8d64fba16 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -1024,6 +1024,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ 	__PS("nr_involuntary_switches", p->nivcsw);
+ 
+ 	P(se.load.weight);
++	P(se.dur_avg);
+ #ifdef CONFIG_SMP
+ 	P(se.avg.load_sum);
+ 	P(se.avg.runnable_sum);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 34aa2e977..b113748ca 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6279,6 +6279,18 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 
+ static void set_next_buddy(struct sched_entity *se);
+ 
++static inline void dur_avg_update(struct task_struct *p, bool task_sleep)
++{
++	u64 dur;
++
++	if (!task_sleep)
++		return;
++
++	dur = p->se.sum_exec_runtime - p->se.prev_sleep_sum_runtime;
++	p->se.prev_sleep_sum_runtime = p->se.sum_exec_runtime;
++	update_avg(&p->se.dur_avg, dur);
++}
++
+ /*
+  * The dequeue_task method is called before nr_running is
+  * decreased. We remove the task from the rbtree and
+@@ -6351,6 +6363,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 
+ dequeue_throttle:
+ 	util_est_update(&rq->cfs, p, task_sleep);
++	dur_avg_update(p, task_sleep);
+ 	hrtick_update(rq);
+ }
+ 
+@@ -6484,6 +6497,20 @@ static int wake_wide(struct task_struct *p)
+ 	return 1;
+ }
+ 
++/*
++ * If a task switches in and then voluntarily relinquishes the
++ * CPU quickly, it is regarded as a short duration task.
++ *
++ * SIS_SHORT tries to wake up the short wakee on current CPU. This
++ * aims to avoid race condition among CPUs due to frequent context
++ * switch.
++ */
++static inline int is_short_task(struct task_struct *p)
++{
++	return sched_feat(SIS_SHORT) && p->se.dur_avg &&
++	       ((p->se.dur_avg * 8) < sysctl_sched_min_granularity);
++}
++
+ /*
+  * The purpose of wake_affine() is to quickly determine on which CPU we can run
+  * soonest. For the purpose of speed we only consider the waking and previous
+@@ -6520,6 +6547,11 @@ wake_affine_idle(int this_cpu, int prev_cpu, int sync)
+ 	if (available_idle_cpu(prev_cpu))
+ 		return prev_cpu;
+ 
++	/* The only running task is a short duration one. */
++	if (cpu_rq(this_cpu)->nr_running == 1 &&
++	    is_short_task(rcu_dereference(cpu_curr(this_cpu))))
++		return this_cpu;
++
+ 	return nr_cpumask_bits;
+ }
+ 
+@@ -6894,6 +6926,13 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 			/* overloaded LLC is unlikely to have idle cpu/core */
+ 			if (nr == 1)
+ 				return -1;
++
++			if (!has_idle_core && this == target &&
++			    (5 * nr < 3 * sd->span_weight) &&
++			    cpu_rq(target)->nr_running <= 1 &&
++			    is_short_task(p) &&
++			    is_short_task(rcu_dereference(cpu_curr(target))))
++				return target;
+ 		}
+ 	}
+ 
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index ee7f23c76..efdc29c42 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -62,6 +62,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
+  */
+ SCHED_FEAT(SIS_PROP, false)
+ SCHED_FEAT(SIS_UTIL, true)
++SCHED_FEAT(SIS_SHORT, true)
+ 
+ /*
+  * Issue a WARN when we do multiple update_rq_clock() calls
+-- 
+2.39.2.501.gd9d677b2d8
+
