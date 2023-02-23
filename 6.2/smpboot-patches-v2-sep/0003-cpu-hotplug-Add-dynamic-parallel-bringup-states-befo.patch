@@ -1,0 +1,132 @@
+From 35e9cc3555f6196c99ab0220a598cc09fdee5134 Mon Sep 17 00:00:00 2001
+From: David Woodhouse <dwmw@amazon.co.uk>
+Date: Thu, 23 Feb 2023 19:11:31 +0000
+Subject: [PATCH 03/12] cpu/hotplug: Add dynamic parallel bringup states before
+ CPUHP_BRINGUP_CPU
+
+There is often significant latency in the early stages of CPU bringup,
+and time is wasted by waking each CPU (e.g. with SIPI/INIT/INIT on x86)
+and then waiting for it to respond before moving on to the next.
+
+Allow a platform to register a set of pre-bringup CPUHP states to which
+each CPU can be stepped in parallel, thus absorbing some of that latency.
+
+There is a subtlety here: even with an empty CPUHP_BP_PARALLEL_DYN step,
+this means that *all* CPUs are brought through the prepare states and to
+CPUHP_BP_PREPARE_DYN before any of them are taken to CPUHP_BRINGUP_CPU
+and then are allowed to run for themselves to CPUHP_ONLINE.
+
+So any combination of prepare/start calls which depend on A-B ordering
+for each CPU in turn, such as the X2APIC code which used to allocate a
+cluster mask 'just in case' and store it in a global variable in the
+prep stage, then potentially consume that preallocated structure from
+the AP and set the global pointer to NULL to be reallocated in
+CPUHP_X2APIC_PREPARE for the next CPU... would explode horribly.
+
+Any platform enabling the CPUHP_BP_PARALLEL_DYN steps must be reviewed
+and tested to ensure that such issues do not exist, and the existing
+behaviour of bringing CPUs to CPUHP_BP_PREPARE_DYN and then immediately
+to CPUHP_BRINGUP_CPU and CPUHP_ONLINE only one at a time does not change
+unless such a state is registered.
+
+Note that the new parallel stages do *not* yet bring each AP to the
+CPUHP_BRINGUP_CPU state at the same time, only to the new states which
+exist before it. The final loop in bringup_nonboot_cpus() is untouched,
+bringing each AP in turn from the final PARALLEL_DYN state (or all the
+way from CPUHP_OFFLINE) to CPUHP_BRINGUP_CPU and then waiting for that
+AP to do its own processing and reach CPUHP_ONLINE before releasing the
+next.
+
+Parallelising that part by bringing them all to CPUHP_BRINGUP_CPU
+and then waiting for them all is an exercise for the future.
+
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Signed-off-by: Usama Arif <usama.arif@bytedance.com>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+Tested-by: Kim Phillips <kim.phillips@amd.com>
+Tested-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ include/linux/cpuhotplug.h |  2 ++
+ kernel/cpu.c               | 31 +++++++++++++++++++++++++++++--
+ 2 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 6c6859bfc..e5a73ae6c 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -133,6 +133,8 @@ enum cpuhp_state {
+ 	CPUHP_MIPS_SOC_PREPARE,
+ 	CPUHP_BP_PREPARE_DYN,
+ 	CPUHP_BP_PREPARE_DYN_END		= CPUHP_BP_PREPARE_DYN + 20,
++	CPUHP_BP_PARALLEL_DYN,
++	CPUHP_BP_PARALLEL_DYN_END		= CPUHP_BP_PARALLEL_DYN + 4,
+ 	CPUHP_BRINGUP_CPU,
+ 
+ 	/*
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 6c0a92ca6..fffb0da61 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -1504,8 +1504,30 @@ int bringup_hibernate_cpu(unsigned int sleep_cpu)
+ 
+ void bringup_nonboot_cpus(unsigned int setup_max_cpus)
+ {
++	unsigned int n = setup_max_cpus - num_online_cpus();
+ 	unsigned int cpu;
+ 
++	/*
++	 * An architecture may have registered parallel pre-bringup states to
++	 * which each CPU may be brought in parallel. For each such state,
++	 * bring N CPUs to it in turn before the final round of bringing them
++	 * online.
++	 */
++	if (n > 0) {
++		enum cpuhp_state st = CPUHP_BP_PARALLEL_DYN;
++
++		while (st <= CPUHP_BP_PARALLEL_DYN_END && cpuhp_hp_states[st].name) {
++			int i = n;
++
++			for_each_present_cpu(cpu) {
++				cpu_up(cpu, st);
++				if (!--i)
++					break;
++			}
++			st++;
++		}
++	}
++
+ 	for_each_present_cpu(cpu) {
+ 		if (num_online_cpus() >= setup_max_cpus)
+ 			break;
+@@ -1882,6 +1904,10 @@ static int cpuhp_reserve_state(enum cpuhp_state state)
+ 		step = cpuhp_hp_states + CPUHP_BP_PREPARE_DYN;
+ 		end = CPUHP_BP_PREPARE_DYN_END;
+ 		break;
++	case CPUHP_BP_PARALLEL_DYN:
++		step = cpuhp_hp_states + CPUHP_BP_PARALLEL_DYN;
++		end = CPUHP_BP_PARALLEL_DYN_END;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1906,14 +1932,15 @@ static int cpuhp_store_callbacks(enum cpuhp_state state, const char *name,
+ 	/*
+ 	 * If name is NULL, then the state gets removed.
+ 	 *
+-	 * CPUHP_AP_ONLINE_DYN and CPUHP_BP_PREPARE_DYN are handed out on
++	 * CPUHP_AP_ONLINE_DYN and CPUHP_BP_P*_DYN are handed out on
+ 	 * the first allocation from these dynamic ranges, so the removal
+ 	 * would trigger a new allocation and clear the wrong (already
+ 	 * empty) state, leaving the callbacks of the to be cleared state
+ 	 * dangling, which causes wreckage on the next hotplug operation.
+ 	 */
+ 	if (name && (state == CPUHP_AP_ONLINE_DYN ||
+-		     state == CPUHP_BP_PREPARE_DYN)) {
++		     state == CPUHP_BP_PREPARE_DYN ||
++		     state == CPUHP_BP_PARALLEL_DYN)) {
+ 		ret = cpuhp_reserve_state(state);
+ 		if (ret < 0)
+ 			return ret;
+-- 
+2.39.2.501.gd9d677b2d8
+
