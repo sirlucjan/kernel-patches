@@ -1,0 +1,2306 @@
+From 3640f91a090ac759658a4f5dd2ede737b95f5a9f Mon Sep 17 00:00:00 2001
+From: Theodore Ts'o <tytso@mit.edu>
+Date: Wed, 14 Dec 2022 15:08:18 -0500
+Subject: [PATCH 01/23] ext4: improve xattr consistency checking and error
+ reporting
+
+Refactor the in-inode and xattr block consistency checking, and report
+more fine-grained reports of the consistency problems.  Also add more
+consistency checks for ea_inode number.
+
+Reviewed-by: Andreas Dilger <adilger@dilger.ca>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Link: https://lore.kernel.org/r/20221214200818.870087-1-tytso@mit.edu
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/xattr.c | 126 ++++++++++++++++++++++++++++++------------------
+ 1 file changed, 80 insertions(+), 46 deletions(-)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index a2f04a380..111e52a32 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -184,27 +184,73 @@ ext4_xattr_handler(int name_index)
+ }
+ 
+ static int
+-ext4_xattr_check_entries(struct ext4_xattr_entry *entry, void *end,
+-			 void *value_start)
++check_xattrs(struct inode *inode, struct buffer_head *bh,
++	     struct ext4_xattr_entry *entry, void *end, void *value_start,
++	     const char *function, unsigned int line)
+ {
+ 	struct ext4_xattr_entry *e = entry;
++	int err = -EFSCORRUPTED;
++	char *err_str;
++
++	if (bh) {
++		if (BHDR(bh)->h_magic != cpu_to_le32(EXT4_XATTR_MAGIC) ||
++		    BHDR(bh)->h_blocks != cpu_to_le32(1)) {
++			err_str = "invalid header";
++			goto errout;
++		}
++		if (buffer_verified(bh))
++			return 0;
++		if (!ext4_xattr_block_csum_verify(inode, bh)) {
++			err = -EFSBADCRC;
++			err_str = "invalid checksum";
++			goto errout;
++		}
++	} else {
++		struct ext4_xattr_ibody_header *header = value_start;
++
++		header -= 1;
++		if (end - (void *)header < sizeof(*header) + sizeof(u32)) {
++			err_str = "in-inode xattr block too small";
++			goto errout;
++		}
++		if (header->h_magic != cpu_to_le32(EXT4_XATTR_MAGIC)) {
++			err_str = "bad magic number in in-inode xattr";
++			goto errout;
++		}
++	}
+ 
+ 	/* Find the end of the names list */
+ 	while (!IS_LAST_ENTRY(e)) {
+ 		struct ext4_xattr_entry *next = EXT4_XATTR_NEXT(e);
+-		if ((void *)next >= end)
+-			return -EFSCORRUPTED;
+-		if (strnlen(e->e_name, e->e_name_len) != e->e_name_len)
+-			return -EFSCORRUPTED;
++		if ((void *)next >= end) {
++			err_str = "e_name out of bounds";
++			goto errout;
++		}
++		if (strnlen(e->e_name, e->e_name_len) != e->e_name_len) {
++			err_str = "bad e_name length";
++			goto errout;
++		}
+ 		e = next;
+ 	}
+ 
+ 	/* Check the values */
+ 	while (!IS_LAST_ENTRY(entry)) {
+ 		u32 size = le32_to_cpu(entry->e_value_size);
++		unsigned long ea_ino = le32_to_cpu(entry->e_value_inum);
+ 
+-		if (size > EXT4_XATTR_SIZE_MAX)
+-			return -EFSCORRUPTED;
++		if (!ext4_has_feature_ea_inode(inode->i_sb) && ea_ino) {
++			err_str = "ea_inode specified without ea_inode feature enabled";
++			goto errout;
++		}
++		if (ea_ino && ((ea_ino == EXT4_ROOT_INO) ||
++			       !ext4_valid_inum(inode->i_sb, ea_ino))) {
++			err_str = "invalid ea_ino";
++			goto errout;
++		}
++		if (size > EXT4_XATTR_SIZE_MAX) {
++			err_str = "e_value size too large";
++			goto errout;
++		}
+ 
+ 		if (size != 0 && entry->e_value_inum == 0) {
+ 			u16 offs = le16_to_cpu(entry->e_value_offs);
+@@ -216,66 +262,54 @@ ext4_xattr_check_entries(struct ext4_xattr_entry *entry, void *end,
+ 			 * the padded and unpadded sizes, since the size may
+ 			 * overflow to 0 when adding padding.
+ 			 */
+-			if (offs > end - value_start)
+-				return -EFSCORRUPTED;
++			if (offs > end - value_start) {
++				err_str = "e_value out of bounds";
++				goto errout;
++			}
+ 			value = value_start + offs;
+ 			if (value < (void *)e + sizeof(u32) ||
+ 			    size > end - value ||
+-			    EXT4_XATTR_SIZE(size) > end - value)
+-				return -EFSCORRUPTED;
++			    EXT4_XATTR_SIZE(size) > end - value) {
++				err_str = "overlapping e_value ";
++				goto errout;
++			}
+ 		}
+ 		entry = EXT4_XATTR_NEXT(entry);
+ 	}
+-
++	if (bh)
++		set_buffer_verified(bh);
+ 	return 0;
++
++errout:
++	if (bh)
++		__ext4_error_inode(inode, function, line, 0, -err,
++				   "corrupted xattr block %llu: %s",
++				   (unsigned long long) bh->b_blocknr,
++				   err_str);
++	else
++		__ext4_error_inode(inode, function, line, 0, -err,
++				   "corrupted in-inode xattr: %s", err_str);
++	return err;
+ }
+ 
+ static inline int
+ __ext4_xattr_check_block(struct inode *inode, struct buffer_head *bh,
+ 			 const char *function, unsigned int line)
+ {
+-	int error = -EFSCORRUPTED;
+-
+-	if (BHDR(bh)->h_magic != cpu_to_le32(EXT4_XATTR_MAGIC) ||
+-	    BHDR(bh)->h_blocks != cpu_to_le32(1))
+-		goto errout;
+-	if (buffer_verified(bh))
+-		return 0;
+-
+-	error = -EFSBADCRC;
+-	if (!ext4_xattr_block_csum_verify(inode, bh))
+-		goto errout;
+-	error = ext4_xattr_check_entries(BFIRST(bh), bh->b_data + bh->b_size,
+-					 bh->b_data);
+-errout:
+-	if (error)
+-		__ext4_error_inode(inode, function, line, 0, -error,
+-				   "corrupted xattr block %llu",
+-				   (unsigned long long) bh->b_blocknr);
+-	else
+-		set_buffer_verified(bh);
+-	return error;
++	return check_xattrs(inode, bh, BFIRST(bh), bh->b_data + bh->b_size,
++			    bh->b_data, function, line);
+ }
+ 
+ #define ext4_xattr_check_block(inode, bh) \
+ 	__ext4_xattr_check_block((inode), (bh),  __func__, __LINE__)
+ 
+ 
+-static int
++static inline int
+ __xattr_check_inode(struct inode *inode, struct ext4_xattr_ibody_header *header,
+ 			 void *end, const char *function, unsigned int line)
+ {
+-	int error = -EFSCORRUPTED;
+-
+-	if (end - (void *)header < sizeof(*header) + sizeof(u32) ||
+-	    (header->h_magic != cpu_to_le32(EXT4_XATTR_MAGIC)))
+-		goto errout;
+-	error = ext4_xattr_check_entries(IFIRST(header), end, IFIRST(header));
+-errout:
+-	if (error)
+-		__ext4_error_inode(inode, function, line, 0, -error,
+-				   "corrupted in-inode xattr");
+-	return error;
++	return check_xattrs(inode, NULL, IFIRST(header), end, IFIRST(header),
++			    function, line);
+ }
+ 
+ #define xattr_check_inode(inode, header, end) \
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From de67fe086897fd24f3c2e661dea8209c3ded416f Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Fri, 16 Dec 2022 21:02:12 -0800
+Subject: [PATCH 02/23] ext4: use ext4_fc_tl_mem in fast-commit replay path
+
+To avoid 'sparse' warnings about missing endianness conversions, don't
+store native endianness values into struct ext4_fc_tl.  Instead, use a
+separate struct type, ext4_fc_tl_mem.
+
+Fixes: dcc5827484d6 ("ext4: factor out ext4_fc_get_tl()")
+Cc: Ye Bin <yebin10@huawei.com>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221217050212.150665-1-ebiggers@kernel.org
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/fast_commit.c | 44 +++++++++++++++++++++++++------------------
+ 1 file changed, 26 insertions(+), 18 deletions(-)
+
+diff --git a/fs/ext4/fast_commit.c b/fs/ext4/fast_commit.c
+index 4594b62f1..b06de728b 100644
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -1332,8 +1332,14 @@ struct dentry_info_args {
+ 	char *dname;
+ };
+ 
++/* Same as struct ext4_fc_tl, but uses native endianness fields */
++struct ext4_fc_tl_mem {
++	u16 fc_tag;
++	u16 fc_len;
++};
++
+ static inline void tl_to_darg(struct dentry_info_args *darg,
+-			      struct ext4_fc_tl *tl, u8 *val)
++			      struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+ 	struct ext4_fc_dentry_info fcd;
+ 
+@@ -1345,16 +1351,18 @@ static inline void tl_to_darg(struct dentry_info_args *darg,
+ 	darg->dname_len = tl->fc_len - sizeof(struct ext4_fc_dentry_info);
+ }
+ 
+-static inline void ext4_fc_get_tl(struct ext4_fc_tl *tl, u8 *val)
++static inline void ext4_fc_get_tl(struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+-	memcpy(tl, val, EXT4_FC_TAG_BASE_LEN);
+-	tl->fc_len = le16_to_cpu(tl->fc_len);
+-	tl->fc_tag = le16_to_cpu(tl->fc_tag);
++	struct ext4_fc_tl tl_disk;
++
++	memcpy(&tl_disk, val, EXT4_FC_TAG_BASE_LEN);
++	tl->fc_len = le16_to_cpu(tl_disk.fc_len);
++	tl->fc_tag = le16_to_cpu(tl_disk.fc_tag);
+ }
+ 
+ /* Unlink replay function */
+-static int ext4_fc_replay_unlink(struct super_block *sb, struct ext4_fc_tl *tl,
+-				 u8 *val)
++static int ext4_fc_replay_unlink(struct super_block *sb,
++				 struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+ 	struct inode *inode, *old_parent;
+ 	struct qstr entry;
+@@ -1451,8 +1459,8 @@ static int ext4_fc_replay_link_internal(struct super_block *sb,
+ }
+ 
+ /* Link replay function */
+-static int ext4_fc_replay_link(struct super_block *sb, struct ext4_fc_tl *tl,
+-			       u8 *val)
++static int ext4_fc_replay_link(struct super_block *sb,
++			       struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+ 	struct inode *inode;
+ 	struct dentry_info_args darg;
+@@ -1506,8 +1514,8 @@ static int ext4_fc_record_modified_inode(struct super_block *sb, int ino)
+ /*
+  * Inode replay function
+  */
+-static int ext4_fc_replay_inode(struct super_block *sb, struct ext4_fc_tl *tl,
+-				u8 *val)
++static int ext4_fc_replay_inode(struct super_block *sb,
++				struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+ 	struct ext4_fc_inode fc_inode;
+ 	struct ext4_inode *raw_inode;
+@@ -1609,8 +1617,8 @@ static int ext4_fc_replay_inode(struct super_block *sb, struct ext4_fc_tl *tl,
+  * inode for which we are trying to create a dentry here, should already have
+  * been replayed before we start here.
+  */
+-static int ext4_fc_replay_create(struct super_block *sb, struct ext4_fc_tl *tl,
+-				 u8 *val)
++static int ext4_fc_replay_create(struct super_block *sb,
++				 struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+ 	int ret = 0;
+ 	struct inode *inode = NULL;
+@@ -1708,7 +1716,7 @@ int ext4_fc_record_regions(struct super_block *sb, int ino,
+ 
+ /* Replay add range tag */
+ static int ext4_fc_replay_add_range(struct super_block *sb,
+-				    struct ext4_fc_tl *tl, u8 *val)
++				    struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+ 	struct ext4_fc_add_range fc_add_ex;
+ 	struct ext4_extent newex, *ex;
+@@ -1828,8 +1836,8 @@ static int ext4_fc_replay_add_range(struct super_block *sb,
+ 
+ /* Replay DEL_RANGE tag */
+ static int
+-ext4_fc_replay_del_range(struct super_block *sb, struct ext4_fc_tl *tl,
+-			 u8 *val)
++ext4_fc_replay_del_range(struct super_block *sb,
++			 struct ext4_fc_tl_mem *tl, u8 *val)
+ {
+ 	struct inode *inode;
+ 	struct ext4_fc_del_range lrange;
+@@ -2025,7 +2033,7 @@ static int ext4_fc_replay_scan(journal_t *journal,
+ 	struct ext4_fc_replay_state *state;
+ 	int ret = JBD2_FC_REPLAY_CONTINUE;
+ 	struct ext4_fc_add_range ext;
+-	struct ext4_fc_tl tl;
++	struct ext4_fc_tl_mem tl;
+ 	struct ext4_fc_tail tail;
+ 	__u8 *start, *end, *cur, *val;
+ 	struct ext4_fc_head head;
+@@ -2144,7 +2152,7 @@ static int ext4_fc_replay(journal_t *journal, struct buffer_head *bh,
+ {
+ 	struct super_block *sb = journal->j_private;
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+-	struct ext4_fc_tl tl;
++	struct ext4_fc_tl_mem tl;
+ 	__u8 *start, *end, *cur, *val;
+ 	int ret = JBD2_FC_REPLAY_CONTINUE;
+ 	struct ext4_fc_replay_state *state = &sbi->s_fc_replay_state;
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 3e8ffba7c7cc53f24c86b41a95d1501028fae78c Mon Sep 17 00:00:00 2001
+From: Wang Jianjian <wangjianjian3@huawei.com>
+Date: Mon, 19 Dec 2022 09:51:28 +0800
+Subject: [PATCH 03/23] ext4: don't show commit interval if it is zero
+
+If commit interval is 0, it means using default value.
+
+Fixes: 6e47a3cc68fc ("ext4: get rid of super block and sbi from handle_mount_ops()")
+Signed-off-by: Wang Jianjian <wangjianjian3@huawei.com>
+Link: https://lore.kernel.org/r/20221219015128.876717-1-wangjianjian3@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/super.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 260c1b3e3..3b9e30e1a 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -2146,7 +2146,7 @@ static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 		return 0;
+ 	case Opt_commit:
+ 		if (result.uint_32 == 0)
+-			ctx->s_commit_interval = JBD2_DEFAULT_MAX_COMMIT_AGE;
++			result.uint_32 = JBD2_DEFAULT_MAX_COMMIT_AGE;
+ 		else if (result.uint_32 > INT_MAX / HZ) {
+ 			ext4_msg(NULL, KERN_ERR,
+ 				 "Invalid commit interval %d, "
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From d5de15934c59032c157850d166c2d2ba86f3ae85 Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Mon, 26 Dec 2022 14:20:15 +0800
+Subject: [PATCH 04/23] ext4: dio take shared inode lock when overwriting
+ preallocated blocks
+
+In the dio write path, we only take shared inode lock for the case of
+aligned overwriting initialized blocks inside EOF. But for overwriting
+preallocated blocks, it may only need to split unwritten extents, this
+procedure has been protected under i_data_sem lock, it's safe to
+release the exclusive inode lock and take shared inode lock.
+
+This could give a significant speed up for multi-threaded writes. Test
+on Intel Xeon Gold 6140 and nvme SSD with below fio parameters.
+
+ direct=1
+ ioengine=libaio
+ iodepth=10
+ numjobs=10
+ runtime=60
+ rw=randwrite
+ size=100G
+
+And the test result are:
+Before:
+ bs=4k       IOPS=11.1k, BW=43.2MiB/s
+ bs=16k      IOPS=11.1k, BW=173MiB/s
+ bs=64k      IOPS=11.2k, BW=697MiB/s
+
+After:
+ bs=4k       IOPS=41.4k, BW=162MiB/s
+ bs=16k      IOPS=41.3k, BW=646MiB/s
+ bs=64k      IOPS=13.5k, BW=843MiB/s
+
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221226062015.3479416-1-yi.zhang@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/file.c | 34 ++++++++++++++++++++++------------
+ 1 file changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index 7ac0a81bd..6e9f198ec 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -202,8 +202,9 @@ ext4_extending_io(struct inode *inode, loff_t offset, size_t len)
+ 	return false;
+ }
+ 
+-/* Is IO overwriting allocated and initialized blocks? */
+-static bool ext4_overwrite_io(struct inode *inode, loff_t pos, loff_t len)
++/* Is IO overwriting allocated or initialized blocks? */
++static bool ext4_overwrite_io(struct inode *inode,
++			      loff_t pos, loff_t len, bool *unwritten)
+ {
+ 	struct ext4_map_blocks map;
+ 	unsigned int blkbits = inode->i_blkbits;
+@@ -217,12 +218,15 @@ static bool ext4_overwrite_io(struct inode *inode, loff_t pos, loff_t len)
+ 	blklen = map.m_len;
+ 
+ 	err = ext4_map_blocks(NULL, inode, &map, 0);
++	if (err != blklen)
++		return false;
+ 	/*
+ 	 * 'err==len' means that all of the blocks have been preallocated,
+-	 * regardless of whether they have been initialized or not. To exclude
+-	 * unwritten extents, we need to check m_flags.
++	 * regardless of whether they have been initialized or not. We need to
++	 * check m_flags to distinguish the unwritten extents.
+ 	 */
+-	return err == blklen && (map.m_flags & EXT4_MAP_MAPPED);
++	*unwritten = !(map.m_flags & EXT4_MAP_MAPPED);
++	return true;
+ }
+ 
+ static ssize_t ext4_generic_write_checks(struct kiocb *iocb,
+@@ -431,11 +435,16 @@ static const struct iomap_dio_ops ext4_dio_write_ops = {
+  * - For extending writes case we don't take the shared lock, since it requires
+  *   updating inode i_disksize and/or orphan handling with exclusive lock.
+  *
+- * - shared locking will only be true mostly with overwrites. Otherwise we will
+- *   switch to exclusive i_rwsem lock.
++ * - shared locking will only be true mostly with overwrites, including
++ *   initialized blocks and unwritten blocks. For overwrite unwritten blocks
++ *   we protect splitting extents by i_data_sem in ext4_inode_info, so we can
++ *   also release exclusive i_rwsem lock.
++ *
++ * - Otherwise we will switch to exclusive i_rwsem lock.
+  */
+ static ssize_t ext4_dio_write_checks(struct kiocb *iocb, struct iov_iter *from,
+-				     bool *ilock_shared, bool *extend)
++				     bool *ilock_shared, bool *extend,
++				     bool *unwritten)
+ {
+ 	struct file *file = iocb->ki_filp;
+ 	struct inode *inode = file_inode(file);
+@@ -459,7 +468,7 @@ static ssize_t ext4_dio_write_checks(struct kiocb *iocb, struct iov_iter *from,
+ 	 * in file_modified().
+ 	 */
+ 	if (*ilock_shared && (!IS_NOSEC(inode) || *extend ||
+-	     !ext4_overwrite_io(inode, offset, count))) {
++	     !ext4_overwrite_io(inode, offset, count, unwritten))) {
+ 		if (iocb->ki_flags & IOCB_NOWAIT) {
+ 			ret = -EAGAIN;
+ 			goto out;
+@@ -491,7 +500,7 @@ static ssize_t ext4_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 	loff_t offset = iocb->ki_pos;
+ 	size_t count = iov_iter_count(from);
+ 	const struct iomap_ops *iomap_ops = &ext4_iomap_ops;
+-	bool extend = false, unaligned_io = false;
++	bool extend = false, unaligned_io = false, unwritten = false;
+ 	bool ilock_shared = true;
+ 
+ 	/*
+@@ -534,7 +543,8 @@ static ssize_t ext4_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 		return ext4_buffered_write_iter(iocb, from);
+ 	}
+ 
+-	ret = ext4_dio_write_checks(iocb, from, &ilock_shared, &extend);
++	ret = ext4_dio_write_checks(iocb, from,
++				    &ilock_shared, &extend, &unwritten);
+ 	if (ret <= 0)
+ 		return ret;
+ 
+@@ -582,7 +592,7 @@ static ssize_t ext4_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 		ext4_journal_stop(handle);
+ 	}
+ 
+-	if (ilock_shared)
++	if (ilock_shared && !unwritten)
+ 		iomap_ops = &ext4_iomap_overwrite_ops;
+ 	ret = iomap_dio_rw(iocb, from, iomap_ops, &ext4_dio_write_ops,
+ 			   (unaligned_io || extend) ? IOMAP_DIO_FORCE_WAIT : 0,
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 2339e7d6651d6c7e906d0f5dcafdf10c295e2f3d Mon Sep 17 00:00:00 2001
+From: Tanmay Bhushan <007047221b@gmail.com>
+Date: Fri, 30 Dec 2022 15:18:58 +0100
+Subject: [PATCH 05/23] ext4: remove dead code in updating backup sb
+
+ext4_update_backup_sb checks for err having some value
+after unlocking buffer. But err has not been updated
+till that point in any code which will lead execution
+of the code in question.
+
+Signed-off-by: Tanmay Bhushan <007047221b@gmail.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20221230141858.3828-1-007047221b@gmail.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/ioctl.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index 8067ccda3..2e8c34036 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -155,9 +155,6 @@ static int ext4_update_backup_sb(struct super_block *sb,
+ 	set_buffer_uptodate(bh);
+ 	unlock_buffer(bh);
+ 
+-	if (err)
+-		goto out_bh;
+-
+ 	if (handle) {
+ 		err = ext4_handle_dirty_metadata(handle, NULL, bh);
+ 		if (err)
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From c60df5f7937130dd38548f257911b55a8b779581 Mon Sep 17 00:00:00 2001
+From: Jun Nie <jun.nie@linaro.org>
+Date: Tue, 3 Jan 2023 09:45:16 +0800
+Subject: [PATCH 06/23] ext4: optimize ea_inode block expansion
+
+Copy ea data from inode entry when expanding ea block if possible.
+Then remove the ea entry if expansion success. Thus memcpy to a
+temporary buffer may be avoided.
+
+If the expansion fails, we do not need to recovery the removed ea
+entry neither in this way.
+
+Reported-by: syzbot+2dacb8f015bf1420155f@syzkaller.appspotmail.com
+Link: https://syzkaller.appspot.com/bug?id=3613786cb88c93aa1c6a279b1df6a7b201347d08
+Link: https://lore.kernel.org/r/20230103014517.495275-2-jun.nie@linaro.org
+Cc: stable@kernel.org
+Signed-off-by: Jun Nie <jun.nie@linaro.org>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/xattr.c | 28 +++++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 111e52a32..4cabf86bb 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -2601,9 +2601,8 @@ static int ext4_xattr_move_to_block(handle_t *handle, struct inode *inode,
+ 
+ 	is = kzalloc(sizeof(struct ext4_xattr_ibody_find), GFP_NOFS);
+ 	bs = kzalloc(sizeof(struct ext4_xattr_block_find), GFP_NOFS);
+-	buffer = kvmalloc(value_size, GFP_NOFS);
+ 	b_entry_name = kmalloc(entry->e_name_len + 1, GFP_NOFS);
+-	if (!is || !bs || !buffer || !b_entry_name) {
++	if (!is || !bs || !b_entry_name) {
+ 		error = -ENOMEM;
+ 		goto out;
+ 	}
+@@ -2615,12 +2614,18 @@ static int ext4_xattr_move_to_block(handle_t *handle, struct inode *inode,
+ 
+ 	/* Save the entry name and the entry value */
+ 	if (entry->e_value_inum) {
++		buffer = kvmalloc(value_size, GFP_NOFS);
++		if (!buffer) {
++			error = -ENOMEM;
++			goto out;
++		}
++
+ 		error = ext4_xattr_inode_get(inode, entry, buffer, value_size);
+ 		if (error)
+ 			goto out;
+ 	} else {
+ 		size_t value_offs = le16_to_cpu(entry->e_value_offs);
+-		memcpy(buffer, (void *)IFIRST(header) + value_offs, value_size);
++		buffer = (void *)IFIRST(header) + value_offs;
+ 	}
+ 
+ 	memcpy(b_entry_name, entry->e_name, entry->e_name_len);
+@@ -2635,25 +2640,26 @@ static int ext4_xattr_move_to_block(handle_t *handle, struct inode *inode,
+ 	if (error)
+ 		goto out;
+ 
+-	/* Remove the chosen entry from the inode */
+-	error = ext4_xattr_ibody_set(handle, inode, &i, is);
+-	if (error)
+-		goto out;
+-
+ 	i.value = buffer;
+ 	i.value_len = value_size;
+ 	error = ext4_xattr_block_find(inode, &i, bs);
+ 	if (error)
+ 		goto out;
+ 
+-	/* Add entry which was removed from the inode into the block */
++	/* Move ea entry from the inode into the block */
+ 	error = ext4_xattr_block_set(handle, inode, &i, bs);
+ 	if (error)
+ 		goto out;
+-	error = 0;
++
++	/* Remove the chosen entry from the inode */
++	i.value = NULL;
++	i.value_len = 0;
++	error = ext4_xattr_ibody_set(handle, inode, &i, is);
++
+ out:
+ 	kfree(b_entry_name);
+-	kvfree(buffer);
++	if (entry->e_value_inum && buffer)
++		kvfree(buffer);
+ 	if (is)
+ 		brelse(is->iloc.bh);
+ 	if (bs)
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 28d1cc0011ad4644b42e78698d0b5f386e64d325 Mon Sep 17 00:00:00 2001
+From: Jun Nie <jun.nie@linaro.org>
+Date: Tue, 3 Jan 2023 09:45:17 +0800
+Subject: [PATCH 07/23] ext4: refuse to create ea block when umounted
+
+The ea block expansion need to access s_root while it is
+already set as NULL when umount is triggered. Refuse this
+request to avoid panic.
+
+Reported-by: syzbot+2dacb8f015bf1420155f@syzkaller.appspotmail.com
+Link: https://syzkaller.appspot.com/bug?id=3613786cb88c93aa1c6a279b1df6a7b201347d08
+Link: https://lore.kernel.org/r/20230103014517.495275-3-jun.nie@linaro.org
+Cc: stable@kernel.org
+Signed-off-by: Jun Nie <jun.nie@linaro.org>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/xattr.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 4cabf86bb..25275e5e8 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -1472,6 +1472,13 @@ static struct inode *ext4_xattr_inode_create(handle_t *handle,
+ 	uid_t owner[2] = { i_uid_read(inode), i_gid_read(inode) };
+ 	int err;
+ 
++	if (inode->i_sb->s_root == NULL) {
++		ext4_warning(inode->i_sb,
++			     "refuse to create EA inode when umounting");
++		WARN_ON(1);
++		return ERR_PTR(-EINVAL);
++	}
++
+ 	/*
+ 	 * Let the next inode be the goal, so we try and allocate the EA inode
+ 	 * in the same group, or nearby one.
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 7460085d057d5049d3ccece215e2d6a24253cf06 Mon Sep 17 00:00:00 2001
+From: zhanchengbin <zhanchengbin1@huawei.com>
+Date: Tue, 3 Jan 2023 10:28:12 +0800
+Subject: [PATCH 08/23] ext4: fix inode tree inconsistency caused by ENOMEM
+
+If ENOMEM fails when the extent is splitting, we need to restore the length
+of the split extent.
+In the ext4_split_extent_at function, only in ext4_ext_create_new_leaf will
+it alloc memory and change the shape of the extent tree,even if an ENOMEM
+is returned at this time, the extent tree is still self-consistent, Just
+restore the split extent lens in the function ext4_split_extent_at.
+
+ext4_split_extent_at
+ ext4_ext_insert_extent
+  ext4_ext_create_new_leaf
+   1)ext4_ext_split
+     ext4_find_extent
+   2)ext4_ext_grow_indepth
+     ext4_find_extent
+
+Signed-off-by: zhanchengbin <zhanchengbin1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230103022812.130603-1-zhanchengbin1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/extents.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 9de1c9d1a..3559ea6b0 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -3251,7 +3251,7 @@ static int ext4_split_extent_at(handle_t *handle,
+ 		ext4_ext_mark_unwritten(ex2);
+ 
+ 	err = ext4_ext_insert_extent(handle, inode, ppath, &newex, flags);
+-	if (err != -ENOSPC && err != -EDQUOT)
++	if (err != -ENOSPC && err != -EDQUOT && err != -ENOMEM)
+ 		goto out;
+ 
+ 	if (EXT4_EXT_MAY_ZEROOUT & split_flag) {
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 45353036b8ebc9833e8c0ce6d43591ac50cb6db9 Mon Sep 17 00:00:00 2001
+From: XU pengfei <xupengfei@nfschina.com>
+Date: Wed, 4 Jan 2023 13:52:29 +0800
+Subject: [PATCH 09/23] ext4: remove unnecessary variable initialization
+
+Variables are assigned first and then used. Initialization is not required.
+
+Signed-off-by: XU pengfei <xupengfei@nfschina.com>
+Link: https://lore.kernel.org/r/20230104055229.3663-1-xupengfei@nfschina.com
+---
+ fs/ext4/inode.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 9d9f414f9..9df913bdb 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5788,7 +5788,7 @@ static int ext4_meta_trans_blocks(struct inode *inode, int lblocks,
+ 	ext4_group_t groups, ngroups = ext4_get_groups_count(inode->i_sb);
+ 	int gdpblocks;
+ 	int idxblocks;
+-	int ret = 0;
++	int ret;
+ 
+ 	/*
+ 	 * How many index blocks need to touch to map @lblocks logical blocks
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 04b81cfcfa14a90f3e4d8e6120d43341a0268397 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Sat, 7 Jan 2023 11:21:25 +0800
+Subject: [PATCH 10/23] ext4: fail ext4_iget if special inode unallocated
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In ext4_fill_super(), EXT4_ORPHAN_FS flag is cleared after
+ext4_orphan_cleanup() is executed. Therefore, when __ext4_iget() is
+called to get an inode whose i_nlink is 0 when the flag exists, no error
+is returned. If the inode is a special inode, a null pointer dereference
+may occur. If the value of i_nlink is 0 for any inodes (except boot loader
+inodes) got by using the EXT4_IGET_SPECIAL flag, the current file system
+is corrupted. Therefore, make the ext4_iget() function return an error if
+it gets such an abnormal special inode.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=199179
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216541
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216539
+Reported-by: Luís Henriques <lhenriques@suse.de>
+Suggested-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230107032126.4165860-2-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 9df913bdb..b65dadfe3 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4872,13 +4872,6 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
+ 		goto bad_inode;
+ 	raw_inode = ext4_raw_inode(&iloc);
+ 
+-	if ((ino == EXT4_ROOT_INO) && (raw_inode->i_links_count == 0)) {
+-		ext4_error_inode(inode, function, line, 0,
+-				 "iget: root inode unallocated");
+-		ret = -EFSCORRUPTED;
+-		goto bad_inode;
+-	}
+-
+ 	if ((flags & EXT4_IGET_HANDLE) &&
+ 	    (raw_inode->i_links_count == 0) && (raw_inode->i_mode == 0)) {
+ 		ret = -ESTALE;
+@@ -4951,11 +4944,16 @@ struct inode *__ext4_iget(struct super_block *sb, unsigned long ino,
+ 	 * NeilBrown 1999oct15
+ 	 */
+ 	if (inode->i_nlink == 0) {
+-		if ((inode->i_mode == 0 ||
++		if ((inode->i_mode == 0 || flags & EXT4_IGET_SPECIAL ||
+ 		     !(EXT4_SB(inode->i_sb)->s_mount_state & EXT4_ORPHAN_FS)) &&
+ 		    ino != EXT4_BOOT_LOADER_INO) {
+-			/* this inode is deleted */
+-			ret = -ESTALE;
++			/* this inode is deleted or unallocated */
++			if (flags & EXT4_IGET_SPECIAL) {
++				ext4_error_inode(inode, function, line, 0,
++						 "iget: special inode unallocated");
++				ret = -EFSCORRUPTED;
++			} else
++				ret = -ESTALE;
+ 			goto bad_inode;
+ 		}
+ 		/* The only unlinked inodes we let through here have
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 06f03bcd35f43939fc807eb4bb4b725f1d13cf2a Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Sat, 7 Jan 2023 11:21:26 +0800
+Subject: [PATCH 11/23] ext4: update s_journal_inum if it changes after journal
+ replay
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When mounting a crafted ext4 image, s_journal_inum may change after journal
+replay, which is obviously unreasonable because we have successfully loaded
+and replayed the journal through the old s_journal_inum. And the new
+s_journal_inum bypasses some of the checks in ext4_get_journal(), which
+may trigger a null pointer dereference problem. So if s_journal_inum
+changes after the journal replay, we ignore the change, and rewrite the
+current journal_inum to the superblock.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216541
+Reported-by: Luís Henriques <lhenriques@suse.de>
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230107032126.4165860-3-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/super.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 3b9e30e1a..45bcfd35e 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -5953,8 +5953,11 @@ static int ext4_load_journal(struct super_block *sb,
+ 	if (!really_read_only && journal_devnum &&
+ 	    journal_devnum != le32_to_cpu(es->s_journal_dev)) {
+ 		es->s_journal_dev = cpu_to_le32(journal_devnum);
+-
+-		/* Make sure we flush the recovery flag to disk. */
++		ext4_commit_super(sb);
++	}
++	if (!really_read_only && journal_inum &&
++	    journal_inum != le32_to_cpu(es->s_journal_inum)) {
++		es->s_journal_inum = cpu_to_le32(journal_inum);
+ 		ext4_commit_super(sb);
+ 	}
+ 
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 12cf5004af14f11483156d0fd86ef6f175d05331 Mon Sep 17 00:00:00 2001
+From: Zhihao Cheng <chengzhihao1@huawei.com>
+Date: Tue, 10 Jan 2023 09:53:27 +0800
+Subject: [PATCH 12/23] jbd2: fix data missing when reusing bh which is ready
+ to be checkpointed
+
+Following process will make data lost and could lead to a filesystem
+corrupted problem:
+
+1. jh(bh) is inserted into T1->t_checkpoint_list, bh is dirty, and
+   jh->b_transaction = NULL
+2. T1 is added into journal->j_checkpoint_transactions.
+3. Get bh prepare to write while doing checkpoing:
+           PA				    PB
+   do_get_write_access             jbd2_log_do_checkpoint
+    spin_lock(&jh->b_state_lock)
+     if (buffer_dirty(bh))
+      clear_buffer_dirty(bh)   // clear buffer dirty
+       set_buffer_jbddirty(bh)
+				    transaction =
+				    journal->j_checkpoint_transactions
+				    jh = transaction->t_checkpoint_list
+				    if (!buffer_dirty(bh))
+		                      __jbd2_journal_remove_checkpoint(jh)
+				      // bh won't be flushed
+		                    jbd2_cleanup_journal_tail
+    __jbd2_journal_file_buffer(jh, transaction, BJ_Reserved)
+4. Aborting journal/Power-cut before writing latest bh on journal area.
+
+In this way we get a corrupted filesystem with bh's data lost.
+
+Fix it by moving the clearing of buffer_dirty bit just before the call
+to __jbd2_journal_file_buffer(), both bit clearing and jh->b_transaction
+assignment are under journal->j_list_lock locked, so that
+jbd2_log_do_checkpoint() will wait until jh's new transaction fininshed
+even bh is currently not dirty. And journal_shrink_one_cp_list() won't
+remove jh from checkpoint list if the buffer head is reused in
+do_get_write_access().
+
+Fetch a reproducer in [Link].
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=216898
+Cc: <stable@kernel.org>
+Signed-off-by: Zhihao Cheng <chengzhihao1@huawei.com>
+Signed-off-by: zhanchengbin <zhanchengbin1@huawei.com>
+Suggested-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230110015327.1181863-1-chengzhihao1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/jbd2/transaction.c | 50 +++++++++++++++++++++++++------------------
+ 1 file changed, 29 insertions(+), 21 deletions(-)
+
+diff --git a/fs/jbd2/transaction.c b/fs/jbd2/transaction.c
+index 6a404ac1c..15de13850 100644
+--- a/fs/jbd2/transaction.c
++++ b/fs/jbd2/transaction.c
+@@ -1010,36 +1010,28 @@ do_get_write_access(handle_t *handle, struct journal_head *jh,
+ 	 * ie. locked but not dirty) or tune2fs (which may actually have
+ 	 * the buffer dirtied, ugh.)  */
+ 
+-	if (buffer_dirty(bh)) {
++	if (buffer_dirty(bh) && jh->b_transaction) {
++		warn_dirty_buffer(bh);
+ 		/*
+-		 * First question: is this buffer already part of the current
+-		 * transaction or the existing committing transaction?
+-		 */
+-		if (jh->b_transaction) {
+-			J_ASSERT_JH(jh,
+-				jh->b_transaction == transaction ||
+-				jh->b_transaction ==
+-					journal->j_committing_transaction);
+-			if (jh->b_next_transaction)
+-				J_ASSERT_JH(jh, jh->b_next_transaction ==
+-							transaction);
+-			warn_dirty_buffer(bh);
+-		}
+-		/*
+-		 * In any case we need to clean the dirty flag and we must
+-		 * do it under the buffer lock to be sure we don't race
+-		 * with running write-out.
++		 * We need to clean the dirty flag and we must do it under the
++		 * buffer lock to be sure we don't race with running write-out.
+ 		 */
+ 		JBUFFER_TRACE(jh, "Journalling dirty buffer");
+ 		clear_buffer_dirty(bh);
++		/*
++		 * The buffer is going to be added to BJ_Reserved list now and
++		 * nothing guarantees jbd2_journal_dirty_metadata() will be
++		 * ever called for it. So we need to set jbddirty bit here to
++		 * make sure the buffer is dirtied and written out when the
++		 * journaling machinery is done with it.
++		 */
+ 		set_buffer_jbddirty(bh);
+ 	}
+ 
+-	unlock_buffer(bh);
+-
+ 	error = -EROFS;
+ 	if (is_handle_aborted(handle)) {
+ 		spin_unlock(&jh->b_state_lock);
++		unlock_buffer(bh);
+ 		goto out;
+ 	}
+ 	error = 0;
+@@ -1049,8 +1041,10 @@ do_get_write_access(handle_t *handle, struct journal_head *jh,
+ 	 * b_next_transaction points to it
+ 	 */
+ 	if (jh->b_transaction == transaction ||
+-	    jh->b_next_transaction == transaction)
++	    jh->b_next_transaction == transaction) {
++		unlock_buffer(bh);
+ 		goto done;
++	}
+ 
+ 	/*
+ 	 * this is the first time this transaction is touching this buffer,
+@@ -1074,10 +1068,24 @@ do_get_write_access(handle_t *handle, struct journal_head *jh,
+ 		 */
+ 		smp_wmb();
+ 		spin_lock(&journal->j_list_lock);
++		if (test_clear_buffer_dirty(bh)) {
++			/*
++			 * Execute buffer dirty clearing and jh->b_transaction
++			 * assignment under journal->j_list_lock locked to
++			 * prevent bh being removed from checkpoint list if
++			 * the buffer is in an intermediate state (not dirty
++			 * and jh->b_transaction is NULL).
++			 */
++			JBUFFER_TRACE(jh, "Journalling dirty buffer");
++			set_buffer_jbddirty(bh);
++		}
+ 		__jbd2_journal_file_buffer(jh, transaction, BJ_Reserved);
+ 		spin_unlock(&journal->j_list_lock);
++		unlock_buffer(bh);
+ 		goto done;
+ 	}
++	unlock_buffer(bh);
++
+ 	/*
+ 	 * If there is already a copy-out version of this buffer, then we don't
+ 	 * need to make another one
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 2920d373c3661bf61c8fb2cfda295ef973c246b3 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Tue, 10 Jan 2023 21:34:36 +0800
+Subject: [PATCH 13/23] ext4: fix task hung in ext4_xattr_delete_inode
+
+Syzbot reported a hung task problem:
+==================================================================
+INFO: task syz-executor232:5073 blocked for more than 143 seconds.
+      Not tainted 6.2.0-rc2-syzkaller-00024-g512dee0c00ad #0
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+task:syz-exec232 state:D stack:21024 pid:5073 ppid:5072 flags:0x00004004
+Call Trace:
+ <TASK>
+ context_switch kernel/sched/core.c:5244 [inline]
+ __schedule+0x995/0xe20 kernel/sched/core.c:6555
+ schedule+0xcb/0x190 kernel/sched/core.c:6631
+ __wait_on_freeing_inode fs/inode.c:2196 [inline]
+ find_inode_fast+0x35a/0x4c0 fs/inode.c:950
+ iget_locked+0xb1/0x830 fs/inode.c:1273
+ __ext4_iget+0x22e/0x3ed0 fs/ext4/inode.c:4861
+ ext4_xattr_inode_iget+0x68/0x4e0 fs/ext4/xattr.c:389
+ ext4_xattr_inode_dec_ref_all+0x1a7/0xe50 fs/ext4/xattr.c:1148
+ ext4_xattr_delete_inode+0xb04/0xcd0 fs/ext4/xattr.c:2880
+ ext4_evict_inode+0xd7c/0x10b0 fs/ext4/inode.c:296
+ evict+0x2a4/0x620 fs/inode.c:664
+ ext4_orphan_cleanup+0xb60/0x1340 fs/ext4/orphan.c:474
+ __ext4_fill_super fs/ext4/super.c:5516 [inline]
+ ext4_fill_super+0x81cd/0x8700 fs/ext4/super.c:5644
+ get_tree_bdev+0x400/0x620 fs/super.c:1282
+ vfs_get_tree+0x88/0x270 fs/super.c:1489
+ do_new_mount+0x289/0xad0 fs/namespace.c:3145
+ do_mount fs/namespace.c:3488 [inline]
+ __do_sys_mount fs/namespace.c:3697 [inline]
+ __se_sys_mount+0x2d3/0x3c0 fs/namespace.c:3674
+ do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+ do_syscall_64+0x3d/0xb0 arch/x86/entry/common.c:80
+ entry_SYSCALL_64_after_hwframe+0x63/0xcd
+RIP: 0033:0x7fa5406fd5ea
+RSP: 002b:00007ffc7232f968 EFLAGS: 00000202 ORIG_RAX: 00000000000000a5
+RAX: ffffffffffffffda RBX: 0000000000000003 RCX: 00007fa5406fd5ea
+RDX: 0000000020000440 RSI: 0000000020000000 RDI: 00007ffc7232f970
+RBP: 00007ffc7232f970 R08: 00007ffc7232f9b0 R09: 0000000000000432
+R10: 0000000000804a03 R11: 0000000000000202 R12: 0000000000000004
+R13: 0000555556a7a2c0 R14: 00007ffc7232f9b0 R15: 0000000000000000
+ </TASK>
+==================================================================
+
+The problem is that the inode contains an xattr entry with ea_inum of 15
+when cleaning up an orphan inode <15>. When evict inode <15>, the reference
+counting of the corresponding EA inode is decreased. When EA inode <15> is
+found by find_inode_fast() in __ext4_iget(), it is found that the EA inode
+holds the I_FREEING flag and waits for the EA inode to complete deletion.
+As a result, when inode <15> is being deleted, we wait for inode <15> to
+complete the deletion, resulting in an infinite loop and triggering Hung
+Task. To solve this problem, we only need to check whether the ino of EA
+inode and parent is the same before getting EA inode.
+
+Link: https://syzkaller.appspot.com/bug?extid=77d6fcc37bbb92f26048
+Reported-by: syzbot+77d6fcc37bbb92f26048@syzkaller.appspotmail.com
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230110133436.996350-1-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/xattr.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 25275e5e8..62f2ec599 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -422,6 +422,17 @@ static int ext4_xattr_inode_iget(struct inode *parent, unsigned long ea_ino,
+ 	struct inode *inode;
+ 	int err;
+ 
++	/*
++	 * We have to check for this corruption early as otherwise
++	 * iget_locked() could wait indefinitely for the state of our
++	 * parent inode.
++	 */
++	if (parent->i_ino == ea_ino) {
++		ext4_error(parent->i_sb,
++			   "Parent and EA inode have the same ino %lu", ea_ino);
++		return -EFSCORRUPTED;
++	}
++
+ 	inode = ext4_iget(parent->i_sb, ea_ino, EXT4_IGET_NORMAL);
+ 	if (IS_ERR(inode)) {
+ 		err = PTR_ERR(inode);
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 7af5dbabc164e19d74f6704ef3c3c35844ac0288 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Jan 2023 16:43:25 +0100
+Subject: [PATCH 14/23] ext4: update stale comment about write constraints
+
+The comment above do_journal_get_write_access() is very stale. Most of
+it just does not refer to what the function does today or how jbd2
+works. The bit about transaction handling during write(2) is still
+correct so just update the function names in that part and move the
+comment to a more appropriate place.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230111154338.392-1-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 31 +++++++------------------------
+ 1 file changed, 7 insertions(+), 24 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index b65dadfe3..20604cdb7 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1005,30 +1005,6 @@ int ext4_walk_page_buffers(handle_t *handle, struct inode *inode,
+ 	return ret;
+ }
+ 
+-/*
+- * To preserve ordering, it is essential that the hole instantiation and
+- * the data write be encapsulated in a single transaction.  We cannot
+- * close off a transaction and start a new one between the ext4_get_block()
+- * and the commit_write().  So doing the jbd2_journal_start at the start of
+- * prepare_write() is the right place.
+- *
+- * Also, this function can nest inside ext4_writepage().  In that case, we
+- * *know* that ext4_writepage() has generated enough buffer credits to do the
+- * whole page.  So we won't block on the journal in that case, which is good,
+- * because the caller may be PF_MEMALLOC.
+- *
+- * By accident, ext4 can be reentered when a transaction is open via
+- * quota file writes.  If we were to commit the transaction while thus
+- * reentered, there can be a deadlock - we would be holding a quota
+- * lock, and the commit would never complete if another thread had a
+- * transaction open and was blocking on the quota lock - a ranking
+- * violation.
+- *
+- * So what we do is to rely on the fact that jbd2_journal_stop/journal_start
+- * will _not_ run commit under these circumstances because handle->h_ref
+- * is elevated.  We'll still have enough credits for the tiny quotafile
+- * write.
+- */
+ int do_journal_get_write_access(handle_t *handle, struct inode *inode,
+ 				struct buffer_head *bh)
+ {
+@@ -1149,6 +1125,13 @@ static int ext4_block_write_begin(struct page *page, loff_t pos, unsigned len,
+ }
+ #endif
+ 
++/*
++ * To preserve ordering, it is essential that the hole instantiation and
++ * the data write be encapsulated in a single transaction.  We cannot
++ * close off a transaction and start a new one between the ext4_get_block()
++ * and the ext4_write_end().  So doing the jbd2_journal_start at the start of
++ * ext4_write_begin() is the right place.
++ */
+ static int ext4_write_begin(struct file *file, struct address_space *mapping,
+ 			    loff_t pos, unsigned len,
+ 			    struct page **pagep, void **fsdata)
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 6b38f72ae7947ac3d7776efdc30acf04fb215f0b Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Jan 2023 16:43:26 +0100
+Subject: [PATCH 15/23] ext4: use nr_to_write directly in
+ mpage_prepare_extent_to_map()
+
+When looking up extent of pages to map in mpage_prepare_extent_to_map()
+we count how many pages we still need to find in a copy of
+wbc->nr_to_write counter. With more complex page handling for
+data=journal mode, it will be easier to use wbc->nr_to_write directly so
+that we don't forget to carry over changes back to nr_to_write counter.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230111154338.392-2-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 20604cdb7..89e0ecaec 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2580,7 +2580,6 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 	struct address_space *mapping = mpd->inode->i_mapping;
+ 	struct pagevec pvec;
+ 	unsigned int nr_pages;
+-	long left = mpd->wbc->nr_to_write;
+ 	pgoff_t index = mpd->first_page;
+ 	pgoff_t end = mpd->last_page;
+ 	xa_mark_t tag;
+@@ -2614,7 +2613,9 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 			 * newly appeared dirty pages, but have not synced all
+ 			 * of the old dirty pages.
+ 			 */
+-			if (mpd->wbc->sync_mode == WB_SYNC_NONE && left <= 0)
++			if (mpd->wbc->sync_mode == WB_SYNC_NONE &&
++			    mpd->wbc->nr_to_write <=
++			    mpd->map.m_len >> (PAGE_SHIFT - blkbits))
+ 				goto out;
+ 
+ 			/* If we can't merge this page, we are done. */
+@@ -2683,7 +2684,6 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 					goto out;
+ 				err = 0;
+ 			}
+-			left--;
+ 		}
+ 		pagevec_release(&pvec);
+ 		cond_resched();
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 9920da054c7898600374122d62a07054fb674663 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Jan 2023 16:43:27 +0100
+Subject: [PATCH 16/23] ext4: mark page for delayed dirtying only if it is
+ pinned
+
+In data=journal mode, page should be dirtied only when it has buffers
+for checkpoint or it is writeably mapped. In the first case, we don't
+need to do anything special. In the second case, page was already added
+to the journal by ext4_page_mkwrite() and since transaction commit
+writeprotects mapped pages again, page should be writeable (and thus
+dirtied) only while it is part of the running transaction. So nothing
+needs to be done either. The only special case is when someone pins the
+page and uses this pin for modifying page data. So recognize this
+special case and only then mark the page as having data that needs
+adding to the journal.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230111154338.392-3-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 28 +++++++++++++++-------------
+ 1 file changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 89e0ecaec..a18fde965 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -3670,24 +3670,26 @@ const struct iomap_ops ext4_iomap_report_ops = {
+ };
+ 
+ /*
+- * Whenever the folio is being dirtied, corresponding buffers should already
+- * be attached to the transaction (we take care of this in ext4_page_mkwrite()
+- * and ext4_write_begin()). However we cannot move buffers to dirty transaction
+- * lists here because ->dirty_folio is called under VFS locks and the folio
+- * is not necessarily locked.
+- *
+- * We cannot just dirty the folio and leave attached buffers clean, because the
+- * buffers' dirty state is "definitive".  We cannot just set the buffers dirty
+- * or jbddirty because all the journalling code will explode.
+- *
+- * So what we do is to mark the folio "pending dirty" and next time writepage
+- * is called, propagate that into the buffers appropriately.
++ * For data=journal mode, folio should be marked dirty only when it was
++ * writeably mapped. When that happens, it was already attached to the
++ * transaction and marked as jbddirty (we take care of this in
++ * ext4_page_mkwrite()). On transaction commit, we writeprotect page mappings
++ * so we should have nothing to do here, except for the case when someone
++ * had the page pinned and dirtied the page through this pin (e.g. by doing
++ * direct IO to it). In that case we'd need to attach buffers here to the
++ * transaction but we cannot due to lock ordering.  We cannot just dirty the
++ * folio and leave attached buffers clean, because the buffers' dirty state is
++ * "definitive".  We cannot just set the buffers dirty or jbddirty because all
++ * the journalling code will explode.  So what we do is to mark the folio
++ * "pending dirty" and next time ext4_writepages() is called, attach buffers
++ * to the transaction appropriately.
+  */
+ static bool ext4_journalled_dirty_folio(struct address_space *mapping,
+ 		struct folio *folio)
+ {
+ 	WARN_ON_ONCE(!folio_buffers(folio));
+-	folio_set_checked(folio);
++	if (folio_maybe_dma_pinned(folio))
++		folio_set_checked(folio);
+ 	return filemap_dirty_folio(mapping, folio);
+ }
+ 
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 5fac50330077f46ea669212082ea218ec5bc0ec3 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Jan 2023 16:43:28 +0100
+Subject: [PATCH 17/23] ext4: don't unlock page in ext4_bio_write_page()
+
+Do not unlock the written page in ext4_bio_write_page(). Instead leave
+the page locked and unlock it in the callers. We'll need to keep the
+page locked for data=journal writeback for a bit longer.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230111154338.392-4-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c   |  2 ++
+ fs/ext4/page-io.c | 10 +++++-----
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index a18fde965..e81e665e6 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2076,6 +2076,7 @@ static int ext4_writepage(struct page *page,
+ 		return -ENOMEM;
+ 	}
+ 	ret = ext4_bio_write_page(&io_submit, page, len);
++	unlock_page(page);
+ 	ext4_io_submit(&io_submit);
+ 	/* Drop io_end reference we got from init */
+ 	ext4_put_io_end_defer(io_submit.io_end);
+@@ -2110,6 +2111,7 @@ static int mpage_submit_page(struct mpage_da_data *mpd, struct page *page)
+ 	else
+ 		len = PAGE_SIZE;
+ 	err = ext4_bio_write_page(&mpd->io_submit, page, len);
++	unlock_page(page);
+ 	if (!err)
+ 		mpd->wbc->nr_to_write--;
+ 	mpd->first_page++;
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index beaec6d81..3bc7c7c5b 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -500,7 +500,7 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 
+ 	/* Nothing to submit? Just unlock the page... */
+ 	if (!nr_to_submit)
+-		goto unlock;
++		return 0;
+ 
+ 	bh = head = page_buffers(page);
+ 
+@@ -548,7 +548,8 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 				}
+ 				bh = bh->b_this_page;
+ 			} while (bh != head);
+-			goto unlock;
++
++			return ret;
+ 		}
+ 	}
+ 
+@@ -564,7 +565,6 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 		io_submit_add_bh(io, inode,
+ 				 bounce_page ? bounce_page : page, bh);
+ 	} while ((bh = bh->b_this_page) != head);
+-unlock:
+-	unlock_page(page);
+-	return ret;
++
++	return 0;
+ }
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From dcd70b1e1f87b9e8ec58af65364119b9be9b20e6 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Jan 2023 16:43:29 +0100
+Subject: [PATCH 18/23] ext4: move page unlocking out of mpage_submit_page()
+
+Move page unlocking during page writeback out of mpage_submit_page()
+into the callers. This will allow writeback in data=journal mode to keep
+the page locked for a bit longer. Since page unlocking it tightly
+connected to increment of mpd->first_page (as that determines cleanup of
+locked but unwritten pages), move page unlocking as well as
+mpd->first_page handling into a helper function.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230111154338.392-5-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index e81e665e6..7bd074ec9 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2083,6 +2083,12 @@ static int ext4_writepage(struct page *page,
+ 	return ret;
+ }
+ 
++static void mpage_page_done(struct mpage_da_data *mpd, struct page *page)
++{
++	mpd->first_page++;
++	unlock_page(page);
++}
++
+ static int mpage_submit_page(struct mpage_da_data *mpd, struct page *page)
+ {
+ 	int len;
+@@ -2111,10 +2117,8 @@ static int mpage_submit_page(struct mpage_da_data *mpd, struct page *page)
+ 	else
+ 		len = PAGE_SIZE;
+ 	err = ext4_bio_write_page(&mpd->io_submit, page, len);
+-	unlock_page(page);
+ 	if (!err)
+ 		mpd->wbc->nr_to_write--;
+-	mpd->first_page++;
+ 
+ 	return err;
+ }
+@@ -2226,6 +2230,7 @@ static int mpage_process_page_bufs(struct mpage_da_data *mpd,
+ 	/* So far everything mapped? Submit the page for IO. */
+ 	if (mpd->map.m_len == 0) {
+ 		err = mpage_submit_page(mpd, head->b_page);
++		mpage_page_done(mpd, head->b_page);
+ 		if (err < 0)
+ 			return err;
+ 	}
+@@ -2357,6 +2362,7 @@ static int mpage_map_and_submit_buffers(struct mpage_da_data *mpd)
+ 				goto out;
+ 			/* Page fully mapped - let IO run! */
+ 			err = mpage_submit_page(mpd, page);
++			mpage_page_done(mpd, page);
+ 			if (err < 0)
+ 				goto out;
+ 		}
+@@ -2667,14 +2673,11 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 			 * modify metadata is simple. Just submit the page.
+ 			 */
+ 			if (!mpd->can_map) {
+-				if (ext4_page_nomap_can_writeout(page)) {
++				if (ext4_page_nomap_can_writeout(page))
+ 					err = mpage_submit_page(mpd, page);
+-					if (err < 0)
+-						goto out;
+-				} else {
+-					unlock_page(page);
+-					mpd->first_page++;
+-				}
++				mpage_page_done(mpd, page);
++				if (err < 0)
++					goto out;
+ 			} else {
+ 				/* Add all dirty buffers to mpd */
+ 				lblk = ((ext4_lblk_t)page->index) <<
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 8b5fe0912b66cbb570fe77f045c88e88b861b734 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Jan 2023 16:43:30 +0100
+Subject: [PATCH 19/23] ext4: move mpage_page_done() calls after error handling
+
+In case mpage_submit_page() returns error, it doesn't really matter
+whether we call mpage_page_done() and then return error or whether we
+return directly because in that case page cleanup will be done by
+mpage_release_unused_pages() instead. Logically, it makes more sense to
+leave the cleanup to mpage_release_unused_pages() because we didn't
+succeed in writing the page. So move mpage_page_done() calls after the
+error handling.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230111154338.392-6-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 7bd074ec9..20396aec7 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2230,9 +2230,9 @@ static int mpage_process_page_bufs(struct mpage_da_data *mpd,
+ 	/* So far everything mapped? Submit the page for IO. */
+ 	if (mpd->map.m_len == 0) {
+ 		err = mpage_submit_page(mpd, head->b_page);
+-		mpage_page_done(mpd, head->b_page);
+ 		if (err < 0)
+ 			return err;
++		mpage_page_done(mpd, head->b_page);
+ 	}
+ 	if (lblk >= blocks) {
+ 		mpd->scanned_until_end = 1;
+@@ -2362,9 +2362,9 @@ static int mpage_map_and_submit_buffers(struct mpage_da_data *mpd)
+ 				goto out;
+ 			/* Page fully mapped - let IO run! */
+ 			err = mpage_submit_page(mpd, page);
+-			mpage_page_done(mpd, page);
+ 			if (err < 0)
+ 				goto out;
++			mpage_page_done(mpd, page);
+ 		}
+ 		folio_batch_release(&fbatch);
+ 	}
+@@ -2673,11 +2673,12 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 			 * modify metadata is simple. Just submit the page.
+ 			 */
+ 			if (!mpd->can_map) {
+-				if (ext4_page_nomap_can_writeout(page))
++				if (ext4_page_nomap_can_writeout(page)) {
+ 					err = mpage_submit_page(mpd, page);
++					if (err < 0)
++						goto out;
++				}
+ 				mpage_page_done(mpd, page);
+-				if (err < 0)
+-					goto out;
+ 			} else {
+ 				/* Add all dirty buffers to mpd */
+ 				lblk = ((ext4_lblk_t)page->index) <<
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 715fe2e2ec478f9b4142aece911a44ddbbce0c5a Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Jan 2023 16:43:31 +0100
+Subject: [PATCH 20/23] ext4: convert data=journal writeback to use
+ ext4_writepages()
+
+Add support for writeback of journalled data directly into
+ext4_writepages() instead of offloading it to write_cache_pages(). This
+actually significantly simplifies the code and reduces code duplication.
+For checkpointing of committed data we can use ext4_writepages()
+rightaway the same way as writeback of ordered data uses it on
+transaction commit. For journalling of dirty mapped pages, we need to
+add a special case to mpage_prepare_extent_to_map() to add all page
+buffers to the journal.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230111154338.392-7-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c             | 340 ++++++++++--------------------------
+ include/trace/events/ext4.h |   7 -
+ 2 files changed, 90 insertions(+), 257 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 20396aec7..24128f6cd 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -136,7 +136,6 @@ static inline int ext4_begin_ordered_truncate(struct inode *inode,
+ 						   new_size);
+ }
+ 
+-static int __ext4_journalled_writepage(struct page *page, unsigned int len);
+ static int ext4_meta_trans_blocks(struct inode *inode, int lblocks,
+ 				  int pextents);
+ 
+@@ -1632,12 +1631,6 @@ static void ext4_print_free_blocks(struct inode *inode)
+ 	return;
+ }
+ 
+-static int ext4_bh_delay_or_unwritten(handle_t *handle, struct inode *inode,
+-				      struct buffer_head *bh)
+-{
+-	return (buffer_delay(bh) || buffer_unwritten(bh)) && buffer_dirty(bh);
+-}
+-
+ /*
+  * ext4_insert_delayed_block - adds a delayed block to the extents status
+  *                             tree, incrementing the reserved cluster/block
+@@ -1870,219 +1863,6 @@ int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
+ 	return 0;
+ }
+ 
+-static int __ext4_journalled_writepage(struct page *page,
+-				       unsigned int len)
+-{
+-	struct address_space *mapping = page->mapping;
+-	struct inode *inode = mapping->host;
+-	handle_t *handle = NULL;
+-	int ret = 0, err = 0;
+-	int inline_data = ext4_has_inline_data(inode);
+-	struct buffer_head *inode_bh = NULL;
+-	loff_t size;
+-
+-	ClearPageChecked(page);
+-
+-	if (inline_data) {
+-		BUG_ON(page->index != 0);
+-		BUG_ON(len > ext4_get_max_inline_size(inode));
+-		inode_bh = ext4_journalled_write_inline_data(inode, len, page);
+-		if (inode_bh == NULL)
+-			goto out;
+-	}
+-	/*
+-	 * We need to release the page lock before we start the
+-	 * journal, so grab a reference so the page won't disappear
+-	 * out from under us.
+-	 */
+-	get_page(page);
+-	unlock_page(page);
+-
+-	handle = ext4_journal_start(inode, EXT4_HT_WRITE_PAGE,
+-				    ext4_writepage_trans_blocks(inode));
+-	if (IS_ERR(handle)) {
+-		ret = PTR_ERR(handle);
+-		put_page(page);
+-		goto out_no_pagelock;
+-	}
+-	BUG_ON(!ext4_handle_valid(handle));
+-
+-	lock_page(page);
+-	put_page(page);
+-	size = i_size_read(inode);
+-	if (page->mapping != mapping || page_offset(page) > size) {
+-		/* The page got truncated from under us */
+-		ext4_journal_stop(handle);
+-		ret = 0;
+-		goto out;
+-	}
+-
+-	if (inline_data) {
+-		ret = ext4_mark_inode_dirty(handle, inode);
+-	} else {
+-		struct buffer_head *page_bufs = page_buffers(page);
+-
+-		if (page->index == size >> PAGE_SHIFT)
+-			len = size & ~PAGE_MASK;
+-		else
+-			len = PAGE_SIZE;
+-
+-		ret = ext4_walk_page_buffers(handle, inode, page_bufs, 0, len,
+-					     NULL, do_journal_get_write_access);
+-
+-		err = ext4_walk_page_buffers(handle, inode, page_bufs, 0, len,
+-					     NULL, write_end_fn);
+-	}
+-	if (ret == 0)
+-		ret = err;
+-	err = ext4_jbd2_inode_add_write(handle, inode, page_offset(page), len);
+-	if (ret == 0)
+-		ret = err;
+-	EXT4_I(inode)->i_datasync_tid = handle->h_transaction->t_tid;
+-	err = ext4_journal_stop(handle);
+-	if (!ret)
+-		ret = err;
+-
+-	ext4_set_inode_state(inode, EXT4_STATE_JDATA);
+-out:
+-	unlock_page(page);
+-out_no_pagelock:
+-	brelse(inode_bh);
+-	return ret;
+-}
+-
+-/*
+- * Note that we don't need to start a transaction unless we're journaling data
+- * because we should have holes filled from ext4_page_mkwrite(). We even don't
+- * need to file the inode to the transaction's list in ordered mode because if
+- * we are writing back data added by write(), the inode is already there and if
+- * we are writing back data modified via mmap(), no one guarantees in which
+- * transaction the data will hit the disk. In case we are journaling data, we
+- * cannot start transaction directly because transaction start ranks above page
+- * lock so we have to do some magic.
+- *
+- * This function can get called via...
+- *   - ext4_writepages after taking page lock (have journal handle)
+- *   - journal_submit_inode_data_buffers (no journal handle)
+- *   - shrink_page_list via the kswapd/direct reclaim (no journal handle)
+- *   - grab_page_cache when doing write_begin (have journal handle)
+- *
+- * We don't do any block allocation in this function. If we have page with
+- * multiple blocks we need to write those buffer_heads that are mapped. This
+- * is important for mmaped based write. So if we do with blocksize 1K
+- * truncate(f, 1024);
+- * a = mmap(f, 0, 4096);
+- * a[0] = 'a';
+- * truncate(f, 4096);
+- * we have in the page first buffer_head mapped via page_mkwrite call back
+- * but other buffer_heads would be unmapped but dirty (dirty done via the
+- * do_wp_page). So writepage should write the first block. If we modify
+- * the mmap area beyond 1024 we will again get a page_fault and the
+- * page_mkwrite callback will do the block allocation and mark the
+- * buffer_heads mapped.
+- *
+- * We redirty the page if we have any buffer_heads that is either delay or
+- * unwritten in the page.
+- *
+- * We can get recursively called as show below.
+- *
+- *	ext4_writepage() -> kmalloc() -> __alloc_pages() -> page_launder() ->
+- *		ext4_writepage()
+- *
+- * But since we don't do any block allocation we should not deadlock.
+- * Page also have the dirty flag cleared so we don't get recurive page_lock.
+- */
+-static int ext4_writepage(struct page *page,
+-			  struct writeback_control *wbc)
+-{
+-	struct folio *folio = page_folio(page);
+-	int ret = 0;
+-	loff_t size;
+-	unsigned int len;
+-	struct buffer_head *page_bufs = NULL;
+-	struct inode *inode = page->mapping->host;
+-	struct ext4_io_submit io_submit;
+-
+-	if (unlikely(ext4_forced_shutdown(EXT4_SB(inode->i_sb)))) {
+-		folio_invalidate(folio, 0, folio_size(folio));
+-		folio_unlock(folio);
+-		return -EIO;
+-	}
+-
+-	trace_ext4_writepage(page);
+-	size = i_size_read(inode);
+-	if (page->index == size >> PAGE_SHIFT &&
+-	    !ext4_verity_in_progress(inode))
+-		len = size & ~PAGE_MASK;
+-	else
+-		len = PAGE_SIZE;
+-
+-	/* Should never happen but for bugs in other kernel subsystems */
+-	if (!page_has_buffers(page)) {
+-		ext4_warning_inode(inode,
+-		   "page %lu does not have buffers attached", page->index);
+-		ClearPageDirty(page);
+-		unlock_page(page);
+-		return 0;
+-	}
+-
+-	page_bufs = page_buffers(page);
+-	/*
+-	 * We cannot do block allocation or other extent handling in this
+-	 * function. If there are buffers needing that, we have to redirty
+-	 * the page. But we may reach here when we do a journal commit via
+-	 * journal_submit_inode_data_buffers() and in that case we must write
+-	 * allocated buffers to achieve data=ordered mode guarantees.
+-	 *
+-	 * Also, if there is only one buffer per page (the fs block
+-	 * size == the page size), if one buffer needs block
+-	 * allocation or needs to modify the extent tree to clear the
+-	 * unwritten flag, we know that the page can't be written at
+-	 * all, so we might as well refuse the write immediately.
+-	 * Unfortunately if the block size != page size, we can't as
+-	 * easily detect this case using ext4_walk_page_buffers(), but
+-	 * for the extremely common case, this is an optimization that
+-	 * skips a useless round trip through ext4_bio_write_page().
+-	 */
+-	if (ext4_walk_page_buffers(NULL, inode, page_bufs, 0, len, NULL,
+-				   ext4_bh_delay_or_unwritten)) {
+-		redirty_page_for_writepage(wbc, page);
+-		if ((current->flags & PF_MEMALLOC) ||
+-		    (inode->i_sb->s_blocksize == PAGE_SIZE)) {
+-			/*
+-			 * For memory cleaning there's no point in writing only
+-			 * some buffers. So just bail out. Warn if we came here
+-			 * from direct reclaim.
+-			 */
+-			WARN_ON_ONCE((current->flags & (PF_MEMALLOC|PF_KSWAPD))
+-							== PF_MEMALLOC);
+-			unlock_page(page);
+-			return 0;
+-		}
+-	}
+-
+-	if (PageChecked(page) && ext4_should_journal_data(inode))
+-		/*
+-		 * It's mmapped pagecache.  Add buffers and journal it.  There
+-		 * doesn't seem much point in redirtying the page here.
+-		 */
+-		return __ext4_journalled_writepage(page, len);
+-
+-	ext4_io_submit_init(&io_submit, wbc);
+-	io_submit.io_end = ext4_init_io_end(inode, GFP_NOFS);
+-	if (!io_submit.io_end) {
+-		redirty_page_for_writepage(wbc, page);
+-		unlock_page(page);
+-		return -ENOMEM;
+-	}
+-	ret = ext4_bio_write_page(&io_submit, page, len);
+-	unlock_page(page);
+-	ext4_io_submit(&io_submit);
+-	/* Drop io_end reference we got from init */
+-	ext4_put_io_end_defer(io_submit.io_end);
+-	return ret;
+-}
+-
+ static void mpage_page_done(struct mpage_da_data *mpd, struct page *page)
+ {
+ 	mpd->first_page++;
+@@ -2563,6 +2343,50 @@ static bool ext4_page_nomap_can_writeout(struct page *page)
+ 	return false;
+ }
+ 
++static int ext4_journal_page_buffers(handle_t *handle, struct page *page,
++				     int len)
++{
++	struct buffer_head *page_bufs = page_buffers(page);
++	struct inode *inode = page->mapping->host;
++	int ret, err;
++
++	ret = ext4_walk_page_buffers(handle, inode, page_bufs, 0, len,
++				     NULL, do_journal_get_write_access);
++	err = ext4_walk_page_buffers(handle, inode, page_bufs, 0, len,
++				     NULL, write_end_fn);
++	if (ret == 0)
++		ret = err;
++	err = ext4_jbd2_inode_add_write(handle, inode, page_offset(page), len);
++	if (ret == 0)
++		ret = err;
++	EXT4_I(inode)->i_datasync_tid = handle->h_transaction->t_tid;
++
++	ext4_set_inode_state(inode, EXT4_STATE_JDATA);
++
++	return ret;
++}
++
++static int mpage_journal_page_buffers(handle_t *handle,
++				      struct mpage_da_data *mpd,
++				      struct page *page)
++{
++	struct inode *inode = mpd->inode;
++	loff_t size = i_size_read(inode);
++	int len;
++
++	ClearPageChecked(page);
++	clear_page_dirty_for_io(page);
++	mpd->wbc->nr_to_write--;
++
++	if (page->index == size >> PAGE_SHIFT &&
++	    !ext4_verity_in_progress(inode))
++		len = size & ~PAGE_MASK;
++	else
++		len = PAGE_SIZE;
++
++	return ext4_journal_page_buffers(handle, page, len);
++}
++
+ /*
+  * mpage_prepare_extent_to_map - find & lock contiguous range of dirty pages
+  * 				 needing mapping, submit mapped pages
+@@ -2595,12 +2419,20 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 	int blkbits = mpd->inode->i_blkbits;
+ 	ext4_lblk_t lblk;
+ 	struct buffer_head *head;
++	handle_t *handle = NULL;
++	int bpp = ext4_journal_blocks_per_page(mpd->inode);
+ 
+ 	if (mpd->wbc->sync_mode == WB_SYNC_ALL || mpd->wbc->tagged_writepages)
+ 		tag = PAGECACHE_TAG_TOWRITE;
+ 	else
+ 		tag = PAGECACHE_TAG_DIRTY;
+ 
++	if (ext4_should_journal_data(mpd->inode)) {
++		handle = ext4_journal_start(mpd->inode, EXT4_HT_WRITE_PAGE,
++					    bpp);
++		if (IS_ERR(handle))
++			return PTR_ERR(handle);
++	}
+ 	pagevec_init(&pvec);
+ 	mpd->map.m_len = 0;
+ 	mpd->next_page = index;
+@@ -2630,6 +2462,13 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 			if (mpd->map.m_len > 0 && mpd->next_page != page->index)
+ 				goto out;
+ 
++			if (handle) {
++				err = ext4_journal_ensure_credits(handle, bpp,
++								  0);
++				if (err < 0)
++					goto out;
++			}
++
+ 			lock_page(page);
+ 			/*
+ 			 * If the page is no longer dirty, or its mapping no
+@@ -2669,8 +2508,15 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 				mpd->first_page = page->index;
+ 			mpd->next_page = page->index + 1;
+ 			/*
+-			 * Writeout for transaction commit where we cannot
+-			 * modify metadata is simple. Just submit the page.
++			 * Writeout when we cannot modify metadata is simple.
++			 * Just submit the page. For data=journal mode we
++			 * first handle writeout of the page for checkpoint and
++			 * only after that handle delayed page dirtying. This
++			 * is crutial so that forcing a transaction commit and
++			 * then calling filemap_write_and_wait() guarantees
++			 * current state of data is in its final location. Such
++			 * sequence is used for example by insert/collapse
++			 * range operations before discarding the page cache.
+ 			 */
+ 			if (!mpd->can_map) {
+ 				if (ext4_page_nomap_can_writeout(page)) {
+@@ -2678,6 +2524,13 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 					if (err < 0)
+ 						goto out;
+ 				}
++				/* Pending dirtying of journalled data? */
++				if (PageChecked(page)) {
++					err = mpage_journal_page_buffers(handle,
++						mpd, page);
++					if (err < 0)
++						goto out;
++				}
+ 				mpage_page_done(mpd, page);
+ 			} else {
+ 				/* Add all dirty buffers to mpd */
+@@ -2695,18 +2548,16 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 		cond_resched();
+ 	}
+ 	mpd->scanned_until_end = 1;
++	if (handle)
++		ext4_journal_stop(handle);
+ 	return 0;
+ out:
+ 	pagevec_release(&pvec);
++	if (handle)
++		ext4_journal_stop(handle);
+ 	return err;
+ }
+ 
+-static int ext4_writepage_cb(struct page *page, struct writeback_control *wbc,
+-			     void *data)
+-{
+-	return ext4_writepage(page, wbc);
+-}
+-
+ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ {
+ 	struct writeback_control *wbc = mpd->wbc;
+@@ -2732,13 +2583,6 @@ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ 	if (!mapping->nrpages || !mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+ 		goto out_writepages;
+ 
+-	if (ext4_should_journal_data(inode)) {
+-		blk_start_plug(&plug);
+-		ret = write_cache_pages(mapping, wbc, ext4_writepage_cb, NULL);
+-		blk_finish_plug(&plug);
+-		goto out_writepages;
+-	}
+-
+ 	/*
+ 	 * If the filesystem has aborted, it is read-only, so return
+ 	 * right away instead of dumping stack traces later on that
+@@ -2773,6 +2617,13 @@ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ 		ext4_journal_stop(handle);
+ 	}
+ 
++	/*
++	 * data=journal mode does not do delalloc so we just need to writeout /
++	 * journal already mapped buffers
++	 */
++	if (ext4_should_journal_data(inode))
++		mpd->can_map = 0;
++
+ 	if (ext4_should_dioread_nolock(inode)) {
+ 		/*
+ 		 * We may need to convert up to one extent per block in
+@@ -3149,9 +3000,8 @@ static int ext4_da_write_end(struct file *file,
+ 	 * i_disksize since writeback will push i_disksize upto i_size
+ 	 * eventually. If the end of the current write is > i_size and
+ 	 * inside an allocated block (ext4_da_should_update_i_disksize()
+-	 * check), we need to update i_disksize here as neither
+-	 * ext4_writepage() nor certain ext4_writepages() paths not
+-	 * allocating blocks update i_disksize.
++	 * check), we need to update i_disksize here as certain
++	 * ext4_writepages() paths not allocating blocks update i_disksize.
+ 	 *
+ 	 * Note that we defer inode dirtying to generic_write_end() /
+ 	 * ext4_da_write_inline_data_end().
+@@ -5371,7 +5221,7 @@ static void ext4_wait_for_tail_page_commit(struct inode *inode)
+ 	 * If the folio is fully truncated, we don't need to wait for any commit
+ 	 * (and we even should not as __ext4_journalled_invalidate_folio() may
+ 	 * strip all buffers from the folio but keep the folio dirty which can then
+-	 * confuse e.g. concurrent ext4_writepage() seeing dirty folio without
++	 * confuse e.g. concurrent ext4_writepages() seeing dirty folio without
+ 	 * buffers). Also we don't need to wait for any commit if all buffers in
+ 	 * the folio remain valid. This is most beneficial for the common case of
+ 	 * blocksize == PAGESIZE.
+@@ -6309,18 +6159,8 @@ vm_fault_t ext4_page_mkwrite(struct vm_fault *vmf)
+ 		err = __block_write_begin(page, 0, len, ext4_get_block);
+ 		if (!err) {
+ 			ret = VM_FAULT_SIGBUS;
+-			if (ext4_walk_page_buffers(handle, inode,
+-					page_buffers(page), 0, len, NULL,
+-					do_journal_get_write_access))
+-				goto out_error;
+-			if (ext4_walk_page_buffers(handle, inode,
+-					page_buffers(page), 0, len, NULL,
+-					write_end_fn))
+-				goto out_error;
+-			if (ext4_jbd2_inode_add_write(handle, inode,
+-						      page_offset(page), len))
++			if (ext4_journal_page_buffers(handle, page, len))
+ 				goto out_error;
+-			ext4_set_inode_state(inode, EXT4_STATE_JDATA);
+ 		} else {
+ 			unlock_page(page);
+ 		}
+diff --git a/include/trace/events/ext4.h b/include/trace/events/ext4.h
+index 77b426ae0..ebccf6a6a 100644
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@ -584,13 +584,6 @@ DECLARE_EVENT_CLASS(ext4__page_op,
+ 		  (unsigned long) __entry->index)
+ );
+ 
+-DEFINE_EVENT(ext4__page_op, ext4_writepage,
+-
+-	TP_PROTO(struct page *page),
+-
+-	TP_ARGS(page)
+-);
+-
+ DEFINE_EVENT(ext4__page_op, ext4_readpage,
+ 
+ 	TP_PROTO(struct page *page),
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 9f25a4d6e7dd6cee52a301eae9605426c45e593b Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Thu, 19 Jan 2023 09:37:11 +0800
+Subject: [PATCH 21/23] ext4: init error handle resource before init group
+ descriptors
+
+Now, 's_err_report' timer is init after ext4_group_desc_init() when fill
+super. Theoretically, ext4_group_desc_init() may access to error handle
+as follows:
+__ext4_fill_super
+  ext4_group_desc_init
+    ext4_check_descriptors
+      ext4_get_group_desc
+        ext4_error
+          ext4_handle_error
+            ext4_commit_super
+              ext4_update_super
+                if (!es->s_error_count)
+                  mod_timer(&sbi->s_err_report, jiffies + 24*60*60*HZ);
+		  --> Accessing Uninitialized Variables
+timer_setup(&sbi->s_err_report, print_daily_error_info, 0);
+
+Maybe above issue is just theoretical, as ext4_check_descriptors() didn't
+judge 'gpd' which get from ext4_get_group_desc(), if access to error handle
+ext4_get_group_desc() will return NULL, then will trigger null-ptr-deref in
+ext4_check_descriptors().
+However, from the perspective of pure code, it is better to initialize
+resource that may need to be used first.
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230119013711.86680-1-yebin@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/super.c | 19 +++++++------------
+ 1 file changed, 7 insertions(+), 12 deletions(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 45bcfd35e..143e0b573 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -4738,7 +4738,6 @@ static int ext4_group_desc_init(struct super_block *sb,
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	unsigned int db_count;
+ 	ext4_fsblk_t block;
+-	int ret;
+ 	int i;
+ 
+ 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
+@@ -4778,8 +4777,7 @@ static int ext4_group_desc_init(struct super_block *sb,
+ 			ext4_msg(sb, KERN_ERR,
+ 			       "can't read group descriptor %d", i);
+ 			sbi->s_gdb_count = i;
+-			ret = PTR_ERR(bh);
+-			goto out;
++			return PTR_ERR(bh);
+ 		}
+ 		rcu_read_lock();
+ 		rcu_dereference(sbi->s_group_desc)[i] = bh;
+@@ -4788,13 +4786,10 @@ static int ext4_group_desc_init(struct super_block *sb,
+ 	sbi->s_gdb_count = db_count;
+ 	if (!ext4_check_descriptors(sb, logical_sb_block, first_not_zeroed)) {
+ 		ext4_msg(sb, KERN_ERR, "group descriptors corrupted!");
+-		ret = -EFSCORRUPTED;
+-		goto out;
++		return -EFSCORRUPTED;
+ 	}
++
+ 	return 0;
+-out:
+-	ext4_group_desc_free(sbi);
+-	return ret;
+ }
+ 
+ static int ext4_load_and_init_journal(struct super_block *sb,
+@@ -5220,14 +5215,14 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
+ 	if (ext4_geometry_check(sb, es))
+ 		goto failed_mount;
+ 
+-	err = ext4_group_desc_init(sb, es, logical_sb_block, &first_not_zeroed);
+-	if (err)
+-		goto failed_mount;
+-
+ 	timer_setup(&sbi->s_err_report, print_daily_error_info, 0);
+ 	spin_lock_init(&sbi->s_error_lock);
+ 	INIT_WORK(&sbi->s_error_work, flush_stashed_error_work);
+ 
++	err = ext4_group_desc_init(sb, es, logical_sb_block, &first_not_zeroed);
++	if (err)
++		goto failed_mount3;
++
+ 	/* Register extent status tree shrinker */
+ 	if (ext4_es_register_shrinker(sbi))
+ 		goto failed_mount3;
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 26794479276a63ffa9a9e373632e451375eb1875 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Thu, 26 Jan 2023 12:22:21 +0100
+Subject: [PATCH 22/23] ext4: Fix possible corruption when moving a directory
+
+When we are renaming a directory to a different directory, we need to
+update '..' entry in the moved directory. However nothing prevents moved
+directory from being modified and even converted from the inline format
+to the normal format. When such race happens the rename code gets
+confused and we crash. Fix the problem by locking the moved directory.
+
+CC: stable@vger.kernel.org
+Fixes: 32f7f22c0b52 ("ext4: let ext4_rename handle inline dir")
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230126112221.11866-1-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/namei.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index dd28453d6..270fbcba7 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3872,9 +3872,16 @@ static int ext4_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
+ 			if (new.dir != old.dir && EXT4_DIR_LINK_MAX(new.dir))
+ 				goto end_rename;
+ 		}
++		/*
++		 * We need to protect against old.inode directory getting
++		 * converted from inline directory format into a normal one.
++		 */
++		inode_lock_nested(old.inode, I_MUTEX_NONDIR2);
+ 		retval = ext4_rename_dir_prepare(handle, &old);
+-		if (retval)
++		if (retval) {
++			inode_unlock(old.inode);
+ 			goto end_rename;
++		}
+ 	}
+ 	/*
+ 	 * If we're renaming a file within an inline_data dir and adding or
+@@ -4006,6 +4013,8 @@ static int ext4_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
+ 	} else {
+ 		ext4_journal_stop(handle);
+ 	}
++	if (old.dir_bh)
++		inode_unlock(old.inode);
+ release_bh:
+ 	brelse(old.dir_bh);
+ 	brelse(old.bh);
+-- 
+2.39.2.501.gd9d677b2d8
+
+
+From 51d622298b8b215a6b948480074d35cb35ee1d47 Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Sun, 29 Jan 2023 11:49:39 +0800
+Subject: [PATCH 23/23] ext4: fix incorrect options show of original mount_opt
+ and extend mount_opt2
+
+Current _ext4_show_options() do not distinguish MOPT_2 flag, so it mixed
+extend sbi->s_mount_opt2 options with sbi->s_mount_opt, it could lead to
+show incorrect options, e.g. show fc_debug_force if we mount with
+errors=continue mode and miss it if we set.
+
+  $ mkfs.ext4 /dev/pmem0
+  $ mount -o errors=remount-ro /dev/pmem0 /mnt
+  $ cat /proc/fs/ext4/pmem0/options | grep fc_debug_force
+    #empty
+  $ mount -o remount,errors=continue /mnt
+  $ cat /proc/fs/ext4/pmem0/options | grep fc_debug_force
+    fc_debug_force
+  $ mount -o remount,errors=remount-ro,fc_debug_force /mnt
+  $ cat /proc/fs/ext4/pmem0/options | grep fc_debug_force
+    #empty
+
+Fixes: 995a3ed67fc8 ("ext4: add fast_commit feature and handling for extended mount options")
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230129034939.3702550-1-yi.zhang@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/ext4.h  |  1 +
+ fs/ext4/super.c | 28 +++++++++++++++++++++-------
+ 2 files changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 140e1eb30..647914614 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1529,6 +1529,7 @@ struct ext4_sb_info {
+ 	unsigned int s_mount_opt2;
+ 	unsigned long s_mount_flags;
+ 	unsigned int s_def_mount_opt;
++	unsigned int s_def_mount_opt2;
+ 	ext4_fsblk_t s_sb_block;
+ 	atomic64_t s_resv_clusters;
+ 	kuid_t s_resuid;
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 143e0b573..2192b4111 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -2894,7 +2894,7 @@ static int _ext4_show_options(struct seq_file *seq, struct super_block *sb,
+ {
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	struct ext4_super_block *es = sbi->s_es;
+-	int def_errors, def_mount_opt = sbi->s_def_mount_opt;
++	int def_errors;
+ 	const struct mount_opts *m;
+ 	char sep = nodefs ? '\n' : ',';
+ 
+@@ -2906,15 +2906,28 @@ static int _ext4_show_options(struct seq_file *seq, struct super_block *sb,
+ 
+ 	for (m = ext4_mount_opts; m->token != Opt_err; m++) {
+ 		int want_set = m->flags & MOPT_SET;
++		int opt_2 = m->flags & MOPT_2;
++		unsigned int mount_opt, def_mount_opt;
++
+ 		if (((m->flags & (MOPT_SET|MOPT_CLEAR)) == 0) ||
+ 		    m->flags & MOPT_SKIP)
+ 			continue;
+-		if (!nodefs && !(m->mount_opt & (sbi->s_mount_opt ^ def_mount_opt)))
+-			continue; /* skip if same as the default */
++
++		if (opt_2) {
++			mount_opt = sbi->s_mount_opt2;
++			def_mount_opt = sbi->s_def_mount_opt2;
++		} else {
++			mount_opt = sbi->s_mount_opt;
++			def_mount_opt = sbi->s_def_mount_opt;
++		}
++		/* skip if same as the default */
++		if (!nodefs && !(m->mount_opt & (mount_opt ^ def_mount_opt)))
++			continue;
++		/* select Opt_noFoo vs Opt_Foo */
+ 		if ((want_set &&
+-		     (sbi->s_mount_opt & m->mount_opt) != m->mount_opt) ||
+-		    (!want_set && (sbi->s_mount_opt & m->mount_opt)))
+-			continue; /* select Opt_noFoo vs Opt_Foo */
++		     (mount_opt & m->mount_opt) != m->mount_opt) ||
++		    (!want_set && (mount_opt & m->mount_opt)))
++			continue;
+ 		SEQ_OPTS_PRINT("%s", token2str(m->token));
+ 	}
+ 
+@@ -2942,7 +2955,7 @@ static int _ext4_show_options(struct seq_file *seq, struct super_block *sb,
+ 	if (nodefs || sbi->s_stripe)
+ 		SEQ_OPTS_PRINT("stripe=%lu", sbi->s_stripe);
+ 	if (nodefs || EXT4_MOUNT_DATA_FLAGS &
+-			(sbi->s_mount_opt ^ def_mount_opt)) {
++			(sbi->s_mount_opt ^ sbi->s_def_mount_opt)) {
+ 		if (test_opt(sb, DATA_FLAGS) == EXT4_MOUNT_JOURNAL_DATA)
+ 			SEQ_OPTS_PUTS("data=journal");
+ 		else if (test_opt(sb, DATA_FLAGS) == EXT4_MOUNT_ORDERED_DATA)
+@@ -5081,6 +5094,7 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
+ 		goto failed_mount;
+ 
+ 	sbi->s_def_mount_opt = sbi->s_mount_opt;
++	sbi->s_def_mount_opt2 = sbi->s_mount_opt2;
+ 
+ 	err = ext4_check_opt_consistency(fc, sb);
+ 	if (err < 0)
+-- 
+2.39.2.501.gd9d677b2d8
+
