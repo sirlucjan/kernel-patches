@@ -1,0 +1,240 @@
+From fb25697157b5924b161a74fd2f05edba48341848 Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Fri, 3 Mar 2023 16:31:29 +0900
+Subject: [PATCH 3/4] zsmalloc: rework compaction algorithm
+
+The zsmalloc compaction algorithm has the potential to
+waste some CPU cycles, particularly when compacting pages
+within the same fullness group. This is due to the way it
+selects the head page of the fullness list for source and
+destination pages, and how it reinserts those pages during
+each iteration. The algorithm may first use a page as a
+migration destination and then as a migration source,
+leading to an unnecessary back-and-forth movement of
+objects.
+
+Consider the following fullness list:
+
+PageA PageB PageC PageD PageE
+
+During the first iteration, the compaction algorithm will
+select PageA as the source and PageB as the destination.
+All of PageA's objects will be moved to PageB, and then
+PageA will be released while PageB is reinserted into the
+fullness list.
+
+PageB PageC PageD PageE
+
+During the next iteration, the compaction algorithm will
+again select the head of the list as the source and destination,
+meaning that PageB will now serve as the source and PageC as
+the destination. This will result in the objects being moved
+away from PageB, the same objects that were just moved to PageB
+in the previous iteration.
+
+To prevent this avalanche effect, the compaction algorithm
+should not reinsert the destination page between iterations.
+By doing so, the most optimal page will continue to be used
+and its usage ratio will increase, reducing internal
+fragmentation. The destination page should only be reinserted
+into the fullness list if:
+- It becomes full
+- No source page is available.
+
+TEST
+====
+
+It's very challenging to reliably test this series. I ended up
+developing my own synthetic test that has 100% reproducibility.
+The test generates significan fragmentation (for each size class)
+and then performs compaction for each class individually and tracks
+the number of memcpy() in zs_object_copy(), so that we can compare
+the amount work compaction does on per-class basis.
+
+Total amount of work (zram mm_stat objs_moved)
+----------------------------------------------
+
+Old fullness grouping, old compaction algorithm:
+323977 memcpy() in zs_object_copy().
+
+Old fullness grouping, new compaction algorithm:
+262944 memcpy() in zs_object_copy().
+
+New fullness grouping, new compaction algorithm:
+213978 memcpy() in zs_object_copy().
+
+Per-class compaction memcpy() comparison (T-test)
+-------------------------------------------------
+
+x Old fullness grouping, old compaction algorithm
++ Old fullness grouping, new compaction algorithm
+
+    N           Min           Max        Median           Avg        Stddev
+x 140           349          3513          2461     2314.1214     806.03271
++ 140           289          2778          2006     1878.1714     641.02073
+Difference at 95.0% confidence
+        -435.95 +/- 170.595
+        -18.8387% +/- 7.37193%
+        (Student's t, pooled s = 728.216)
+
+x Old fullness grouping, old compaction algorithm
++ New fullness grouping, new compaction algorithm
+
+    N           Min           Max        Median           Avg        Stddev
+x 140           349          3513          2461     2314.1214     806.03271
++ 140           226          2279          1644     1528.4143     524.85268
+Difference at 95.0% confidence
+        -785.707 +/- 159.331
+        -33.9527% +/- 6.88516%
+        (Student's t, pooled s = 680.132)
+
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+---
+ mm/zsmalloc.c | 78 ++++++++++++++++++++++++---------------------------
+ 1 file changed, 36 insertions(+), 42 deletions(-)
+
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 630854575..141a3f69b 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1780,15 +1780,14 @@ struct zs_compact_control {
+ 	int obj_idx;
+ };
+ 
+-static int migrate_zspage(struct zs_pool *pool, struct size_class *class,
+-				struct zs_compact_control *cc)
++static void migrate_zspage(struct zs_pool *pool, struct size_class *class,
++			   struct zs_compact_control *cc)
+ {
+ 	unsigned long used_obj, free_obj;
+ 	unsigned long handle;
+ 	struct page *s_page = cc->s_page;
+ 	struct page *d_page = cc->d_page;
+ 	int obj_idx = cc->obj_idx;
+-	int ret = 0;
+ 
+ 	while (1) {
+ 		handle = find_alloced_obj(class, s_page, &obj_idx);
+@@ -1801,10 +1800,8 @@ static int migrate_zspage(struct zs_pool *pool, struct size_class *class,
+ 		}
+ 
+ 		/* Stop if there is no more space */
+-		if (zspage_full(class, get_zspage(d_page))) {
+-			ret = -ENOMEM;
++		if (zspage_full(class, get_zspage(d_page)))
+ 			break;
+-		}
+ 
+ 		used_obj = handle_to_obj(handle);
+ 		free_obj = obj_malloc(pool, get_zspage(d_page), handle);
+@@ -1817,8 +1814,6 @@ static int migrate_zspage(struct zs_pool *pool, struct size_class *class,
+ 	/* Remember last position in this iteration */
+ 	cc->s_page = s_page;
+ 	cc->obj_idx = obj_idx;
+-
+-	return ret;
+ }
+ 
+ static struct zspage *isolate_src_zspage(struct size_class *class)
+@@ -2213,7 +2208,7 @@ static unsigned long __zs_compact(struct zs_pool *pool,
+ 				  struct size_class *class)
+ {
+ 	struct zs_compact_control cc;
+-	struct zspage *src_zspage;
++	struct zspage *src_zspage = NULL;
+ 	struct zspage *dst_zspage = NULL;
+ 	unsigned long pages_freed = 0;
+ 
+@@ -2222,50 +2217,45 @@ static unsigned long __zs_compact(struct zs_pool *pool,
+ 	 * as well as zpage allocation/free
+ 	 */
+ 	spin_lock(&pool->lock);
+-	while ((src_zspage = isolate_src_zspage(class))) {
+-		/* protect someone accessing the zspage(i.e., zs_map_object) */
+-		migrate_write_lock(src_zspage);
++	while (zs_can_compact(class)) {
++		int ret;
+ 
+-		if (!zs_can_compact(class))
++		if (!dst_zspage) {
++			dst_zspage = isolate_dst_zspage(class);
++			if (!dst_zspage)
++				break;
++			migrate_write_lock(dst_zspage);
++			cc.d_page = get_first_page(dst_zspage);
++		}
++
++		src_zspage = isolate_src_zspage(class);
++		if (!src_zspage)
+ 			break;
+ 
++		migrate_write_lock_nested(src_zspage);
++
+ 		cc.obj_idx = 0;
+ 		cc.s_page = get_first_page(src_zspage);
++		migrate_zspage(pool, class, &cc);
++		ret = putback_zspage(class, src_zspage);
++		migrate_write_unlock(src_zspage);
+ 
+-		while ((dst_zspage = isolate_dst_zspage(class))) {
+-			migrate_write_lock_nested(dst_zspage);
+-
+-			cc.d_page = get_first_page(dst_zspage);
+-			/*
+-			 * If there is no more space in dst_page, resched
+-			 * and see if anyone had allocated another zspage.
+-			 */
+-			if (!migrate_zspage(pool, class, &cc))
+-				break;
++		if (ret == ZS_INUSE_RATIO_0) {
++			free_zspage(pool, class, src_zspage);
++			pages_freed += class->pages_per_zspage;
++			src_zspage = NULL;
++		}
+ 
++		if (get_fullness_group(class, dst_zspage) == ZS_INUSE_RATIO_100
++		    || spin_is_contended(&pool->lock)) {
+ 			putback_zspage(class, dst_zspage);
+ 			migrate_write_unlock(dst_zspage);
+ 			dst_zspage = NULL;
+-			if (spin_is_contended(&pool->lock))
+-				break;
+-		}
+ 
+-		/* Stop if we couldn't find slot */
+-		if (dst_zspage == NULL)
+-			break;
+-
+-		putback_zspage(class, dst_zspage);
+-		migrate_write_unlock(dst_zspage);
+-
+-		if (putback_zspage(class, src_zspage) == ZS_INUSE_RATIO_0) {
+-			migrate_write_unlock(src_zspage);
+-			free_zspage(pool, class, src_zspage);
+-			pages_freed += class->pages_per_zspage;
+-		} else
+-			migrate_write_unlock(src_zspage);
+-		spin_unlock(&pool->lock);
+-		cond_resched();
+-		spin_lock(&pool->lock);
++			spin_unlock(&pool->lock);
++			cond_resched();
++			spin_lock(&pool->lock);
++		}
+ 	}
+ 
+ 	if (src_zspage) {
+@@ -2273,6 +2263,10 @@ static unsigned long __zs_compact(struct zs_pool *pool,
+ 		migrate_write_unlock(src_zspage);
+ 	}
+ 
++	if (dst_zspage) {
++		putback_zspage(class, dst_zspage);
++		migrate_write_unlock(dst_zspage);
++	}
+ 	spin_unlock(&pool->lock);
+ 
+ 	return pages_freed;
+-- 
+2.39.2.501.gd9d677b2d8
+
