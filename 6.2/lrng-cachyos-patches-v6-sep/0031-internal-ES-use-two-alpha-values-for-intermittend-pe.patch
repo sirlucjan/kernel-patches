@@ -1,0 +1,219 @@
+From 308011856f6aa10732ec9fee76e92fb37eff2b5e Mon Sep 17 00:00:00 2001
+From: Stephan Mueller <smueller@chronox.de>
+Date: Tue, 14 Mar 2023 19:59:32 +0100
+Subject: [PATCH 31/31] internal ES: use two alpha values for
+ intermittend/permanent health failure
+
+According to SP800-90B, two health failures are allowed: the intermittend
+and the permanent failure. So far, only the intermittent failure was
+implemented. The permanent failure was achieved by resetting the entire
+entropy source including its health test state and waiting for two or
+more back-to-back health errors.
+
+This approach is appropriate for RCT, but not for APT as APT has a
+non-linear cutoff value. Thus, this patch implements 2 cutoff values
+for both RCT/APT. This implies that the health state is left untouched
+when an intermittent failure occurs. The noise sources are reset
+and a new APT powerup-self test is performed. Yet, whith the unchanged
+health test state, the counting of failures continues until a permanent
+failure is reached.
+
+Any non-failing raw entropy value causes the health tests to reset.
+
+A permanent failure causes the entire entropy source to reset including
+its health state plus an error note is sent. In case
+lrng_es_mgr.lrng_panic_on_permanent_health_failure is set to 1, the
+kernel panics - which is needed if the LRNG is part of a FIPS 140
+module.
+
+Signed-off-by: Stephan Mueller <smueller@chronox.de>
+---
+ drivers/char/lrng/Kconfig       | 12 +++++
+ drivers/char/lrng/lrng_health.c | 80 ++++++++++++++++-----------------
+ 2 files changed, 51 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/char/lrng/Kconfig b/drivers/char/lrng/Kconfig
+index f4c343265..b001fd3c1 100644
+--- a/drivers/char/lrng/Kconfig
++++ b/drivers/char/lrng/Kconfig
+@@ -286,12 +286,24 @@ config LRNG_RCT_CUTOFF
+ 	default 31 if !LRNG_RCT_BROKEN
+ 	default 1 if LRNG_RCT_BROKEN
+ 
++# Default taken from SP800-90B sec 4.4.1 - significance level 2^-80
++config LRNG_RCT_CUTOFF_PERMANENT
++	int
++	default 81 if !LRNG_RCT_BROKEN
++	default 2 if LRNG_RCT_BROKEN
++
+ # Default taken from SP800-90B sec 4.4.2 - significance level 2^-30
+ config LRNG_APT_CUTOFF
+ 	int
+ 	default 325 if !LRNG_APT_BROKEN
+ 	default 32 if LRNG_APT_BROKEN
+ 
++# Default taken from SP800-90B sec 4.4.2 - significance level 2^-80
++config LRNG_APT_CUTOFF_PERMANENT
++	int
++	default 371 if !LRNG_APT_BROKEN
++	default 33 if LRNG_APT_BROKEN
++
+ comment "Interrupt Entropy Source"
+ 
+ config LRNG_IRQ
+diff --git a/drivers/char/lrng/lrng_health.c b/drivers/char/lrng/lrng_health.c
+index c52229cbd..2c884d1c1 100644
+--- a/drivers/char/lrng/lrng_health.c
++++ b/drivers/char/lrng/lrng_health.c
+@@ -24,8 +24,6 @@ struct lrng_stuck_test {
+ /* Repetition Count Test */
+ struct lrng_rct {
+ 	atomic_t rct_count;	/* Number of stuck values */
+-
+-	atomic_t successive_failures;	/* Permanent health failures */
+ };
+ 
+ /* Adaptive Proportion Test */
+@@ -38,8 +36,6 @@ struct lrng_apt {
+ 	atomic_t apt_count;		/* APT counter */
+ 	atomic_t apt_base;		/* APT base reference */
+ 
+-	atomic_t successive_failures;	/* Permanent health failures */
+-
+ 	atomic_t apt_trigger;
+ 	bool apt_base_set;	/* Is APT base set? */
+ };
+@@ -60,10 +56,8 @@ struct lrng_health_es_state {
+ 
+ #define LRNG_HEALTH_ES_INIT(x) \
+ 	x.rct.rct_count = ATOMIC_INIT(0), \
+-	x.rct.successive_failures = ATOMIC_INIT(0), \
+ 	x.apt.apt_count = ATOMIC_INIT(0), \
+ 	x.apt.apt_base = ATOMIC_INIT(-1), \
+-	x.apt.successive_failures = ATOMIC_INIT(0), \
+ 	x.apt.apt_trigger = ATOMIC_INIT(LRNG_APT_WINDOW_SIZE), \
+ 	x.apt.apt_base_set = false, \
+ 	x.sp80090b_startup_blocks = ATOMIC_INIT(LRNG_SP80090B_STARTUP_BLOCKS), \
+@@ -162,19 +156,6 @@ static void lrng_sp80090b_startup_failure(struct lrng_health *health,
+ 	 */
+ 	atomic_set(&es_state->sp80090b_startup_blocks,
+ 		   LRNG_SP80090B_STARTUP_BLOCKS);
+-
+-	if (lrng_enforce_panic_on_permanent_health_failure()) {
+-		struct lrng_apt *apt = &es_state->apt;
+-		struct lrng_rct *rct = &es_state->rct;
+-
+-		if ((atomic_read(&apt->successive_failures) >=
+-		     LRNG_PERMANENT_HEALTH_FAILURES) ||
+-		    (atomic_read(&rct->successive_failures) >=
+-		     LRNG_PERMANENT_HEALTH_FAILURES)) {
+-			panic("Too many successive SP800-90B health test errors for internal entropy source %u\n",
+-			      es);
+-		}
+-	}
+ }
+ 
+ /*
+@@ -189,16 +170,40 @@ static void lrng_sp80090b_runtime_failure(struct lrng_health *health,
+ 	es_state->sp80090b_startup_done = false;
+ }
+ 
++static void lrng_rct_reset(struct lrng_rct *rct);
++static void lrng_apt_reset(struct lrng_apt *apt, unsigned int time_masked);
++static void lrng_apt_restart(struct lrng_apt *apt);
++static void lrng_sp80090b_permanent_failure(struct lrng_health *health,
++					    enum lrng_internal_es es)
++{
++	struct lrng_health_es_state *es_state = &health->es_state[es];
++	struct lrng_apt *apt = &es_state->apt;
++	struct lrng_rct *rct = &es_state->rct;
++
++	if (lrng_enforce_panic_on_permanent_health_failure()) {
++		panic("SP800-90B permanent health test failure for internal entropy source %u\n",
++		      es);
++	}
++
++	pr_err("SP800-90B permanent health test failure for internal entropy source %u - invalidating all existing entropy and initiate SP800-90B startup\n",
++	       es);
++	lrng_sp80090b_runtime_failure(health, es);
++
++	lrng_rct_reset(rct);
++	lrng_apt_reset(apt, 0);
++	lrng_apt_restart(apt);
++}
++
+ static void lrng_sp80090b_failure(struct lrng_health *health,
+ 				  enum lrng_internal_es es)
+ {
+ 	struct lrng_health_es_state *es_state = &health->es_state[es];
+ 
+ 	if (es_state->sp80090b_startup_done) {
+-		pr_err("SP800-90B runtime health test failure for internal entropy source %u - invalidating all existing entropy and initiate SP800-90B startup\n", es);
++		pr_warn("SP800-90B runtime health test failure for internal entropy source %u - invalidating all existing entropy and initiate SP800-90B startup\n", es);
+ 		lrng_sp80090b_runtime_failure(health, es);
+ 	} else {
+-		pr_err("SP800-90B startup test failure for internal entropy source %u - resetting\n", es);
++		pr_warn("SP800-90B startup test failure for internal entropy source %u - resetting\n", es);
+ 		lrng_sp80090b_startup_failure(health, es);
+ 	}
+ }
+@@ -278,13 +283,10 @@ static void lrng_apt_insert(struct lrng_health *health,
+ 	if (now_time == (unsigned int)atomic_read(&apt->apt_base)) {
+ 		u32 apt_val = (u32)atomic_inc_return_relaxed(&apt->apt_count);
+ 
+-		if (apt_val >= CONFIG_LRNG_APT_CUTOFF) {
+-			atomic_inc(&apt->successive_failures);
++		if (apt_val >= CONFIG_LRNG_APT_CUTOFF_PERMANENT)
++			lrng_sp80090b_permanent_failure(health, es);
++		else if (apt_val >= CONFIG_LRNG_APT_CUTOFF)
+ 			lrng_sp80090b_failure(health, es);
+-		} else {
+-			/* Reset any successive failure count */
+-			atomic_set(&apt->successive_failures, 0);
+-		}
+ 	}
+ 
+ 	if (atomic_dec_and_test(&apt->apt_trigger)) {
+@@ -311,6 +313,12 @@ static void lrng_apt_insert(struct lrng_health *health,
+  * is received.
+  ***************************************************************************/
+ 
++static void lrng_rct_reset(struct lrng_rct *rct)
++{
++	/* Reset RCT */
++	atomic_set(&rct->rct_count, 0);
++}
++
+ /*
+  * Hot code path - Insert data for Repetition Count Test
+  *
+@@ -340,22 +348,12 @@ static void lrng_rct(struct lrng_health *health, enum lrng_internal_es es,
+ 		 * Hence we need to subtract one from the cutoff value as
+ 		 * calculated following SP800-90B.
+ 		 */
+-		if (rct_count >= CONFIG_LRNG_RCT_CUTOFF) {
+-			atomic_set(&rct->rct_count, 0);
+-
+-			/*
+-			 * APT must start anew as we consider all previously
+-			 * recorded data to contain no entropy.
+-			 */
+-			lrng_apt_restart(&es_state->apt);
+-
+-			atomic_inc(&rct->successive_failures);
++		if (rct_count >= CONFIG_LRNG_RCT_CUTOFF_PERMANENT)
++			lrng_sp80090b_permanent_failure(health, es);
++		else if (rct_count >= CONFIG_LRNG_RCT_CUTOFF)
+ 			lrng_sp80090b_failure(health, es);
+-		}
+ 	} else {
+-		atomic_set(&rct->rct_count, 0);
+-		/* Reset any successive failure count */
+-		atomic_set(&rct->successive_failures, 0);
++		lrng_rct_reset(rct);
+ 	}
+ }
+ 
+-- 
+2.39.2.501.gd9d677b2d8
+
