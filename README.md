@@ -35,4 +35,6 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [WireGuard](https://git.zx2c4.com/wireguard-linux-compat)
 
+- [linux-vd](https://gitlab.com/torvic9)
+
 - [Linux Kernel Mailing List Archive](https://lkml.org) / [Linux Kernel Mailing List Archive](https://lore.kernel.org/lkml/) / [Linux Kernel Mailing List Archive](https://patchwork.kernel.org)
