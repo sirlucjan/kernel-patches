@@ -1,0 +1,365 @@
+From 516cb359236d914cd0be2d5bd4e0192088eddbf9 Mon Sep 17 00:00:00 2001
+From: Wangyang Guo <wangyang.guo@intel.com>
+Date: Thu, 23 Mar 2023 21:55:29 +0100
+Subject: [PATCH 23/30] net: dst: Prevent false sharing vs. dst_entry::
+ __refcnt
+
+dst_entry::__refcnt is highly contended in scenarios where many connections
+happen from and to the same IP. The reference count is an atomic_t, so the
+reference count operations have to take the cache-line exclusive.
+
+Aside of the unavoidable reference count contention there is another
+significant problem which is caused by that: False sharing.
+
+perf top identified two affected read accesses. dst_entry::lwtstate and
+rtable::rt_genid.
+
+dst_entry:__refcnt is located at offset 64 of dst_entry, which puts it into
+a seperate cacheline vs. the read mostly members located at the beginning
+of the struct.
+
+That prevents false sharing vs. the struct members in the first 64
+bytes of the structure, but there is also
+
+  dst_entry::lwtstate
+
+which is located after the reference count and in the same cache line. This
+member is read after a reference count has been acquired.
+
+struct rtable embeds a struct dst_entry at offset 0. struct dst_entry has a
+size of 112 bytes, which means that the struct members of rtable which
+follow the dst member share the same cache line as dst_entry::__refcnt.
+Especially
+
+  rtable::rt_genid
+
+is also read by the contexts which have a reference count acquired
+already.
+
+When dst_entry:__refcnt is incremented or decremented via an atomic
+operation these read accesses stall. This was found when analysing the
+memtier benchmark in 1:100 mode, which amplifies the problem extremly.
+
+Move the rt[6i]_uncached[_list] members out of struct rtable and struct
+rt6_info into struct dst_entry to provide padding and move the lwtstate
+member after that so it ends up in the same cache line.
+
+The resulting improvement depends on the micro-architecture and the number
+of CPUs. It ranges from +20% to +120% with a localhost memtier/memcached
+benchmark.
+
+[ tglx: Rearrange struct ]
+
+Signed-off-by: Wangyang Guo <wangyang.guo@intel.com>
+Signed-off-by: Arjan van de Ven <arjan@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: David Ahern <dsahern@kernel.org>
+---
+ include/net/dst.h       | 15 ++++++++++++++-
+ include/net/ip6_fib.h   |  3 ---
+ include/net/ip6_route.h |  2 +-
+ include/net/route.h     |  3 ---
+ net/ipv4/route.c        | 20 ++++++++++----------
+ net/ipv4/xfrm4_policy.c |  4 ++--
+ net/ipv6/route.c        | 26 +++++++++++++-------------
+ net/ipv6/xfrm6_policy.c |  4 ++--
+ 8 files changed, 42 insertions(+), 35 deletions(-)
+
+diff --git a/include/net/dst.h b/include/net/dst.h
+index d67fda89c..81f2279ea 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -69,15 +69,28 @@ struct dst_entry {
+ #endif
+ 	int			__use;
+ 	unsigned long		lastuse;
+-	struct lwtunnel_state   *lwtstate;
+ 	struct rcu_head		rcu_head;
+ 	short			error;
+ 	short			__pad;
+ 	__u32			tclassid;
+ #ifndef CONFIG_64BIT
++	struct lwtunnel_state   *lwtstate;
+ 	atomic_t		__refcnt;	/* 32-bit offset 64 */
+ #endif
+ 	netdevice_tracker	dev_tracker;
++
++	/*
++	 * Used by rtable and rt6_info. Moves lwtstate into the next cache
++	 * line on 64bit so that lwtstate does not cause false sharing with
++	 * __refcnt under contention of __refcnt. This also puts the
++	 * frequently accessed members of rtable and rt6_info out of the
++	 * __refcnt cache line.
++	 */
++	struct list_head	rt_uncached;
++	struct uncached_list	*rt_uncached_list;
++#ifdef CONFIG_64BIT
++	struct lwtunnel_state   *lwtstate;
++#endif
+ };
+ 
+ struct dst_metrics {
+diff --git a/include/net/ip6_fib.h b/include/net/ip6_fib.h
+index 6268963d9..79570cb4e 100644
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -217,9 +217,6 @@ struct rt6_info {
+ 	struct inet6_dev		*rt6i_idev;
+ 	u32				rt6i_flags;
+ 
+-	struct list_head		rt6i_uncached;
+-	struct uncached_list		*rt6i_uncached_list;
+-
+ 	/* more non-fragment space at head required */
+ 	unsigned short			rt6i_nfheader_len;
+ };
+diff --git a/include/net/ip6_route.h b/include/net/ip6_route.h
+index 81ee387a1..3556595ce 100644
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -100,7 +100,7 @@ static inline struct dst_entry *ip6_route_output(struct net *net,
+ static inline void ip6_rt_put_flags(struct rt6_info *rt, int flags)
+ {
+ 	if (!(flags & RT6_LOOKUP_F_DST_NOREF) ||
+-	    !list_empty(&rt->rt6i_uncached))
++	    !list_empty(&rt->dst.rt_uncached))
+ 		ip6_rt_put(rt);
+ }
+ 
+diff --git a/include/net/route.h b/include/net/route.h
+index fe00b0a2e..bcc367cf3 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -78,9 +78,6 @@ struct rtable {
+ 	/* Miscellaneous cached information */
+ 	u32			rt_mtu_locked:1,
+ 				rt_pmtu:31;
+-
+-	struct list_head	rt_uncached;
+-	struct uncached_list	*rt_uncached_list;
+ };
+ 
+ static inline bool rt_is_input_route(const struct rtable *rt)
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index de6e3515a..0f0cb629e 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1508,20 +1508,20 @@ void rt_add_uncached_list(struct rtable *rt)
+ {
+ 	struct uncached_list *ul = raw_cpu_ptr(&rt_uncached_list);
+ 
+-	rt->rt_uncached_list = ul;
++	rt->dst.rt_uncached_list = ul;
+ 
+ 	spin_lock_bh(&ul->lock);
+-	list_add_tail(&rt->rt_uncached, &ul->head);
++	list_add_tail(&rt->dst.rt_uncached, &ul->head);
+ 	spin_unlock_bh(&ul->lock);
+ }
+ 
+ void rt_del_uncached_list(struct rtable *rt)
+ {
+-	if (!list_empty(&rt->rt_uncached)) {
+-		struct uncached_list *ul = rt->rt_uncached_list;
++	if (!list_empty(&rt->dst.rt_uncached)) {
++		struct uncached_list *ul = rt->dst.rt_uncached_list;
+ 
+ 		spin_lock_bh(&ul->lock);
+-		list_del_init(&rt->rt_uncached);
++		list_del_init(&rt->dst.rt_uncached);
+ 		spin_unlock_bh(&ul->lock);
+ 	}
+ }
+@@ -1546,13 +1546,13 @@ void rt_flush_dev(struct net_device *dev)
+ 			continue;
+ 
+ 		spin_lock_bh(&ul->lock);
+-		list_for_each_entry_safe(rt, safe, &ul->head, rt_uncached) {
++		list_for_each_entry_safe(rt, safe, &ul->head, dst.rt_uncached) {
+ 			if (rt->dst.dev != dev)
+ 				continue;
+ 			rt->dst.dev = blackhole_netdev;
+ 			netdev_ref_replace(dev, blackhole_netdev,
+ 					   &rt->dst.dev_tracker, GFP_ATOMIC);
+-			list_move(&rt->rt_uncached, &ul->quarantine);
++			list_move(&rt->dst.rt_uncached, &ul->quarantine);
+ 		}
+ 		spin_unlock_bh(&ul->lock);
+ 	}
+@@ -1644,7 +1644,7 @@ struct rtable *rt_dst_alloc(struct net_device *dev,
+ 		rt->rt_uses_gateway = 0;
+ 		rt->rt_gw_family = 0;
+ 		rt->rt_gw4 = 0;
+-		INIT_LIST_HEAD(&rt->rt_uncached);
++		INIT_LIST_HEAD(&rt->dst.rt_uncached);
+ 
+ 		rt->dst.output = ip_output;
+ 		if (flags & RTCF_LOCAL)
+@@ -1675,7 +1675,7 @@ struct rtable *rt_dst_clone(struct net_device *dev, struct rtable *rt)
+ 			new_rt->rt_gw4 = rt->rt_gw4;
+ 		else if (rt->rt_gw_family == AF_INET6)
+ 			new_rt->rt_gw6 = rt->rt_gw6;
+-		INIT_LIST_HEAD(&new_rt->rt_uncached);
++		INIT_LIST_HEAD(&new_rt->dst.rt_uncached);
+ 
+ 		new_rt->dst.input = rt->dst.input;
+ 		new_rt->dst.output = rt->dst.output;
+@@ -2859,7 +2859,7 @@ struct dst_entry *ipv4_blackhole_route(struct net *net, struct dst_entry *dst_or
+ 		else if (rt->rt_gw_family == AF_INET6)
+ 			rt->rt_gw6 = ort->rt_gw6;
+ 
+-		INIT_LIST_HEAD(&rt->rt_uncached);
++		INIT_LIST_HEAD(&rt->dst.rt_uncached);
+ 	}
+ 
+ 	dst_release(dst_orig);
+diff --git a/net/ipv4/xfrm4_policy.c b/net/ipv4/xfrm4_policy.c
+index 3d0dfa6cf..47861c8b7 100644
+--- a/net/ipv4/xfrm4_policy.c
++++ b/net/ipv4/xfrm4_policy.c
+@@ -91,7 +91,7 @@ static int xfrm4_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+ 		xdst->u.rt.rt_gw6 = rt->rt_gw6;
+ 	xdst->u.rt.rt_pmtu = rt->rt_pmtu;
+ 	xdst->u.rt.rt_mtu_locked = rt->rt_mtu_locked;
+-	INIT_LIST_HEAD(&xdst->u.rt.rt_uncached);
++	INIT_LIST_HEAD(&xdst->u.rt.dst.rt_uncached);
+ 	rt_add_uncached_list(&xdst->u.rt);
+ 
+ 	return 0;
+@@ -121,7 +121,7 @@ static void xfrm4_dst_destroy(struct dst_entry *dst)
+ 	struct xfrm_dst *xdst = (struct xfrm_dst *)dst;
+ 
+ 	dst_destroy_metrics_generic(dst);
+-	if (xdst->u.rt.rt_uncached_list)
++	if (xdst->u.rt.dst.rt_uncached_list)
+ 		rt_del_uncached_list(&xdst->u.rt);
+ 	xfrm_dst_destroy(xdst);
+ }
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 0fdb03df2..5d502be40 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -139,20 +139,20 @@ void rt6_uncached_list_add(struct rt6_info *rt)
+ {
+ 	struct uncached_list *ul = raw_cpu_ptr(&rt6_uncached_list);
+ 
+-	rt->rt6i_uncached_list = ul;
++	rt->dst.rt_uncached_list = ul;
+ 
+ 	spin_lock_bh(&ul->lock);
+-	list_add_tail(&rt->rt6i_uncached, &ul->head);
++	list_add_tail(&rt->dst.rt_uncached, &ul->head);
+ 	spin_unlock_bh(&ul->lock);
+ }
+ 
+ void rt6_uncached_list_del(struct rt6_info *rt)
+ {
+-	if (!list_empty(&rt->rt6i_uncached)) {
+-		struct uncached_list *ul = rt->rt6i_uncached_list;
++	if (!list_empty(&rt->dst.rt_uncached)) {
++		struct uncached_list *ul = rt->dst.rt_uncached_list;
+ 
+ 		spin_lock_bh(&ul->lock);
+-		list_del_init(&rt->rt6i_uncached);
++		list_del_init(&rt->dst.rt_uncached);
+ 		spin_unlock_bh(&ul->lock);
+ 	}
+ }
+@@ -169,7 +169,7 @@ static void rt6_uncached_list_flush_dev(struct net_device *dev)
+ 			continue;
+ 
+ 		spin_lock_bh(&ul->lock);
+-		list_for_each_entry_safe(rt, safe, &ul->head, rt6i_uncached) {
++		list_for_each_entry_safe(rt, safe, &ul->head, dst.rt_uncached) {
+ 			struct inet6_dev *rt_idev = rt->rt6i_idev;
+ 			struct net_device *rt_dev = rt->dst.dev;
+ 			bool handled = false;
+@@ -188,7 +188,7 @@ static void rt6_uncached_list_flush_dev(struct net_device *dev)
+ 				handled = true;
+ 			}
+ 			if (handled)
+-				list_move(&rt->rt6i_uncached,
++				list_move(&rt->dst.rt_uncached,
+ 					  &ul->quarantine);
+ 		}
+ 		spin_unlock_bh(&ul->lock);
+@@ -334,7 +334,7 @@ static const struct rt6_info ip6_blk_hole_entry_template = {
+ static void rt6_info_init(struct rt6_info *rt)
+ {
+ 	memset_after(rt, 0, dst);
+-	INIT_LIST_HEAD(&rt->rt6i_uncached);
++	INIT_LIST_HEAD(&rt->dst.rt_uncached);
+ }
+ 
+ /* allocate dst with ip6_dst_ops */
+@@ -2638,7 +2638,7 @@ struct dst_entry *ip6_route_output_flags(struct net *net,
+ 	dst = ip6_route_output_flags_noref(net, sk, fl6, flags);
+ 	rt6 = (struct rt6_info *)dst;
+ 	/* For dst cached in uncached_list, refcnt is already taken. */
+-	if (list_empty(&rt6->rt6i_uncached) && !dst_hold_safe(dst)) {
++	if (list_empty(&rt6->dst.rt_uncached) && !dst_hold_safe(dst)) {
+ 		dst = &net->ipv6.ip6_null_entry->dst;
+ 		dst_hold(dst);
+ 	}
+@@ -2748,7 +2748,7 @@ INDIRECT_CALLABLE_SCOPE struct dst_entry *ip6_dst_check(struct dst_entry *dst,
+ 	from = rcu_dereference(rt->from);
+ 
+ 	if (from && (rt->rt6i_flags & RTF_PCPU ||
+-	    unlikely(!list_empty(&rt->rt6i_uncached))))
++	    unlikely(!list_empty(&rt->dst.rt_uncached))))
+ 		dst_ret = rt6_dst_from_check(rt, from, cookie);
+ 	else
+ 		dst_ret = rt6_check(rt, from, cookie);
+@@ -6477,7 +6477,7 @@ static int __net_init ip6_route_net_init(struct net *net)
+ 	net->ipv6.ip6_null_entry->dst.ops = &net->ipv6.ip6_dst_ops;
+ 	dst_init_metrics(&net->ipv6.ip6_null_entry->dst,
+ 			 ip6_template_metrics, true);
+-	INIT_LIST_HEAD(&net->ipv6.ip6_null_entry->rt6i_uncached);
++	INIT_LIST_HEAD(&net->ipv6.ip6_null_entry->dst.rt_uncached);
+ 
+ #ifdef CONFIG_IPV6_MULTIPLE_TABLES
+ 	net->ipv6.fib6_has_custom_rules = false;
+@@ -6489,7 +6489,7 @@ static int __net_init ip6_route_net_init(struct net *net)
+ 	net->ipv6.ip6_prohibit_entry->dst.ops = &net->ipv6.ip6_dst_ops;
+ 	dst_init_metrics(&net->ipv6.ip6_prohibit_entry->dst,
+ 			 ip6_template_metrics, true);
+-	INIT_LIST_HEAD(&net->ipv6.ip6_prohibit_entry->rt6i_uncached);
++	INIT_LIST_HEAD(&net->ipv6.ip6_prohibit_entry->dst.rt_uncached);
+ 
+ 	net->ipv6.ip6_blk_hole_entry = kmemdup(&ip6_blk_hole_entry_template,
+ 					       sizeof(*net->ipv6.ip6_blk_hole_entry),
+@@ -6499,7 +6499,7 @@ static int __net_init ip6_route_net_init(struct net *net)
+ 	net->ipv6.ip6_blk_hole_entry->dst.ops = &net->ipv6.ip6_dst_ops;
+ 	dst_init_metrics(&net->ipv6.ip6_blk_hole_entry->dst,
+ 			 ip6_template_metrics, true);
+-	INIT_LIST_HEAD(&net->ipv6.ip6_blk_hole_entry->rt6i_uncached);
++	INIT_LIST_HEAD(&net->ipv6.ip6_blk_hole_entry->dst.rt_uncached);
+ #ifdef CONFIG_IPV6_SUBTREES
+ 	net->ipv6.fib6_routes_require_src = 0;
+ #endif
+diff --git a/net/ipv6/xfrm6_policy.c b/net/ipv6/xfrm6_policy.c
+index ea435eba3..2b493f8d0 100644
+--- a/net/ipv6/xfrm6_policy.c
++++ b/net/ipv6/xfrm6_policy.c
+@@ -89,7 +89,7 @@ static int xfrm6_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+ 	xdst->u.rt6.rt6i_gateway = rt->rt6i_gateway;
+ 	xdst->u.rt6.rt6i_dst = rt->rt6i_dst;
+ 	xdst->u.rt6.rt6i_src = rt->rt6i_src;
+-	INIT_LIST_HEAD(&xdst->u.rt6.rt6i_uncached);
++	INIT_LIST_HEAD(&xdst->u.rt6.dst.rt_uncached);
+ 	rt6_uncached_list_add(&xdst->u.rt6);
+ 
+ 	return 0;
+@@ -121,7 +121,7 @@ static void xfrm6_dst_destroy(struct dst_entry *dst)
+ 	if (likely(xdst->u.rt6.rt6i_idev))
+ 		in6_dev_put(xdst->u.rt6.rt6i_idev);
+ 	dst_destroy_metrics_generic(dst);
+-	if (xdst->u.rt6.rt6i_uncached_list)
++	if (xdst->u.rt6.dst.rt_uncached_list)
+ 		rt6_uncached_list_del(&xdst->u.rt6);
+ 	xfrm_dst_destroy(xdst);
+ }
+-- 
+2.40.0.71.g950264636c
+

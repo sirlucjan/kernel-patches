@@ -1,0 +1,251 @@
+From c9b710ae40c00b7147487decbebab5d1e80793f8 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Thu, 23 Mar 2023 21:55:32 +0100
+Subject: [PATCH 26/30] net: dst: Switch to rcuref_t reference counting
+
+Under high contention dst_entry::__refcnt becomes a significant bottleneck.
+
+atomic_inc_not_zero() is implemented with a cmpxchg() loop, which goes into
+high retry rates on contention.
+
+Switch the reference count to rcuref_t which results in a significant
+performance gain. Rename the reference count member to __rcuref to reflect
+the change.
+
+The gain depends on the micro-architecture and the number of concurrent
+operations and has been measured in the range of +25% to +130% with a
+localhost memtier/memcached benchmark which amplifies the problem
+massively.
+
+Running the memtier/memcached benchmark over a real (1Gb) network
+connection the conversion on top of the false sharing fix for struct
+dst_entry::__refcnt results in a total gain in the 2%-5% range over the
+upstream baseline.
+
+Reported-by: Wangyang Guo <wangyang.guo@intel.com>
+Reported-by: Arjan Van De Ven <arjan.van.de.ven@intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20230307125538.989175656@linutronix.de
+---
+ include/net/dst.h               | 19 ++++++++++---------
+ include/net/sock.h              |  2 +-
+ net/bridge/br_nf_core.c         |  2 +-
+ net/core/dst.c                  | 26 +++++---------------------
+ net/core/rtnetlink.c            |  2 +-
+ net/ipv6/route.c                |  6 +++---
+ net/netfilter/ipvs/ip_vs_xmit.c |  4 ++--
+ 7 files changed, 23 insertions(+), 38 deletions(-)
+
+diff --git a/include/net/dst.h b/include/net/dst.h
+index 81f2279ea..78884429d 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -16,6 +16,7 @@
+ #include <linux/bug.h>
+ #include <linux/jiffies.h>
+ #include <linux/refcount.h>
++#include <linux/rcuref.h>
+ #include <net/neighbour.h>
+ #include <asm/processor.h>
+ #include <linux/indirect_call_wrapper.h>
+@@ -61,11 +62,11 @@ struct dst_entry {
+ 	unsigned short		trailer_len;	/* space to reserve at tail */
+ 
+ 	/*
+-	 * __refcnt wants to be on a different cache line from
++	 * __rcuref wants to be on a different cache line from
+ 	 * input/output/ops or performance tanks badly
+ 	 */
+ #ifdef CONFIG_64BIT
+-	atomic_t		__refcnt;	/* 64-bit offset 64 */
++	rcuref_t		__rcuref;	/* 64-bit offset 64 */
+ #endif
+ 	int			__use;
+ 	unsigned long		lastuse;
+@@ -75,16 +76,16 @@ struct dst_entry {
+ 	__u32			tclassid;
+ #ifndef CONFIG_64BIT
+ 	struct lwtunnel_state   *lwtstate;
+-	atomic_t		__refcnt;	/* 32-bit offset 64 */
++	rcuref_t		__rcuref;	/* 32-bit offset 64 */
+ #endif
+ 	netdevice_tracker	dev_tracker;
+ 
+ 	/*
+ 	 * Used by rtable and rt6_info. Moves lwtstate into the next cache
+ 	 * line on 64bit so that lwtstate does not cause false sharing with
+-	 * __refcnt under contention of __refcnt. This also puts the
++	 * __rcuref under contention of __rcuref. This also puts the
+ 	 * frequently accessed members of rtable and rt6_info out of the
+-	 * __refcnt cache line.
++	 * __rcuref cache line.
+ 	 */
+ 	struct list_head	rt_uncached;
+ 	struct uncached_list	*rt_uncached_list;
+@@ -238,10 +239,10 @@ static inline void dst_hold(struct dst_entry *dst)
+ {
+ 	/*
+ 	 * If your kernel compilation stops here, please check
+-	 * the placement of __refcnt in struct dst_entry
++	 * the placement of __rcuref in struct dst_entry
+ 	 */
+-	BUILD_BUG_ON(offsetof(struct dst_entry, __refcnt) & 63);
+-	WARN_ON(atomic_inc_not_zero(&dst->__refcnt) == 0);
++	BUILD_BUG_ON(offsetof(struct dst_entry, __rcuref) & 63);
++	WARN_ON(!rcuref_get(&dst->__rcuref));
+ }
+ 
+ static inline void dst_use_noref(struct dst_entry *dst, unsigned long time)
+@@ -305,7 +306,7 @@ static inline void skb_dst_copy(struct sk_buff *nskb, const struct sk_buff *oskb
+  */
+ static inline bool dst_hold_safe(struct dst_entry *dst)
+ {
+-	return atomic_inc_not_zero(&dst->__refcnt);
++	return rcuref_get(&dst->__rcuref);
+ }
+ 
+ /**
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 573f2bf7e..5edf00388 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -2131,7 +2131,7 @@ sk_dst_get(struct sock *sk)
+ 
+ 	rcu_read_lock();
+ 	dst = rcu_dereference(sk->sk_dst_cache);
+-	if (dst && !atomic_inc_not_zero(&dst->__refcnt))
++	if (dst && !rcuref_get(&dst->__rcuref))
+ 		dst = NULL;
+ 	rcu_read_unlock();
+ 	return dst;
+diff --git a/net/bridge/br_nf_core.c b/net/bridge/br_nf_core.c
+index 8c69f0c95..98aea5485 100644
+--- a/net/bridge/br_nf_core.c
++++ b/net/bridge/br_nf_core.c
+@@ -73,7 +73,7 @@ void br_netfilter_rtable_init(struct net_bridge *br)
+ {
+ 	struct rtable *rt = &br->fake_rtable;
+ 
+-	atomic_set(&rt->dst.__refcnt, 1);
++	rcuref_init(&rt->dst.__rcuref, 1);
+ 	rt->dst.dev = br->dev;
+ 	dst_init_metrics(&rt->dst, br_dst_default_metrics, true);
+ 	rt->dst.flags	= DST_NOXFRM | DST_FAKE_RTABLE;
+diff --git a/net/core/dst.c b/net/core/dst.c
+index 31c08a338..3247e8404 100644
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@ -66,7 +66,7 @@ void dst_init(struct dst_entry *dst, struct dst_ops *ops,
+ 	dst->tclassid = 0;
+ #endif
+ 	dst->lwtstate = NULL;
+-	atomic_set(&dst->__refcnt, initial_ref);
++	rcuref_init(&dst->__rcuref, initial_ref);
+ 	dst->__use = 0;
+ 	dst->lastuse = jiffies;
+ 	dst->flags = flags;
+@@ -162,31 +162,15 @@ EXPORT_SYMBOL(dst_dev_put);
+ 
+ void dst_release(struct dst_entry *dst)
+ {
+-	if (dst) {
+-		int newrefcnt;
+-
+-		newrefcnt = atomic_dec_return(&dst->__refcnt);
+-		if (WARN_ONCE(newrefcnt < 0, "dst_release underflow"))
+-			net_warn_ratelimited("%s: dst:%p refcnt:%d\n",
+-					     __func__, dst, newrefcnt);
+-		if (!newrefcnt)
+-			call_rcu_hurry(&dst->rcu_head, dst_destroy_rcu);
+-	}
++	if (dst && rcuref_put(&dst->__rcuref))
++		call_rcu_hurry(&dst->rcu_head, dst_destroy_rcu);
+ }
+ EXPORT_SYMBOL(dst_release);
+ 
+ void dst_release_immediate(struct dst_entry *dst)
+ {
+-	if (dst) {
+-		int newrefcnt;
+-
+-		newrefcnt = atomic_dec_return(&dst->__refcnt);
+-		if (WARN_ONCE(newrefcnt < 0, "dst_release_immediate underflow"))
+-			net_warn_ratelimited("%s: dst:%p refcnt:%d\n",
+-					     __func__, dst, newrefcnt);
+-		if (!newrefcnt)
+-			dst_destroy(dst);
+-	}
++	if (dst && rcuref_put(&dst->__rcuref))
++		dst_destroy(dst);
+ }
+ EXPORT_SYMBOL(dst_release_immediate);
+ 
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 6e44e92eb..a6380dd47 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -840,7 +840,7 @@ int rtnl_put_cacheinfo(struct sk_buff *skb, struct dst_entry *dst, u32 id,
+ 	if (dst) {
+ 		ci.rta_lastuse = jiffies_delta_to_clock_t(jiffies - dst->lastuse);
+ 		ci.rta_used = dst->__use;
+-		ci.rta_clntref = atomic_read(&dst->__refcnt);
++		ci.rta_clntref = rcuref_read(&dst->__rcuref);
+ 	}
+ 	if (expires) {
+ 		unsigned long clock;
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 5d502be40..b9d22a0a6 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -293,7 +293,7 @@ static const struct fib6_info fib6_null_entry_template = {
+ 
+ static const struct rt6_info ip6_null_entry_template = {
+ 	.dst = {
+-		.__refcnt	= ATOMIC_INIT(1),
++		.__rcuref	= RCUREF_INIT(1),
+ 		.__use		= 1,
+ 		.obsolete	= DST_OBSOLETE_FORCE_CHK,
+ 		.error		= -ENETUNREACH,
+@@ -307,7 +307,7 @@ static const struct rt6_info ip6_null_entry_template = {
+ 
+ static const struct rt6_info ip6_prohibit_entry_template = {
+ 	.dst = {
+-		.__refcnt	= ATOMIC_INIT(1),
++		.__rcuref	= RCUREF_INIT(1),
+ 		.__use		= 1,
+ 		.obsolete	= DST_OBSOLETE_FORCE_CHK,
+ 		.error		= -EACCES,
+@@ -319,7 +319,7 @@ static const struct rt6_info ip6_prohibit_entry_template = {
+ 
+ static const struct rt6_info ip6_blk_hole_entry_template = {
+ 	.dst = {
+-		.__refcnt	= ATOMIC_INIT(1),
++		.__rcuref	= RCUREF_INIT(1),
+ 		.__use		= 1,
+ 		.obsolete	= DST_OBSOLETE_FORCE_CHK,
+ 		.error		= -EINVAL,
+diff --git a/net/netfilter/ipvs/ip_vs_xmit.c b/net/netfilter/ipvs/ip_vs_xmit.c
+index 80448885c..99c349c0d 100644
+--- a/net/netfilter/ipvs/ip_vs_xmit.c
++++ b/net/netfilter/ipvs/ip_vs_xmit.c
+@@ -339,7 +339,7 @@ __ip_vs_get_out_rt(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
+ 			spin_unlock_bh(&dest->dst_lock);
+ 			IP_VS_DBG(10, "new dst %pI4, src %pI4, refcnt=%d\n",
+ 				  &dest->addr.ip, &dest_dst->dst_saddr.ip,
+-				  atomic_read(&rt->dst.__refcnt));
++				  rcuref_read(&rt->dst.__rcuref));
+ 		}
+ 		if (ret_saddr)
+ 			*ret_saddr = dest_dst->dst_saddr.ip;
+@@ -507,7 +507,7 @@ __ip_vs_get_out_rt_v6(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
+ 			spin_unlock_bh(&dest->dst_lock);
+ 			IP_VS_DBG(10, "new dst %pI6, src %pI6, refcnt=%d\n",
+ 				  &dest->addr.in6, &dest_dst->dst_saddr.in6,
+-				  atomic_read(&rt->dst.__refcnt));
++				  rcuref_read(&rt->dst.__rcuref));
+ 		}
+ 		if (ret_saddr)
+ 			*ret_saddr = dest_dst->dst_saddr.in6;
+-- 
+2.40.0.71.g950264636c
+
