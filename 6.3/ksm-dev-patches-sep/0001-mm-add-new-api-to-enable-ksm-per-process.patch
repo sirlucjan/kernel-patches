@@ -1,0 +1,384 @@
+From 9b36817f25ec69775aab8eeef7d4830f013ccd5c Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Mon, 17 Apr 2023 22:13:40 -0700
+Subject: [PATCH 1/6] mm: add new api to enable ksm per process
+
+So far KSM can only be enabled by calling madvise for memory regions.  To
+be able to use KSM for more workloads, KSM needs to have the ability to be
+enabled / disabled at the process / cgroup level.
+
+1. New options for prctl system command
+
+   This patch series adds two new options to the prctl system call.
+   The first one allows to enable KSM at the process level and the second
+   one to query the setting.
+
+   The setting will be inherited by child processes.
+
+   With the above setting, KSM can be enabled for the seed process of a
+   cgroup and all processes in the cgroup will inherit the setting.
+
+2. Changes to KSM processing
+
+   When KSM is enabled at the process level, the KSM code will iterate
+   over all the VMA's and enable KSM for the eligible VMA's.
+
+   When forking a process that has KSM enabled, the setting will be
+   inherited by the new child process.
+
+  1) Introduce new MMF_VM_MERGE_ANY flag
+
+     This introduces the new flag MMF_VM_MERGE_ANY flag.  When this flag
+     is set, kernel samepage merging (ksm) gets enabled for all vma's of a
+     process.
+
+  2) Setting VM_MERGEABLE on VMA creation
+
+     When a VMA is created, if the MMF_VM_MERGE_ANY flag is set, the
+     VM_MERGEABLE flag will be set for this VMA.
+
+  3) support disabling of ksm for a process
+
+     This adds the ability to disable ksm for a process if ksm has been
+     enabled for the process with prctl.
+
+  4) add new prctl option to get and set ksm for a process
+
+     This adds two new options to the prctl system call
+     - enable ksm for all vmas of a process (if the vmas support it).
+     - query if ksm has been enabled for a process.
+
+3. Disabling MMF_VM_MERGE_ANY for storage keys in s390
+
+   In the s390 architecture when storage keys are used, the
+   MMF_VM_MERGE_ANY will be disabled.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ arch/s390/mm/gmap.c            |   7 +++
+ include/linux/ksm.h            |  21 ++++++-
+ include/linux/sched/coredump.h |   1 +
+ include/uapi/linux/prctl.h     |   2 +
+ kernel/sys.c                   |  27 +++++++++
+ mm/ksm.c                       | 104 +++++++++++++++++++++++++++------
+ mm/mmap.c                      |   3 +
+ 7 files changed, 146 insertions(+), 19 deletions(-)
+
+diff --git a/arch/s390/mm/gmap.c b/arch/s390/mm/gmap.c
+index 5a716bdcb..094981176 100644
+--- a/arch/s390/mm/gmap.c
++++ b/arch/s390/mm/gmap.c
+@@ -2591,6 +2591,13 @@ int gmap_mark_unmergeable(void)
+ 	int ret;
+ 	VMA_ITERATOR(vmi, mm, 0);
+ 
++	/*
++	 * Make sure to disable KSM (if enabled for the whole process or
++	 * individual VMAs). Note that nothing currently hinders user space
++	 * from re-enabling it.
++	 */
++	clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
++
+ 	for_each_vma(vmi, vma) {
+ 		/* Copy vm_flags to avoid partial modifications in ksm_madvise */
+ 		vm_flags = vma->vm_flags;
+diff --git a/include/linux/ksm.h b/include/linux/ksm.h
+index 7e232ba59..fa9963736 100644
+--- a/include/linux/ksm.h
++++ b/include/linux/ksm.h
+@@ -18,13 +18,26 @@
+ #ifdef CONFIG_KSM
+ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long end, int advice, unsigned long *vm_flags);
++
++void ksm_add_vma(struct vm_area_struct *vma);
++int ksm_enable_merge_any(struct mm_struct *mm);
++
+ int __ksm_enter(struct mm_struct *mm);
+ void __ksm_exit(struct mm_struct *mm);
+ 
+ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
+ {
+-	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags))
+-		return __ksm_enter(mm);
++	int ret;
++
++	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags)) {
++		ret = __ksm_enter(mm);
++		if (ret)
++			return ret;
++	}
++
++	if (test_bit(MMF_VM_MERGE_ANY, &oldmm->flags))
++		set_bit(MMF_VM_MERGE_ANY, &mm->flags);
++
+ 	return 0;
+ }
+ 
+@@ -53,6 +66,10 @@ void folio_migrate_ksm(struct folio *newfolio, struct folio *folio);
+ 
+ #else  /* !CONFIG_KSM */
+ 
++static inline void ksm_add_vma(struct vm_area_struct *vma)
++{
++}
++
+ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
+ {
+ 	return 0;
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index 0e17ae7fb..0ee96ea7a 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -90,4 +90,5 @@ static inline int get_dumpable(struct mm_struct *mm)
+ #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+ 				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK)
+ 
++#define MMF_VM_MERGE_ANY	29
+ #endif /* _LINUX_SCHED_COREDUMP_H */
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index 1312a137f..759b3f53e 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -290,4 +290,6 @@ struct prctl_mm_map {
+ #define PR_SET_VMA		0x53564d41
+ # define PR_SET_VMA_ANON_NAME		0
+ 
++#define PR_SET_MEMORY_MERGE		67
++#define PR_GET_MEMORY_MERGE		68
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 351de7916..f95ec83ac 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -15,6 +15,7 @@
+ #include <linux/highuid.h>
+ #include <linux/fs.h>
+ #include <linux/kmod.h>
++#include <linux/ksm.h>
+ #include <linux/perf_event.h>
+ #include <linux/resource.h>
+ #include <linux/kernel.h>
+@@ -2672,6 +2673,32 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 	case PR_SET_VMA:
+ 		error = prctl_set_vma(arg2, arg3, arg4, arg5);
+ 		break;
++#ifdef CONFIG_KSM
++	case PR_SET_MEMORY_MERGE:
++		if (arg3 || arg4 || arg5)
++			return -EINVAL;
++		if (mmap_write_lock_killable(me->mm))
++			return -EINTR;
++
++		if (arg2) {
++			error = ksm_enable_merge_any(me->mm);
++		} else {
++			/*
++			 * TODO: we might want disable KSM on all VMAs and
++			 * trigger unsharing to completely disable KSM.
++			 */
++			clear_bit(MMF_VM_MERGE_ANY, &me->mm->flags);
++			error = 0;
++		}
++		mmap_write_unlock(me->mm);
++		break;
++	case PR_GET_MEMORY_MERGE:
++		if (arg2 || arg3 || arg4 || arg5)
++			return -EINVAL;
++
++		error = !!test_bit(MMF_VM_MERGE_ANY, &me->mm->flags);
++		break;
++#endif
+ 	default:
+ 		error = -EINVAL;
+ 		break;
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 2b8d30068..19a1bbed3 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -512,6 +512,28 @@ static int break_ksm(struct vm_area_struct *vma, unsigned long addr)
+ 	return (ret & VM_FAULT_OOM) ? -ENOMEM : 0;
+ }
+ 
++static bool vma_ksm_compatible(struct vm_area_struct *vma)
++{
++	if (vma->vm_flags & (VM_SHARED  | VM_MAYSHARE   | VM_PFNMAP  |
++			     VM_IO      | VM_DONTEXPAND | VM_HUGETLB |
++			     VM_MIXEDMAP))
++		return false;		/* just ignore the advice */
++
++	if (vma_is_dax(vma))
++		return false;
++
++#ifdef VM_SAO
++	if (vma->vm_flags & VM_SAO)
++		return false;
++#endif
++#ifdef VM_SPARC_ADI
++	if (vma->vm_flags & VM_SPARC_ADI)
++		return false;
++#endif
++
++	return true;
++}
++
+ static struct vm_area_struct *find_mergeable_vma(struct mm_struct *mm,
+ 		unsigned long addr)
+ {
+@@ -1020,6 +1042,7 @@ static int unmerge_and_remove_all_rmap_items(void)
+ 
+ 			mm_slot_free(mm_slot_cache, mm_slot);
+ 			clear_bit(MMF_VM_MERGEABLE, &mm->flags);
++			clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
+ 			mmdrop(mm);
+ 		} else
+ 			spin_unlock(&ksm_mmlist_lock);
+@@ -2395,6 +2418,7 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ 
+ 		mm_slot_free(mm_slot_cache, mm_slot);
+ 		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
++		clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
+ 		mmap_read_unlock(mm);
+ 		mmdrop(mm);
+ 	} else {
+@@ -2471,6 +2495,66 @@ static int ksm_scan_thread(void *nothing)
+ 	return 0;
+ }
+ 
++static void __ksm_add_vma(struct vm_area_struct *vma)
++{
++	unsigned long vm_flags = vma->vm_flags;
++
++	if (vm_flags & VM_MERGEABLE)
++		return;
++
++	if (vma_ksm_compatible(vma))
++		vm_flags_set(vma, VM_MERGEABLE);
++}
++
++/**
++ * ksm_add_vma - Mark vma as mergeable if compatible
++ *
++ * @vma:  Pointer to vma
++ */
++void ksm_add_vma(struct vm_area_struct *vma)
++{
++	struct mm_struct *mm = vma->vm_mm;
++
++	if (test_bit(MMF_VM_MERGE_ANY, &mm->flags))
++		__ksm_add_vma(vma);
++}
++
++static void ksm_add_vmas(struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++
++	VMA_ITERATOR(vmi, mm, 0);
++	for_each_vma(vmi, vma)
++		__ksm_add_vma(vma);
++}
++
++/**
++ * ksm_enable_merge_any - Add mm to mm ksm list and enable merging on all
++ *                        compatible VMA's
++ *
++ * @mm:  Pointer to mm
++ *
++ * Returns 0 on success, otherwise error code
++ */
++int ksm_enable_merge_any(struct mm_struct *mm)
++{
++	int err;
++
++	if (test_bit(MMF_VM_MERGE_ANY, &mm->flags))
++		return 0;
++
++	if (!test_bit(MMF_VM_MERGEABLE, &mm->flags)) {
++		err = __ksm_enter(mm);
++		if (err)
++			return err;
++	}
++
++	set_bit(MMF_VM_MERGE_ANY, &mm->flags);
++	ksm_add_vmas(mm);
++
++	return 0;
++}
++
+ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long end, int advice, unsigned long *vm_flags)
+ {
+@@ -2479,25 +2563,10 @@ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 
+ 	switch (advice) {
+ 	case MADV_MERGEABLE:
+-		/*
+-		 * Be somewhat over-protective for now!
+-		 */
+-		if (*vm_flags & (VM_MERGEABLE | VM_SHARED  | VM_MAYSHARE   |
+-				 VM_PFNMAP    | VM_IO      | VM_DONTEXPAND |
+-				 VM_HUGETLB | VM_MIXEDMAP))
+-			return 0;		/* just ignore the advice */
+-
+-		if (vma_is_dax(vma))
++		if (vma->vm_flags & VM_MERGEABLE)
+ 			return 0;
+-
+-#ifdef VM_SAO
+-		if (*vm_flags & VM_SAO)
++		if (!vma_ksm_compatible(vma))
+ 			return 0;
+-#endif
+-#ifdef VM_SPARC_ADI
+-		if (*vm_flags & VM_SPARC_ADI)
+-			return 0;
+-#endif
+ 
+ 		if (!test_bit(MMF_VM_MERGEABLE, &mm->flags)) {
+ 			err = __ksm_enter(mm);
+@@ -2600,6 +2669,7 @@ void __ksm_exit(struct mm_struct *mm)
+ 
+ 	if (easy_to_free) {
+ 		mm_slot_free(mm_slot_cache, mm_slot);
++		clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
+ 		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
+ 		mmdrop(mm);
+ 	} else if (mm_slot) {
+diff --git a/mm/mmap.c b/mm/mmap.c
+index d5475fbf5..9a583b553 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -46,6 +46,7 @@
+ #include <linux/pkeys.h>
+ #include <linux/oom.h>
+ #include <linux/sched/mm.h>
++#include <linux/ksm.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/cacheflush.h>
+@@ -2697,6 +2698,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 	if (file && vm_flags & VM_SHARED)
+ 		mapping_unmap_writable(file->f_mapping);
+ 	file = vma->vm_file;
++	ksm_add_vma(vma);
+ expanded:
+ 	perf_event_mmap(vma);
+ 
+@@ -2969,6 +2971,7 @@ static int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 		goto mas_store_fail;
+ 
+ 	mm->map_count++;
++	ksm_add_vma(vma);
+ out:
+ 	perf_event_mmap(vma);
+ 	mm->total_vm += len >> PAGE_SHIFT;
+-- 
+2.40.0.71.g950264636c
+
