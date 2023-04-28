@@ -1,0 +1,280 @@
+From d77bc6b0f66d472c07b5bf8f4050ab88bb88834f Mon Sep 17 00:00:00 2001
+From: Anthony Yznaga <anthony.yznaga@oracle.com>
+Date: Wed, 26 Apr 2023 17:08:46 -0700
+Subject: [PATCH 10/21] PKRAM: prepare for adding preserved ranges to memblock
+ reserved
+
+Calling memblock_reserve() repeatedly to add preserved ranges is
+inefficient and risks clobbering preserved memory if the memblock
+reserved regions array must be resized.  Instead, calculate the size
+needed to accommodate the preserved ranges, find a suitable range for
+a new reserved regions array that does not overlap any preserved range,
+and populate it with a new, merged regions array.
+
+Signed-off-by: Anthony Yznaga <anthony.yznaga@oracle.com>
+---
+ mm/pkram.c | 244 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 244 insertions(+)
+
+diff --git a/mm/pkram.c b/mm/pkram.c
+index 3790e5180..c649504fa 100644
+--- a/mm/pkram.c
++++ b/mm/pkram.c
+@@ -7,6 +7,7 @@
+ #include <linux/kernel.h>
+ #include <linux/kobject.h>
+ #include <linux/list.h>
++#include <linux/memblock.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -1138,3 +1139,246 @@ static unsigned long pkram_populate_regions_list(void)
+ 
+ 	return priv.nr_regions;
+ }
++
++struct pkram_region *pkram_first_region(struct pkram_super_block *sb,
++					struct pkram_region_list **rlp, int *idx)
++{
++	WARN_ON(!sb);
++	WARN_ON(!sb->region_list_pfn);
++
++	if (!sb || !sb->region_list_pfn)
++		return NULL;
++
++	*rlp = pfn_to_kaddr(sb->region_list_pfn);
++	*idx = 0;
++
++	return &(*rlp)->regions[0];
++}
++
++struct pkram_region *pkram_next_region(struct pkram_region_list **rlp, int *idx)
++{
++	struct pkram_region_list *rl = *rlp;
++	int i = *idx;
++
++	i++;
++	if (i >= PKRAM_REGIONS_LIST_MAX) {
++		if (!rl->next_pfn) {
++			pr_err("PKRAM: %s: no more pkram_region_list pages\n", __func__);
++			return NULL;
++		}
++		rl = pfn_to_kaddr(rl->next_pfn);
++		*rlp = rl;
++		i = 0;
++	}
++	*idx = i;
++
++	if (rl->regions[i].size == 0)
++		return NULL;
++
++	return &rl->regions[i];
++}
++
++struct pkram_region *pkram_first_region_topdown(struct pkram_super_block *sb,
++						struct pkram_region_list **rlp, int *idx)
++{
++	struct pkram_region_list *rl;
++
++	WARN_ON(!sb);
++	WARN_ON(!sb->region_list_pfn);
++
++	if (!sb || !sb->region_list_pfn)
++		return NULL;
++
++	rl = pfn_to_kaddr(sb->region_list_pfn);
++	if (!rl->prev_pfn) {
++		WARN_ON(1);
++		return NULL;
++	}
++	rl = pfn_to_kaddr(rl->prev_pfn);
++
++	*rlp = rl;
++
++	*idx = (sb->nr_regions - 1) % PKRAM_REGIONS_LIST_MAX;
++
++	return &rl->regions[*idx];
++}
++
++struct pkram_region *pkram_next_region_topdown(struct pkram_region_list **rlp, int *idx)
++{
++	struct pkram_region_list *rl = *rlp;
++	int i = *idx;
++
++	if (i == 0) {
++		if (!rl->prev_pfn)
++			return NULL;
++		rl = pfn_to_kaddr(rl->prev_pfn);
++		*rlp = rl;
++		i = PKRAM_REGIONS_LIST_MAX - 1;
++	} else
++		i--;
++
++	*idx = i;
++
++	return &rl->regions[i];
++}
++
++/*
++ * Use the pkram regions list to allocate a block of memory that does
++ * not overlap with preserved pages.
++ */
++phys_addr_t __init alloc_topdown(phys_addr_t size)
++{
++	phys_addr_t hole_start, hole_end, hole_size;
++	struct pkram_region_list *rl;
++	struct pkram_region *r;
++	phys_addr_t addr = 0;
++	int idx;
++
++	hole_end = memblock.current_limit;
++	r = pkram_first_region_topdown(pkram_sb, &rl, &idx);
++
++	while (r) {
++		hole_start = r->base + r->size;
++		hole_size = hole_end - hole_start;
++
++		if (hole_size >= size) {
++			addr = memblock_phys_alloc_range(size, PAGE_SIZE,
++							hole_start, hole_end);
++			if (addr)
++				break;
++		}
++
++		hole_end = r->base;
++		r = pkram_next_region_topdown(&rl, &idx);
++	}
++
++	if (!addr)
++		addr = memblock_phys_alloc_range(size, PAGE_SIZE, 0, hole_end);
++
++	return addr;
++}
++
++int __init pkram_create_merged_reserved(struct memblock_type *new)
++{
++	unsigned long cnt_a;
++	unsigned long cnt_b;
++	long i, j, k;
++	struct memblock_region *r;
++	struct memblock_region *rgn;
++	struct pkram_region *pkr;
++	struct pkram_region_list *rl;
++	int idx;
++	unsigned long total_size = 0;
++	unsigned long nr_preserved = 0;
++
++	cnt_a = memblock.reserved.cnt;
++	cnt_b = pkram_sb->nr_regions;
++
++	i = 0;
++	j = 0;
++	k = 0;
++
++	pkr = pkram_first_region(pkram_sb, &rl, &idx);
++	if (!pkr)
++		return -EINVAL;
++	while (i < cnt_a && j < cnt_b && pkr) {
++		r = &memblock.reserved.regions[i];
++		rgn = &new->regions[k];
++
++		if (r->base + r->size <= pkr->base) {
++			*rgn = *r;
++			i++;
++		} else if (pkr->base + pkr->size <= r->base) {
++			rgn->base = pkr->base;
++			rgn->size = pkr->size;
++			memblock_set_region_node(rgn, MAX_NUMNODES);
++
++			nr_preserved +=  (rgn->size >> PAGE_SHIFT);
++			pkr = pkram_next_region(&rl, &idx);
++			j++;
++		} else {
++			pr_err("PKRAM: unexpected overlap:\n");
++			pr_err("PKRAM: reserved: base=%pa,size=%pa,flags=0x%x\n", &r->base,
++				&r->size, (int)r->flags);
++			pr_err("PKRAM: pkram: base=%pa,size=%pa\n", &pkr->base, &pkr->size);
++			return -EBUSY;
++		}
++		total_size += rgn->size;
++		k++;
++	}
++
++	while (i < cnt_a) {
++		r = &memblock.reserved.regions[i];
++		rgn = &new->regions[k];
++
++		*rgn = *r;
++
++		total_size += rgn->size;
++		i++;
++		k++;
++	}
++	while (j < cnt_b && pkr) {
++		rgn = &new->regions[k];
++		rgn->base = pkr->base;
++		rgn->size = pkr->size;
++		memblock_set_region_node(rgn, MAX_NUMNODES);
++
++		nr_preserved += (rgn->size >> PAGE_SHIFT);
++		total_size += rgn->size;
++		pkr = pkram_next_region(&rl, &idx);
++		j++;
++		k++;
++	}
++
++	WARN_ON(cnt_a + cnt_b != k);
++	new->cnt = cnt_a + cnt_b;
++	new->total_size = total_size;
++
++	return 0;
++}
++
++/*
++ * Reserve pages that belong to preserved memory.  This is accomplished by
++ * merging the existing reserved ranges with the preserved ranges into
++ * a new, sufficiently sized memblock reserved array.
++ *
++ * This function should be called at boot time as early as possible to prevent
++ * preserved memory from being recycled.
++ */
++int __init pkram_merge_with_reserved(void)
++{
++	struct memblock_type new;
++	unsigned long new_max;
++	phys_addr_t new_size;
++	phys_addr_t addr;
++	int err;
++
++	/*
++	 * Need space to insert one more range into memblock.reserved
++	 * without memblock_double_array() being called.
++	 */
++	if (memblock.reserved.cnt == memblock.reserved.max) {
++		WARN_ONCE(1, "PKRAM: no space for new memblock list\n");
++		return -ENOMEM;
++	}
++
++	new_max = memblock.reserved.max + pkram_sb->nr_regions;
++	new_size = PAGE_ALIGN(sizeof(struct memblock_region) * new_max);
++
++	addr = alloc_topdown(new_size);
++	if (!addr)
++		return -ENOMEM;
++
++	new.regions = __va(addr);
++	new.max = new_max;
++	err = pkram_create_merged_reserved(&new);
++	if (err)
++		return err;
++
++	memblock.reserved.cnt = new.cnt;
++	memblock.reserved.max = new.max;
++	memblock.reserved.total_size = new.total_size;
++	memblock.reserved.regions = new.regions;
++
++	return 0;
++}
+-- 
+2.40.0.71.g950264636c
+

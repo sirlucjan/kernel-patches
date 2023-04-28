@@ -1,0 +1,227 @@
+From c3482a1147152d9901d4a280c9d49184d2b238ee Mon Sep 17 00:00:00 2001
+From: Anthony Yznaga <anthony.yznaga@oracle.com>
+Date: Wed, 26 Apr 2023 17:08:56 -0700
+Subject: [PATCH 20/21] x86/KASLR: PKRAM: support physical kaslr
+
+Avoid regions of memory that contain preserved pages when computing
+slots used to select where to put the decompressed kernel.
+
+Signed-off-by: Anthony Yznaga <anthony.yznaga@oracle.com>
+---
+ arch/x86/boot/compressed/Makefile |   3 +
+ arch/x86/boot/compressed/kaslr.c  |  10 ++-
+ arch/x86/boot/compressed/misc.h   |  10 +++
+ arch/x86/boot/compressed/pkram.c  | 110 ++++++++++++++++++++++++++++++
+ mm/pkram.c                        |   2 +-
+ 5 files changed, 132 insertions(+), 3 deletions(-)
+ create mode 100644 arch/x86/boot/compressed/pkram.c
+
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index 6b6cfe607..d9a5af94a 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -103,6 +103,9 @@ ifdef CONFIG_X86_64
+ 	vmlinux-objs-$(CONFIG_AMD_MEM_ENCRYPT) += $(obj)/mem_encrypt.o
+ 	vmlinux-objs-y += $(obj)/pgtable_64.o
+ 	vmlinux-objs-$(CONFIG_AMD_MEM_ENCRYPT) += $(obj)/sev.o
++ifdef CONFIG_RANDOMIZE_BASE
++	vmlinux-objs-$(CONFIG_PKRAM) += $(obj)/pkram.o
++endif
+ endif
+ 
+ vmlinux-objs-$(CONFIG_ACPI) += $(obj)/acpi.o
+diff --git a/arch/x86/boot/compressed/kaslr.c b/arch/x86/boot/compressed/kaslr.c
+index 454757fbd..047b8b9a0 100644
+--- a/arch/x86/boot/compressed/kaslr.c
++++ b/arch/x86/boot/compressed/kaslr.c
+@@ -436,6 +436,7 @@ static bool mem_avoid_overlap(struct mem_vector *img,
+ 	struct setup_data *ptr;
+ 	u64 earliest = img->start + img->size;
+ 	bool is_overlapping = false;
++	struct mem_vector avoid;
+ 
+ 	for (i = 0; i < MEM_AVOID_MAX; i++) {
+ 		if (mem_overlaps(img, &mem_avoid[i]) &&
+@@ -449,8 +450,6 @@ static bool mem_avoid_overlap(struct mem_vector *img,
+ 	/* Avoid all entries in the setup_data linked list. */
+ 	ptr = (struct setup_data *)(unsigned long)boot_params->hdr.setup_data;
+ 	while (ptr) {
+-		struct mem_vector avoid;
+-
+ 		avoid.start = (unsigned long)ptr;
+ 		avoid.size = sizeof(*ptr) + ptr->len;
+ 
+@@ -475,6 +474,12 @@ static bool mem_avoid_overlap(struct mem_vector *img,
+ 		ptr = (struct setup_data *)(unsigned long)ptr->next;
+ 	}
+ 
++	if (pkram_has_overlap(img, &avoid) && (avoid.start < earliest)) {
++		*overlap = avoid;
++		earliest = overlap->start;
++		is_overlapping = true;
++	}
++
+ 	return is_overlapping;
+ }
+ 
+@@ -836,6 +841,7 @@ void choose_random_location(unsigned long input,
+ 		return;
+ 	}
+ 
++	pkram_init();
+ 	boot_params->hdr.loadflags |= KASLR_FLAG;
+ 
+ 	if (IS_ENABLED(CONFIG_X86_32))
+diff --git a/arch/x86/boot/compressed/misc.h b/arch/x86/boot/compressed/misc.h
+index 20118fb7c..01ff5e507 100644
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@ -124,6 +124,16 @@ static inline void console_init(void)
+ { }
+ #endif
+ 
++#ifdef CONFIG_PKRAM
++void pkram_init(void);
++int pkram_has_overlap(struct mem_vector *entry, struct mem_vector *overlap);
++#else
++static inline void pkram_init(void) { }
++static inline int pkram_has_overlap(struct mem_vector *entry,
++				    struct mem_vector *overlap)
++{ return 0; }
++#endif
++
+ #ifdef CONFIG_AMD_MEM_ENCRYPT
+ void sev_enable(struct boot_params *bp);
+ void snp_check_features(void);
+diff --git a/arch/x86/boot/compressed/pkram.c b/arch/x86/boot/compressed/pkram.c
+new file mode 100644
+index 000000000..19267ca2c
+--- /dev/null
++++ b/arch/x86/boot/compressed/pkram.c
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include "misc.h"
++
++#define PKRAM_MAGIC		0x706B726D
++
++struct pkram_super_block {
++	__u32	magic;
++
++	__u64	node_pfn;
++	__u64	region_list_pfn;
++	__u64	nr_regions;
++};
++
++struct pkram_region {
++	phys_addr_t base;
++	phys_addr_t size;
++};
++
++struct pkram_region_list {
++	__u64	prev_pfn;
++	__u64	next_pfn;
++
++	struct pkram_region regions[0];
++};
++
++#define PKRAM_REGIONS_LIST_MAX \
++	((PAGE_SIZE-sizeof(struct pkram_region_list))/sizeof(struct pkram_region))
++
++static u64 pkram_sb_pfn;
++static struct pkram_super_block *pkram_sb;
++
++void pkram_init(void)
++{
++	struct pkram_super_block *sb;
++	char arg[32];
++
++	if (cmdline_find_option("pkram", arg, sizeof(arg)) > 0) {
++		if (kstrtoull(arg, 16, &pkram_sb_pfn) != 0)
++			return;
++	} else
++		return;
++
++	sb = (struct pkram_super_block *)(pkram_sb_pfn << PAGE_SHIFT);
++	if (sb->magic != PKRAM_MAGIC) {
++		debug_putstr("PKRAM: invalid super block\n");
++		return;
++	}
++
++	pkram_sb = sb;
++}
++
++static struct pkram_region *pkram_first_region(struct pkram_super_block *sb,
++					       struct pkram_region_list **rlp, int *idx)
++{
++	if (!sb || !sb->region_list_pfn)
++		return NULL;
++
++	*rlp = (struct pkram_region_list *)(sb->region_list_pfn << PAGE_SHIFT);
++	*idx = 0;
++
++	return &(*rlp)->regions[0];
++}
++
++static struct pkram_region *pkram_next_region(struct pkram_region_list **rlp, int *idx)
++{
++	struct pkram_region_list *rl = *rlp;
++	int i = *idx;
++
++	i++;
++	if (i >= PKRAM_REGIONS_LIST_MAX) {
++		if (!rl->next_pfn) {
++			debug_putstr("PKRAM: no more pkram_region_list pages\n");
++			return NULL;
++		}
++		rl = (struct pkram_region_list *)(rl->next_pfn << PAGE_SHIFT);
++		*rlp = rl;
++		i = 0;
++	}
++	*idx = i;
++
++	if (rl->regions[i].size == 0)
++		return NULL;
++
++	return &rl->regions[i];
++}
++
++int pkram_has_overlap(struct mem_vector *entry, struct mem_vector *overlap)
++{
++	struct pkram_region_list *rl;
++	struct pkram_region *r;
++	int idx;
++
++	r = pkram_first_region(pkram_sb, &rl, &idx);
++
++	while (r) {
++		if (r->base + r->size <= entry->start) {
++			r = pkram_next_region(&rl, &idx);
++			continue;
++		}
++		if (r->base >= entry->start + entry->size)
++			return 0;
++
++		overlap->start = r->base;
++		overlap->size = r->size;
++		return 1;
++	}
++
++	return 0;
++}
+diff --git a/mm/pkram.c b/mm/pkram.c
+index f38236e5d..a3e045b8d 100644
+--- a/mm/pkram.c
++++ b/mm/pkram.c
+@@ -96,7 +96,7 @@ struct pkram_region_list {
+ 	__u64	prev_pfn;
+ 	__u64	next_pfn;
+ 
+-	struct pkram_region regions[0];
++	struct pkram_region regions[];
+ };
+ 
+ #define PKRAM_REGIONS_LIST_MAX \
+-- 
+2.40.0.71.g950264636c
+
