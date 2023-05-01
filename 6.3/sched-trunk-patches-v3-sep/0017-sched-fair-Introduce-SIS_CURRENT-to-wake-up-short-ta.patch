@@ -1,0 +1,266 @@
+From 4a6734d7e1ad35aa535c06c36f518055c98287ec Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Sat, 22 Apr 2023 22:26:10 +0200
+Subject: [PATCH 17/21] sched/fair: Introduce SIS_CURRENT to wake up short task
+ on current CPU
+
+The main purpose is to avoid too many cross CPU wake up when it is
+unnecessary. The frequent cross CPU wakeup brings significant damage
+to some workloads, especially on high core count systems:
+1. The cross CPU wakeup triggers race condition that, some wakers are
+   stacked on 1 CPU which delays the wakeup of their wakees.
+2. The cross CPU wakeup brings c2c overhead if the waker and wakee share
+   cache resource.
+
+Inhibits the cross CPU wake-up by placing the wakee on waking CPU,
+if both the waker and wakee are short-duration tasks, and when the
+waker and wakee wake up each other.
+
+The first patch introduces the definition of a short-duration task.
+The second patch leverages the first patch to choose a local CPU for wakee.
+
+Overall there is performance improvement when the benchmark has
+close 1:1 waker/wakee relationship, such as will-it-scale, netperf, tbench.
+And for netperf, it has a universal performance improvement under many
+different utilization. And there is no noticeable impact on schbench, hackbench,
+or a OLTP workload with a commercial RDBMS, according to the test on
+Intel Sapphire Rapids, which has 2 x 56C/112T = 224 CPUs.
+
+Per the lastest test on Zen3 from Prateek,  tbench/netperf shows good
+improvement at 128 clients, SPECjbb2015 shows improvement in max-jOPS.
+
+Changes since v6:
+1. Rename SIS_SHORT to SIS_CURRENT, which better describes this feature.
+2. Remove the 50% utilization threshold. Removes the has_idle_cores check.
+   After this change, SIS_CURRENT is applicable to all system utilization.
+3. Add a condition that only waker and wakee wake up each other would enable
+   the SIS_CURRENT. That is, A->last_wakee = B and B->last_wakee = A.
+
+Changes since v5:
+1. Check the wakee_flips of the waker/wakee. If the wakee_flips
+   of waker/wakee are both 0, it indicates that the waker and the wakee
+   are waking up each other. In this case, put them together on the
+   same CPU. This is to avoid that too many wakees are stacked on
+   one CPU, which might cause regression on redis.
+
+Changes since v4:
+1. Dietmar has commented on the task duration calculation. So refined
+   the commit log to reduce confusion.
+2. Change [PATCH 1/2] to only record the average duration of a task.
+   So this change could benefit UTIL_EST_FASTER[1].
+3. As v4 reported regression on Zen3 and Kunpeng Arm64, add back
+   the system average utilization restriction that, if the system
+   is not busy, do not enable the short wake up. Above logic has
+   shown improvment on Zen3[2].
+4. Restrict the wakeup target to be current CPU, rather than both
+   current CPU and task's previous CPU. This could also benefit
+   wakeup optimization from interrupt in the future, which is
+   suggested by Yicong.
+
+Changes since v3:
+1. Honglei and Josh have concern that the threshold of short
+   task duration could be too long. Decreased the threshold from
+   sysctl_sched_min_granularity to (sysctl_sched_min_granularity / 8),
+   and the '8' comes from get_update_sysctl_factor().
+2. Export p->se.dur_avg to /proc/{pid}/sched per Yicong's suggestion.
+3. Move the calculation of average duration from put_prev_task_fair()
+   to dequeue_task_fair(). Because there is an issue in v3 that,
+   put_prev_task_fair() will not be invoked by pick_next_task_fair()
+   in fast path, thus the dur_avg could not be updated timely.
+4. Fix the comment in PATCH 2/2, that "WRITE_ONCE(CPU1->ttwu_pending, 1);"
+   on CPU0 is earlier than CPU1 getting "ttwu_list->p0", per Tianchen.
+5. Move the scan for CPU with short duration task from select_idle_cpu()
+   to select_idle_siblings(), because there is no CPU scan involved, per
+   Yicong.
+
+Changes since v2:
+
+1. Peter suggested comparing the duration of waker and the cost to
+   scan for an idle CPU: If the cost is higher than the task duration,
+   do not waste time finding an idle CPU, choose the local or previous
+   CPU directly. A prototype was created based on this suggestion.
+   However, according to the test result, this prototype does not inhibit
+   the cross CPU wakeup and did not bring improvement. Because the cost
+   to find an idle CPU is small in the problematic scenario. The root
+   cause of the problem is a race condition between scanning for an idle
+   CPU and task enqueue(please refer to the commit log in PATCH 2/2).
+   So v3 does not change the core logic of v2, with some refinement based
+   on Peter's suggestion.
+
+2. Simplify the logic to record the task duration per Peter and Abel's suggestion.
+
+[1] https://lore.kernel.org/lkml/c56855a7-14fd-4737-fc8b-8ea21487c5f6@arm.com/
+[2] https://lore.kernel.org/all/cover.1666531576.git.yu.c.chen@intel.com/
+
+v6: https://lore.kernel.org/lkml/cover.1677069490.git.yu.c.chen@intel.com/
+v5: https://lore.kernel.org/lkml/cover.1675361144.git.yu.c.chen@intel.com/
+v4: https://lore.kernel.org/lkml/cover.1671158588.git.yu.c.chen@intel.com/
+v3: https://lore.kernel.org/lkml/cover.1669862147.git.yu.c.chen@intel.com/
+v2: https://lore.kernel.org/all/cover.1666531576.git.yu.c.chen@intel.com/
+v1: https://lore.kernel.org/lkml/20220915165407.1776363-1-yu.c.chen@intel.com/
+
+Chen Yu (2):
+  sched/fair: Record the average duration of a task
+  sched/fair: Introduce SIS_CURRENT to wake up short task on current CPU
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ include/linux/sched.h   |  3 +++
+ kernel/sched/core.c     |  2 ++
+ kernel/sched/debug.c    |  1 +
+ kernel/sched/fair.c     | 59 +++++++++++++++++++++++++++++++++++++++++
+ kernel/sched/features.h |  1 +
+ 5 files changed, 66 insertions(+)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 63d242164..6d398b337 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -557,6 +557,9 @@ struct sched_entity {
+ 	u64				prev_sum_exec_runtime;
+ 
+ 	u64				nr_migrations;
++	u64				prev_sleep_sum_runtime;
++	/* average duration of a task */
++	u64				dur_avg;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	int				depth;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0d18c3969..f338bb158 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4434,6 +4434,8 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->se.prev_sum_exec_runtime	= 0;
+ 	p->se.nr_migrations		= 0;
+ 	p->se.vruntime			= 0;
++	p->se.dur_avg			= 0;
++	p->se.prev_sleep_sum_runtime	= 0;
+ 	INIT_LIST_HEAD(&p->se.group_node);
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 1637b65ba..8d64fba16 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -1024,6 +1024,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ 	__PS("nr_involuntary_switches", p->nivcsw);
+ 
+ 	P(se.load.weight);
++	P(se.dur_avg);
+ #ifdef CONFIG_SMP
+ 	P(se.avg.load_sum);
+ 	P(se.avg.runnable_sum);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 574f65398..6e857de3f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6315,6 +6315,18 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 
+ static void set_next_buddy(struct sched_entity *se);
+ 
++static inline void dur_avg_update(struct task_struct *p, bool task_sleep)
++{
++	u64 dur;
++
++	if (!task_sleep)
++		return;
++
++	dur = p->se.sum_exec_runtime - p->se.prev_sleep_sum_runtime;
++	p->se.prev_sleep_sum_runtime = p->se.sum_exec_runtime;
++	update_avg(&p->se.dur_avg, dur);
++}
++
+ /*
+  * The dequeue_task method is called before nr_running is
+  * decreased. We remove the task from the rbtree and
+@@ -6387,6 +6399,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 
+ dequeue_throttle:
+ 	util_est_update(&rq->cfs, p, task_sleep);
++	dur_avg_update(p, task_sleep);
+ 	hrtick_update(rq);
+ }
+ 
+@@ -6520,6 +6533,46 @@ static int wake_wide(struct task_struct *p)
+ 	return 1;
+ }
+ 
++/*
++ * Wake up the task on current CPU, if the following conditions are met:
++ *
++ * 1. waker A is the only running task on this_cpu
++ * 3. A is a short duration task (waker will fall asleep soon)
++ * 4. wakee B is a short duration task (impact of B on A is minor)
++ * 5. A and B wake up each other alternately
++ */
++static bool
++wake_on_current(int this_cpu, struct task_struct *p)
++{
++	if (!sched_feat(SIS_CURRENT))
++		return false;
++
++	if (cpu_rq(this_cpu)->nr_running > 1)
++		return false;
++
++	/*
++	 * If a task switches in and then voluntarily relinquishes the
++	 * CPU quickly, it is regarded as a short duration task. In that
++	 * way, the short waker is likely to relinquish the CPU soon, which
++	 * provides room for the wakee. Meanwhile, a short wakee would bring
++	 * minor impact to the target rq. Put the short waker and wakee together
++	 * bring benefit to cache-share task pairs and avoid migration overhead.
++	 */
++	if (!current->se.dur_avg || ((current->se.dur_avg * 8) >= sysctl_sched_min_granularity))
++		return false;
++
++	if (!p->se.dur_avg || ((p->se.dur_avg * 8) >= sysctl_sched_min_granularity))
++		return false;
++
++	if (current->wakee_flips || p->wakee_flips)
++		return false;
++
++	if (current->last_wakee != p || p->last_wakee != current)
++		return false;
++
++	return true;
++}
++
+ /*
+  * The purpose of wake_affine() is to quickly determine on which CPU we can run
+  * soonest. For the purpose of speed we only consider the waking and previous
+@@ -6613,6 +6666,9 @@ static int wake_affine(struct sched_domain *sd, struct task_struct *p,
+ 	if (sched_feat(WA_WEIGHT) && target == nr_cpumask_bits)
+ 		target = wake_affine_weight(sd, p, this_cpu, prev_cpu, sync);
+ 
++	if (target == nr_cpumask_bits && wake_on_current(this_cpu, p))
++		target = this_cpu;
++
+ 	schedstat_inc(p->stats.nr_wakeups_affine_attempts);
+ 	if (target == nr_cpumask_bits)
+ 		return prev_cpu;
+@@ -7134,6 +7190,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		}
+ 	}
+ 
++	if (smp_processor_id() == target && wake_on_current(target, p))
++		return target;
++
+ 	i = select_idle_cpu(p, sd, has_idle_core, target);
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index ee7f23c76..a3e05827f 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -62,6 +62,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
+  */
+ SCHED_FEAT(SIS_PROP, false)
+ SCHED_FEAT(SIS_UTIL, true)
++SCHED_FEAT(SIS_CURRENT, true)
+ 
+ /*
+  * Issue a WARN when we do multiple update_rq_clock() calls
+-- 
+2.40.1.445.gf85cd430b1
+
