@@ -1,0 +1,242 @@
+From 8be946bb80932f09f43b1c14494b2ada1aedfad3 Mon Sep 17 00:00:00 2001
+From: Hao Jia <jiahao.os@bytedance.com>
+Date: Thu, 16 Mar 2023 16:18:06 +0800
+Subject: [PATCH 02/31] sched/core: Avoid selecting the task that is throttled
+ to run when core-sched enable
+
+When {rt, cfs}_rq or dl task is throttled, since cookied tasks
+are not dequeued from the core tree, So sched_core_find() and
+sched_core_next() may return throttled task, which may
+cause throttled task to run on the CPU.
+
+So we add checks in sched_core_find() and sched_core_next()
+to make sure that the return is a runnable task that is
+not throttled.
+
+Co-developed-by: Cruz Zhao <CruzZhao@linux.alibaba.com>
+Signed-off-by: Cruz Zhao <CruzZhao@linux.alibaba.com>
+Signed-off-by: Hao Jia <jiahao.os@bytedance.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20230316081806.69544-1-jiahao.os@bytedance.com
+---
+ kernel/sched/core.c     | 60 ++++++++++++++++++++++++++++-------------
+ kernel/sched/deadline.c | 10 +++++++
+ kernel/sched/fair.c     | 16 +++++++++++
+ kernel/sched/rt.c       | 19 +++++++++++++
+ kernel/sched/sched.h    |  4 +++
+ 5 files changed, 90 insertions(+), 19 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0d18c3969..b5fe02b45 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -261,36 +261,51 @@ void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
+ 		resched_curr(rq);
+ }
+ 
+-/*
+- * Find left-most (aka, highest priority) task matching @cookie.
+- */
+-static struct task_struct *sched_core_find(struct rq *rq, unsigned long cookie)
++static int sched_task_is_throttled(struct task_struct *p, int cpu)
+ {
+-	struct rb_node *node;
+-
+-	node = rb_find_first((void *)cookie, &rq->core_tree, rb_sched_core_cmp);
+-	/*
+-	 * The idle task always matches any cookie!
+-	 */
+-	if (!node)
+-		return idle_sched_class.pick_task(rq);
++	if (p->sched_class->task_is_throttled)
++		return p->sched_class->task_is_throttled(p, cpu);
+ 
+-	return __node_2_sc(node);
++	return 0;
+ }
+ 
+ static struct task_struct *sched_core_next(struct task_struct *p, unsigned long cookie)
+ {
+ 	struct rb_node *node = &p->core_node;
++	int cpu = task_cpu(p);
++
++	do {
++		node = rb_next(node);
++		if (!node)
++			return NULL;
++
++		p = __node_2_sc(node);
++		if (p->core_cookie != cookie)
++			return NULL;
++
++	} while (sched_task_is_throttled(p, cpu));
++
++	return p;
++}
++
++/*
++ * Find left-most (aka, highest priority) and unthrottled task matching @cookie.
++ * If no suitable task is found, NULL will be returned.
++ */
++static struct task_struct *sched_core_find(struct rq *rq, unsigned long cookie)
++{
++	struct task_struct *p;
++	struct rb_node *node;
+ 
+-	node = rb_next(node);
++	node = rb_find_first((void *)cookie, &rq->core_tree, rb_sched_core_cmp);
+ 	if (!node)
+ 		return NULL;
+ 
+-	p = container_of(node, struct task_struct, core_node);
+-	if (p->core_cookie != cookie)
+-		return NULL;
++	p = __node_2_sc(node);
++	if (!sched_task_is_throttled(p, rq->cpu))
++		return p;
+ 
+-	return p;
++	return sched_core_next(p, cookie);
+ }
+ 
+ /*
+@@ -6239,7 +6254,7 @@ static bool try_steal_cookie(int this, int that)
+ 		goto unlock;
+ 
+ 	p = sched_core_find(src, cookie);
+-	if (p == src->idle)
++	if (!p)
+ 		goto unlock;
+ 
+ 	do {
+@@ -6251,6 +6266,13 @@ static bool try_steal_cookie(int this, int that)
+ 
+ 		if (p->core_occupation > dst->idle->core_occupation)
+ 			goto next;
++		/*
++		 * sched_core_find() and sched_core_next() will ensure that task @p
++		 * is not throttled now, we also need to check whether the runqueue
++		 * of the destination CPU is being throttled.
++		 */
++		if (sched_task_is_throttled(p, this))
++			goto next;
+ 
+ 		deactivate_task(src, p, 0);
+ 		set_task_cpu(p, this);
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 71b24371a..4cc7e1ca0 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2704,6 +2704,13 @@ static void prio_changed_dl(struct rq *rq, struct task_struct *p,
+ #endif
+ }
+ 
++#ifdef CONFIG_SCHED_CORE
++static int task_is_throttled_dl(struct task_struct *p, int cpu)
++{
++	return p->dl.dl_throttled;
++}
++#endif
++
+ DEFINE_SCHED_CLASS(dl) = {
+ 
+ 	.enqueue_task		= enqueue_task_dl,
+@@ -2736,6 +2743,9 @@ DEFINE_SCHED_CLASS(dl) = {
+ 	.switched_to		= switched_to_dl,
+ 
+ 	.update_curr		= update_curr_dl,
++#ifdef CONFIG_SCHED_CORE
++	.task_is_throttled	= task_is_throttled_dl,
++#endif
+ };
+ 
+ /* Used for dl_bw check and update, used under sched_rt_handler()::mutex */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 5f6587d94..99d0f7a1f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11976,6 +11976,18 @@ bool cfs_prio_less(const struct task_struct *a, const struct task_struct *b,
+ 
+ 	return delta > 0;
+ }
++
++static int task_is_throttled_fair(struct task_struct *p, int cpu)
++{
++	struct cfs_rq *cfs_rq;
++
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	cfs_rq = task_group(p)->cfs_rq[cpu];
++#else
++	cfs_rq = &cpu_rq(cpu)->cfs;
++#endif
++	return throttled_hierarchy(cfs_rq);
++}
+ #else
+ static inline void task_tick_core(struct rq *rq, struct task_struct *curr) {}
+ #endif
+@@ -12602,6 +12614,10 @@ DEFINE_SCHED_CLASS(fair) = {
+ 	.task_change_group	= task_change_group_fair,
+ #endif
+ 
++#ifdef CONFIG_SCHED_CORE
++	.task_is_throttled	= task_is_throttled_fair,
++#endif
++
+ #ifdef CONFIG_UCLAMP_TASK
+ 	.uclamp_enabled		= 1,
+ #endif
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 0a11f44ad..9d67dfbf1 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -2677,6 +2677,21 @@ static unsigned int get_rr_interval_rt(struct rq *rq, struct task_struct *task)
+ 		return 0;
+ }
+ 
++#ifdef CONFIG_SCHED_CORE
++static int task_is_throttled_rt(struct task_struct *p, int cpu)
++{
++	struct rt_rq *rt_rq;
++
++#ifdef CONFIG_RT_GROUP_SCHED
++	rt_rq = task_group(p)->rt_rq[cpu];
++#else
++	rt_rq = &cpu_rq(cpu)->rt;
++#endif
++
++	return rt_rq_throttled(rt_rq);
++}
++#endif
++
+ DEFINE_SCHED_CLASS(rt) = {
+ 
+ 	.enqueue_task		= enqueue_task_rt,
+@@ -2710,6 +2725,10 @@ DEFINE_SCHED_CLASS(rt) = {
+ 
+ 	.update_curr		= update_curr_rt,
+ 
++#ifdef CONFIG_SCHED_CORE
++	.task_is_throttled	= task_is_throttled_rt,
++#endif
++
+ #ifdef CONFIG_UCLAMP_TASK
+ 	.uclamp_enabled		= 1,
+ #endif
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 3e8df6d31..060616944 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2224,6 +2224,10 @@ struct sched_class {
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	void (*task_change_group)(struct task_struct *p);
+ #endif
++
++#ifdef CONFIG_SCHED_CORE
++	int (*task_is_throttled)(struct task_struct *p, int cpu);
++#endif
+ };
+ 
+ static inline void put_prev_task(struct rq *rq, struct task_struct *prev)
+-- 
+2.40.1.445.gf85cd430b1
+
