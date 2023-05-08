@@ -1,0 +1,2014 @@
+From b154de645df06d0c8485b2c2fa79530d658f7c78 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Mon, 17 Apr 2023 22:13:40 -0700
+Subject: [PATCH 1/7] mm: add new api to enable ksm per process
+
+So far KSM can only be enabled by calling madvise for memory regions.  To
+be able to use KSM for more workloads, KSM needs to have the ability to be
+enabled / disabled at the process / cgroup level.
+
+1. New options for prctl system command
+
+   This patch series adds two new options to the prctl system call.
+   The first one allows to enable KSM at the process level and the second
+   one to query the setting.
+
+   The setting will be inherited by child processes.
+
+   With the above setting, KSM can be enabled for the seed process of a
+   cgroup and all processes in the cgroup will inherit the setting.
+
+2. Changes to KSM processing
+
+   When KSM is enabled at the process level, the KSM code will iterate
+   over all the VMA's and enable KSM for the eligible VMA's.
+
+   When forking a process that has KSM enabled, the setting will be
+   inherited by the new child process.
+
+  1) Introduce new MMF_VM_MERGE_ANY flag
+
+     This introduces the new flag MMF_VM_MERGE_ANY flag.  When this flag
+     is set, kernel samepage merging (ksm) gets enabled for all vma's of a
+     process.
+
+  2) Setting VM_MERGEABLE on VMA creation
+
+     When a VMA is created, if the MMF_VM_MERGE_ANY flag is set, the
+     VM_MERGEABLE flag will be set for this VMA.
+
+  3) support disabling of ksm for a process
+
+     This adds the ability to disable ksm for a process if ksm has been
+     enabled for the process with prctl.
+
+  4) add new prctl option to get and set ksm for a process
+
+     This adds two new options to the prctl system call
+     - enable ksm for all vmas of a process (if the vmas support it).
+     - query if ksm has been enabled for a process.
+
+3. Disabling MMF_VM_MERGE_ANY for storage keys in s390
+
+   In the s390 architecture when storage keys are used, the
+   MMF_VM_MERGE_ANY will be disabled.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ arch/s390/mm/gmap.c            |   7 +++
+ include/linux/ksm.h            |  21 ++++++-
+ include/linux/sched/coredump.h |   1 +
+ include/uapi/linux/prctl.h     |   2 +
+ kernel/sys.c                   |  27 +++++++++
+ mm/ksm.c                       | 104 +++++++++++++++++++++++++++------
+ mm/mmap.c                      |   3 +
+ 7 files changed, 146 insertions(+), 19 deletions(-)
+
+diff --git a/arch/s390/mm/gmap.c b/arch/s390/mm/gmap.c
+index 5a716bdcb..094981176 100644
+--- a/arch/s390/mm/gmap.c
++++ b/arch/s390/mm/gmap.c
+@@ -2591,6 +2591,13 @@ int gmap_mark_unmergeable(void)
+ 	int ret;
+ 	VMA_ITERATOR(vmi, mm, 0);
+ 
++	/*
++	 * Make sure to disable KSM (if enabled for the whole process or
++	 * individual VMAs). Note that nothing currently hinders user space
++	 * from re-enabling it.
++	 */
++	clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
++
+ 	for_each_vma(vmi, vma) {
+ 		/* Copy vm_flags to avoid partial modifications in ksm_madvise */
+ 		vm_flags = vma->vm_flags;
+diff --git a/include/linux/ksm.h b/include/linux/ksm.h
+index 7e232ba59..fa9963736 100644
+--- a/include/linux/ksm.h
++++ b/include/linux/ksm.h
+@@ -18,13 +18,26 @@
+ #ifdef CONFIG_KSM
+ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long end, int advice, unsigned long *vm_flags);
++
++void ksm_add_vma(struct vm_area_struct *vma);
++int ksm_enable_merge_any(struct mm_struct *mm);
++
+ int __ksm_enter(struct mm_struct *mm);
+ void __ksm_exit(struct mm_struct *mm);
+ 
+ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
+ {
+-	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags))
+-		return __ksm_enter(mm);
++	int ret;
++
++	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags)) {
++		ret = __ksm_enter(mm);
++		if (ret)
++			return ret;
++	}
++
++	if (test_bit(MMF_VM_MERGE_ANY, &oldmm->flags))
++		set_bit(MMF_VM_MERGE_ANY, &mm->flags);
++
+ 	return 0;
+ }
+ 
+@@ -53,6 +66,10 @@ void folio_migrate_ksm(struct folio *newfolio, struct folio *folio);
+ 
+ #else  /* !CONFIG_KSM */
+ 
++static inline void ksm_add_vma(struct vm_area_struct *vma)
++{
++}
++
+ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
+ {
+ 	return 0;
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index 0e17ae7fb..0ee96ea7a 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -90,4 +90,5 @@ static inline int get_dumpable(struct mm_struct *mm)
+ #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+ 				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK)
+ 
++#define MMF_VM_MERGE_ANY	29
+ #endif /* _LINUX_SCHED_COREDUMP_H */
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index 1312a137f..759b3f53e 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -290,4 +290,6 @@ struct prctl_mm_map {
+ #define PR_SET_VMA		0x53564d41
+ # define PR_SET_VMA_ANON_NAME		0
+ 
++#define PR_SET_MEMORY_MERGE		67
++#define PR_GET_MEMORY_MERGE		68
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 351de7916..f95ec83ac 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -15,6 +15,7 @@
+ #include <linux/highuid.h>
+ #include <linux/fs.h>
+ #include <linux/kmod.h>
++#include <linux/ksm.h>
+ #include <linux/perf_event.h>
+ #include <linux/resource.h>
+ #include <linux/kernel.h>
+@@ -2672,6 +2673,32 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 	case PR_SET_VMA:
+ 		error = prctl_set_vma(arg2, arg3, arg4, arg5);
+ 		break;
++#ifdef CONFIG_KSM
++	case PR_SET_MEMORY_MERGE:
++		if (arg3 || arg4 || arg5)
++			return -EINVAL;
++		if (mmap_write_lock_killable(me->mm))
++			return -EINTR;
++
++		if (arg2) {
++			error = ksm_enable_merge_any(me->mm);
++		} else {
++			/*
++			 * TODO: we might want disable KSM on all VMAs and
++			 * trigger unsharing to completely disable KSM.
++			 */
++			clear_bit(MMF_VM_MERGE_ANY, &me->mm->flags);
++			error = 0;
++		}
++		mmap_write_unlock(me->mm);
++		break;
++	case PR_GET_MEMORY_MERGE:
++		if (arg2 || arg3 || arg4 || arg5)
++			return -EINVAL;
++
++		error = !!test_bit(MMF_VM_MERGE_ANY, &me->mm->flags);
++		break;
++#endif
+ 	default:
+ 		error = -EINVAL;
+ 		break;
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 2b8d30068..19a1bbed3 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -512,6 +512,28 @@ static int break_ksm(struct vm_area_struct *vma, unsigned long addr)
+ 	return (ret & VM_FAULT_OOM) ? -ENOMEM : 0;
+ }
+ 
++static bool vma_ksm_compatible(struct vm_area_struct *vma)
++{
++	if (vma->vm_flags & (VM_SHARED  | VM_MAYSHARE   | VM_PFNMAP  |
++			     VM_IO      | VM_DONTEXPAND | VM_HUGETLB |
++			     VM_MIXEDMAP))
++		return false;		/* just ignore the advice */
++
++	if (vma_is_dax(vma))
++		return false;
++
++#ifdef VM_SAO
++	if (vma->vm_flags & VM_SAO)
++		return false;
++#endif
++#ifdef VM_SPARC_ADI
++	if (vma->vm_flags & VM_SPARC_ADI)
++		return false;
++#endif
++
++	return true;
++}
++
+ static struct vm_area_struct *find_mergeable_vma(struct mm_struct *mm,
+ 		unsigned long addr)
+ {
+@@ -1020,6 +1042,7 @@ static int unmerge_and_remove_all_rmap_items(void)
+ 
+ 			mm_slot_free(mm_slot_cache, mm_slot);
+ 			clear_bit(MMF_VM_MERGEABLE, &mm->flags);
++			clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
+ 			mmdrop(mm);
+ 		} else
+ 			spin_unlock(&ksm_mmlist_lock);
+@@ -2395,6 +2418,7 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ 
+ 		mm_slot_free(mm_slot_cache, mm_slot);
+ 		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
++		clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
+ 		mmap_read_unlock(mm);
+ 		mmdrop(mm);
+ 	} else {
+@@ -2471,6 +2495,66 @@ static int ksm_scan_thread(void *nothing)
+ 	return 0;
+ }
+ 
++static void __ksm_add_vma(struct vm_area_struct *vma)
++{
++	unsigned long vm_flags = vma->vm_flags;
++
++	if (vm_flags & VM_MERGEABLE)
++		return;
++
++	if (vma_ksm_compatible(vma))
++		vm_flags_set(vma, VM_MERGEABLE);
++}
++
++/**
++ * ksm_add_vma - Mark vma as mergeable if compatible
++ *
++ * @vma:  Pointer to vma
++ */
++void ksm_add_vma(struct vm_area_struct *vma)
++{
++	struct mm_struct *mm = vma->vm_mm;
++
++	if (test_bit(MMF_VM_MERGE_ANY, &mm->flags))
++		__ksm_add_vma(vma);
++}
++
++static void ksm_add_vmas(struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++
++	VMA_ITERATOR(vmi, mm, 0);
++	for_each_vma(vmi, vma)
++		__ksm_add_vma(vma);
++}
++
++/**
++ * ksm_enable_merge_any - Add mm to mm ksm list and enable merging on all
++ *                        compatible VMA's
++ *
++ * @mm:  Pointer to mm
++ *
++ * Returns 0 on success, otherwise error code
++ */
++int ksm_enable_merge_any(struct mm_struct *mm)
++{
++	int err;
++
++	if (test_bit(MMF_VM_MERGE_ANY, &mm->flags))
++		return 0;
++
++	if (!test_bit(MMF_VM_MERGEABLE, &mm->flags)) {
++		err = __ksm_enter(mm);
++		if (err)
++			return err;
++	}
++
++	set_bit(MMF_VM_MERGE_ANY, &mm->flags);
++	ksm_add_vmas(mm);
++
++	return 0;
++}
++
+ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long end, int advice, unsigned long *vm_flags)
+ {
+@@ -2479,25 +2563,10 @@ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 
+ 	switch (advice) {
+ 	case MADV_MERGEABLE:
+-		/*
+-		 * Be somewhat over-protective for now!
+-		 */
+-		if (*vm_flags & (VM_MERGEABLE | VM_SHARED  | VM_MAYSHARE   |
+-				 VM_PFNMAP    | VM_IO      | VM_DONTEXPAND |
+-				 VM_HUGETLB | VM_MIXEDMAP))
+-			return 0;		/* just ignore the advice */
+-
+-		if (vma_is_dax(vma))
++		if (vma->vm_flags & VM_MERGEABLE)
+ 			return 0;
+-
+-#ifdef VM_SAO
+-		if (*vm_flags & VM_SAO)
++		if (!vma_ksm_compatible(vma))
+ 			return 0;
+-#endif
+-#ifdef VM_SPARC_ADI
+-		if (*vm_flags & VM_SPARC_ADI)
+-			return 0;
+-#endif
+ 
+ 		if (!test_bit(MMF_VM_MERGEABLE, &mm->flags)) {
+ 			err = __ksm_enter(mm);
+@@ -2600,6 +2669,7 @@ void __ksm_exit(struct mm_struct *mm)
+ 
+ 	if (easy_to_free) {
+ 		mm_slot_free(mm_slot_cache, mm_slot);
++		clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
+ 		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
+ 		mmdrop(mm);
+ 	} else if (mm_slot) {
+diff --git a/mm/mmap.c b/mm/mmap.c
+index eefa6f0cd..2f8e08304 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -46,6 +46,7 @@
+ #include <linux/pkeys.h>
+ #include <linux/oom.h>
+ #include <linux/sched/mm.h>
++#include <linux/ksm.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/cacheflush.h>
+@@ -2697,6 +2698,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 	if (file && vm_flags & VM_SHARED)
+ 		mapping_unmap_writable(file->f_mapping);
+ 	file = vma->vm_file;
++	ksm_add_vma(vma);
+ expanded:
+ 	perf_event_mmap(vma);
+ 
+@@ -2969,6 +2971,7 @@ static int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 		goto mas_store_fail;
+ 
+ 	mm->map_count++;
++	ksm_add_vma(vma);
+ out:
+ 	perf_event_mmap(vma);
+ 	mm->total_vm += len >> PAGE_SHIFT;
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From ab51ba64ac4f432eac3b08f7c44240dd5c74cdc3 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Mon, 17 Apr 2023 22:13:41 -0700
+Subject: [PATCH 2/7] mm: add new KSM process and sysfs knobs
+
+This adds the general_profit KSM sysfs knob and the process profit metric
+knobs to ksm_stat.
+
+1) expose general_profit metric
+
+   The documentation mentions a general profit metric, however this
+   metric is not calculated.  In addition the formula depends on the size
+   of internal structures, which makes it more difficult for an
+   administrator to make the calculation.  Adding the metric for a better
+   user experience.
+
+2) document general_profit sysfs knob
+
+3) calculate ksm process profit metric
+
+   The ksm documentation mentions the process profit metric and how to
+   calculate it.  This adds the calculation of the metric.
+
+4) mm: expose ksm process profit metric in ksm_stat
+
+   This exposes the ksm process profit metric in /proc/<pid>/ksm_stat.
+   The documentation mentions the formula for the ksm process profit
+   metric, however it does not calculate it.  In addition the formula
+   depends on the size of internal structures.  So it makes sense to
+   expose it.
+
+5) document new procfs ksm knobs
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Reviewed-by: Bagas Sanjaya <bagasdotme@gmail.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rik van Riel <riel@surriel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ Documentation/ABI/testing/sysfs-kernel-mm-ksm |  8 +++++++
+ Documentation/admin-guide/mm/ksm.rst          |  5 ++++-
+ fs/proc/base.c                                |  3 +++
+ include/linux/ksm.h                           |  4 ++++
+ mm/ksm.c                                      | 21 +++++++++++++++++++
+ 5 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-kernel-mm-ksm b/Documentation/ABI/testing/sysfs-kernel-mm-ksm
+index d244674a9..6041a025b 100644
+--- a/Documentation/ABI/testing/sysfs-kernel-mm-ksm
++++ b/Documentation/ABI/testing/sysfs-kernel-mm-ksm
+@@ -51,3 +51,11 @@ Description:	Control merging pages across different NUMA nodes.
+ 
+ 		When it is set to 0 only pages from the same node are merged,
+ 		otherwise pages from all nodes can be merged together (default).
++
++What:		/sys/kernel/mm/ksm/general_profit
++Date:		April 2023
++KernelVersion:  6.4
++Contact:	Linux memory management mailing list <linux-mm@kvack.org>
++Description:	Measure how effective KSM is.
++		general_profit: how effective is KSM. The formula for the
++		calculation is in Documentation/admin-guide/mm/ksm.rst.
+diff --git a/Documentation/admin-guide/mm/ksm.rst b/Documentation/admin-guide/mm/ksm.rst
+index eed51a910..551083a39 100644
+--- a/Documentation/admin-guide/mm/ksm.rst
++++ b/Documentation/admin-guide/mm/ksm.rst
+@@ -157,6 +157,8 @@ stable_node_chains_prune_millisecs
+ 
+ The effectiveness of KSM and MADV_MERGEABLE is shown in ``/sys/kernel/mm/ksm/``:
+ 
++general_profit
++        how effective is KSM. The calculation is explained below.
+ pages_shared
+         how many shared pages are being used
+ pages_sharing
+@@ -207,7 +209,8 @@ several times, which are unprofitable memory consumed.
+ 			  ksm_rmap_items * sizeof(rmap_item).
+ 
+    where ksm_merging_pages is shown under the directory ``/proc/<pid>/``,
+-   and ksm_rmap_items is shown in ``/proc/<pid>/ksm_stat``.
++   and ksm_rmap_items is shown in ``/proc/<pid>/ksm_stat``. The process profit
++   is also shown in ``/proc/<pid>/ksm_stat`` as ksm_process_profit.
+ 
+ From the perspective of application, a high ratio of ``ksm_rmap_items`` to
+ ``ksm_merging_pages`` means a bad madvise-applied policy, so developers or
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 5e0e0ccd4..96a6a08c8 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -96,6 +96,7 @@
+ #include <linux/time_namespace.h>
+ #include <linux/resctrl.h>
+ #include <linux/cn_proc.h>
++#include <linux/ksm.h>
+ #include <trace/events/oom.h>
+ #include "internal.h"
+ #include "fd.h"
+@@ -3207,6 +3208,8 @@ static int proc_pid_ksm_stat(struct seq_file *m, struct pid_namespace *ns,
+ 	mm = get_task_mm(task);
+ 	if (mm) {
+ 		seq_printf(m, "ksm_rmap_items %lu\n", mm->ksm_rmap_items);
++		seq_printf(m, "ksm_merging_pages %lu\n", mm->ksm_merging_pages);
++		seq_printf(m, "ksm_process_profit %ld\n", ksm_process_profit(mm));
+ 		mmput(mm);
+ 	}
+ 
+diff --git a/include/linux/ksm.h b/include/linux/ksm.h
+index fa9963736..590934bdd 100644
+--- a/include/linux/ksm.h
++++ b/include/linux/ksm.h
+@@ -64,6 +64,10 @@ struct page *ksm_might_need_to_copy(struct page *page,
+ void rmap_walk_ksm(struct folio *folio, struct rmap_walk_control *rwc);
+ void folio_migrate_ksm(struct folio *newfolio, struct folio *folio);
+ 
++#ifdef CONFIG_PROC_FS
++long ksm_process_profit(struct mm_struct *);
++#endif /* CONFIG_PROC_FS */
++
+ #else  /* !CONFIG_KSM */
+ 
+ static inline void ksm_add_vma(struct vm_area_struct *vma)
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 19a1bbed3..741abae0b 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -2945,6 +2945,14 @@ static void wait_while_offlining(void)
+ }
+ #endif /* CONFIG_MEMORY_HOTREMOVE */
+ 
++#ifdef CONFIG_PROC_FS
++long ksm_process_profit(struct mm_struct *mm)
++{
++	return mm->ksm_merging_pages * PAGE_SIZE -
++		mm->ksm_rmap_items * sizeof(struct ksm_rmap_item);
++}
++#endif /* CONFIG_PROC_FS */
++
+ #ifdef CONFIG_SYSFS
+ /*
+  * This all compiles without CONFIG_SYSFS, but is a waste of space.
+@@ -3209,6 +3217,18 @@ static ssize_t pages_volatile_show(struct kobject *kobj,
+ }
+ KSM_ATTR_RO(pages_volatile);
+ 
++static ssize_t general_profit_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	long general_profit;
++
++	general_profit = ksm_pages_sharing * PAGE_SIZE -
++				ksm_rmap_items * sizeof(struct ksm_rmap_item);
++
++	return sysfs_emit(buf, "%ld\n", general_profit);
++}
++KSM_ATTR_RO(general_profit);
++
+ static ssize_t stable_node_dups_show(struct kobject *kobj,
+ 				     struct kobj_attribute *attr, char *buf)
+ {
+@@ -3273,6 +3293,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&stable_node_dups_attr.attr,
+ 	&stable_node_chains_prune_millisecs_attr.attr,
+ 	&use_zero_pages_attr.attr,
++	&general_profit_attr.attr,
+ 	NULL,
+ };
+ 
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From bccc3a4e4a35cd5e78541257e7bae77561917b0a Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Mon, 17 Apr 2023 22:13:42 -0700
+Subject: [PATCH 3/7] selftests/mm: add new selftests for KSM
+
+This adds three new tests to the selftests for KSM.  These tests use the
+new prctl API's to enable and disable KSM.
+
+1) add new prctl flags to prctl header file in tools dir
+
+   This adds the new prctl flags to the include file prct.h in the
+   tools directory.  This makes sure they are available for testing.
+
+2) add KSM prctl merge test to ksm_tests
+
+   This adds the -t option to the ksm_tests program.  The -t flag
+   allows to specify if it should use madvise or prctl ksm merging.
+
+3) add two functions for debugging merge outcome for ksm_tests
+
+   This adds two functions to report the metrics in /proc/self/ksm_stat
+   and /sys/kernel/debug/mm/ksm. The debug output is enabled with the
+   -d option.
+
+4) add KSM prctl test to ksm_functional_tests
+
+   This adds a test to the ksm_functional_test that verifies that the
+   prctl system call to enable / disable KSM works.
+
+5) add KSM fork test to ksm_functional_test
+
+   Add fork test to verify that the MMF_VM_MERGE_ANY flag is inherited
+   by the child process.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rik van Riel <riel@surriel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ tools/include/uapi/linux/prctl.h              |   2 +
+ tools/testing/selftests/mm/Makefile           |   2 +-
+ .../selftests/mm/ksm_functional_tests.c       |  91 ++++++++-
+ tools/testing/selftests/mm/ksm_tests.c        | 172 ++++++++++++++----
+ 4 files changed, 228 insertions(+), 39 deletions(-)
+
+diff --git a/tools/include/uapi/linux/prctl.h b/tools/include/uapi/linux/prctl.h
+index 1312a137f..759b3f53e 100644
+--- a/tools/include/uapi/linux/prctl.h
++++ b/tools/include/uapi/linux/prctl.h
+@@ -290,4 +290,6 @@ struct prctl_mm_map {
+ #define PR_SET_VMA		0x53564d41
+ # define PR_SET_VMA_ANON_NAME		0
+ 
++#define PR_SET_MEMORY_MERGE		67
++#define PR_GET_MEMORY_MERGE		68
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/tools/testing/selftests/mm/Makefile b/tools/testing/selftests/mm/Makefile
+index c31d952cf..fbf5646b1 100644
+--- a/tools/testing/selftests/mm/Makefile
++++ b/tools/testing/selftests/mm/Makefile
+@@ -29,7 +29,7 @@ MACHINE ?= $(shell echo $(uname_M) | sed -e 's/aarch64.*/arm64/' -e 's/ppc64.*/p
+ # LDLIBS.
+ MAKEFLAGS += --no-builtin-rules
+ 
+-CFLAGS = -Wall -I $(top_srcdir) $(EXTRA_CFLAGS) $(KHDR_INCLUDES)
++CFLAGS = -Wall -I $(top_srcdir) -I $(top_srcdir)/tools/include/uapi $(EXTRA_CFLAGS) $(KHDR_INCLUDES)
+ LDLIBS = -lrt -lpthread
+ TEST_GEN_FILES = cow
+ TEST_GEN_FILES += compaction_test
+diff --git a/tools/testing/selftests/mm/ksm_functional_tests.c b/tools/testing/selftests/mm/ksm_functional_tests.c
+index d8b5b4930..a1645019b 100644
+--- a/tools/testing/selftests/mm/ksm_functional_tests.c
++++ b/tools/testing/selftests/mm/ksm_functional_tests.c
+@@ -15,8 +15,10 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <sys/mman.h>
++#include <sys/prctl.h>
+ #include <sys/syscall.h>
+ #include <sys/ioctl.h>
++#include <sys/wait.h>
+ #include <linux/userfaultfd.h>
+ 
+ #include "../kselftest.h"
+@@ -241,9 +243,93 @@ static void test_unmerge_uffd_wp(void)
+ }
+ #endif
+ 
++/* Verify that KSM can be enabled / queried with prctl. */
++static void test_prctl(void)
++{
++	int ret;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	ret = prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0);
++	if (ret < 0 && errno == EINVAL) {
++		ksft_test_result_skip("PR_SET_MEMORY_MERGE not supported\n");
++		return;
++	} else if (ret) {
++		ksft_test_result_fail("PR_SET_MEMORY_MERGE=1 failed\n");
++		return;
++	}
++
++	ret = prctl(PR_GET_MEMORY_MERGE, 0, 0, 0, 0);
++	if (ret < 0) {
++		ksft_test_result_fail("PR_GET_MEMORY_MERGE failed\n");
++		return;
++	} else if (ret != 1) {
++		ksft_test_result_fail("PR_SET_MEMORY_MERGE=1 not effective\n");
++		return;
++	}
++
++	ret = prctl(PR_SET_MEMORY_MERGE, 0, 0, 0, 0);
++	if (ret) {
++		ksft_test_result_fail("PR_SET_MEMORY_MERGE=0 failed\n");
++		return;
++	}
++
++	ret = prctl(PR_GET_MEMORY_MERGE, 0, 0, 0, 0);
++	if (ret < 0) {
++		ksft_test_result_fail("PR_GET_MEMORY_MERGE failed\n");
++		return;
++	} else if (ret != 0) {
++		ksft_test_result_fail("PR_SET_MEMORY_MERGE=0 not effective\n");
++		return;
++	}
++
++	ksft_test_result_pass("Setting/clearing PR_SET_MEMORY_MERGE works\n");
++}
++
++/* Verify that prctl ksm flag is inherited. */
++static void test_prctl_fork(void)
++{
++	int ret, status;
++	pid_t child_pid;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	ret = prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0);
++	if (ret < 0 && errno == EINVAL) {
++		ksft_test_result_skip("PR_SET_MEMORY_MERGE not supported\n");
++		return;
++	} else if (ret) {
++		ksft_test_result_fail("PR_SET_MEMORY_MERGE=1 failed\n");
++		return;
++	}
++
++	child_pid = fork();
++	if (!child_pid) {
++		exit(prctl(PR_GET_MEMORY_MERGE, 0, 0, 0, 0));
++	} else if (child_pid < 0) {
++		ksft_test_result_fail("fork() failed\n");
++		return;
++	}
++
++	if (waitpid(child_pid, &status, 0) < 0) {
++		ksft_test_result_fail("waitpid() failed\n");
++		return;
++	} else if (WEXITSTATUS(status) != 1) {
++		ksft_test_result_fail("unexpected PR_GET_MEMORY_MERGE result in child\n");
++		return;
++	}
++
++	if (prctl(PR_SET_MEMORY_MERGE, 0, 0, 0, 0)) {
++		ksft_test_result_fail("PR_SET_MEMORY_MERGE=0 failed\n");
++		return;
++	}
++
++	ksft_test_result_pass("PR_SET_MEMORY_MERGE value is inherited\n");
++}
++
+ int main(int argc, char **argv)
+ {
+-	unsigned int tests = 2;
++	unsigned int tests = 4;
+ 	int err;
+ 
+ #ifdef __NR_userfaultfd
+@@ -271,6 +357,9 @@ int main(int argc, char **argv)
+ 	test_unmerge_uffd_wp();
+ #endif
+ 
++	test_prctl();
++	test_prctl_fork();
++
+ 	err = ksft_get_fail_cnt();
+ 	if (err)
+ 		ksft_exit_fail_msg("%d out of %d tests failed\n",
+diff --git a/tools/testing/selftests/mm/ksm_tests.c b/tools/testing/selftests/mm/ksm_tests.c
+index f9eb4d67e..db5d5ce79 100644
+--- a/tools/testing/selftests/mm/ksm_tests.c
++++ b/tools/testing/selftests/mm/ksm_tests.c
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <sys/mman.h>
++#include <sys/prctl.h>
++#include <sys/wait.h>
+ #include <stdbool.h>
+ #include <time.h>
+ #include <string.h>
+@@ -21,6 +23,7 @@
+ #define KSM_PROT_STR_DEFAULT "rw"
+ #define KSM_USE_ZERO_PAGES_DEFAULT false
+ #define KSM_MERGE_ACROSS_NODES_DEFAULT true
++#define KSM_MERGE_TYPE_DEFAULT 0
+ #define MB (1ul << 20)
+ 
+ struct ksm_sysfs {
+@@ -33,9 +36,16 @@ struct ksm_sysfs {
+ 	unsigned long use_zero_pages;
+ };
+ 
++enum ksm_merge_type {
++	KSM_MERGE_MADVISE,
++	KSM_MERGE_PRCTL,
++	KSM_MERGE_LAST = KSM_MERGE_PRCTL
++};
++
+ enum ksm_test_name {
+ 	CHECK_KSM_MERGE,
+ 	CHECK_KSM_UNMERGE,
++	CHECK_KSM_GET_MERGE_TYPE,
+ 	CHECK_KSM_ZERO_PAGE_MERGE,
+ 	CHECK_KSM_NUMA_MERGE,
+ 	KSM_MERGE_TIME,
+@@ -44,6 +54,8 @@ enum ksm_test_name {
+ 	KSM_COW_TIME
+ };
+ 
++int debug;
++
+ static int ksm_write_sysfs(const char *file_path, unsigned long val)
+ {
+ 	FILE *f = fopen(file_path, "w");
+@@ -82,6 +94,53 @@ static int ksm_read_sysfs(const char *file_path, unsigned long *val)
+ 	return 0;
+ }
+ 
++static void ksm_print_sysfs(void)
++{
++	unsigned long max_page_sharing, pages_sharing, pages_shared;
++	unsigned long full_scans, pages_unshared, pages_volatile;
++	unsigned long stable_node_chains, stable_node_dups;
++	long general_profit;
++
++	if (ksm_read_sysfs(KSM_FP("pages_shared"), &pages_shared) ||
++	    ksm_read_sysfs(KSM_FP("pages_sharing"), &pages_sharing) ||
++	    ksm_read_sysfs(KSM_FP("max_page_sharing"), &max_page_sharing) ||
++	    ksm_read_sysfs(KSM_FP("full_scans"), &full_scans) ||
++	    ksm_read_sysfs(KSM_FP("pages_unshared"), &pages_unshared) ||
++	    ksm_read_sysfs(KSM_FP("pages_volatile"), &pages_volatile) ||
++	    ksm_read_sysfs(KSM_FP("stable_node_chains"), &stable_node_chains) ||
++	    ksm_read_sysfs(KSM_FP("stable_node_dups"), &stable_node_dups) ||
++	    ksm_read_sysfs(KSM_FP("general_profit"), (unsigned long *)&general_profit))
++		return;
++
++	printf("pages_shared      : %lu\n", pages_shared);
++	printf("pages_sharing     : %lu\n", pages_sharing);
++	printf("max_page_sharing  : %lu\n", max_page_sharing);
++	printf("full_scans        : %lu\n", full_scans);
++	printf("pages_unshared    : %lu\n", pages_unshared);
++	printf("pages_volatile    : %lu\n", pages_volatile);
++	printf("stable_node_chains: %lu\n", stable_node_chains);
++	printf("stable_node_dups  : %lu\n", stable_node_dups);
++	printf("general_profit    : %ld\n", general_profit);
++}
++
++static void ksm_print_procfs(void)
++{
++	const char *file_name = "/proc/self/ksm_stat";
++	char buffer[512];
++	FILE *f = fopen(file_name, "r");
++
++	if (!f) {
++		fprintf(stderr, "f %s\n", file_name);
++		perror("fopen");
++		return;
++	}
++
++	while (fgets(buffer, sizeof(buffer), f))
++		printf("%s", buffer);
++
++	fclose(f);
++}
++
+ static int str_to_prot(char *prot_str)
+ {
+ 	int prot = 0;
+@@ -128,7 +187,12 @@ static void print_help(void)
+ 	       "     Default: %d\n", KSM_USE_ZERO_PAGES_DEFAULT);
+ 	printf(" -m: change merge_across_nodes tunable\n"
+ 	       "     Default: %d\n", KSM_MERGE_ACROSS_NODES_DEFAULT);
++	printf(" -d: turn debugging output on\n");
+ 	printf(" -s: the size of duplicated memory area (in MiB)\n");
++	printf(" -t: KSM merge type\n"
++	       "     Default: 0\n"
++	       "     0: madvise merging\n"
++	       "     1: prctl merging\n");
+ 
+ 	exit(0);
+ }
+@@ -176,12 +240,21 @@ static int ksm_do_scan(int scan_count, struct timespec start_time, int timeout)
+ 	return 0;
+ }
+ 
+-static int ksm_merge_pages(void *addr, size_t size, struct timespec start_time, int timeout)
++static int ksm_merge_pages(int merge_type, void *addr, size_t size,
++			struct timespec start_time, int timeout)
+ {
+-	if (madvise(addr, size, MADV_MERGEABLE)) {
+-		perror("madvise");
+-		return 1;
++	if (merge_type == KSM_MERGE_MADVISE) {
++		if (madvise(addr, size, MADV_MERGEABLE)) {
++			perror("madvise");
++			return 1;
++		}
++	} else if (merge_type == KSM_MERGE_PRCTL) {
++		if (prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0)) {
++			perror("prctl");
++			return 1;
++		}
+ 	}
++
+ 	if (ksm_write_sysfs(KSM_FP("run"), 1))
+ 		return 1;
+ 
+@@ -211,6 +284,11 @@ static bool assert_ksm_pages_count(long dupl_page_count)
+ 	    ksm_read_sysfs(KSM_FP("max_page_sharing"), &max_page_sharing))
+ 		return false;
+ 
++	if (debug) {
++		ksm_print_sysfs();
++		ksm_print_procfs();
++	}
++
+ 	/*
+ 	 * Since there must be at least 2 pages for merging and 1 page can be
+ 	 * shared with the limited number of pages (max_page_sharing), sometimes
+@@ -266,7 +344,8 @@ static int ksm_restore(struct ksm_sysfs *ksm_sysfs)
+ 	return 0;
+ }
+ 
+-static int check_ksm_merge(int mapping, int prot, long page_count, int timeout, size_t page_size)
++static int check_ksm_merge(int merge_type, int mapping, int prot,
++			long page_count, int timeout, size_t page_size)
+ {
+ 	void *map_ptr;
+ 	struct timespec start_time;
+@@ -281,13 +360,15 @@ static int check_ksm_merge(int mapping, int prot, long page_count, int timeout,
+ 	if (!map_ptr)
+ 		return KSFT_FAIL;
+ 
+-	if (ksm_merge_pages(map_ptr, page_size * page_count, start_time, timeout))
++	if (ksm_merge_pages(merge_type, map_ptr, page_size * page_count, start_time, timeout))
+ 		goto err_out;
+ 
+ 	/* verify that the right number of pages are merged */
+ 	if (assert_ksm_pages_count(page_count)) {
+ 		printf("OK\n");
+ 		munmap(map_ptr, page_size * page_count);
++		if (merge_type == KSM_MERGE_PRCTL)
++			prctl(PR_SET_MEMORY_MERGE, 0, 0, 0, 0);
+ 		return KSFT_PASS;
+ 	}
+ 
+@@ -297,7 +378,7 @@ static int check_ksm_merge(int mapping, int prot, long page_count, int timeout,
+ 	return KSFT_FAIL;
+ }
+ 
+-static int check_ksm_unmerge(int mapping, int prot, int timeout, size_t page_size)
++static int check_ksm_unmerge(int merge_type, int mapping, int prot, int timeout, size_t page_size)
+ {
+ 	void *map_ptr;
+ 	struct timespec start_time;
+@@ -313,7 +394,7 @@ static int check_ksm_unmerge(int mapping, int prot, int timeout, size_t page_siz
+ 	if (!map_ptr)
+ 		return KSFT_FAIL;
+ 
+-	if (ksm_merge_pages(map_ptr, page_size * page_count, start_time, timeout))
++	if (ksm_merge_pages(merge_type, map_ptr, page_size * page_count, start_time, timeout))
+ 		goto err_out;
+ 
+ 	/* change 1 byte in each of the 2 pages -- KSM must automatically unmerge them */
+@@ -337,8 +418,8 @@ static int check_ksm_unmerge(int mapping, int prot, int timeout, size_t page_siz
+ 	return KSFT_FAIL;
+ }
+ 
+-static int check_ksm_zero_page_merge(int mapping, int prot, long page_count, int timeout,
+-				     bool use_zero_pages, size_t page_size)
++static int check_ksm_zero_page_merge(int merge_type, int mapping, int prot, long page_count,
++				int timeout, bool use_zero_pages, size_t page_size)
+ {
+ 	void *map_ptr;
+ 	struct timespec start_time;
+@@ -356,7 +437,7 @@ static int check_ksm_zero_page_merge(int mapping, int prot, long page_count, int
+ 	if (!map_ptr)
+ 		return KSFT_FAIL;
+ 
+-	if (ksm_merge_pages(map_ptr, page_size * page_count, start_time, timeout))
++	if (ksm_merge_pages(merge_type, map_ptr, page_size * page_count, start_time, timeout))
+ 		goto err_out;
+ 
+        /*
+@@ -402,8 +483,8 @@ static int get_first_mem_node(void)
+ 	return get_next_mem_node(numa_max_node());
+ }
+ 
+-static int check_ksm_numa_merge(int mapping, int prot, int timeout, bool merge_across_nodes,
+-				size_t page_size)
++static int check_ksm_numa_merge(int merge_type, int mapping, int prot, int timeout,
++				bool merge_across_nodes, size_t page_size)
+ {
+ 	void *numa1_map_ptr, *numa2_map_ptr;
+ 	struct timespec start_time;
+@@ -439,8 +520,8 @@ static int check_ksm_numa_merge(int mapping, int prot, int timeout, bool merge_a
+ 	memset(numa2_map_ptr, '*', page_size);
+ 
+ 	/* try to merge the pages */
+-	if (ksm_merge_pages(numa1_map_ptr, page_size, start_time, timeout) ||
+-	    ksm_merge_pages(numa2_map_ptr, page_size, start_time, timeout))
++	if (ksm_merge_pages(merge_type, numa1_map_ptr, page_size, start_time, timeout) ||
++	    ksm_merge_pages(merge_type, numa2_map_ptr, page_size, start_time, timeout))
+ 		goto err_out;
+ 
+        /*
+@@ -466,7 +547,8 @@ static int check_ksm_numa_merge(int mapping, int prot, int timeout, bool merge_a
+ 	return KSFT_FAIL;
+ }
+ 
+-static int ksm_merge_hugepages_time(int mapping, int prot, int timeout, size_t map_size)
++static int ksm_merge_hugepages_time(int merge_type, int mapping, int prot,
++				int timeout, size_t map_size)
+ {
+ 	void *map_ptr, *map_ptr_orig;
+ 	struct timespec start_time, end_time;
+@@ -508,7 +590,7 @@ static int ksm_merge_hugepages_time(int mapping, int prot, int timeout, size_t m
+ 		perror("clock_gettime");
+ 		goto err_out;
+ 	}
+-	if (ksm_merge_pages(map_ptr, map_size, start_time, timeout))
++	if (ksm_merge_pages(merge_type, map_ptr, map_size, start_time, timeout))
+ 		goto err_out;
+ 	if (clock_gettime(CLOCK_MONOTONIC_RAW, &end_time)) {
+ 		perror("clock_gettime");
+@@ -533,7 +615,7 @@ static int ksm_merge_hugepages_time(int mapping, int prot, int timeout, size_t m
+ 	return KSFT_FAIL;
+ }
+ 
+-static int ksm_merge_time(int mapping, int prot, int timeout, size_t map_size)
++static int ksm_merge_time(int merge_type, int mapping, int prot, int timeout, size_t map_size)
+ {
+ 	void *map_ptr;
+ 	struct timespec start_time, end_time;
+@@ -549,7 +631,7 @@ static int ksm_merge_time(int mapping, int prot, int timeout, size_t map_size)
+ 		perror("clock_gettime");
+ 		goto err_out;
+ 	}
+-	if (ksm_merge_pages(map_ptr, map_size, start_time, timeout))
++	if (ksm_merge_pages(merge_type, map_ptr, map_size, start_time, timeout))
+ 		goto err_out;
+ 	if (clock_gettime(CLOCK_MONOTONIC_RAW, &end_time)) {
+ 		perror("clock_gettime");
+@@ -574,7 +656,7 @@ static int ksm_merge_time(int mapping, int prot, int timeout, size_t map_size)
+ 	return KSFT_FAIL;
+ }
+ 
+-static int ksm_unmerge_time(int mapping, int prot, int timeout, size_t map_size)
++static int ksm_unmerge_time(int merge_type, int mapping, int prot, int timeout, size_t map_size)
+ {
+ 	void *map_ptr;
+ 	struct timespec start_time, end_time;
+@@ -589,7 +671,7 @@ static int ksm_unmerge_time(int mapping, int prot, int timeout, size_t map_size)
+ 		perror("clock_gettime");
+ 		goto err_out;
+ 	}
+-	if (ksm_merge_pages(map_ptr, map_size, start_time, timeout))
++	if (ksm_merge_pages(merge_type, map_ptr, map_size, start_time, timeout))
+ 		goto err_out;
+ 
+ 	if (clock_gettime(CLOCK_MONOTONIC_RAW, &start_time)) {
+@@ -621,7 +703,7 @@ static int ksm_unmerge_time(int mapping, int prot, int timeout, size_t map_size)
+ 	return KSFT_FAIL;
+ }
+ 
+-static int ksm_cow_time(int mapping, int prot, int timeout, size_t page_size)
++static int ksm_cow_time(int merge_type, int mapping, int prot, int timeout, size_t page_size)
+ {
+ 	void *map_ptr;
+ 	struct timespec start_time, end_time;
+@@ -660,7 +742,7 @@ static int ksm_cow_time(int mapping, int prot, int timeout, size_t page_size)
+ 		memset(map_ptr + page_size * i, '+', i / 2 + 1);
+ 		memset(map_ptr + page_size * (i + 1), '+', i / 2 + 1);
+ 	}
+-	if (ksm_merge_pages(map_ptr, page_size * page_count, start_time, timeout))
++	if (ksm_merge_pages(merge_type, map_ptr, page_size * page_count, start_time, timeout))
+ 		goto err_out;
+ 
+ 	if (clock_gettime(CLOCK_MONOTONIC_RAW, &start_time)) {
+@@ -697,6 +779,7 @@ int main(int argc, char *argv[])
+ 	int ret, opt;
+ 	int prot = 0;
+ 	int ksm_scan_limit_sec = KSM_SCAN_LIMIT_SEC_DEFAULT;
++	int merge_type = KSM_MERGE_TYPE_DEFAULT;
+ 	long page_count = KSM_PAGE_COUNT_DEFAULT;
+ 	size_t page_size = sysconf(_SC_PAGESIZE);
+ 	struct ksm_sysfs ksm_sysfs_old;
+@@ -705,7 +788,7 @@ int main(int argc, char *argv[])
+ 	bool merge_across_nodes = KSM_MERGE_ACROSS_NODES_DEFAULT;
+ 	long size_MB = 0;
+ 
+-	while ((opt = getopt(argc, argv, "ha:p:l:z:m:s:MUZNPCHD")) != -1) {
++	while ((opt = getopt(argc, argv, "dha:p:l:z:m:s:t:MUZNPCHD")) != -1) {
+ 		switch (opt) {
+ 		case 'a':
+ 			prot = str_to_prot(optarg);
+@@ -739,12 +822,26 @@ int main(int argc, char *argv[])
+ 			else
+ 				merge_across_nodes = 1;
+ 			break;
++		case 'd':
++			debug = 1;
++			break;
+ 		case 's':
+ 			size_MB = atoi(optarg);
+ 			if (size_MB <= 0) {
+ 				printf("Size must be greater than 0\n");
+ 				return KSFT_FAIL;
+ 			}
++		case 't':
++			{
++				int tmp = atoi(optarg);
++
++				if (tmp < 0 || tmp > KSM_MERGE_LAST) {
++					printf("Invalid merge type\n");
++					return KSFT_FAIL;
++				}
++				merge_type = tmp;
++			}
++			break;
+ 		case 'M':
+ 			break;
+ 		case 'U':
+@@ -795,35 +892,36 @@ int main(int argc, char *argv[])
+ 
+ 	switch (test_name) {
+ 	case CHECK_KSM_MERGE:
+-		ret = check_ksm_merge(MAP_PRIVATE | MAP_ANONYMOUS, prot, page_count,
++		ret = check_ksm_merge(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot, page_count,
+ 				      ksm_scan_limit_sec, page_size);
+ 		break;
+ 	case CHECK_KSM_UNMERGE:
+-		ret = check_ksm_unmerge(MAP_PRIVATE | MAP_ANONYMOUS, prot, ksm_scan_limit_sec,
+-					page_size);
++		ret = check_ksm_unmerge(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot,
++					ksm_scan_limit_sec, page_size);
+ 		break;
+ 	case CHECK_KSM_ZERO_PAGE_MERGE:
+-		ret = check_ksm_zero_page_merge(MAP_PRIVATE | MAP_ANONYMOUS, prot, page_count,
+-						ksm_scan_limit_sec, use_zero_pages, page_size);
++		ret = check_ksm_zero_page_merge(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot,
++						page_count, ksm_scan_limit_sec, use_zero_pages,
++						page_size);
+ 		break;
+ 	case CHECK_KSM_NUMA_MERGE:
+-		ret = check_ksm_numa_merge(MAP_PRIVATE | MAP_ANONYMOUS, prot, ksm_scan_limit_sec,
+-					   merge_across_nodes, page_size);
++		ret = check_ksm_numa_merge(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot,
++					ksm_scan_limit_sec, merge_across_nodes, page_size);
+ 		break;
+ 	case KSM_MERGE_TIME:
+ 		if (size_MB == 0) {
+ 			printf("Option '-s' is required.\n");
+ 			return KSFT_FAIL;
+ 		}
+-		ret = ksm_merge_time(MAP_PRIVATE | MAP_ANONYMOUS, prot, ksm_scan_limit_sec,
+-				     size_MB);
++		ret = ksm_merge_time(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot,
++				ksm_scan_limit_sec, size_MB);
+ 		break;
+ 	case KSM_MERGE_TIME_HUGE_PAGES:
+ 		if (size_MB == 0) {
+ 			printf("Option '-s' is required.\n");
+ 			return KSFT_FAIL;
+ 		}
+-		ret = ksm_merge_hugepages_time(MAP_PRIVATE | MAP_ANONYMOUS, prot,
++		ret = ksm_merge_hugepages_time(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot,
+ 				ksm_scan_limit_sec, size_MB);
+ 		break;
+ 	case KSM_UNMERGE_TIME:
+@@ -831,12 +929,12 @@ int main(int argc, char *argv[])
+ 			printf("Option '-s' is required.\n");
+ 			return KSFT_FAIL;
+ 		}
+-		ret = ksm_unmerge_time(MAP_PRIVATE | MAP_ANONYMOUS, prot,
++		ret = ksm_unmerge_time(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot,
+ 				       ksm_scan_limit_sec, size_MB);
+ 		break;
+ 	case KSM_COW_TIME:
+-		ret = ksm_cow_time(MAP_PRIVATE | MAP_ANONYMOUS, prot, ksm_scan_limit_sec,
+-				   page_size);
++		ret = ksm_cow_time(merge_type, MAP_PRIVATE | MAP_ANONYMOUS, prot,
++				ksm_scan_limit_sec, page_size);
+ 		break;
+ 	}
+ 
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From 83c873a5d2008a9dc737a683d94e70ef7ed0dcfc Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Sat, 22 Apr 2023 22:54:18 +0200
+Subject: [PATCH 4/7] mm/ksm: unmerge and clear VM_MERGEABLE when setting
+ PR_SET_MEMORY_MERGE=0
+
+Let's unmerge any KSM pages when setting PR_SET_MEMORY_MERGE=0, and clear
+the VM_MERGEABLE flag from all VMAs -- just like KSM would. Of course,
+only do that if we previously set PR_SET_MEMORY_MERGE=1.
+
+Acked-by: Stefan Roesch <shr@devkernel.io>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+---
+ include/linux/ksm.h |  1 +
+ kernel/sys.c        | 12 +++------
+ mm/ksm.c            | 59 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 63 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/ksm.h b/include/linux/ksm.h
+index 590934bdd..7108bc65d 100644
+--- a/include/linux/ksm.h
++++ b/include/linux/ksm.h
+@@ -21,6 +21,7 @@ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 
+ void ksm_add_vma(struct vm_area_struct *vma);
+ int ksm_enable_merge_any(struct mm_struct *mm);
++int ksm_disable_merge_any(struct mm_struct *mm);
+ 
+ int __ksm_enter(struct mm_struct *mm);
+ void __ksm_exit(struct mm_struct *mm);
+diff --git a/kernel/sys.c b/kernel/sys.c
+index f95ec83ac..26ddfcc3c 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2680,16 +2680,10 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 		if (mmap_write_lock_killable(me->mm))
+ 			return -EINTR;
+ 
+-		if (arg2) {
++		if (arg2)
+ 			error = ksm_enable_merge_any(me->mm);
+-		} else {
+-			/*
+-			 * TODO: we might want disable KSM on all VMAs and
+-			 * trigger unsharing to completely disable KSM.
+-			 */
+-			clear_bit(MMF_VM_MERGE_ANY, &me->mm->flags);
+-			error = 0;
+-		}
++		else
++			error = ksm_disable_merge_any(me->mm);
+ 		mmap_write_unlock(me->mm);
+ 		break;
+ 	case PR_GET_MEMORY_MERGE:
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 741abae0b..db69a3509 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -2506,6 +2506,22 @@ static void __ksm_add_vma(struct vm_area_struct *vma)
+ 		vm_flags_set(vma, VM_MERGEABLE);
+ }
+ 
++static int __ksm_del_vma(struct vm_area_struct *vma)
++{
++	int err;
++
++	if (!(vma->vm_flags & VM_MERGEABLE))
++		return 0;
++
++	if (vma->anon_vma) {
++		err = unmerge_ksm_pages(vma, vma->vm_start, vma->vm_end);
++		if (err)
++			return err;
++	}
++
++	vm_flags_clear(vma, VM_MERGEABLE);
++	return 0;
++}
+ /**
+  * ksm_add_vma - Mark vma as mergeable if compatible
+  *
+@@ -2528,6 +2544,20 @@ static void ksm_add_vmas(struct mm_struct *mm)
+ 		__ksm_add_vma(vma);
+ }
+ 
++static int ksm_del_vmas(struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++	int err;
++
++	VMA_ITERATOR(vmi, mm, 0);
++	for_each_vma(vmi, vma) {
++		err = __ksm_del_vma(vma);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
+ /**
+  * ksm_enable_merge_any - Add mm to mm ksm list and enable merging on all
+  *                        compatible VMA's
+@@ -2555,6 +2585,35 @@ int ksm_enable_merge_any(struct mm_struct *mm)
+ 	return 0;
+ }
+ 
++/**
++ * ksm_disable_merge_any - Disable merging on all compatible VMA's of the mm,
++ *			   previously enabled via ksm_enable_merge_any().
++ *
++ * Disabling merging implies unmerging any merged pages, like setting
++ * MADV_UNMERGEABLE would. If unmerging fails, the whole operation fails and
++ * merging on all compatible VMA's remains enabled.
++ *
++ * @mm: Pointer to mm
++ *
++ * Returns 0 on success, otherwise error code
++ */
++int ksm_disable_merge_any(struct mm_struct *mm)
++{
++	int err;
++
++	if (!test_bit(MMF_VM_MERGE_ANY, &mm->flags))
++		return 0;
++
++	err = ksm_del_vmas(mm);
++	if (err) {
++		ksm_add_vmas(mm);
++		return err;
++	}
++
++	clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
++	return 0;
++}
++
+ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long end, int advice, unsigned long *vm_flags)
+ {
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From 7dbaa2f45777eab3e3cdaeb589fd8a93bf1e83b5 Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Sat, 22 Apr 2023 22:54:19 +0200
+Subject: [PATCH 5/7] selftests/ksm: ksm_functional_tests: add prctl unmerge
+ test
+
+Let's test whether setting PR_SET_MEMORY_MERGE to 0 after setting it to
+1 will unmerge pages, similar to how setting MADV_UNMERGEABLE after setting
+MADV_MERGEABLE would.
+
+Acked-by: Stefan Roesch <shr@devkernel.io>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+---
+ .../selftests/mm/ksm_functional_tests.c       | 46 ++++++++++++++++---
+ 1 file changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/tools/testing/selftests/mm/ksm_functional_tests.c b/tools/testing/selftests/mm/ksm_functional_tests.c
+index a1645019b..1fd7f36cf 100644
+--- a/tools/testing/selftests/mm/ksm_functional_tests.c
++++ b/tools/testing/selftests/mm/ksm_functional_tests.c
+@@ -91,9 +91,10 @@ static int ksm_merge(void)
+ 	return 0;
+ }
+ 
+-static char *mmap_and_merge_range(char val, unsigned long size)
++static char *mmap_and_merge_range(char val, unsigned long size, bool use_prctl)
+ {
+ 	char *map;
++	int ret;
+ 
+ 	map = mmap(NULL, size, PROT_READ|PROT_WRITE,
+ 		   MAP_PRIVATE|MAP_ANON, -1, 0);
+@@ -110,7 +111,17 @@ static char *mmap_and_merge_range(char val, unsigned long size)
+ 
+ 	/* Make sure each page contains the same values to merge them. */
+ 	memset(map, val, size);
+-	if (madvise(map, size, MADV_MERGEABLE)) {
++
++	if (use_prctl) {
++		ret = prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0);
++		if (ret < 0 && errno == EINVAL) {
++			ksft_test_result_skip("PR_SET_MEMORY_MERGE not supported\n");
++			goto unmap;
++		} else if (ret) {
++			ksft_test_result_fail("PR_SET_MEMORY_MERGE=1 failed\n");
++			goto unmap;
++		}
++	} else if (madvise(map, size, MADV_MERGEABLE)) {
+ 		ksft_test_result_fail("MADV_MERGEABLE failed\n");
+ 		goto unmap;
+ 	}
+@@ -133,7 +144,7 @@ static void test_unmerge(void)
+ 
+ 	ksft_print_msg("[RUN] %s\n", __func__);
+ 
+-	map = mmap_and_merge_range(0xcf, size);
++	map = mmap_and_merge_range(0xcf, size, false);
+ 	if (map == MAP_FAILED)
+ 		return;
+ 
+@@ -155,7 +166,7 @@ static void test_unmerge_discarded(void)
+ 
+ 	ksft_print_msg("[RUN] %s\n", __func__);
+ 
+-	map = mmap_and_merge_range(0xcf, size);
++	map = mmap_and_merge_range(0xcf, size, false);
+ 	if (map == MAP_FAILED)
+ 		return;
+ 
+@@ -188,7 +199,7 @@ static void test_unmerge_uffd_wp(void)
+ 
+ 	ksft_print_msg("[RUN] %s\n", __func__);
+ 
+-	map = mmap_and_merge_range(0xcf, size);
++	map = mmap_and_merge_range(0xcf, size, false);
+ 	if (map == MAP_FAILED)
+ 		return;
+ 
+@@ -327,9 +338,31 @@ static void test_prctl_fork(void)
+ 	ksft_test_result_pass("PR_SET_MEMORY_MERGE value is inherited\n");
+ }
+ 
++static void test_prctl_unmerge(void)
++{
++	const unsigned int size = 2 * MiB;
++	char *map;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	map = mmap_and_merge_range(0xcf, size, true);
++	if (map == MAP_FAILED)
++		return;
++
++	if (prctl(PR_SET_MEMORY_MERGE, 0, 0, 0, 0)) {
++		ksft_test_result_fail("PR_SET_MEMORY_MERGE=0 failed\n");
++		goto unmap;
++	}
++
++	ksft_test_result(!range_maps_duplicates(map, size),
++			 "Pages were unmerged\n");
++unmap:
++	munmap(map, size);
++}
++
+ int main(int argc, char **argv)
+ {
+-	unsigned int tests = 4;
++	unsigned int tests = 5;
+ 	int err;
+ 
+ #ifdef __NR_userfaultfd
+@@ -359,6 +392,7 @@ int main(int argc, char **argv)
+ 
+ 	test_prctl();
+ 	test_prctl_fork();
++	test_prctl_unmerge();
+ 
+ 	err = ksft_get_fail_cnt();
+ 	if (err)
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From 64a595d017cf69f5f2bbc1c6931aa70a78c5509b Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Sat, 22 Apr 2023 23:01:56 +0200
+Subject: [PATCH 6/7] mm/ksm: move disabling KSM from s390/gmap code to KSM
+ code
+
+Let's factor out actual disabling of KSM. The existing
+"mm->def_flags &= ~VM_MERGEABLE;" was essentially a NOP and can be dropped,
+because def_flags should never include VM_MERGEABLE. Note that we don't
+currently prevent re-enabling KSM.
+
+This should now be faster in case KSM was never enabled, because we only
+conditionally iterate all VMAs. Further, it certainly looks cleaner.
+
+Acked-by: Janosch Frank <frankja@linux.ibm.com>
+Acked-by: Stefan Roesch <shr@devkernel.io>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+---
+ arch/s390/mm/gmap.c | 20 +-------------------
+ include/linux/ksm.h |  6 ++++++
+ mm/ksm.c            | 11 +++++++++++
+ 3 files changed, 18 insertions(+), 19 deletions(-)
+
+diff --git a/arch/s390/mm/gmap.c b/arch/s390/mm/gmap.c
+index 094981176..dfe905c7b 100644
+--- a/arch/s390/mm/gmap.c
++++ b/arch/s390/mm/gmap.c
+@@ -2585,30 +2585,12 @@ EXPORT_SYMBOL_GPL(s390_enable_sie);
+ 
+ int gmap_mark_unmergeable(void)
+ {
+-	struct mm_struct *mm = current->mm;
+-	struct vm_area_struct *vma;
+-	unsigned long vm_flags;
+-	int ret;
+-	VMA_ITERATOR(vmi, mm, 0);
+-
+ 	/*
+ 	 * Make sure to disable KSM (if enabled for the whole process or
+ 	 * individual VMAs). Note that nothing currently hinders user space
+ 	 * from re-enabling it.
+ 	 */
+-	clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
+-
+-	for_each_vma(vmi, vma) {
+-		/* Copy vm_flags to avoid partial modifications in ksm_madvise */
+-		vm_flags = vma->vm_flags;
+-		ret = ksm_madvise(vma, vma->vm_start, vma->vm_end,
+-				  MADV_UNMERGEABLE, &vm_flags);
+-		if (ret)
+-			return ret;
+-		vm_flags_reset(vma, vm_flags);
+-	}
+-	mm->def_flags &= ~VM_MERGEABLE;
+-	return 0;
++	return ksm_disable(current->mm);
+ }
+ EXPORT_SYMBOL_GPL(gmap_mark_unmergeable);
+ 
+diff --git a/include/linux/ksm.h b/include/linux/ksm.h
+index 7108bc65d..b3d8b7849 100644
+--- a/include/linux/ksm.h
++++ b/include/linux/ksm.h
+@@ -22,6 +22,7 @@ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ void ksm_add_vma(struct vm_area_struct *vma);
+ int ksm_enable_merge_any(struct mm_struct *mm);
+ int ksm_disable_merge_any(struct mm_struct *mm);
++int ksm_disable(struct mm_struct *mm);
+ 
+ int __ksm_enter(struct mm_struct *mm);
+ void __ksm_exit(struct mm_struct *mm);
+@@ -75,6 +76,11 @@ static inline void ksm_add_vma(struct vm_area_struct *vma)
+ {
+ }
+ 
++static inline int ksm_disable(struct mm_struct *mm)
++{
++	return 0;
++}
++
+ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
+ {
+ 	return 0;
+diff --git a/mm/ksm.c b/mm/ksm.c
+index db69a3509..384f5ace6 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -2614,6 +2614,17 @@ int ksm_disable_merge_any(struct mm_struct *mm)
+ 	return 0;
+ }
+ 
++int ksm_disable(struct mm_struct *mm)
++{
++	mmap_assert_write_locked(mm);
++
++	if (!test_bit(MMF_VM_MERGEABLE, &mm->flags))
++		return 0;
++	if (test_bit(MMF_VM_MERGE_ANY, &mm->flags))
++		return ksm_disable_merge_any(mm);
++	return ksm_del_vmas(mm);
++}
++
+ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long end, int advice, unsigned long *vm_flags)
+ {
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From 0b14f495b73d5246c38ffc7ed4c445ec0c42265d Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Mon, 8 May 2023 17:28:35 +0200
+Subject: [PATCH 7/7] mm: expose per-process KSM control via syscalls
+
+d7597f59d1d3 added a new API to enable per-process KSM control. It
+however uses prctl, which doesn't allow controlling KSM from outside of
+the current process.
+
+Hence, expose this API via 3 syscalls: process_ksm_enable,
+process_ksm_disable and process_ksm_status. Given sufficient privileges,
+auto-KSM can be enable by another process.
+
+Since these syscalls are not in the upstream kernel, also expose their
+numbers under /sys/kernel/process_ksm so that userspace tooling like
+uksmd knows how to use them.
+
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ arch/alpha/kernel/syscalls/syscall.tbl      |   3 +
+ arch/arm/tools/syscall.tbl                  |   3 +
+ arch/arm64/include/asm/unistd.h             |   2 +-
+ arch/arm64/include/asm/unistd32.h           |   7 +-
+ arch/ia64/kernel/syscalls/syscall.tbl       |   3 +
+ arch/m68k/kernel/syscalls/syscall.tbl       |   3 +
+ arch/microblaze/kernel/syscalls/syscall.tbl |   3 +
+ arch/mips/kernel/syscalls/syscall_n32.tbl   |   3 +
+ arch/mips/kernel/syscalls/syscall_n64.tbl   |   3 +
+ arch/mips/kernel/syscalls/syscall_o32.tbl   |   3 +
+ arch/parisc/kernel/syscalls/syscall.tbl     |   3 +
+ arch/powerpc/kernel/syscalls/syscall.tbl    |   3 +
+ arch/s390/kernel/syscalls/syscall.tbl       |   3 +
+ arch/sh/kernel/syscalls/syscall.tbl         |   3 +
+ arch/sparc/kernel/syscalls/syscall.tbl      |   3 +
+ arch/x86/entry/syscalls/syscall_32.tbl      |   3 +
+ arch/x86/entry/syscalls/syscall_64.tbl      |   3 +
+ arch/xtensa/kernel/syscalls/syscall.tbl     |   3 +
+ include/linux/syscalls.h                    |   3 +
+ include/uapi/asm-generic/unistd.h           |  11 +-
+ kernel/sys.c                                | 147 ++++++++++++++++++++
+ kernel/sys_ni.c                             |   3 +
+ 22 files changed, 218 insertions(+), 3 deletions(-)
+
+diff --git a/arch/alpha/kernel/syscalls/syscall.tbl b/arch/alpha/kernel/syscalls/syscall.tbl
+index 8ebacf37a..9b8afad2b 100644
+--- a/arch/alpha/kernel/syscalls/syscall.tbl
++++ b/arch/alpha/kernel/syscalls/syscall.tbl
+@@ -490,3 +490,6 @@
+ 558	common	process_mrelease		sys_process_mrelease
+ 559	common  futex_waitv                     sys_futex_waitv
+ 560	common	set_mempolicy_home_node		sys_ni_syscall
++561	common	process_ksm_enable		sys_process_ksm_enable
++562	common	process_ksm_disable		sys_process_ksm_disable
++563	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/arm/tools/syscall.tbl b/arch/arm/tools/syscall.tbl
+index ac964612d..b8a2f2689 100644
+--- a/arch/arm/tools/syscall.tbl
++++ b/arch/arm/tools/syscall.tbl
+@@ -464,3 +464,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common	futex_waitv			sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/arm64/include/asm/unistd.h b/arch/arm64/include/asm/unistd.h
+index 037feba03..6a28fb91b 100644
+--- a/arch/arm64/include/asm/unistd.h
++++ b/arch/arm64/include/asm/unistd.h
+@@ -39,7 +39,7 @@
+ #define __ARM_NR_compat_set_tls		(__ARM_NR_COMPAT_BASE + 5)
+ #define __ARM_NR_COMPAT_END		(__ARM_NR_COMPAT_BASE + 0x800)
+ 
+-#define __NR_compat_syscalls		451
++#define __NR_compat_syscalls		454
+ #endif
+ 
+ #define __ARCH_WANT_SYS_CLONE
+diff --git a/arch/arm64/include/asm/unistd32.h b/arch/arm64/include/asm/unistd32.h
+index 604a2053d..38e367459 100644
+--- a/arch/arm64/include/asm/unistd32.h
++++ b/arch/arm64/include/asm/unistd32.h
+@@ -907,7 +907,12 @@ __SYSCALL(__NR_process_mrelease, sys_process_mrelease)
+ __SYSCALL(__NR_futex_waitv, sys_futex_waitv)
+ #define __NR_set_mempolicy_home_node 450
+ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+-
++#define __NR_process_ksm_enable 451
++__SYSCALL(__NR_process_ksm_enable, sys_process_ksm_enable)
++#define __NR_process_ksm_disable 452
++__SYSCALL(__NR_process_ksm_disable, sys_process_ksm_disable)
++#define __NR_process_ksm_status 453
++__SYSCALL(__NR_process_ksm_status, sys_process_ksm_status)
+ /*
+  * Please add new compat syscalls above this comment and update
+  * __NR_compat_syscalls in asm/unistd.h.
+diff --git a/arch/ia64/kernel/syscalls/syscall.tbl b/arch/ia64/kernel/syscalls/syscall.tbl
+index 72c929d99..aa698c590 100644
+--- a/arch/ia64/kernel/syscalls/syscall.tbl
++++ b/arch/ia64/kernel/syscalls/syscall.tbl
+@@ -371,3 +371,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common  futex_waitv                     sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/m68k/kernel/syscalls/syscall.tbl b/arch/m68k/kernel/syscalls/syscall.tbl
+index b1f3940bc..4e9d10dfd 100644
+--- a/arch/m68k/kernel/syscalls/syscall.tbl
++++ b/arch/m68k/kernel/syscalls/syscall.tbl
+@@ -450,3 +450,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common  futex_waitv                     sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/microblaze/kernel/syscalls/syscall.tbl b/arch/microblaze/kernel/syscalls/syscall.tbl
+index 820145e47..f89d989f9 100644
+--- a/arch/microblaze/kernel/syscalls/syscall.tbl
++++ b/arch/microblaze/kernel/syscalls/syscall.tbl
+@@ -456,3 +456,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common  futex_waitv                     sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/mips/kernel/syscalls/syscall_n32.tbl b/arch/mips/kernel/syscalls/syscall_n32.tbl
+index 253ff994e..fbd19a419 100644
+--- a/arch/mips/kernel/syscalls/syscall_n32.tbl
++++ b/arch/mips/kernel/syscalls/syscall_n32.tbl
+@@ -389,3 +389,6 @@
+ 448	n32	process_mrelease		sys_process_mrelease
+ 449	n32	futex_waitv			sys_futex_waitv
+ 450	n32	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	n32	process_ksm_enable		sys_process_ksm_enable
++452	n32	process_ksm_disable		sys_process_ksm_disable
++453	n32	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/mips/kernel/syscalls/syscall_n64.tbl b/arch/mips/kernel/syscalls/syscall_n64.tbl
+index 3f1886ad9..32694bd4a 100644
+--- a/arch/mips/kernel/syscalls/syscall_n64.tbl
++++ b/arch/mips/kernel/syscalls/syscall_n64.tbl
+@@ -365,3 +365,6 @@
+ 448	n64	process_mrelease		sys_process_mrelease
+ 449	n64	futex_waitv			sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	n64	process_ksm_enable		sys_process_ksm_enable
++452	n64	process_ksm_disable		sys_process_ksm_disable
++453	n64	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/mips/kernel/syscalls/syscall_o32.tbl b/arch/mips/kernel/syscalls/syscall_o32.tbl
+index 8f243e35a..6463565ed 100644
+--- a/arch/mips/kernel/syscalls/syscall_o32.tbl
++++ b/arch/mips/kernel/syscalls/syscall_o32.tbl
+@@ -438,3 +438,6 @@
+ 448	o32	process_mrelease		sys_process_mrelease
+ 449	o32	futex_waitv			sys_futex_waitv
+ 450	o32	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	o32	process_ksm_enable		sys_process_ksm_enable
++452	o32	process_ksm_disable		sys_process_ksm_disable
++453	o32	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/parisc/kernel/syscalls/syscall.tbl b/arch/parisc/kernel/syscalls/syscall.tbl
+index 0e42fceb2..7862be4ce 100644
+--- a/arch/parisc/kernel/syscalls/syscall.tbl
++++ b/arch/parisc/kernel/syscalls/syscall.tbl
+@@ -448,3 +448,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common	futex_waitv			sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/powerpc/kernel/syscalls/syscall.tbl b/arch/powerpc/kernel/syscalls/syscall.tbl
+index a0be12747..8d986c713 100644
+--- a/arch/powerpc/kernel/syscalls/syscall.tbl
++++ b/arch/powerpc/kernel/syscalls/syscall.tbl
+@@ -537,3 +537,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common  futex_waitv                     sys_futex_waitv
+ 450 	nospu	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/s390/kernel/syscalls/syscall.tbl b/arch/s390/kernel/syscalls/syscall.tbl
+index 799147658..5db371173 100644
+--- a/arch/s390/kernel/syscalls/syscall.tbl
++++ b/arch/s390/kernel/syscalls/syscall.tbl
+@@ -453,3 +453,6 @@
+ 448  common	process_mrelease	sys_process_mrelease		sys_process_mrelease
+ 449  common	futex_waitv		sys_futex_waitv			sys_futex_waitv
+ 450  common	set_mempolicy_home_node	sys_set_mempolicy_home_node	sys_set_mempolicy_home_node
++451  common	process_ksm_enable	sys_process_ksm_enable		sys_process_ksm_enable
++452  common	process_ksm_disable	sys_process_ksm_disable		sys_process_ksm_disable
++453  common	process_ksm_status	sys_process_ksm_status		sys_process_ksm_status
+diff --git a/arch/sh/kernel/syscalls/syscall.tbl b/arch/sh/kernel/syscalls/syscall.tbl
+index 2de85c977..df431a526 100644
+--- a/arch/sh/kernel/syscalls/syscall.tbl
++++ b/arch/sh/kernel/syscalls/syscall.tbl
+@@ -453,3 +453,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common  futex_waitv                     sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/sparc/kernel/syscalls/syscall.tbl b/arch/sparc/kernel/syscalls/syscall.tbl
+index 4398cc6fb..f757d9623 100644
+--- a/arch/sparc/kernel/syscalls/syscall.tbl
++++ b/arch/sparc/kernel/syscalls/syscall.tbl
+@@ -496,3 +496,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common  futex_waitv                     sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 320480a8d..f18baa583 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -455,3 +455,6 @@
+ 448	i386	process_mrelease	sys_process_mrelease
+ 449	i386	futex_waitv		sys_futex_waitv
+ 450	i386	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	i386	process_ksm_enable		sys_process_ksm_enable
++452	i386	process_ksm_disable		sys_process_ksm_disable
++453	i386	process_ksm_status		sys_process_ksm_status
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608..03187452c 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -372,6 +372,9 @@
+ 448	common	process_mrelease	sys_process_mrelease
+ 449	common	futex_waitv		sys_futex_waitv
+ 450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
++451	common	process_ksm_enable	sys_process_ksm_enable
++452	common	process_ksm_disable	sys_process_ksm_disable
++453	common	process_ksm_status	sys_process_ksm_status
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/arch/xtensa/kernel/syscalls/syscall.tbl b/arch/xtensa/kernel/syscalls/syscall.tbl
+index 52c94ab5c..4002ab783 100644
+--- a/arch/xtensa/kernel/syscalls/syscall.tbl
++++ b/arch/xtensa/kernel/syscalls/syscall.tbl
+@@ -421,3 +421,6 @@
+ 448	common	process_mrelease		sys_process_mrelease
+ 449	common  futex_waitv                     sys_futex_waitv
+ 450	common	set_mempolicy_home_node		sys_set_mempolicy_home_node
++451	common	process_ksm_enable		sys_process_ksm_enable
++452	common	process_ksm_disable		sys_process_ksm_disable
++453	common	process_ksm_status		sys_process_ksm_status
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 33a0ee3bc..9f5c1a070 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -919,6 +919,9 @@ asmlinkage long sys_madvise(unsigned long start, size_t len, int behavior);
+ asmlinkage long sys_process_madvise(int pidfd, const struct iovec __user *vec,
+ 			size_t vlen, int behavior, unsigned int flags);
+ asmlinkage long sys_process_mrelease(int pidfd, unsigned int flags);
++asmlinkage long sys_process_ksm_enable(int pidfd, unsigned int flags);
++asmlinkage long sys_process_ksm_disable(int pidfd, unsigned int flags);
++asmlinkage long sys_process_ksm_status(int pidfd, unsigned int flags);
+ asmlinkage long sys_remap_file_pages(unsigned long start, unsigned long size,
+ 			unsigned long prot, unsigned long pgoff,
+ 			unsigned long flags);
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 45fa180cc..98731e18a 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -886,8 +886,17 @@ __SYSCALL(__NR_futex_waitv, sys_futex_waitv)
+ #define __NR_set_mempolicy_home_node 450
+ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+ 
++#define __NR_process_ksm_enable 451
++__SYSCALL(__NR_process_ksm_enable, sys_process_ksm_enable)
++
++#define __NR_process_ksm_disable 452
++__SYSCALL(__NR_process_ksm_disable, sys_process_ksm_disable)
++
++#define __NR_process_ksm_status 453
++__SYSCALL(__NR_process_ksm_status, sys_process_ksm_status)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 451
++#define __NR_syscalls 454
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 26ddfcc3c..65c3792ab 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2700,6 +2700,153 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 	return error;
+ }
+ 
++#ifdef CONFIG_KSM
++enum pkc_action {
++	PKC_ENABLE = 0,
++	PKC_DISABLE,
++	PKC_STATUS,
++};
++
++static long do_process_ksm_control(int pidfd, enum pkc_action action)
++{
++	long ret;
++	struct pid *pid;
++	struct task_struct *task;
++	struct mm_struct *mm;
++	unsigned int f_flags;
++
++	pid = pidfd_get_pid(pidfd, &f_flags);
++	if (IS_ERR(pid)) {
++		ret = PTR_ERR(pid);
++		goto out;
++	}
++
++	task = get_pid_task(pid, PIDTYPE_PID);
++	if (!task) {
++		ret = -ESRCH;
++		goto put_pid;
++	}
++
++	/* Require PTRACE_MODE_READ to avoid leaking ASLR metadata. */
++	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
++	if (IS_ERR_OR_NULL(mm)) {
++		ret = IS_ERR(mm) ? PTR_ERR(mm) : -ESRCH;
++		goto release_task;
++	}
++
++	/* Require CAP_SYS_NICE for influencing process performance. */
++	if (!capable(CAP_SYS_NICE)) {
++		ret = -EPERM;
++		goto release_mm;
++	}
++
++	if (mmap_write_lock_killable(mm)) {
++		ret = -EINTR;
++		goto release_mm;
++	}
++
++	switch (action) {
++		case PKC_ENABLE:
++			ret = ksm_enable_merge_any(mm);
++			break;
++		case PKC_DISABLE:
++			ret = ksm_disable_merge_any(mm);
++			break;
++		case PKC_STATUS:
++			ret = !!test_bit(MMF_VM_MERGE_ANY, &mm->flags);
++			break;
++	}
++
++	mmap_write_unlock(mm);
++
++release_mm:
++	mmput(mm);
++release_task:
++	put_task_struct(task);
++put_pid:
++	put_pid(pid);
++out:
++	return ret;
++}
++#endif /* CONFIG_KSM */
++
++SYSCALL_DEFINE2(process_ksm_enable, int, pidfd, unsigned int, flags)
++{
++#ifdef CONFIG_KSM
++	if (flags != 0)
++		return -EINVAL;
++
++	return do_process_ksm_control(pidfd, PKC_ENABLE);
++#else /* CONFIG_KSM */
++	return -ENOSYS;
++#endif /* CONFIG_KSM */
++}
++
++SYSCALL_DEFINE2(process_ksm_disable, int, pidfd, unsigned int, flags)
++{
++#ifdef CONFIG_KSM
++	if (flags != 0)
++		return -EINVAL;
++
++	return do_process_ksm_control(pidfd, PKC_DISABLE);
++#else /* CONFIG_KSM */
++	return -ENOSYS;
++#endif /* CONFIG_KSM */
++}
++
++SYSCALL_DEFINE2(process_ksm_status, int, pidfd, unsigned int, flags)
++{
++#ifdef CONFIG_KSM
++	if (flags != 0)
++		return -EINVAL;
++
++	return do_process_ksm_control(pidfd, PKC_STATUS);
++#else /* CONFIG_KSM */
++	return -ENOSYS;
++#endif /* CONFIG_KSM */
++}
++
++#ifdef CONFIG_KSM
++static ssize_t process_ksm_enable_show(struct kobject *kobj,
++		struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", __NR_process_ksm_enable);
++}
++static struct kobj_attribute process_ksm_enable_attr = __ATTR_RO(process_ksm_enable);
++
++static ssize_t process_ksm_disable_show(struct kobject *kobj,
++		struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", __NR_process_ksm_disable);
++}
++static struct kobj_attribute process_ksm_disable_attr = __ATTR_RO(process_ksm_disable);
++
++static ssize_t process_ksm_status_show(struct kobject *kobj,
++		struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", __NR_process_ksm_status);
++}
++static struct kobj_attribute process_ksm_status_attr = __ATTR_RO(process_ksm_status);
++
++static struct attribute *process_ksm_sysfs_attrs[] = {
++	&process_ksm_enable_attr.attr,
++	&process_ksm_disable_attr.attr,
++	&process_ksm_status_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group process_ksm_sysfs_attr_group = {
++	.attrs = process_ksm_sysfs_attrs,
++	.name = "process_ksm",
++};
++
++static int __init process_ksm_sysfs_init(void)
++{
++	return sysfs_create_group(kernel_kobj, &process_ksm_sysfs_attr_group);
++}
++subsys_initcall(process_ksm_sysfs_init);
++#endif /* CONFIG_KSM */
++
+ SYSCALL_DEFINE3(getcpu, unsigned __user *, cpup, unsigned __user *, nodep,
+ 		struct getcpu_cache __user *, unused)
+ {
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index 860b2dcf3..96fe36a6d 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -292,6 +292,9 @@ COND_SYSCALL(mincore);
+ COND_SYSCALL(madvise);
+ COND_SYSCALL(process_madvise);
+ COND_SYSCALL(process_mrelease);
++COND_SYSCALL(process_ksm_enable);
++COND_SYSCALL(process_ksm_disable);
++COND_SYSCALL(process_ksm_status);
+ COND_SYSCALL(remap_file_pages);
+ COND_SYSCALL(mbind);
+ COND_SYSCALL(get_mempolicy);
+-- 
+2.40.1.445.gf85cd430b1
+
