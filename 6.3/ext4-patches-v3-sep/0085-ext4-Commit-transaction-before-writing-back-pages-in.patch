@@ -1,0 +1,104 @@
+From 70e1279d4e9bf585358029f597f3275b053ec3dd Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 29 Mar 2023 17:49:36 +0200
+Subject: [PATCH 085/108] ext4: Commit transaction before writing back pages in
+ data=journal mode
+
+When journalling data we currently just walk over pages, journal those
+that are marked for delayed dirtying (only pinned pages dirtied behing
+our back these days) and checkpoint other dirty pages. Because some
+pages may be part of running transaction the result is that after
+filemap_write_and_wait() we are not guaranteed pages are stable on disk.
+Thus places that want to flush current pagecache content need to jump
+through hoops to make sure journalled data is not lost. This is
+manageable in cases completely controlled by ext4 (such as extent
+shifting operations or inode eviction) but it gets ugly for stuff like
+fsverity. Furthermore it is rather error prone as people often do not
+realize journalled data needs special handling.
+
+So change ext4_writepages() to commit transaction with inode's data
+before going through the writeback loop in WB_SYNC_ALL mode. As a result
+filemap_write_and_wait() is now really getting pages to stable storage
+and makes pagecache pages safe to reclaim. Consequently we can remove
+the special handling of journalled data from several places in follow up
+patches.
+
+Note that this will make fsync(2) for journalled data more expensive as
+we will end up not only committing the transaction we need but also
+checkpointing the data (which we may have previously skipped if the data
+was part of the running transaction). If we really cared, we would need
+to introduce special VFS function for writing out & invalidating page
+cache for a range, use ->launder_page callback to perform checkpointing,
+and use it from all the places that need this functionality. But at this
+point I'm not convinced the complexity is worth it.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230329154950.19720-5-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ fs/ext4/inode.c | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index d3b24a999..71dd9abee 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1568,6 +1568,7 @@ struct mpage_da_data {
+ 	struct ext4_io_submit io_submit;	/* IO submission data */
+ 	unsigned int do_map:1;
+ 	unsigned int scanned_until_end:1;
++	unsigned int journalled_more_data:1;
+ };
+ 
+ static void mpage_release_unused_pages(struct mpage_da_data *mpd,
+@@ -2545,6 +2546,7 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 						mpd, &folio->page);
+ 					if (err < 0)
+ 						goto out;
++					mpd->journalled_more_data = 1;
+ 				}
+ 				mpage_folio_done(mpd, folio);
+ 			} else {
+@@ -2634,10 +2636,23 @@ static int ext4_do_writepages(struct mpage_da_data *mpd)
+ 
+ 	/*
+ 	 * data=journal mode does not do delalloc so we just need to writeout /
+-	 * journal already mapped buffers
++	 * journal already mapped buffers. On the other hand we need to commit
++	 * transaction to make data stable. We expect all the data to be
++	 * already in the journal (the only exception are DMA pinned pages
++	 * dirtied behind our back) so we commit transaction here and run the
++	 * writeback loop to checkpoint them. The checkpointing is not actually
++	 * necessary to make data persistent *but* quite a few places (extent
++	 * shifting operations, fsverity, ...) depend on being able to drop
++	 * pagecache pages after calling filemap_write_and_wait() and for that
++	 * checkpointing needs to happen.
+ 	 */
+-	if (ext4_should_journal_data(inode))
++	if (ext4_should_journal_data(inode)) {
+ 		mpd->can_map = 0;
++		if (wbc->sync_mode == WB_SYNC_ALL)
++			ext4_fc_commit(sbi->s_journal,
++				       EXT4_I(inode)->i_datasync_tid);
++	}
++	mpd->journalled_more_data = 0;
+ 
+ 	if (ext4_should_dioread_nolock(inode)) {
+ 		/*
+@@ -2818,6 +2833,13 @@ static int ext4_writepages(struct address_space *mapping,
+ 
+ 	percpu_down_read(&EXT4_SB(sb)->s_writepages_rwsem);
+ 	ret = ext4_do_writepages(&mpd);
++	/*
++	 * For data=journal writeback we could have come across pages marked
++	 * for delayed dirtying (PageChecked) which were just added to the
++	 * running transaction. Try once more to get them to stable storage.
++	 */
++	if (!ret && mpd.journalled_more_data)
++		ret = ext4_do_writepages(&mpd);
+ 	percpu_up_read(&EXT4_SB(sb)->s_writepages_rwsem);
+ 
+ 	return ret;
+-- 
+2.40.1.445.gf85cd430b1
+
