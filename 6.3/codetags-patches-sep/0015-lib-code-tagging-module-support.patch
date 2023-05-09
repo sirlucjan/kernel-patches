@@ -1,0 +1,165 @@
+From e0bbd39e24a6f648272f36e0982fa2e5cc0d6bd7 Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Sun, 7 Aug 2022 23:32:31 +0000
+Subject: [PATCH 15/56] lib: code tagging module support
+
+Add support for code tagging from dynamically loaded modules.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Co-developed-by: Kent Overstreet <kent.overstreet@linux.dev>
+Signed-off-by: Kent Overstreet <kent.overstreet@linux.dev>
+---
+ include/linux/codetag.h | 12 +++++++++
+ kernel/module/main.c    |  4 +++
+ lib/codetag.c           | 58 +++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/codetag.h b/include/linux/codetag.h
+index a9d7adecc..386733e89 100644
+--- a/include/linux/codetag.h
++++ b/include/linux/codetag.h
+@@ -42,6 +42,10 @@ struct codetag_module {
+ struct codetag_type_desc {
+ 	const char *section;
+ 	size_t tag_size;
++	void (*module_load)(struct codetag_type *cttype,
++			    struct codetag_module *cmod);
++	void (*module_unload)(struct codetag_type *cttype,
++			      struct codetag_module *cmod);
+ };
+ 
+ struct codetag_iterator {
+@@ -68,4 +72,12 @@ void codetag_to_text(struct seq_buf *out, struct codetag *ct);
+ struct codetag_type *
+ codetag_register_type(const struct codetag_type_desc *desc);
+ 
++#ifdef CONFIG_CODE_TAGGING
++void codetag_load_module(struct module *mod);
++void codetag_unload_module(struct module *mod);
++#else
++static inline void codetag_load_module(struct module *mod) {}
++static inline void codetag_unload_module(struct module *mod) {}
++#endif
++
+ #endif /* _LINUX_CODETAG_H */
+diff --git a/kernel/module/main.c b/kernel/module/main.c
+index d3be89de7..c3d0777d0 100644
+--- a/kernel/module/main.c
++++ b/kernel/module/main.c
+@@ -54,6 +54,7 @@
+ #include <linux/bsearch.h>
+ #include <linux/dynamic_debug.h>
+ #include <linux/audit.h>
++#include <linux/codetag.h>
+ #include <linux/cfi.h>
+ #include <uapi/linux/module.h>
+ #include "internal.h"
+@@ -1148,6 +1149,7 @@ static void free_module(struct module *mod)
+ {
+ 	trace_module_free(mod);
+ 
++	codetag_unload_module(mod);
+ 	mod_sysfs_teardown(mod);
+ 
+ 	/*
+@@ -2867,6 +2869,8 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 	/* Get rid of temporary copy. */
+ 	free_copy(info, flags);
+ 
++	codetag_load_module(mod);
++
+ 	/* Done! */
+ 	trace_module_load(mod);
+ 
+diff --git a/lib/codetag.c b/lib/codetag.c
+index 7708f8388..4ea57fb37 100644
+--- a/lib/codetag.c
++++ b/lib/codetag.c
+@@ -108,15 +108,20 @@ static inline size_t range_size(const struct codetag_type *cttype,
+ static void *get_symbol(struct module *mod, const char *prefix, const char *name)
+ {
+ 	char buf[64];
++	void *ret;
+ 	int res;
+ 
+ 	res = snprintf(buf, sizeof(buf), "%s%s", prefix, name);
+ 	if (WARN_ON(res < 1 || res > sizeof(buf)))
+ 		return NULL;
+ 
+-	return mod ?
++	preempt_disable();
++	ret = mod ?
+ 		(void *)find_kallsyms_symbol_value(mod, buf) :
+ 		(void *)kallsyms_lookup_name(buf);
++	preempt_enable();
++
++	return ret;
+ }
+ 
+ static struct codetag_range get_section_range(struct module *mod,
+@@ -157,8 +162,11 @@ static int codetag_module_init(struct codetag_type *cttype, struct module *mod)
+ 
+ 	down_write(&cttype->mod_lock);
+ 	err = idr_alloc(&cttype->mod_idr, cmod, 0, 0, GFP_KERNEL);
+-	if (err >= 0)
++	if (err >= 0) {
+ 		cttype->count += range_size(cttype, &range);
++		if (cttype->desc.module_load)
++			cttype->desc.module_load(cttype, cmod);
++	}
+ 	up_write(&cttype->mod_lock);
+ 
+ 	if (err < 0) {
+@@ -197,3 +205,49 @@ codetag_register_type(const struct codetag_type_desc *desc)
+ 
+ 	return cttype;
+ }
++
++void codetag_load_module(struct module *mod)
++{
++	struct codetag_type *cttype;
++
++	if (!mod)
++		return;
++
++	mutex_lock(&codetag_lock);
++	list_for_each_entry(cttype, &codetag_types, link)
++		codetag_module_init(cttype, mod);
++	mutex_unlock(&codetag_lock);
++}
++
++void codetag_unload_module(struct module *mod)
++{
++	struct codetag_type *cttype;
++
++	if (!mod)
++		return;
++
++	mutex_lock(&codetag_lock);
++	list_for_each_entry(cttype, &codetag_types, link) {
++		struct codetag_module *found = NULL;
++		struct codetag_module *cmod;
++		unsigned long mod_id, tmp;
++
++		down_write(&cttype->mod_lock);
++		idr_for_each_entry_ul(&cttype->mod_idr, cmod, tmp, mod_id) {
++			if (cmod->mod && cmod->mod == mod) {
++				found = cmod;
++				break;
++			}
++		}
++		if (found) {
++			if (cttype->desc.module_unload)
++				cttype->desc.module_unload(cttype, cmod);
++
++			cttype->count -= range_size(cttype, &cmod->range);
++			idr_remove(&cttype->mod_idr, mod_id);
++			kfree(cmod);
++		}
++		up_write(&cttype->mod_lock);
++	}
++	mutex_unlock(&codetag_lock);
++}
+-- 
+2.40.1.445.gf85cd430b1
+
