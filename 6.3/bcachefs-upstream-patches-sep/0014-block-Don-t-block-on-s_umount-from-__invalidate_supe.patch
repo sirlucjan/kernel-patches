@@ -1,0 +1,141 @@
+From 4ff800a949a5bc133afeb02b190f352f8cfbae2c Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kent.overstreet@linux.dev>
+Date: Tue, 9 May 2023 12:56:39 -0400
+Subject: [PATCH 14/32] block: Don't block on s_umount from
+ __invalidate_super()
+
+__invalidate_super() is used to flush any filesystem mounted on a
+device, generally on some sort of media change event.
+
+However, when unmounting a filesystem and closing the underlying block
+devices, we can deadlock if the block driver then calls
+__invalidate_device() (e.g. because the block device goes away when it
+is no longer in use).
+
+This happens with bcachefs on top of loopback, and can be triggered by
+fstests generic/042:
+
+  put_super
+    -> blkdev_put
+    -> lo_release
+    -> disk_force_media_change
+    -> __invalidate_device
+    -> get_super
+
+This isn't inherently specific to bcachefs - it hasn't shown up with
+other filesystems before because most other filesystems use the sget()
+mechanism for opening/closing block devices (and enforcing exclusion),
+however sget() has its own downsides and weird/sketchy behaviour w.r.t.
+block device open lifetime - if that ever gets fixed more code will run
+into this issue.
+
+The __invalidate_device() call here is really a best effort "I just
+yanked the device for a mounted filesystem, please try not to lose my
+data" - if it's ever actually needed the user has already done something
+crazy, and we probably shouldn't make things worse by deadlocking.
+Switching to a trylock seems in keeping with what the code is trying to
+do.
+
+If we ever get revoke() at the block layer, perhaps we would look at
+rearchitecting to use that instead.
+
+Signed-off-by: Kent Overstreet <kent.overstreet@linux.dev>
+---
+ block/bdev.c       |  2 +-
+ fs/super.c         | 40 +++++++++++++++++++++++++++++++---------
+ include/linux/fs.h |  1 +
+ 3 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/block/bdev.c b/block/bdev.c
+index 1795c7d4b..743e969b7 100644
+--- a/block/bdev.c
++++ b/block/bdev.c
+@@ -922,7 +922,7 @@ EXPORT_SYMBOL(lookup_bdev);
+ 
+ int __invalidate_device(struct block_device *bdev, bool kill_dirty)
+ {
+-	struct super_block *sb = get_super(bdev);
++	struct super_block *sb = try_get_super(bdev);
+ 	int res = 0;
+ 
+ 	if (sb) {
+diff --git a/fs/super.c b/fs/super.c
+index 04bc62ab7..a2decce02 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -791,14 +791,7 @@ void iterate_supers_type(struct file_system_type *type,
+ 
+ EXPORT_SYMBOL(iterate_supers_type);
+ 
+-/**
+- * get_super - get the superblock of a device
+- * @bdev: device to get the superblock for
+- *
+- * Scans the superblock list and finds the superblock of the file system
+- * mounted on the device given. %NULL is returned if no match is found.
+- */
+-struct super_block *get_super(struct block_device *bdev)
++static struct super_block *__get_super(struct block_device *bdev, bool try)
+ {
+ 	struct super_block *sb;
+ 
+@@ -813,7 +806,12 @@ struct super_block *get_super(struct block_device *bdev)
+ 		if (sb->s_bdev == bdev) {
+ 			sb->s_count++;
+ 			spin_unlock(&sb_lock);
+-			down_read(&sb->s_umount);
++
++			if (!try)
++				down_read(&sb->s_umount);
++			else if (!down_read_trylock(&sb->s_umount))
++				return NULL;
++
+ 			/* still alive? */
+ 			if (sb->s_root && (sb->s_flags & SB_BORN))
+ 				return sb;
+@@ -828,6 +826,30 @@ struct super_block *get_super(struct block_device *bdev)
+ 	return NULL;
+ }
+ 
++/**
++ * get_super - get the superblock of a device
++ * @bdev: device to get the superblock for
++ *
++ * Scans the superblock list and finds the superblock of the file system
++ * mounted on the device given. %NULL is returned if no match is found.
++ */
++struct super_block *get_super(struct block_device *bdev)
++{
++	return __get_super(bdev, false);
++}
++
++/**
++ * try_get_super - get the superblock of a device, using trylock on sb->s_umount
++ * @bdev: device to get the superblock for
++ *
++ * Scans the superblock list and finds the superblock of the file system
++ * mounted on the device given. %NULL is returned if no match is found.
++ */
++struct super_block *try_get_super(struct block_device *bdev)
++{
++	return __get_super(bdev, true);
++}
++
+ /**
+  * get_active_super - get an active reference to the superblock of a device
+  * @bdev: device to get the superblock for
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index c85916e9f..1a6f95194 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2878,6 +2878,7 @@ extern struct file_system_type *get_filesystem(struct file_system_type *fs);
+ extern void put_filesystem(struct file_system_type *fs);
+ extern struct file_system_type *get_fs_type(const char *name);
+ extern struct super_block *get_super(struct block_device *);
++extern struct super_block *try_get_super(struct block_device *);
+ extern struct super_block *get_active_super(struct block_device *bdev);
+ extern void drop_super(struct super_block *sb);
+ extern void drop_super_exclusive(struct super_block *sb);
+-- 
+2.40.1.445.gf85cd430b1
+
