@@ -1,0 +1,157 @@
+From c2e7d68c9afc430380408101fdddeab433966080 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Sun, 26 Mar 2023 15:15:57 +0200
+Subject: [PATCH 43/44] sched/eevdf: Sleeper bonus
+
+Add a sleeper bonus hack, but keep it default disabled. This should
+allow easy testing if regressions are due to this.
+
+Specifically; this 'restores' performance for things like starve and
+stress-futex, stress-nanosleep that rely on sleeper bonus to compete
+against an always running parent (the fair 67%/33% split vs the
+50%/50% bonus thing).
+
+OTOH this completely destroys latency and hackbench (as in 5x worse).
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ kernel/sched/fair.c     | 47 +++++++++++++++++++++++++++++++++++------
+ kernel/sched/features.h |  1 +
+ kernel/sched/sched.h    |  3 ++-
+ 3 files changed, 43 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 36a7db1..4ce7287 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4862,7 +4862,7 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq) {}
+ #endif /* CONFIG_SMP */
+ 
+ static void
+-place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
++place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ {
+ 	u64 vslice = calc_delta_fair(se->slice, se);
+ 	u64 vruntime = avg_vruntime(cfs_rq);
+@@ -4954,22 +4954,55 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+ 		if (WARN_ON_ONCE(!load))
+ 			load = 1;
+ 		lag = div_s64(lag, load);
++
++		vruntime -= lag;
++	}
++
++	/*
++	 * Base the deadline on the 'normal' EEVDF placement policy in an
++	 * attempt to not let the bonus crud below wreck things completely.
++	 */
++	se->deadline = vruntime;
++
++	/*
++	 * The whole 'sleeper' bonus hack... :-/ This is strictly unfair.
++	 *
++	 * By giving a sleeping task a little boost, it becomes possible for a
++	 * 50% task to compete equally with a 100% task. That is, strictly fair
++	 * that setup would result in a 67% / 33% split. Sleeper bonus will
++	 * change that to 50% / 50%.
++	 *
++	 * This thing hurts my brain, because tasks leaving with negative lag
++	 * will move 'time' backward, so comparing against a historical
++	 * se->vruntime is dodgy as heck.
++	 */
++	if (sched_feat(PLACE_BONUS) &&
++	    (flags & ENQUEUE_WAKEUP) && !(flags & ENQUEUE_MIGRATED)) {
++		/*
++		 * If se->vruntime is ahead of vruntime, something dodgy
++		 * happened and we cannot give bonus due to not having valid
++		 * history.
++		 */
++		if ((s64)(se->vruntime - vruntime) < 0) {
++			vruntime -= se->slice/2;
++			vruntime = max_vruntime(se->vruntime, vruntime);
++		}
+ 	}
+ 
+-	se->vruntime = vruntime - lag;
++	se->vruntime = vruntime;
+ 
+ 	/*
+ 	 * When joining the competition; the exisiting tasks will be,
+ 	 * on average, halfway through their slice, as such start tasks
+ 	 * off with half a slice to ease into the competition.
+ 	 */
+-	if (sched_feat(PLACE_DEADLINE_INITIAL) && initial)
++	if (sched_feat(PLACE_DEADLINE_INITIAL) && (flags & ENQUEUE_INITIAL))
+ 		vslice /= 2;
+ 
+ 	/*
+ 	 * EEVDF: vd_i = ve_i + r_i/w_i
+ 	 */
+-	se->deadline = se->vruntime + vslice;
++	se->deadline += vslice;
+ }
+ 
+ static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
+@@ -4986,7 +5019,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	 * update_curr().
+ 	 */
+ 	if (curr)
+-		place_entity(cfs_rq, se, 0);
++		place_entity(cfs_rq, se, flags);
+ 
+ 	update_curr(cfs_rq);
+ 
+@@ -5013,7 +5046,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	 * we can place the entity.
+ 	 */
+ 	if (!curr)
+-		place_entity(cfs_rq, se, 0);
++		place_entity(cfs_rq, se, flags);
+ 
+ 	account_entity_enqueue(cfs_rq, se);
+ 
+@@ -12018,7 +12051,7 @@ static void task_fork_fair(struct task_struct *p)
+ 	curr = cfs_rq->curr;
+ 	if (curr)
+ 		update_curr(cfs_rq);
+-	place_entity(cfs_rq, se, 1);
++	place_entity(cfs_rq, se, ENQUEUE_INITIAL);
+ 	rq_unlock(rq, &rf);
+ }
+ 
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 7d65b40..bef658e 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -7,6 +7,7 @@
+ SCHED_FEAT(PLACE_LAG, true)
+ SCHED_FEAT(PLACE_FUDGE, true)
+ SCHED_FEAT(PLACE_DEADLINE_INITIAL, true)
++SCHED_FEAT(PLACE_BONUS, false)
+ 
+ /*
+  * Prefer to schedule the task we woke last (assuming it failed
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index d6c65a8..18cc49b 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2160,7 +2160,7 @@ extern const u32		sched_prio_to_wmult[40];
+  * ENQUEUE_HEAD      - place at front of runqueue (tail if not specified)
+  * ENQUEUE_REPLENISH - CBS (replenish runtime and postpone deadline)
+  * ENQUEUE_MIGRATED  - the task was migrated during wakeup
+- *
++ * ENQUEUE_INITIAL   - place a new task (fork/clone)
+  */
+ 
+ #define DEQUEUE_SLEEP		0x01
+@@ -2180,6 +2180,7 @@ extern const u32		sched_prio_to_wmult[40];
+ #else
+ #define ENQUEUE_MIGRATED	0x00
+ #endif
++#define ENQUEUE_INITIAL		0x80
+ 
+ #define RETRY_TASK		((void *)-1UL)
+ 
+-- 
+2.40.1.445.gf85cd430b1
+
