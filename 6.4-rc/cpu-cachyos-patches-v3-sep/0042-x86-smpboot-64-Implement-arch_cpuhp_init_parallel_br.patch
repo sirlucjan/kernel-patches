@@ -1,0 +1,231 @@
+From f1e21b7b9c77614b60f0f4857da09370a05d2257 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Fri, 12 May 2023 23:07:56 +0200
+Subject: [PATCH 42/42] x86/smpboot/64: Implement
+ arch_cpuhp_init_parallel_bringup() and enable it
+
+Implement the validation function which tells the core code whether
+parallel bringup is possible.
+
+The only condition for now is that the kernel does not run in an encrypted
+guest as these will trap the RDMSR via #VC, which cannot be handled at that
+point in early startup.
+
+There was an earlier variant for AMD-SEV which used the GHBC protocol for
+retrieving the APIC ID via CPUID, but there is no guarantee that the
+initial APIC ID in CPUID is the same as the real APIC ID. There is no
+enforcement from the secure firmware and the hypervisor can assign APIC IDs
+as it sees fit as long as the ACPI/MADT table is consistent with that
+assignment.
+
+Unfortunately there is no RDMSR GHCB protocol at the moment, so enabling
+AMD-SEV guests for parallel startup needs some more thought.
+
+Intel-TDX provides a secure RDMSR hypercall, but supporting that is outside
+the scope of this change.
+
+Fixup announce_cpu() as e.g. on Hyper-V CPU1 is the secondary sibling of
+CPU0, which makes the @cpu == 1 logic in announce_cpu() fall apart.
+
+[ mikelley: Reported the announce_cpu() fallout
+
+Originally-by: David Woodhouse <dwmw@amazon.co.uk>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Michael Kelley <mikelley@microsoft.com>
+---
+ arch/x86/Kconfig             |  3 +-
+ arch/x86/kernel/cpu/common.c |  6 +--
+ arch/x86/kernel/smpboot.c    | 87 +++++++++++++++++++++++++++++-------
+ 3 files changed, 75 insertions(+), 21 deletions(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index c140a73b4..953823fdf 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -274,8 +274,9 @@ config X86
+ 	select HAVE_UNSTABLE_SCHED_CLOCK
+ 	select HAVE_USER_RETURN_NOTIFIER
+ 	select HAVE_GENERIC_VDSO
++	select HOTPLUG_PARALLEL			if SMP && X86_64
+ 	select HOTPLUG_SMT			if SMP
+-	select HOTPLUG_SPLIT_STARTUP		if SMP
++	select HOTPLUG_SPLIT_STARTUP		if SMP && X86_32
+ 	select IRQ_FORCED_THREADING
+ 	select NEED_PER_CPU_EMBED_FIRST_CHUNK
+ 	select NEED_PER_CPU_PAGE_FIRST_CHUNK
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 640fd1802..7cc44ebea 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -2128,11 +2128,7 @@ static inline void setup_getcpu(int cpu)
+ }
+ 
+ #ifdef CONFIG_X86_64
+-static inline void ucode_cpu_init(int cpu)
+-{
+-	if (cpu)
+-		load_ucode_ap();
+-}
++static inline void ucode_cpu_init(int cpu) { }
+ 
+ static inline void tss_setup_ist(struct tss_struct *tss)
+ {
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 4b97373d8..660709e94 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -58,6 +58,7 @@
+ #include <linux/overflow.h>
+ #include <linux/stackprotector.h>
+ #include <linux/cpuhotplug.h>
++#include <linux/mc146818rtc.h>
+ 
+ #include <asm/acpi.h>
+ #include <asm/cacheinfo.h>
+@@ -75,7 +76,7 @@
+ #include <asm/fpu/api.h>
+ #include <asm/setup.h>
+ #include <asm/uv/uv.h>
+-#include <linux/mc146818rtc.h>
++#include <asm/microcode.h>
+ #include <asm/i8259.h>
+ #include <asm/misc.h>
+ #include <asm/qspinlock.h>
+@@ -128,7 +129,6 @@ int arch_update_cpu_topology(void)
+ 	return retval;
+ }
+ 
+-
+ static unsigned int smpboot_warm_reset_vector_count;
+ 
+ static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
+@@ -226,16 +226,43 @@ static void notrace start_secondary(void *unused)
+ 	 */
+ 	cr4_init();
+ 
+-#ifdef CONFIG_X86_32
+-	/* switch away from the initial page table */
+-	load_cr3(swapper_pg_dir);
+-	__flush_tlb_all();
+-#endif
++	/*
++	 * 32-bit specific. 64-bit reaches this code with the correct page
++	 * table established. Yet another historical divergence.
++	 */
++	if (IS_ENABLED(CONFIG_X86_32)) {
++		/* switch away from the initial page table */
++		load_cr3(swapper_pg_dir);
++		__flush_tlb_all();
++	}
++
+ 	cpu_init_exception_handling();
+ 
+ 	/*
+-	 * Synchronization point with the hotplug core. Sets the
+-	 * synchronization state to ALIVE and waits for the control CPU to
++	 * 32-bit systems load the microcode from the ASM startup code for
++	 * historical reasons.
++	 *
++	 * On 64-bit systems load it before reaching the AP alive
++	 * synchronization point below so it is not part of the full per
++	 * CPU serialized bringup part when "parallel" bringup is enabled.
++	 *
++	 * That's even safe when hyperthreading is enabled in the CPU as
++	 * the core code starts the primary threads first and leaves the
++	 * secondary threads waiting for SIPI. Loading microcode on
++	 * physical cores concurrently is a safe operation.
++	 *
++	 * This covers both the Intel specific issue that concurrent
++	 * microcode loading on SMT siblings must be prohibited and the
++	 * vendor independent issue`that microcode loading which changes
++	 * CPUID, MSRs etc. must be strictly serialized to maintain
++	 * software state correctness.
++	 */
++	if (IS_ENABLED(CONFIG_X86_64))
++		load_ucode_ap();
++
++	/*
++	 * Synchronization point with the hotplug core. Sets this CPUs
++	 * synchronization state to ALIVE and spin-waits for the control CPU to
+ 	 * release this CPU for further bringup.
+ 	 */
+ 	cpuhp_ap_sync_alive();
+@@ -918,9 +945,9 @@ static int wakeup_secondary_cpu_via_init(int phys_apicid, unsigned long start_ei
+ /* reduce the number of lines printed when booting a large cpu count system */
+ static void announce_cpu(int cpu, int apicid)
+ {
++	static int width, node_width, first = 1;
+ 	static int current_node = NUMA_NO_NODE;
+ 	int node = early_cpu_to_node(cpu);
+-	static int width, node_width;
+ 
+ 	if (!width)
+ 		width = num_digits(num_possible_cpus()) + 1; /* + '#' sign */
+@@ -928,10 +955,10 @@ static void announce_cpu(int cpu, int apicid)
+ 	if (!node_width)
+ 		node_width = num_digits(num_possible_nodes()) + 1; /* + '#' */
+ 
+-	if (cpu == 1)
+-		printk(KERN_INFO "x86: Booting SMP configuration:\n");
+-
+ 	if (system_state < SYSTEM_RUNNING) {
++		if (first)
++			pr_info("x86: Booting SMP configuration:\n");
++
+ 		if (node != current_node) {
+ 			if (current_node > (-1))
+ 				pr_cont("\n");
+@@ -942,11 +969,11 @@ static void announce_cpu(int cpu, int apicid)
+ 		}
+ 
+ 		/* Add padding for the BSP */
+-		if (cpu == 1)
++		if (first)
+ 			pr_cont("%*s", width + 1, " ");
++		first = 0;
+ 
+ 		pr_cont("%*s#%d", width - num_digits(cpu), " ", cpu);
+-
+ 	} else
+ 		pr_info("Booting Node %d Processor %d APIC 0x%x\n",
+ 			node, cpu, apicid);
+@@ -1236,6 +1263,36 @@ void __init smp_prepare_cpus_common(void)
+ 	set_cpu_sibling_map(0);
+ }
+ 
++#ifdef CONFIG_X86_64
++/* Establish whether parallel bringup can be supported. */
++bool __init arch_cpuhp_init_parallel_bringup(void)
++{
++	/*
++	 * Encrypted guests require special handling. They enforce X2APIC
++	 * mode but the RDMSR to read the APIC ID is intercepted and raises
++	 * #VC or #VE which cannot be handled in the early startup code.
++	 *
++	 * AMD-SEV does not provide a RDMSR GHCB protocol so the early
++	 * startup code cannot directly communicate with the secure
++	 * firmware. The alternative solution to retrieve the APIC ID via
++	 * CPUID(0xb), which is covered by the GHCB protocol, is not viable
++	 * either because there is no enforcement of the CPUID(0xb)
++	 * provided "initial" APIC ID to be the same as the real APIC ID.
++	 *
++	 * Intel-TDX has a secure RDMSR hypercall, but that needs to be
++	 * implemented seperately in the low level startup ASM code.
++	 */
++	if (cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT)) {
++		pr_info("Parallel CPU startup disabled due to guest state encryption\n");
++		return false;
++	}
++
++	smpboot_control = STARTUP_READ_APICID;
++	pr_debug("Parallel CPU startup enabled: 0x%08x\n", smpboot_control);
++	return true;
++}
++#endif
++
+ /*
+  * Prepare for SMP bootup.
+  * @max_cpus: configured maximum number of CPUs, It is a legacy parameter
+-- 
+2.40.1.445.gf85cd430b1
+
