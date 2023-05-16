@@ -1,0 +1,150 @@
+From 1368accaaa1b657689698831482571845c873eb6 Mon Sep 17 00:00:00 2001
+From: David Woodhouse <dwmw@amazon.co.uk>
+Date: Tue, 28 Mar 2023 20:57:53 +0100
+Subject: [PATCH 11/18] cpu/hotplug: Add CPUHP_BP_PARALLEL_STARTUP state before
+ CPUHP_BRINGUP_CPU
+
+There is often significant latency in the early stages of CPU bringup,
+and time is wasted by waking each CPU (e.g. with SIPI/INIT/INIT on x86)
+and then waiting for it to make its way through hardware powerup and
+through firmware before finally reaching the kernel entry point and
+moving on through its startup.
+
+Allow a platform to register a pre-bringup CPUHP state to which each
+CPU can be stepped in parallel, thus absorbing some of that latency.
+
+There is a subtlety here: even with an empty CPUHP_BP_PARALLEL_STARTUP
+step, this means that *all* CPUs are brought through the prepare states
+all the way to CPUHP_BP_PARALLEL_STARTUP before any of them are taken
+to CPUHP_BRINGUP_CPU and then are allowed to run for themselves to
+CPUHP_ONLINE.
+
+So any combination of prepare/start calls which depend on A-B ordering
+for each CPU in turn would explore horribly. As an example, the X2APIC
+code prior to commit cefad862f238 ("x86/apic/x2apic: Allow CPU
+cluster_mask to be populated in parallel") would allocate a new cluster
+mask "just in case" and store it in a global variable in the prep stage,
+then the AP would potentially consume that preallocated structure and set
+the global pointer to NULL to be reallocated in CPUHP_X2APIC_PREPARE for
+the next CPU. Which doesn't work at all if the prepare step is run for
+all the CPUs first.
+
+Any platform enabling the CPUHP_BP_PARALLEL_STARTUP step must be
+reviewed and tested to ensure that such issues do not exist, and the
+existing behaviour of each AP through to CPUHP_BP_PREPARE_DYN and then
+immediately to CPUHP_BRINGUP_CPU and CPUHP_ONLINE only one at a time
+does not change unless such a state is registered.
+
+Note that this does *not* yet bring each AP to the CPUHP_BRINGUP_CPU
+state at the same time, only to the new CPUHP_BP_PARALLEL_STARTUP state.
+The final loop in bringup_nonboot_cpus() remains the same, bringing each
+AP in turn from the CPUHP_BP_PARALLEL_STARTUP (or all the way from
+CPUHP_OFFLINE) to CPUHP_BRINGUP_CPU and then waiting for that AP to do
+its own processing and reach CPUHP_ONLINE before releasing the next.
+
+Parallelising that part by bringing them all to CPUHP_BRINGUP_CPU and
+then waiting for them all to run to CPUHP_ONLINE at the same time is a
+more complicated exercise for the future.
+
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Signed-off-by: Usama Arif <usama.arif@bytedance.com>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+Tested-by: Kim Phillips <kim.phillips@amd.com>
+Tested-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+Tested-by: Guilherme G. Piccoli <gpiccoli@igalia.com>
+Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+Tested-by: Mark Rutland <mark.rutland@arm.com> [arm64]
+---
+ include/linux/cpuhotplug.h | 22 ++++++++++++++++++++++
+ kernel/cpu.c               | 38 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 5b2f8147d..d2d82c653 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -133,6 +133,28 @@ enum cpuhp_state {
+ 	CPUHP_MIPS_SOC_PREPARE,
+ 	CPUHP_BP_PREPARE_DYN,
+ 	CPUHP_BP_PREPARE_DYN_END		= CPUHP_BP_PREPARE_DYN + 20,
++	/*
++	 * This is an optional state if the architecture supports parallel
++	 * startup. It's used to start bringing the CPU online (e.g. send
++	 * the startup IPI) so that the APs can run in parallel through
++	 * the low level startup code instead of waking them one by one in
++	 * CPUHP_BRINGUP_CPU. This avoids waiting for the AP to react and
++	 * shortens the serialized phase of the bringup.
++	 *
++	 * If the architecture registers this state, all APs will be taken
++	 * to it (and thus through all prior states) before any is taken
++	 * to the subsequent CPUHP_BRINGUP_CPU state.
++	 */
++	CPUHP_BP_PARALLEL_STARTUP,
++
++	/*
++	 * This step brings the AP online and takes it to the point where it
++	 * manages its own state from here on. For the time being, the rest
++	 * of the AP bringup is fully serialized despite running on the AP.
++	 * If the architecture doesn't use the CPUHP_BP_PARALLEL_STARTUP
++	 * state, this step also does all the work of bringing the CPU
++	 * online.
++	 */
+ 	CPUHP_BRINGUP_CPU,
+ 
+ 	/*
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 43e0a77f2..3382273ea 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -1504,13 +1504,45 @@ int bringup_hibernate_cpu(unsigned int sleep_cpu)
+ 
+ void bringup_nonboot_cpus(unsigned int setup_max_cpus)
+ {
+-	unsigned int cpu;
++	unsigned int cpu, n = num_online_cpus();
+ 
++	/*
++	 * On architectures which have setup the CPUHP_BP_PARALLEL_STARTUP
++	 * state, this invokes all BP prepare states and the parallel
++	 * startup state sends the startup IPI to each of the to be onlined
++	 * APs. This avoids waiting for each AP to respond to the startup
++	 * IPI in CPUHP_BRINGUP_CPU. The APs proceed through the low level
++	 * bringup code and then wait for the control CPU to release them
++	 * one by one for the final onlining procedure in the loop below.
++	 *
++	 * For architectures which do not support parallel bringup all
++	 * states are fully serialized in the loop below.
++	 */
++	if (!cpuhp_step_empty(true, cpuhp_get_step(CPUHP_BP_PARALLEL_STARTUP))) {
++		for_each_present_cpu(cpu) {
++			if (n++ >= setup_max_cpus)
++				break;
++			cpu_up(cpu, CPUHP_BP_PARALLEL_STARTUP);
++		}
++	}
++
++	/* Do the per CPU serialized bringup to ONLINE state */
+ 	for_each_present_cpu(cpu) {
+ 		if (num_online_cpus() >= setup_max_cpus)
+ 			break;
+-		if (!cpu_online(cpu))
+-			cpu_up(cpu, CPUHP_ONLINE);
++
++		if (!cpu_online(cpu)) {
++			struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
++			int ret = cpu_up(cpu, CPUHP_ONLINE);
++
++			/*
++			 * Due to the above preparation loop a failed online attempt
++			 * might have only rolled back to CPUHP_BP_PARALLEL_STARTUP. Do the
++			 * remaining cleanups. NOOP for the non parallel case.
++			 */
++			if (ret && can_rollback_cpu(st))
++				WARN_ON(cpuhp_invoke_callback_range(false, cpu, st, CPUHP_OFFLINE));
++		}
+ 	}
+ }
+ 
+-- 
+2.40.1.445.gf85cd430b1
+
