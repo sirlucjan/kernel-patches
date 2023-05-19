@@ -8,6 +8,8 @@
 
 Here are patches reformatted (with `git format-patch` and/or `git diff`) and rebased from: 
 
+- [CachyOS](https://github.com/CachyOS/linux)
+
 - [pf-kernel](https://codeberg.org/pf-kernel/linux)
 
 - [Project C](https://gitlab.com/alfredchen/linux-prjc)
