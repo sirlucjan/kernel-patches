@@ -1,0 +1,211 @@
+From 7772500d6ffecaa8e1a2f08d16a6c691643ed9e1 Mon Sep 17 00:00:00 2001
+From: Wyes Karny <wyes.karny@amd.com>
+Date: Thu, 18 May 2023 05:58:19 +0000
+Subject: [PATCH 1/3] cpufreq: amd-pstate: Update policy->cur for adjust perf
+
+Driver should update policy->cur after updating the frequency.
+Currently amd_pstate doesn't update policy->cur when `adjust_perf`
+is used. Which causes /proc/cpuinfo to show wrong cpu frequency.
+Fix this by updating policy->cur with correct frequency value in
+adjust_perf function callback.
+
+- Before the fix: (setting min freq to 1.5 MHz)
+
+[root@amd]# cat /proc/cpuinfo | grep "cpu MHz" | sort | uniq --count
+      1 cpu MHz         : 1777.016
+      1 cpu MHz         : 1797.160
+      1 cpu MHz         : 1797.270
+    189 cpu MHz         : 400.000
+
+- After the fix: (setting min freq to 1.5 MHz)
+
+[root@amd]# cat /proc/cpuinfo | grep "cpu MHz" | sort | uniq --count
+      1 cpu MHz         : 1753.353
+      1 cpu MHz         : 1756.838
+      1 cpu MHz         : 1776.466
+      1 cpu MHz         : 1776.873
+      1 cpu MHz         : 1777.308
+      1 cpu MHz         : 1779.900
+    183 cpu MHz         : 1805.231
+      1 cpu MHz         : 1956.815
+      1 cpu MHz         : 2246.203
+      1 cpu MHz         : 2259.984
+
+Fixes: 1d215f0319c2 ("cpufreq: amd-pstate: Add fast switch function for AMD P-State")
+
+Signed-off-by: Wyes Karny <wyes.karny@amd.com>
+---
+ drivers/cpufreq/amd-pstate.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 5a3d4aa0f..736dab69b 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -479,12 +479,14 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
+ 				   unsigned long capacity)
+ {
+ 	unsigned long max_perf, min_perf, des_perf,
+-		      cap_perf, lowest_nonlinear_perf;
++		      cap_perf, lowest_nonlinear_perf, max_freq;
+ 	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+ 	struct amd_cpudata *cpudata = policy->driver_data;
++	unsigned int target_freq;
+ 
+ 	cap_perf = READ_ONCE(cpudata->highest_perf);
+ 	lowest_nonlinear_perf = READ_ONCE(cpudata->lowest_nonlinear_perf);
++	max_freq = READ_ONCE(cpudata->max_freq);
+ 
+ 	des_perf = cap_perf;
+ 	if (target_perf < capacity)
+@@ -501,6 +503,10 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
+ 	if (max_perf < min_perf)
+ 		max_perf = min_perf;
+ 
++	des_perf = clamp_t(unsigned long, des_perf, min_perf, max_perf);
++	target_freq = div_u64(des_perf * max_freq, max_perf);
++	policy->cur = target_freq;
++
+ 	amd_pstate_update(cpudata, min_perf, des_perf, max_perf, true,
+ 			policy->governor->flags);
+ 	cpufreq_cpu_put(policy);
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From 9d69613257249fd1f1d51963eca74a65cfc0856c Mon Sep 17 00:00:00 2001
+From: "Gautham R. Shenoy" <gautham.shenoy@amd.com>
+Date: Wed, 17 May 2023 16:28:15 +0000
+Subject: [PATCH 2/3] amd_pstate: Add ->fast_switch() callback
+
+Schedutil normally calls the adjust_perf callback for drivers with
+adjust_perf callback available and fast_switch_possible flag set.
+However, when frequency invariance is disabled and schedutil tries to
+invoke fast_switch. So, there is a chance of kernel crash if this
+function pointer is not set. To protect against this scenario add
+fast_switch callback to amd_pstate driver.
+
+Fixes: 1d215f0319c2 ("cpufreq: amd-pstate: Add fast switch function for AMD P-State")
+
+Signed-off-by: Wyes Karny <wyes.karny@amd.com>
+Signed-off-by: Gautham R. Shenoy <gautham.shenoy@amd.com>
+---
+ drivers/cpufreq/amd-pstate.c | 36 ++++++++++++++++++++++++++++++------
+ 1 file changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 736dab69b..3387bfc2d 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -444,9 +444,8 @@ static int amd_pstate_verify(struct cpufreq_policy_data *policy)
+ 	return 0;
+ }
+ 
+-static int amd_pstate_target(struct cpufreq_policy *policy,
+-			     unsigned int target_freq,
+-			     unsigned int relation)
++static int amd_pstate_update_freq(struct cpufreq_policy *policy,
++				  unsigned int target_freq, bool fast_switch)
+ {
+ 	struct cpufreq_freqs freqs;
+ 	struct amd_cpudata *cpudata = policy->driver_data;
+@@ -465,14 +464,37 @@ static int amd_pstate_target(struct cpufreq_policy *policy,
+ 	des_perf = DIV_ROUND_CLOSEST(target_freq * cap_perf,
+ 				     cpudata->max_freq);
+ 
+-	cpufreq_freq_transition_begin(policy, &freqs);
++	WARN_ON(fast_switch && !policy->fast_switch_enabled);
++	/*
++	 * If fast_switch is desired, then there aren't any registered
++	 * transition notifiers. See comment for
++	 * cpufreq_enable_fast_switch().
++	 */
++	if (!fast_switch)
++		cpufreq_freq_transition_begin(policy, &freqs);
++
+ 	amd_pstate_update(cpudata, min_perf, des_perf,
+-			  max_perf, false, policy->governor->flags);
+-	cpufreq_freq_transition_end(policy, &freqs, false);
++			max_perf, fast_switch, policy->governor->flags);
++
++	if (!fast_switch)
++		cpufreq_freq_transition_end(policy, &freqs, false);
+ 
+ 	return 0;
+ }
+ 
++static int amd_pstate_target(struct cpufreq_policy *policy,
++			     unsigned int target_freq,
++			     unsigned int relation)
++{
++	return amd_pstate_update_freq(policy, target_freq, false);
++}
++
++static unsigned int amd_pstate_fast_switch(struct cpufreq_policy *policy,
++				  unsigned int target_freq)
++{
++	return amd_pstate_update_freq(policy, target_freq, true);
++}
++
+ static void amd_pstate_adjust_perf(unsigned int cpu,
+ 				   unsigned long _min_perf,
+ 				   unsigned long target_perf,
+@@ -721,6 +743,7 @@ static int amd_pstate_cpu_exit(struct cpufreq_policy *policy)
+ 
+ 	freq_qos_remove_request(&cpudata->req[1]);
+ 	freq_qos_remove_request(&cpudata->req[0]);
++	policy->fast_switch_possible = false;
+ 	kfree(cpudata);
+ 
+ 	return 0;
+@@ -1315,6 +1338,7 @@ static struct cpufreq_driver amd_pstate_driver = {
+ 	.flags		= CPUFREQ_CONST_LOOPS | CPUFREQ_NEED_UPDATE_LIMITS,
+ 	.verify		= amd_pstate_verify,
+ 	.target		= amd_pstate_target,
++	.fast_switch    = amd_pstate_fast_switch,
+ 	.init		= amd_pstate_cpu_init,
+ 	.exit		= amd_pstate_cpu_exit,
+ 	.suspend	= amd_pstate_cpu_suspend,
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From b38550b85d96559849c8b302df77d77d2e6c2ee8 Mon Sep 17 00:00:00 2001
+From: Wyes Karny <wyes.karny@amd.com>
+Date: Wed, 17 May 2023 16:28:16 +0000
+Subject: [PATCH 3/3] cpufreq/amd-pstate: Remove fast_switch_possible flag from
+ active driver
+
+amd_pstate active mode driver is only compatible with static governors.
+Therefore it doesn't need fast_switch functionality. Remove
+fast_switch_possible flag from amd_pstate active mode driver.
+
+Fixes: ffa5096a7c33 ("cpufreq: amd-pstate: implement Pstate EPP support for the AMD processors")
+Signed-off-by: Wyes Karny <wyes.karny@amd.com>
+---
+ drivers/cpufreq/amd-pstate.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 3387bfc2d..ddd346a23 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -1108,7 +1108,6 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 	policy->policy = CPUFREQ_POLICY_POWERSAVE;
+ 
+ 	if (boot_cpu_has(X86_FEATURE_CPPC)) {
+-		policy->fast_switch_possible = true;
+ 		ret = rdmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, &value);
+ 		if (ret)
+ 			return ret;
+@@ -1131,7 +1130,6 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ static int amd_pstate_epp_cpu_exit(struct cpufreq_policy *policy)
+ {
+ 	pr_debug("CPU %d exiting\n", policy->cpu);
+-	policy->fast_switch_possible = false;
+ 	return 0;
+ }
+ 
+-- 
+2.40.1.445.gf85cd430b1
+
