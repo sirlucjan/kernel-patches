@@ -1,0 +1,1290 @@
+From 88abfffd2d533883a82637ad07c83efde45024a9 Mon Sep 17 00:00:00 2001
+From: Wengang Wang <wen.gang.wang@oracle.com>
+Date: Mon, 24 Apr 2023 15:51:02 -0700
+Subject: [PATCH 1/7] xfs: avoid freeing multiple extents from same AG in
+ pending transactions
+
+To avoid possible deadlock when allocating AGFL blocks, change the behaviour.
+The orignal hehaviour for freeing extents in an EFI is that the extents in
+the EFI were processed one by one in the same transaction. When the second
+and subsequent extents are being processed, we have produced busy extents for
+previous extents. If the second and subsequent extents are from the same AG
+as the busy extents are, we have the risk of deadlock when allocating AGFL
+blocks. A typical calltrace for the deadlock is like this:
+
+	#0	context_switch() kernel/sched/core.c:3881
+	#1	__schedule() kernel/sched/core.c:5111
+	#2	schedule() kernel/sched/core.c:5186
+	#3	xfs_extent_busy_flush() fs/xfs/xfs_extent_busy.c:598
+	#4	xfs_alloc_ag_vextent_size() fs/xfs/libxfs/xfs_alloc.c:1641
+	#5	xfs_alloc_ag_vextent() fs/xfs/libxfs/xfs_alloc.c:828
+	#6	xfs_alloc_fix_freelist() fs/xfs/libxfs/xfs_alloc.c:2362
+	#7	xfs_free_extent_fix_freelist() fs/xfs/libxfs/xfs_alloc.c:3029
+	#8	__xfs_free_extent() fs/xfs/libxfs/xfs_alloc.c:3067
+	#9	xfs_trans_free_extent() fs/xfs/xfs_extfree_item.c:370
+	#10	xfs_efi_recover() fs/xfs/xfs_extfree_item.c:626
+	#11	xlog_recover_process_efi() fs/xfs/xfs_log_recover.c:4605
+	#12	xlog_recover_process_intents() fs/xfs/xfs_log_recover.c:4893
+	#13	xlog_recover_finish() fs/xfs/xfs_log_recover.c:5824
+	#14	xfs_log_mount_finish() fs/xfs/xfs_log.c:764
+	#15	xfs_mountfs() fs/xfs/xfs_mount.c:978
+	#16	xfs_fs_fill_super() fs/xfs/xfs_super.c:1908
+	#17	mount_bdev() fs/super.c:1417
+	#18	xfs_fs_mount() fs/xfs/xfs_super.c:1985
+	#19	legacy_get_tree() fs/fs_context.c:647
+	#20	vfs_get_tree() fs/super.c:1547
+	#21	do_new_mount() fs/namespace.c:2843
+	#22	do_mount() fs/namespace.c:3163
+	#23	ksys_mount() fs/namespace.c:3372
+	#24	__do_sys_mount() fs/namespace.c:3386
+	#25	__se_sys_mount() fs/namespace.c:3383
+	#26	__x64_sys_mount() fs/namespace.c:3383
+	#27	do_syscall_64() arch/x86/entry/common.c:296
+	#28	entry_SYSCALL_64() arch/x86/entry/entry_64.S:180
+
+The deadlock could happen at both IO time and log recover time.
+
+To avoid above deadlock, this patch changes the extent free procedure.
+1) it always let the first extent from the EFI go (no change).
+2) increase the (new) AG counter when it let a extent go.
+3) for the 2nd+ extents, if the owning AGs ready have pending extents
+   don't let the extent go with current transaction. Instead, move the
+   extent in question and subsequent extents to a new EFI and try the new
+   EFI again with new transaction (by rolling current transaction).
+4) for the EFD to orginal EFI, fill it with all the extents from the original
+   EFI.
+5) though the new EFI is placed after original EFD, it's safe as they are in
+   same in-memory transaction.
+6) The new AG counter for pending extent freeings is decremented after the
+   log items in in-memory transaction is committed to CIL.
+
+Signed-off-by: Wengang Wang <wen.gang.wang@oracle.com>
+---
+ fs/xfs/libxfs/xfs_ag.c    |   1 +
+ fs/xfs/libxfs/xfs_ag.h    |   5 ++
+ fs/xfs/xfs_extfree_item.c | 111 +++++++++++++++++++++++++++++++++++++-
+ fs/xfs/xfs_log_cil.c      |  24 ++++++++-
+ 4 files changed, 138 insertions(+), 3 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_ag.c b/fs/xfs/libxfs/xfs_ag.c
+index 86696a1c6..61ef61e05 100644
+--- a/fs/xfs/libxfs/xfs_ag.c
++++ b/fs/xfs/libxfs/xfs_ag.c
+@@ -378,6 +378,7 @@ xfs_initialize_perag(
+ 		pag->pagb_tree = RB_ROOT;
+ #endif /* __KERNEL__ */
+ 
++		atomic_set(&pag->pag_nr_pending_extents, 0);
+ 		error = xfs_buf_hash_init(pag);
+ 		if (error)
+ 			goto out_remove_pag;
+diff --git a/fs/xfs/libxfs/xfs_ag.h b/fs/xfs/libxfs/xfs_ag.h
+index 5e18536df..5950bc36a 100644
+--- a/fs/xfs/libxfs/xfs_ag.h
++++ b/fs/xfs/libxfs/xfs_ag.h
+@@ -82,6 +82,11 @@ struct xfs_perag {
+ 	uint16_t	pag_sick;
+ 	spinlock_t	pag_state_lock;
+ 
++	/*
++	 * Number of concurrent extent freeings (not committed to CIL yet)
++	 * on this AG.
++	 */
++	atomic_t	pag_nr_pending_extents;
+ 	spinlock_t	pagb_lock;	/* lock for pagb_tree */
+ 	struct rb_root	pagb_tree;	/* ordered tree of busy extents */
+ 	unsigned int	pagb_gen;	/* generation count for pagb_tree */
+diff --git a/fs/xfs/xfs_extfree_item.c b/fs/xfs/xfs_extfree_item.c
+index 011b50469..1dbf36d9c 100644
+--- a/fs/xfs/xfs_extfree_item.c
++++ b/fs/xfs/xfs_extfree_item.c
+@@ -336,6 +336,75 @@ xfs_trans_get_efd(
+ 	return efdp;
+ }
+ 
++/*
++ * Fill the EFD with all extents from the EFI and set the counter.
++ * Note: the EFD should comtain at least one extents already.
++ */
++static void xfs_fill_efd_with_efi(struct xfs_efd_log_item *efdp)
++{
++	struct xfs_efi_log_item	*efip = efdp->efd_efip;
++	uint			i;
++
++	i = efdp->efd_next_extent;
++	ASSERT(i > 0);
++	for (; i < efip->efi_format.efi_nextents; i++) {
++		efdp->efd_format.efd_extents[i] =
++			efip->efi_format.efi_extents[i];
++	}
++	efdp->efd_next_extent = i;
++}
++
++/*
++ * Check if xefi is the first in the efip.
++ * Returns true if so, ad false otherwise
++ */
++static bool xfs_is_first_extent_in_efi(struct xfs_efi_log_item *efip,
++				  struct xfs_extent_free_item *xefi)
++{
++	return efip->efi_format.efi_extents[0].ext_start ==
++					xefi->xefi_startblock;
++}
++
++/*
++ * Check if the xefi needs to be in a new transaction.
++ * efip is the containing EFI of xefi.
++ * Return true if so, false otherwise.
++ */
++static bool xfs_extent_free_need_new_trans(struct xfs_mount *mp,
++				    struct xfs_efi_log_item *efip,
++				    struct xfs_extent_free_item *xefi)
++{
++	bool			ret = true;
++	int			nr_pre;
++	xfs_agnumber_t		agno;
++	struct xfs_perag	*pag;
++
++	agno = XFS_FSB_TO_AGNO(mp, xefi->xefi_startblock);
++	pag = xfs_perag_get(mp, agno);
++	/* The first extent in EFI is always OK to go */
++	if (xfs_is_first_extent_in_efi(efip, xefi)) {
++		atomic_inc(&pag->pag_nr_pending_extents);
++		ret = false;
++		goto out_put;
++	}
++
++	/*
++	 * Now the extent is the 2nd or subsequent in the efip. We need
++	 * new transaction if the AG already has busy extents pending.
++	 */
++	nr_pre = atomic_inc_return(&pag->pag_nr_pending_extents) - 1;
++	/* No prevoius pending extent freeing to this AG */
++	if (nr_pre == 0) {
++		ret = false;
++		goto out_put;
++	}
++
++	atomic_dec(&pag->pag_nr_pending_extents);
++out_put:
++	xfs_perag_put(pag);
++	return ret;
++}
++
+ /*
+  * Free an extent and log it to the EFD. Note that the transaction is marked
+  * dirty regardless of whether the extent free succeeds or fails to support the
+@@ -356,6 +425,28 @@ xfs_trans_free_extent(
+ 	xfs_agblock_t			agbno = XFS_FSB_TO_AGBNO(mp,
+ 							xefi->xefi_startblock);
+ 	int				error;
++	struct xfs_efi_log_item		*efip = efdp->efd_efip;
++
++	if (xfs_extent_free_need_new_trans(mp, efip, xefi)) {
++		/*
++		 * This should be the 2nd+ extent, we don't have to mark the
++		 * transaction and efd dirty, those are already done with the
++		 * first extent.
++		 */
++		ASSERT(tp->t_flags & XFS_TRANS_DIRTY);
++		ASSERT(tp->t_flags & XFS_TRANS_HAS_INTENT_DONE);
++		ASSERT(test_bit(XFS_LI_DIRTY, &efdp->efd_item.li_flags));
++
++		xfs_fill_efd_with_efi(efdp);
++
++		/*
++		 * A preious extent in same AG is processed with the current
++		 * transaction. To avoid possible AGFL allocation deadlock,
++		 * we roll the transaction and then restart with this extent
++		 * with new transaction.
++		 */
++		return -EAGAIN;
++	}
+ 
+ 	oinfo.oi_owner = xefi->xefi_owner;
+ 	if (xefi->xefi_flags & XFS_EFI_ATTR_FORK)
+@@ -369,6 +460,13 @@ xfs_trans_free_extent(
+ 	error = __xfs_free_extent(tp, xefi->xefi_startblock,
+ 			xefi->xefi_blockcount, &oinfo, XFS_AG_RESV_NONE,
+ 			xefi->xefi_flags & XFS_EFI_SKIP_DISCARD);
++	if (error) {
++		struct xfs_perag	*pag;
++
++		pag = xfs_perag_get(mp, agno);
++		atomic_dec(&pag->pag_nr_pending_extents);
++		xfs_perag_put(pag);
++	}
+ 	/*
+ 	 * Mark the transaction dirty, even on error. This ensures the
+ 	 * transaction is aborted, which:
+@@ -476,7 +574,8 @@ xfs_extent_free_finish_item(
+ 	xefi = container_of(item, struct xfs_extent_free_item, xefi_list);
+ 
+ 	error = xfs_trans_free_extent(tp, EFD_ITEM(done), xefi);
+-	kmem_cache_free(xfs_extfree_item_cache, xefi);
++	if (error != -EAGAIN)
++		kmem_cache_free(xfs_extfree_item_cache, xefi);
+ 	return error;
+ }
+ 
+@@ -632,7 +731,15 @@ xfs_efi_item_recover(
+ 		fake.xefi_startblock = extp->ext_start;
+ 		fake.xefi_blockcount = extp->ext_len;
+ 
+-		error = xfs_trans_free_extent(tp, efdp, &fake);
++		if (error == 0)
++			error = xfs_trans_free_extent(tp, efdp, &fake);
++
++		if (error == -EAGAIN) {
++			ASSERT(i > 0);
++			xfs_free_extent_later(tp, fake.xefi_startblock,
++			fake.xefi_blockcount, &XFS_RMAP_OINFO_ANY_OWNER);
++			continue;
++		}
+ 		if (error == -EFSCORRUPTED)
+ 			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
+ 					extp, sizeof(*extp));
+diff --git a/fs/xfs/xfs_log_cil.c b/fs/xfs/xfs_log_cil.c
+index eccbfb99e..97eda4487 100644
+--- a/fs/xfs/xfs_log_cil.c
++++ b/fs/xfs/xfs_log_cil.c
+@@ -16,6 +16,7 @@
+ #include "xfs_log.h"
+ #include "xfs_log_priv.h"
+ #include "xfs_trace.h"
++#include "xfs_ag.h"
+ 
+ struct workqueue_struct *xfs_discard_wq;
+ 
+@@ -643,8 +644,29 @@ xlog_cil_insert_items(
+ 		cilpcp->space_used += len;
+ 	}
+ 	/* attach the transaction to the CIL if it has any busy extents */
+-	if (!list_empty(&tp->t_busy))
++	if (!list_empty(&tp->t_busy)) {
++		struct xfs_perag	*last_pag = NULL;
++		xfs_agnumber_t		last_agno = -1;
++		struct xfs_extent_busy	*ebp;
++
++		/*
++		 * Pending extent freeings are committed to CIL, now it's
++		 * to let other extent freeing on same AG go.
++		 */
++		list_for_each_entry(ebp, &tp->t_busy, list) {
++			if (ebp->agno != last_agno) {
++				last_agno = ebp->agno;
++				if (last_pag)
++					xfs_perag_put(last_pag);
++				last_pag = xfs_perag_get(tp->t_mountp, last_agno);
++			}
++			atomic_dec(&last_pag->pag_nr_pending_extents);
++		}
++		if (last_pag)
++			xfs_perag_put(last_pag);
++
+ 		list_splice_init(&tp->t_busy, &cilpcp->busy_extents);
++	}
+ 
+ 	/*
+ 	 * Now update the order of everything modified in the transaction
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From 60e6390d0225d187217e69512a39b795b7045c4b Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 1 May 2023 11:27:24 -0700
+Subject: [PATCH 2/7] xfs: explicitly specify cpu when forcing inodegc delayed
+ work to run immediately
+
+I've been noticing odd racing behavior in the inodegc code that could
+only be explained by one cpu adding an inode to its inactivation llist
+at the same time that another cpu is processing that cpu's llist.
+Preemption is disabled between get/put_cpu_ptr, so the only explanation
+is scheduler mayhem.  I inserted the following debug code into
+xfs_inodegc_worker (see the next patch):
+
+	ASSERT(gc->cpu == smp_processor_id());
+
+This assertion tripped during overnight tests on the arm64 machines, but
+curiously not on x86_64.  I think we haven't observed any resource leaks
+here because the lockfree list code can handle simultaneous llist_add
+and llist_del_all functions operating on the same list.  However, the
+whole point of having percpu inodegc lists is to take advantage of warm
+memory caches by inactivating inodes on the last processor to touch the
+inode.
+
+The incorrect scheduling seems to occur after an inodegc worker is
+subjected to mod_delayed_work().  This wraps mod_delayed_work_on with
+WORK_CPU_UNBOUND specified as the cpu number.  Unbound allows for
+scheduling on any cpu, not necessarily the same one that scheduled the
+work.
+
+Because preemption is disabled for as long as we have the gc pointer, I
+think it's safe to use current_cpu() (aka smp_processor_id) to queue the
+delayed work item on the correct cpu.
+
+Fixes: 7cf2b0f9611b ("xfs: bound maximum wait time for inodegc work")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+---
+ fs/xfs/xfs_icache.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index c9a7e270a..9f275cb8d 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -2068,7 +2068,8 @@ xfs_inodegc_queue(
+ 		queue_delay = 0;
+ 
+ 	trace_xfs_inodegc_queue(mp, __return_address);
+-	mod_delayed_work(mp->m_inodegc_wq, &gc->work, queue_delay);
++	mod_delayed_work_on(current_cpu(), mp->m_inodegc_wq, &gc->work,
++			queue_delay);
+ 	put_cpu_ptr(gc);
+ 
+ 	if (xfs_inodegc_want_flush_work(ip, items, shrinker_hits)) {
+@@ -2112,7 +2113,8 @@ xfs_inodegc_cpu_dead(
+ 
+ 	if (xfs_is_inodegc_enabled(mp)) {
+ 		trace_xfs_inodegc_queue(mp, __return_address);
+-		mod_delayed_work(mp->m_inodegc_wq, &gc->work, 0);
++		mod_delayed_work_on(current_cpu(), mp->m_inodegc_wq, &gc->work,
++				0);
+ 	}
+ 	put_cpu_ptr(gc);
+ }
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From d85ab4e177cd721d9096087e9b07dd712bf512a8 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 1 May 2023 11:27:41 -0700
+Subject: [PATCH 3/7] xfs: fix xfs_inodegc_stop racing with mod_delayed_work
+
+syzbot reported this warning from the faux inodegc shrinker that tries
+to kick off inodegc work:
+
+------------[ cut here ]------------
+WARNING: CPU: 1 PID: 102 at kernel/workqueue.c:1445 __queue_work+0xd44/0x1120 kernel/workqueue.c:1444
+RIP: 0010:__queue_work+0xd44/0x1120 kernel/workqueue.c:1444
+Call Trace:
+ __queue_delayed_work+0x1c8/0x270 kernel/workqueue.c:1672
+ mod_delayed_work_on+0xe1/0x220 kernel/workqueue.c:1746
+ xfs_inodegc_shrinker_scan fs/xfs/xfs_icache.c:2212 [inline]
+ xfs_inodegc_shrinker_scan+0x250/0x4f0 fs/xfs/xfs_icache.c:2191
+ do_shrink_slab+0x428/0xaa0 mm/vmscan.c:853
+ shrink_slab+0x175/0x660 mm/vmscan.c:1013
+ shrink_one+0x502/0x810 mm/vmscan.c:5343
+ shrink_many mm/vmscan.c:5394 [inline]
+ lru_gen_shrink_node mm/vmscan.c:5511 [inline]
+ shrink_node+0x2064/0x35f0 mm/vmscan.c:6459
+ kswapd_shrink_node mm/vmscan.c:7262 [inline]
+ balance_pgdat+0xa02/0x1ac0 mm/vmscan.c:7452
+ kswapd+0x677/0xd60 mm/vmscan.c:7712
+ kthread+0x2e8/0x3a0 kernel/kthread.c:376
+ ret_from_fork+0x1f/0x30 arch/x86/entry/entry_64.S:308
+
+This warning corresponds to this code in __queue_work:
+
+	/*
+	 * For a draining wq, only works from the same workqueue are
+	 * allowed. The __WQ_DESTROYING helps to spot the issue that
+	 * queues a new work item to a wq after destroy_workqueue(wq).
+	 */
+	if (unlikely(wq->flags & (__WQ_DESTROYING | __WQ_DRAINING) &&
+		     WARN_ON_ONCE(!is_chained_work(wq))))
+		return;
+
+For this to trip, we must have a thread draining the inodedgc workqueue
+and a second thread trying to queue inodegc work to that workqueue.
+This can happen if freezing or a ro remount race with reclaim poking our
+faux inodegc shrinker and another thread dropping an unlinked O_RDONLY
+file:
+
+Thread 0	Thread 1	Thread 2
+
+xfs_inodegc_stop
+
+				xfs_inodegc_shrinker_scan
+				xfs_is_inodegc_enabled
+				<yes, will continue>
+
+xfs_clear_inodegc_enabled
+xfs_inodegc_queue_all
+<list empty, do not queue inodegc worker>
+
+		xfs_inodegc_queue
+		<add to list>
+		xfs_is_inodegc_enabled
+		<no, returns>
+
+drain_workqueue
+<set WQ_DRAINING>
+
+				llist_empty
+				<no, will queue list>
+				mod_delayed_work_on(..., 0)
+				__queue_work
+				<sees WQ_DRAINING, kaboom>
+
+In other words, everything between the access to inodegc_enabled state
+and the decision to poke the inodegc workqueue requires some kind of
+coordination to avoid the WQ_DRAINING state.  We could perhaps introduce
+a lock here, but we could also try to eliminate WQ_DRAINING from the
+picture.
+
+We could replace the drain_workqueue call with a loop that flushes the
+workqueue and queues workers as long as there is at least one inode
+present in the per-cpu inodegc llists.  We've disabled inodegc at this
+point, so we know that the number of queued inodes will eventually hit
+zero as long as xfs_inodegc_start cannot reactivate the workers.
+
+There are four callers of xfs_inodegc_start.  Three of them come from the
+VFS with s_umount held: filesystem thawing, failed filesystem freezing,
+and the rw remount transition.  The fourth caller is mounting rw (no
+remount or freezing possible).
+
+There are three callers ofs xfs_inodegc_stop.  One is unmounting (no
+remount or thaw possible).  Two of them come from the VFS with s_umount
+held: fs freezing and ro remount transition.
+
+Hence, it is correct to replace the drain_workqueue call with a loop
+that drains the inodegc llists.
+
+Fixes: 6191cf3ad59f ("xfs: flush inodegc workqueue tasks before cancel")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+---
+ fs/xfs/xfs_icache.c | 32 +++++++++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 9f275cb8d..54d97687f 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -435,18 +435,23 @@ xfs_iget_check_free_state(
+ }
+ 
+ /* Make all pending inactivation work start immediately. */
+-static void
++static bool
+ xfs_inodegc_queue_all(
+ 	struct xfs_mount	*mp)
+ {
+ 	struct xfs_inodegc	*gc;
+ 	int			cpu;
++	bool			ret = false;
+ 
+ 	for_each_online_cpu(cpu) {
+ 		gc = per_cpu_ptr(mp->m_inodegc, cpu);
+-		if (!llist_empty(&gc->list))
++		if (!llist_empty(&gc->list)) {
+ 			mod_delayed_work_on(cpu, mp->m_inodegc_wq, &gc->work, 0);
++			ret = true;
++		}
+ 	}
++
++	return ret;
+ }
+ 
+ /*
+@@ -1908,24 +1913,41 @@ xfs_inodegc_flush(
+ 
+ /*
+  * Flush all the pending work and then disable the inode inactivation background
+- * workers and wait for them to stop.
++ * workers and wait for them to stop.  Caller must hold sb->s_umount to
++ * coordinate changes in the inodegc_enabled state.
+  */
+ void
+ xfs_inodegc_stop(
+ 	struct xfs_mount	*mp)
+ {
++	bool			rerun;
++
+ 	if (!xfs_clear_inodegc_enabled(mp))
+ 		return;
+ 
++	/*
++	 * Drain all pending inodegc work, including inodes that could be
++	 * queued by racing xfs_inodegc_queue or xfs_inodegc_shrinker_scan
++	 * threads that sample the inodegc state just prior to us clearing it.
++	 * The inodegc flag state prevents new threads from queuing more
++	 * inodes, so we queue pending work items and flush the workqueue until
++	 * all inodegc lists are empty.  IOWs, we cannot use drain_workqueue
++	 * here because it does not allow other unserialized mechanisms to
++	 * reschedule inodegc work while this draining is in progress.
++	 */
+ 	xfs_inodegc_queue_all(mp);
+-	drain_workqueue(mp->m_inodegc_wq);
++	do {
++		flush_workqueue(mp->m_inodegc_wq);
++		rerun = xfs_inodegc_queue_all(mp);
++	} while (rerun);
+ 
+ 	trace_xfs_inodegc_stop(mp, __return_address);
+ }
+ 
+ /*
+  * Enable the inode inactivation background workers and schedule deferred inode
+- * inactivation work if there is any.
++ * inactivation work if there is any.  Caller must hold sb->s_umount to
++ * coordinate changes in the inodegc_enabled state.
+  */
+ void
+ xfs_inodegc_start(
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From cbb0814a3d708251b9d3c8f26abf1643fc5dd04b Mon Sep 17 00:00:00 2001
+From: Xu Panda <xu.panda@zte.com.cn>
+Date: Wed, 1 Feb 2023 09:31:34 -0800
+Subject: [PATCH 4/7] xfs: use strscpy() to instead of strncpy()
+
+The implementation of strscpy() is more robust and safer.
+That's now the recommended way to copy NUL-terminated strings.
+
+Signed-off-by: Xu Panda <xu.panda@zte.com.cn>
+Signed-off-by: Yang Yang <yang.yang29@zte.com.cn>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+---
+ fs/xfs/xfs_xattr.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/fs/xfs/xfs_xattr.c b/fs/xfs/xfs_xattr.c
+index 7b9a0ed1b..1ab1f6cf7 100644
+--- a/fs/xfs/xfs_xattr.c
++++ b/fs/xfs/xfs_xattr.c
+@@ -212,9 +212,7 @@ __xfs_xattr_put_listent(
+ 	offset = context->buffer + context->count;
+ 	memcpy(offset, prefix, prefix_len);
+ 	offset += prefix_len;
+-	strncpy(offset, (char *)name, namelen);			/* real name */
+-	offset += namelen;
+-	*offset = '\0';
++	strscpy(offset, (char *)name, namelen + 1);			/* real name */
+ 
+ compute_size:
+ 	context->count += prefix_len + namelen + 1;
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From c8b3ae55d118c75402c576a78c9e84f93603df4f Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Fri, 26 May 2023 09:19:05 +0200
+Subject: [PATCH 5/7] Revert "xfs: avoid freeing multiple extents from same AG
+ in pending transactions"
+
+This reverts commit 3c2912ca34ae9a57210c4cd126b4f0917132cea6.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ fs/xfs/libxfs/xfs_ag.c    |   1 -
+ fs/xfs/libxfs/xfs_ag.h    |   5 --
+ fs/xfs/xfs_extfree_item.c | 111 +-------------------------------------
+ fs/xfs/xfs_log_cil.c      |  24 +--------
+ 4 files changed, 3 insertions(+), 138 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_ag.c b/fs/xfs/libxfs/xfs_ag.c
+index 61ef61e05..86696a1c6 100644
+--- a/fs/xfs/libxfs/xfs_ag.c
++++ b/fs/xfs/libxfs/xfs_ag.c
+@@ -378,7 +378,6 @@ xfs_initialize_perag(
+ 		pag->pagb_tree = RB_ROOT;
+ #endif /* __KERNEL__ */
+ 
+-		atomic_set(&pag->pag_nr_pending_extents, 0);
+ 		error = xfs_buf_hash_init(pag);
+ 		if (error)
+ 			goto out_remove_pag;
+diff --git a/fs/xfs/libxfs/xfs_ag.h b/fs/xfs/libxfs/xfs_ag.h
+index 5950bc36a..5e18536df 100644
+--- a/fs/xfs/libxfs/xfs_ag.h
++++ b/fs/xfs/libxfs/xfs_ag.h
+@@ -82,11 +82,6 @@ struct xfs_perag {
+ 	uint16_t	pag_sick;
+ 	spinlock_t	pag_state_lock;
+ 
+-	/*
+-	 * Number of concurrent extent freeings (not committed to CIL yet)
+-	 * on this AG.
+-	 */
+-	atomic_t	pag_nr_pending_extents;
+ 	spinlock_t	pagb_lock;	/* lock for pagb_tree */
+ 	struct rb_root	pagb_tree;	/* ordered tree of busy extents */
+ 	unsigned int	pagb_gen;	/* generation count for pagb_tree */
+diff --git a/fs/xfs/xfs_extfree_item.c b/fs/xfs/xfs_extfree_item.c
+index 1dbf36d9c..011b50469 100644
+--- a/fs/xfs/xfs_extfree_item.c
++++ b/fs/xfs/xfs_extfree_item.c
+@@ -336,75 +336,6 @@ xfs_trans_get_efd(
+ 	return efdp;
+ }
+ 
+-/*
+- * Fill the EFD with all extents from the EFI and set the counter.
+- * Note: the EFD should comtain at least one extents already.
+- */
+-static void xfs_fill_efd_with_efi(struct xfs_efd_log_item *efdp)
+-{
+-	struct xfs_efi_log_item	*efip = efdp->efd_efip;
+-	uint			i;
+-
+-	i = efdp->efd_next_extent;
+-	ASSERT(i > 0);
+-	for (; i < efip->efi_format.efi_nextents; i++) {
+-		efdp->efd_format.efd_extents[i] =
+-			efip->efi_format.efi_extents[i];
+-	}
+-	efdp->efd_next_extent = i;
+-}
+-
+-/*
+- * Check if xefi is the first in the efip.
+- * Returns true if so, ad false otherwise
+- */
+-static bool xfs_is_first_extent_in_efi(struct xfs_efi_log_item *efip,
+-				  struct xfs_extent_free_item *xefi)
+-{
+-	return efip->efi_format.efi_extents[0].ext_start ==
+-					xefi->xefi_startblock;
+-}
+-
+-/*
+- * Check if the xefi needs to be in a new transaction.
+- * efip is the containing EFI of xefi.
+- * Return true if so, false otherwise.
+- */
+-static bool xfs_extent_free_need_new_trans(struct xfs_mount *mp,
+-				    struct xfs_efi_log_item *efip,
+-				    struct xfs_extent_free_item *xefi)
+-{
+-	bool			ret = true;
+-	int			nr_pre;
+-	xfs_agnumber_t		agno;
+-	struct xfs_perag	*pag;
+-
+-	agno = XFS_FSB_TO_AGNO(mp, xefi->xefi_startblock);
+-	pag = xfs_perag_get(mp, agno);
+-	/* The first extent in EFI is always OK to go */
+-	if (xfs_is_first_extent_in_efi(efip, xefi)) {
+-		atomic_inc(&pag->pag_nr_pending_extents);
+-		ret = false;
+-		goto out_put;
+-	}
+-
+-	/*
+-	 * Now the extent is the 2nd or subsequent in the efip. We need
+-	 * new transaction if the AG already has busy extents pending.
+-	 */
+-	nr_pre = atomic_inc_return(&pag->pag_nr_pending_extents) - 1;
+-	/* No prevoius pending extent freeing to this AG */
+-	if (nr_pre == 0) {
+-		ret = false;
+-		goto out_put;
+-	}
+-
+-	atomic_dec(&pag->pag_nr_pending_extents);
+-out_put:
+-	xfs_perag_put(pag);
+-	return ret;
+-}
+-
+ /*
+  * Free an extent and log it to the EFD. Note that the transaction is marked
+  * dirty regardless of whether the extent free succeeds or fails to support the
+@@ -425,28 +356,6 @@ xfs_trans_free_extent(
+ 	xfs_agblock_t			agbno = XFS_FSB_TO_AGBNO(mp,
+ 							xefi->xefi_startblock);
+ 	int				error;
+-	struct xfs_efi_log_item		*efip = efdp->efd_efip;
+-
+-	if (xfs_extent_free_need_new_trans(mp, efip, xefi)) {
+-		/*
+-		 * This should be the 2nd+ extent, we don't have to mark the
+-		 * transaction and efd dirty, those are already done with the
+-		 * first extent.
+-		 */
+-		ASSERT(tp->t_flags & XFS_TRANS_DIRTY);
+-		ASSERT(tp->t_flags & XFS_TRANS_HAS_INTENT_DONE);
+-		ASSERT(test_bit(XFS_LI_DIRTY, &efdp->efd_item.li_flags));
+-
+-		xfs_fill_efd_with_efi(efdp);
+-
+-		/*
+-		 * A preious extent in same AG is processed with the current
+-		 * transaction. To avoid possible AGFL allocation deadlock,
+-		 * we roll the transaction and then restart with this extent
+-		 * with new transaction.
+-		 */
+-		return -EAGAIN;
+-	}
+ 
+ 	oinfo.oi_owner = xefi->xefi_owner;
+ 	if (xefi->xefi_flags & XFS_EFI_ATTR_FORK)
+@@ -460,13 +369,6 @@ xfs_trans_free_extent(
+ 	error = __xfs_free_extent(tp, xefi->xefi_startblock,
+ 			xefi->xefi_blockcount, &oinfo, XFS_AG_RESV_NONE,
+ 			xefi->xefi_flags & XFS_EFI_SKIP_DISCARD);
+-	if (error) {
+-		struct xfs_perag	*pag;
+-
+-		pag = xfs_perag_get(mp, agno);
+-		atomic_dec(&pag->pag_nr_pending_extents);
+-		xfs_perag_put(pag);
+-	}
+ 	/*
+ 	 * Mark the transaction dirty, even on error. This ensures the
+ 	 * transaction is aborted, which:
+@@ -574,8 +476,7 @@ xfs_extent_free_finish_item(
+ 	xefi = container_of(item, struct xfs_extent_free_item, xefi_list);
+ 
+ 	error = xfs_trans_free_extent(tp, EFD_ITEM(done), xefi);
+-	if (error != -EAGAIN)
+-		kmem_cache_free(xfs_extfree_item_cache, xefi);
++	kmem_cache_free(xfs_extfree_item_cache, xefi);
+ 	return error;
+ }
+ 
+@@ -731,15 +632,7 @@ xfs_efi_item_recover(
+ 		fake.xefi_startblock = extp->ext_start;
+ 		fake.xefi_blockcount = extp->ext_len;
+ 
+-		if (error == 0)
+-			error = xfs_trans_free_extent(tp, efdp, &fake);
+-
+-		if (error == -EAGAIN) {
+-			ASSERT(i > 0);
+-			xfs_free_extent_later(tp, fake.xefi_startblock,
+-			fake.xefi_blockcount, &XFS_RMAP_OINFO_ANY_OWNER);
+-			continue;
+-		}
++		error = xfs_trans_free_extent(tp, efdp, &fake);
+ 		if (error == -EFSCORRUPTED)
+ 			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
+ 					extp, sizeof(*extp));
+diff --git a/fs/xfs/xfs_log_cil.c b/fs/xfs/xfs_log_cil.c
+index 97eda4487..eccbfb99e 100644
+--- a/fs/xfs/xfs_log_cil.c
++++ b/fs/xfs/xfs_log_cil.c
+@@ -16,7 +16,6 @@
+ #include "xfs_log.h"
+ #include "xfs_log_priv.h"
+ #include "xfs_trace.h"
+-#include "xfs_ag.h"
+ 
+ struct workqueue_struct *xfs_discard_wq;
+ 
+@@ -644,29 +643,8 @@ xlog_cil_insert_items(
+ 		cilpcp->space_used += len;
+ 	}
+ 	/* attach the transaction to the CIL if it has any busy extents */
+-	if (!list_empty(&tp->t_busy)) {
+-		struct xfs_perag	*last_pag = NULL;
+-		xfs_agnumber_t		last_agno = -1;
+-		struct xfs_extent_busy	*ebp;
+-
+-		/*
+-		 * Pending extent freeings are committed to CIL, now it's
+-		 * to let other extent freeing on same AG go.
+-		 */
+-		list_for_each_entry(ebp, &tp->t_busy, list) {
+-			if (ebp->agno != last_agno) {
+-				last_agno = ebp->agno;
+-				if (last_pag)
+-					xfs_perag_put(last_pag);
+-				last_pag = xfs_perag_get(tp->t_mountp, last_agno);
+-			}
+-			atomic_dec(&last_pag->pag_nr_pending_extents);
+-		}
+-		if (last_pag)
+-			xfs_perag_put(last_pag);
+-
++	if (!list_empty(&tp->t_busy))
+ 		list_splice_init(&tp->t_busy, &cilpcp->busy_extents);
+-	}
+ 
+ 	/*
+ 	 * Now update the order of everything modified in the transaction
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From 36d8b9d1e573f4c80ca9da506f2cac24f8a63e46 Mon Sep 17 00:00:00 2001
+From: Wengang Wang <wen.gang.wang@oracle.com>
+Date: Fri, 19 May 2023 10:18:29 -0700
+Subject: [PATCH 6/7] xfs: Don't block in xfs_extent_busy_flush
+
+The following calltrace is seen:
+	#0	context_switch() kernel/sched/core.c:3881
+	#1	__schedule() kernel/sched/core.c:5111
+	#2	schedule() kernel/sched/core.c:5186
+	#3	xfs_extent_busy_flush() fs/xfs/xfs_extent_busy.c:598
+	#4	xfs_alloc_ag_vextent_size() fs/xfs/libxfs/xfs_alloc.c:1641
+	#5	xfs_alloc_ag_vextent() fs/xfs/libxfs/xfs_alloc.c:828
+	#6	xfs_alloc_fix_freelist() fs/xfs/libxfs/xfs_alloc.c:2362
+	#7	xfs_free_extent_fix_freelist() fs/xfs/libxfs/xfs_alloc.c:3029
+	#8	__xfs_free_extent() fs/xfs/libxfs/xfs_alloc.c:3067
+	#9	xfs_trans_free_extent() fs/xfs/xfs_extfree_item.c:370
+	#10	xfs_efi_recover() fs/xfs/xfs_extfree_item.c:626
+	#11	xlog_recover_process_efi() fs/xfs/xfs_log_recover.c:4605
+	#12	xlog_recover_process_intents() fs/xfs/xfs_log_recover.c:4893
+	#13	xlog_recover_finish() fs/xfs/xfs_log_recover.c:5824
+	#14	xfs_log_mount_finish() fs/xfs/xfs_log.c:764
+	#15	xfs_mountfs() fs/xfs/xfs_mount.c:978
+	#16	xfs_fs_fill_super() fs/xfs/xfs_super.c:1908
+	#17	mount_bdev() fs/super.c:1417
+	#18	xfs_fs_mount() fs/xfs/xfs_super.c:1985
+	#19	legacy_get_tree() fs/fs_context.c:647
+	#20	vfs_get_tree() fs/super.c:1547
+	#21	do_new_mount() fs/namespace.c:2843
+	#22	do_mount() fs/namespace.c:3163
+	#23	ksys_mount() fs/namespace.c:3372
+	#24	__do_sys_mount() fs/namespace.c:3386
+	#25	__se_sys_mount() fs/namespace.c:3383
+	#26	__x64_sys_mount() fs/namespace.c:3383
+	#27	do_syscall_64() arch/x86/entry/common.c:296
+	#28	entry_SYSCALL_64() arch/x86/entry/entry_64.S:180
+
+During the process of the 2nd and subsequetial record in an EFI.
+It is waiting for the busy blocks to be cleaned, but the only busy extent
+is still hold in current xfs_trans->t_busy. That busy extent was added when
+processing previous EFI record. And because that busy extent is not committed
+yet, it can't be cleaned.
+
+To avoid above deadlock, we don't block in xfs_extent_busy_flush() when
+allocating AGFL blocks, instead it returns -EAGAIN. On receiving -EAGAIN
+we are able to retry that EFI record with a new transaction after committing
+the old transactin. With old transaction committed, the busy extent attached
+to the old transaction get the change to be cleaned. On the retry, there is
+no existing busy extents in the new transaction, thus no deadlock.
+
+Signed-off-by: Wengang Wang <wen.gang.wang@oracle.com>
+---
+ fs/xfs/libxfs/xfs_alloc.c | 30 ++++++++++++++++++++++++------
+ fs/xfs/libxfs/xfs_alloc.h |  2 ++
+ fs/xfs/scrub/repair.c     |  4 ++--
+ fs/xfs/xfs_extent_busy.c  | 34 +++++++++++++++++++++++++++++-----
+ fs/xfs/xfs_extent_busy.h  |  6 +++---
+ fs/xfs/xfs_extfree_item.c | 37 ++++++++++++++++++++++++++++++++++++-
+ fs/xfs/xfs_log_recover.c  | 23 ++++++++++-------------
+ fs/xfs/xfs_trans_ail.c    |  2 +-
+ fs/xfs/xfs_trans_priv.h   |  1 +
+ 9 files changed, 108 insertions(+), 31 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_alloc.c b/fs/xfs/libxfs/xfs_alloc.c
+index 203f16c48..abfd2acb3 100644
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@ -1491,6 +1491,7 @@ STATIC int
+ xfs_alloc_ag_vextent_near(
+ 	struct xfs_alloc_arg	*args)
+ {
++	int			flags = args->flags | XFS_ALLOC_FLAG_TRYFLUSH;
+ 	struct xfs_alloc_cur	acur = {};
+ 	int			error;		/* error code */
+ 	int			i;		/* result code, temporary */
+@@ -1564,8 +1565,11 @@ xfs_alloc_ag_vextent_near(
+ 	if (!acur.len) {
+ 		if (acur.busy) {
+ 			trace_xfs_alloc_near_busy(args);
+-			xfs_extent_busy_flush(args->mp, args->pag,
+-					      acur.busy_gen);
++			error = xfs_extent_busy_flush(args->tp, args->pag,
++					      acur.busy_gen, flags);
++			if (error)
++				goto out;
++			flags &= ~XFS_ALLOC_FLAG_TRYFLUSH;
+ 			goto restart;
+ 		}
+ 		trace_xfs_alloc_size_neither(args);
+@@ -1592,6 +1596,7 @@ STATIC int				/* error */
+ xfs_alloc_ag_vextent_size(
+ 	xfs_alloc_arg_t	*args)		/* allocation argument structure */
+ {
++	int		flags = args->flags | XFS_ALLOC_FLAG_TRYFLUSH;
+ 	struct xfs_agf	*agf = args->agbp->b_addr;
+ 	struct xfs_btree_cur *bno_cur;	/* cursor for bno btree */
+ 	struct xfs_btree_cur *cnt_cur;	/* cursor for cnt btree */
+@@ -1670,8 +1675,13 @@ xfs_alloc_ag_vextent_size(
+ 				xfs_btree_del_cursor(cnt_cur,
+ 						     XFS_BTREE_NOERROR);
+ 				trace_xfs_alloc_size_busy(args);
+-				xfs_extent_busy_flush(args->mp,
+-							args->pag, busy_gen);
++				error = xfs_extent_busy_flush(args->tp, args->pag,
++						busy_gen, flags);
++				if (error) {
++					cnt_cur = NULL;
++					goto error0;
++				}
++				flags &= ~XFS_ALLOC_FLAG_TRYFLUSH;
+ 				goto restart;
+ 			}
+ 		}
+@@ -1755,7 +1765,13 @@ xfs_alloc_ag_vextent_size(
+ 		if (busy) {
+ 			xfs_btree_del_cursor(cnt_cur, XFS_BTREE_NOERROR);
+ 			trace_xfs_alloc_size_busy(args);
+-			xfs_extent_busy_flush(args->mp, args->pag, busy_gen);
++			error = xfs_extent_busy_flush(args->tp, args->pag,
++					busy_gen, flags);
++			if (error) {
++				cnt_cur = NULL;
++				goto error0;
++			}
++			flags &= ~XFS_ALLOC_FLAG_TRYFLUSH;
+ 			goto restart;
+ 		}
+ 		goto out_nominleft;
+@@ -2629,6 +2645,7 @@ xfs_alloc_fix_freelist(
+ 	targs.agno = args->agno;
+ 	targs.alignment = targs.minlen = targs.prod = 1;
+ 	targs.pag = pag;
++	targs.flags = args->flags & XFS_ALLOC_FLAG_FREEING;
+ 	error = xfs_alloc_read_agfl(pag, tp, &agflbp);
+ 	if (error)
+ 		goto out_agbp_relse;
+@@ -3572,6 +3589,7 @@ xfs_free_extent_fix_freelist(
+ 	args.mp = tp->t_mountp;
+ 	args.agno = pag->pag_agno;
+ 	args.pag = pag;
++	args.flags = XFS_ALLOC_FLAG_FREEING;
+ 
+ 	/*
+ 	 * validate that the block number is legal - the enables us to detect
+@@ -3580,7 +3598,7 @@ xfs_free_extent_fix_freelist(
+ 	if (args.agno >= args.mp->m_sb.sb_agcount)
+ 		return -EFSCORRUPTED;
+ 
+-	error = xfs_alloc_fix_freelist(&args, XFS_ALLOC_FLAG_FREEING);
++	error = xfs_alloc_fix_freelist(&args, args.flags);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/xfs/libxfs/xfs_alloc.h b/fs/xfs/libxfs/xfs_alloc.h
+index 2b246d74c..5038fba87 100644
+--- a/fs/xfs/libxfs/xfs_alloc.h
++++ b/fs/xfs/libxfs/xfs_alloc.h
+@@ -24,6 +24,7 @@ unsigned int xfs_agfl_size(struct xfs_mount *mp);
+ #define	XFS_ALLOC_FLAG_NORMAP	0x00000004  /* don't modify the rmapbt */
+ #define	XFS_ALLOC_FLAG_NOSHRINK	0x00000008  /* don't shrink the freelist */
+ #define	XFS_ALLOC_FLAG_CHECK	0x00000010  /* test only, don't modify args */
++#define	XFS_ALLOC_FLAG_TRYFLUSH	0x00000020  /* don't block in busyextent flush*/
+ 
+ /*
+  * Argument structure for xfs_alloc routines.
+@@ -57,6 +58,7 @@ typedef struct xfs_alloc_arg {
+ #ifdef DEBUG
+ 	bool		alloc_minlen_only; /* allocate exact minlen extent */
+ #endif
++	int		flags;		/* XFS_ALLOC_FLAG_* */
+ } xfs_alloc_arg_t;
+ 
+ /*
+diff --git a/fs/xfs/scrub/repair.c b/fs/xfs/scrub/repair.c
+index 1b71174ec..2ba28e425 100644
+--- a/fs/xfs/scrub/repair.c
++++ b/fs/xfs/scrub/repair.c
+@@ -496,9 +496,9 @@ xrep_fix_freelist(
+ 	args.agno = sc->sa.pag->pag_agno;
+ 	args.alignment = 1;
+ 	args.pag = sc->sa.pag;
++	args.flags = can_shrink ? 0 : XFS_ALLOC_FLAG_NOSHRINK;
+ 
+-	return xfs_alloc_fix_freelist(&args,
+-			can_shrink ? 0 : XFS_ALLOC_FLAG_NOSHRINK);
++	return xfs_alloc_fix_freelist(&args, args.flags);
+ }
+ 
+ /*
+diff --git a/fs/xfs/xfs_extent_busy.c b/fs/xfs/xfs_extent_busy.c
+index f3d328e4a..ea1c1857b 100644
+--- a/fs/xfs/xfs_extent_busy.c
++++ b/fs/xfs/xfs_extent_busy.c
+@@ -567,18 +567,41 @@ xfs_extent_busy_clear(
+ /*
+  * Flush out all busy extents for this AG.
+  */
+-void
++int
+ xfs_extent_busy_flush(
+-	struct xfs_mount	*mp,
++	struct xfs_trans	*tp,
+ 	struct xfs_perag	*pag,
+-	unsigned		busy_gen)
++	unsigned		busy_gen,
++	int			flags)
+ {
+ 	DEFINE_WAIT		(wait);
+ 	int			error;
+ 
+-	error = xfs_log_force(mp, XFS_LOG_SYNC);
++	error = xfs_log_force(tp->t_mountp, XFS_LOG_SYNC);
+ 	if (error)
+-		return;
++		return error;
++
++	/*
++	 * If we are holding busy extents, the caller may not want to block
++	 * straight away. If we are being told just to try a flush or progress
++	 * has been made since we last skipped a busy extent, return
++	 * immediately to allow the caller to try again. If we are freeing
++	 * extents, we might actually be holding the only free extents in the
++	 * transaction busy list and the log force won't resolve that
++	 * situation. In this case, return -EAGAIN in that case to tell the
++	 * caller it needs to commit the busy extents it holds before retrying
++	 * the extent free operation.
++	 */
++	if (!list_empty(&tp->t_busy)) {
++		if (flags & XFS_ALLOC_FLAG_TRYFLUSH)
++			return 0;
++
++		if (busy_gen != READ_ONCE(pag->pagb_gen))
++			return 0;
++
++		if (flags & XFS_ALLOC_FLAG_FREEING)
++			return -EAGAIN;
++	}
+ 
+ 	do {
+ 		prepare_to_wait(&pag->pagb_wait, &wait, TASK_KILLABLE);
+@@ -588,6 +611,7 @@ xfs_extent_busy_flush(
+ 	} while (1);
+ 
+ 	finish_wait(&pag->pagb_wait, &wait);
++	return 0;
+ }
+ 
+ void
+diff --git a/fs/xfs/xfs_extent_busy.h b/fs/xfs/xfs_extent_busy.h
+index 4a1181310..edeedb92e 100644
+--- a/fs/xfs/xfs_extent_busy.h
++++ b/fs/xfs/xfs_extent_busy.h
+@@ -51,9 +51,9 @@ bool
+ xfs_extent_busy_trim(struct xfs_alloc_arg *args, xfs_agblock_t *bno,
+ 		xfs_extlen_t *len, unsigned *busy_gen);
+ 
+-void
+-xfs_extent_busy_flush(struct xfs_mount *mp, struct xfs_perag *pag,
+-	unsigned busy_gen);
++int
++xfs_extent_busy_flush(struct xfs_trans *tp, struct xfs_perag *pag,
++	unsigned busy_gen, int flags);
+ 
+ void
+ xfs_extent_busy_wait_all(struct xfs_mount *mp);
+diff --git a/fs/xfs/xfs_extfree_item.c b/fs/xfs/xfs_extfree_item.c
+index 011b50469..3c5a9e995 100644
+--- a/fs/xfs/xfs_extfree_item.c
++++ b/fs/xfs/xfs_extfree_item.c
+@@ -336,6 +336,25 @@ xfs_trans_get_efd(
+ 	return efdp;
+ }
+ 
++/*
++ * Fill the EFD with all extents from the EFI and set the counter.
++ * Note: the EFD should comtain at least one extents already.
++ */
++static void xfs_fill_efd_with_efi(struct xfs_efd_log_item *efdp)
++{
++	struct xfs_efi_log_item *efip = efdp->efd_efip;
++	uint                    i;
++
++	if (efdp->efd_next_extent == efip->efi_format.efi_nextents)
++		return;
++
++	for (i = 0; i < efip->efi_format.efi_nextents; i++) {
++	       efdp->efd_format.efd_extents[i] =
++		       efip->efi_format.efi_extents[i];
++	}
++	efdp->efd_next_extent = efip->efi_format.efi_nextents;
++}
++
+ /*
+  * Free an extent and log it to the EFD. Note that the transaction is marked
+  * dirty regardless of whether the extent free succeeds or fails to support the
+@@ -369,6 +388,10 @@ xfs_trans_free_extent(
+ 	error = __xfs_free_extent(tp, xefi->xefi_startblock,
+ 			xefi->xefi_blockcount, &oinfo, XFS_AG_RESV_NONE,
+ 			xefi->xefi_flags & XFS_EFI_SKIP_DISCARD);
++	if (error == -EAGAIN) {
++		xfs_fill_efd_with_efi(efdp);
++		return error;
++	}
+ 	/*
+ 	 * Mark the transaction dirty, even on error. This ensures the
+ 	 * transaction is aborted, which:
+@@ -476,7 +499,8 @@ xfs_extent_free_finish_item(
+ 	xefi = container_of(item, struct xfs_extent_free_item, xefi_list);
+ 
+ 	error = xfs_trans_free_extent(tp, EFD_ITEM(done), xefi);
+-	kmem_cache_free(xfs_extfree_item_cache, xefi);
++	if (error != -EAGAIN)
++		kmem_cache_free(xfs_extfree_item_cache, xefi);
+ 	return error;
+ }
+ 
+@@ -633,6 +657,17 @@ xfs_efi_item_recover(
+ 		fake.xefi_blockcount = extp->ext_len;
+ 
+ 		error = xfs_trans_free_extent(tp, efdp, &fake);
++		if (error == -EAGAIN) {
++			xfs_free_extent_later(tp, fake.xefi_startblock,
++				fake.xefi_blockcount, &XFS_RMAP_OINFO_ANY_OWNER);
++			/*
++			 * try to free as many extents as possible with current
++			 * transaction
++			 */
++			error = 0;
++			continue;
++		};
++
+ 		if (error == -EFSCORRUPTED)
+ 			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
+ 					extp, sizeof(*extp));
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 322eb2ee6..00bfe9683 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -2540,30 +2540,27 @@ xlog_recover_process_intents(
+ 	struct xfs_log_item	*lip;
+ 	struct xfs_ail		*ailp;
+ 	int			error = 0;
+-#if defined(DEBUG) || defined(XFS_WARN)
+-	xfs_lsn_t		last_lsn;
+-#endif
++	xfs_lsn_t		threshold_lsn;
+ 
+ 	ailp = log->l_ailp;
++	threshold_lsn = xfs_ail_max_lsn(ailp);
+ 	spin_lock(&ailp->ail_lock);
+-#if defined(DEBUG) || defined(XFS_WARN)
+-	last_lsn = xlog_assign_lsn(log->l_curr_cycle, log->l_curr_block);
+-#endif
++
+ 	for (lip = xfs_trans_ail_cursor_first(ailp, &cur, 0);
+ 	     lip != NULL;
+ 	     lip = xfs_trans_ail_cursor_next(ailp, &cur)) {
+ 		const struct xfs_item_ops	*ops;
++		/*
++		 * Orignal redo EFI could be splitted into new EFIs. Those
++		 * new EFIs are supposed to be processed in capture_list.
++		 * Stop here when original redo intents are done.
++		 */
++		if (XFS_LSN_CMP(threshold_lsn, lip->li_lsn) < 0)
++			break;
+ 
+ 		if (!xlog_item_is_intent(lip))
+ 			break;
+ 
+-		/*
+-		 * We should never see a redo item with a LSN higher than
+-		 * the last transaction we found in the log at the start
+-		 * of recovery.
+-		 */
+-		ASSERT(XFS_LSN_CMP(last_lsn, lip->li_lsn) >= 0);
+-
+ 		/*
+ 		 * NOTE: If your intent processing routine can create more
+ 		 * deferred ops, you /must/ attach them to the capture list in
+diff --git a/fs/xfs/xfs_trans_ail.c b/fs/xfs/xfs_trans_ail.c
+index 7d4109af1..2825f55ec 100644
+--- a/fs/xfs/xfs_trans_ail.c
++++ b/fs/xfs/xfs_trans_ail.c
+@@ -137,7 +137,7 @@ xfs_ail_min_lsn(
+ /*
+  * Return the maximum lsn held in the AIL, or zero if the AIL is empty.
+  */
+-static xfs_lsn_t
++xfs_lsn_t
+ xfs_ail_max_lsn(
+ 	struct xfs_ail		*ailp)
+ {
+diff --git a/fs/xfs/xfs_trans_priv.h b/fs/xfs/xfs_trans_priv.h
+index d54001503..86b4f29b2 100644
+--- a/fs/xfs/xfs_trans_priv.h
++++ b/fs/xfs/xfs_trans_priv.h
+@@ -106,6 +106,7 @@ void			xfs_ail_push_all(struct xfs_ail *);
+ void			xfs_ail_push_all_sync(struct xfs_ail *);
+ struct xfs_log_item	*xfs_ail_min(struct xfs_ail  *ailp);
+ xfs_lsn_t		xfs_ail_min_lsn(struct xfs_ail *ailp);
++xfs_lsn_t		xfs_ail_max_lsn(struct xfs_ail *ailp);
+ 
+ struct xfs_log_item *	xfs_trans_ail_cursor_first(struct xfs_ail *ailp,
+ 					struct xfs_ail_cursor *cur,
+-- 
+2.40.1.445.gf85cd430b1
+
+
+From cb26cca4f301fb8ccd34a79d5f8ea605ac674535 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Mon, 29 May 2023 12:59:50 +1000
+Subject: [PATCH 7/7] xfs: fix double xfs_perag_rele() in
+ xfs_filestream_pick_ag()
+
+xfs_bmap_longest_free_extent() can return an error when accessing
+the AGF fails. In this case, the behaviour of
+xfs_filestream_pick_ag() is conditional on the error. We may
+continue the loop, or break out of it. The error handling after the
+loop cleans up the perag reference held when the break occurs. If we
+continue, the next loop iteration handles cleaning up the perag
+reference.
+
+EIther way, we don't need to release the active perag reference when
+xfs_bmap_longest_free_extent() fails. Doing so means we do a double
+decrement on the active reference count, and this causes tha active
+reference count to fall to zero. At this point, new active
+references will fail.
+
+This leads to unmount hanging because it tries to grab active
+references to that perag, only for it to fail. This happens inside a
+loop that retries until a inode tree radix tree tag is cleared,
+which cannot happen because we can't get an active reference to the
+perag.
+
+The unmount livelocks in this path:
+
+  xfs_reclaim_inodes+0x80/0xc0
+  xfs_unmount_flush_inodes+0x5b/0x70
+  xfs_unmountfs+0x5b/0x1a0
+  xfs_fs_put_super+0x49/0x110
+  generic_shutdown_super+0x7c/0x1a0
+  kill_block_super+0x27/0x50
+  deactivate_locked_super+0x30/0x90
+  deactivate_super+0x3c/0x50
+  cleanup_mnt+0xc2/0x160
+  __cleanup_mnt+0x12/0x20
+  task_work_run+0x5e/0xa0
+  exit_to_user_mode_prepare+0x1bc/0x1c0
+  syscall_exit_to_user_mode+0x16/0x40
+  do_syscall_64+0x40/0x80
+  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+
+Reported-by: Pengfei Xu <pengfei.xu@intel.com>
+Fixes: eb70aa2d8ed9 ("xfs: use for_each_perag_wrap in xfs_filestream_pick_ag")
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+---
+ fs/xfs/xfs_filestream.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/fs/xfs/xfs_filestream.c b/fs/xfs/xfs_filestream.c
+index 22c13933c..2fc98d313 100644
+--- a/fs/xfs/xfs_filestream.c
++++ b/fs/xfs/xfs_filestream.c
+@@ -78,7 +78,6 @@ xfs_filestream_pick_ag(
+ 		*longest = 0;
+ 		err = xfs_bmap_longest_free_extent(pag, NULL, longest);
+ 		if (err) {
+-			xfs_perag_rele(pag);
+ 			if (err != -EAGAIN)
+ 				break;
+ 			/* Couldn't lock the AGF, skip this AG. */
+-- 
+2.40.1.445.gf85cd430b1
+
