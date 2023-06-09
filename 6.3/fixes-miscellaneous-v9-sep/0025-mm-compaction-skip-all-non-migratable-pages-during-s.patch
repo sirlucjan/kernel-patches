@@ -1,0 +1,163 @@
+From 3242664f4e4e18937629e317ac1ea6a3c98db5ea Mon Sep 17 00:00:00 2001
+From: Khalid Aziz <khalid.aziz@oracle.com>
+Date: Thu, 25 May 2023 13:15:07 -0600
+Subject: [PATCH 25/25] mm, compaction: skip all non-migratable pages during
+ scan
+
+Pages pinned in memory through extra refcounts can not be migrated.
+Currently as isolate_migratepages_block() scans pages for compaction, it
+skips any pinned anonymous pages.  All non-migratable pages should be
+skipped and not just the anonymous pinned pages.  This patch adds a check
+for extra refcounts on a page to determine if the page can be migrated.
+This was seen as a real issue on a customer workload where a large number
+of pages were pinned by vfio on the host and any attempts to allocate
+hugepages resulted in significant amount of cpu time spent in either
+direct compaction or in kcompactd scanning vfio pinned pages over and over
+again that can not be migrated.  These are the changes in relevant stats
+with this patch for a test run of this scenario:
+
+				Before			After
+compact_migrate_scanned		329,798,858		370,984,387
+compact_free_scanned		40,478,406		25,843,262
+compact_isolated		135,470,452		777,235
+pgmigrate_success		544,255			507,325
+pgmigrate_fail			134,616,282		47
+kcompactd CPU time		5:12.81			0:12.28
+
+Before the patch, large number of pages were isolated but most of
+them failed to migrate.
+
+Link: https://lkml.kernel.org/r/20230525191507.160076-1-khalid.aziz@oracle.com
+Signed-off-by: Khalid Aziz <khalid.aziz@oracle.com>
+Suggested-by: Steve Sistare <steven.sistare@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ include/linux/migrate.h | 16 +++++++++++++++
+ mm/compaction.c         | 44 +++++++++++++++++++++++++++++++++++++----
+ mm/migrate.c            | 14 -------------
+ 3 files changed, 56 insertions(+), 18 deletions(-)
+
+diff --git a/include/linux/migrate.h b/include/linux/migrate.h
+index 6241a15..4f59e15 100644
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -141,6 +141,22 @@ const struct movable_operations *page_movable_ops(struct page *page)
+ 		((unsigned long)page->mapping - PAGE_MAPPING_MOVABLE);
+ }
+ 
++static inline
++int folio_expected_refs(struct address_space *mapping,
++		struct folio *folio)
++{
++	int refs = 1;
++
++	if (!mapping)
++		return refs;
++
++	refs += folio_nr_pages(folio);
++	if (folio_test_private(folio))
++		refs++;
++
++	return refs;
++}
++
+ #ifdef CONFIG_NUMA_BALANCING
+ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
+ 			   int node);
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 5a9501e..b548e05 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -764,6 +764,42 @@ static bool too_many_isolated(pg_data_t *pgdat)
+ 	return too_many;
+ }
+ 
++/*
++ * Check if this base page should be skipped from isolation because
++ * it has extra refcounts that will prevent it from being migrated.
++ * This code is inspired by similar code in migrate_vma_check_page(),
++ * can_split_folio() and folio_migrate_mapping()
++ */
++static inline bool page_has_extra_refs(struct page *page,
++					struct address_space *mapping)
++{
++	unsigned long extra_refs;
++	struct folio *folio;
++
++	/*
++	 * Skip this check for pages in ZONE_MOVABLE or MIGRATE_CMA
++	 * pages that can not be long term pinned
++	 */
++	if (is_zone_movable_page(page) || is_migrate_cma_page(page))
++		return false;
++
++	folio = page_folio(page);
++
++	/*
++	 * caller holds a ref already from get_page_unless_zero()
++	 * which is accounted for in folio_expected_refs()
++	 */
++	extra_refs = folio_expected_refs(mapping, folio);
++
++	/*
++	 * This is an admittedly racy check but good enough to determine
++	 * if a page is pinned and can not be migrated
++	 */
++	if ((folio_ref_count(folio) - extra_refs) > folio_mapcount(folio))
++		return true;
++	return false;
++}
++
+ /**
+  * isolate_migratepages_block() - isolate all migrate-able pages within
+  *				  a single pageblock
+@@ -992,12 +1028,12 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 			goto isolate_fail;
+ 
+ 		/*
+-		 * Migration will fail if an anonymous page is pinned in memory,
+-		 * so avoid taking lru_lock and isolating it unnecessarily in an
+-		 * admittedly racy check.
++		 * Migration will fail if a page has extra refcounts
++		 * from long term pinning preventing it from migrating,
++		 * so avoid taking lru_lock and isolating it unnecessarily.
+ 		 */
+ 		mapping = page_mapping(page);
+-		if (!mapping && (page_count(page) - 1) > total_mapcount(page))
++		if (!cc->alloc_contig && page_has_extra_refs(page, mapping))
+ 			goto isolate_fail_put;
+ 
+ 		/*
+diff --git a/mm/migrate.c b/mm/migrate.c
+index db3f154..a2f3e58 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -385,20 +385,6 @@ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
+ }
+ #endif
+ 
+-static int folio_expected_refs(struct address_space *mapping,
+-		struct folio *folio)
+-{
+-	int refs = 1;
+-	if (!mapping)
+-		return refs;
+-
+-	refs += folio_nr_pages(folio);
+-	if (folio_test_private(folio))
+-		refs++;
+-
+-	return refs;
+-}
+-
+ /*
+  * Replace the page in the mapping.
+  *
+-- 
+2.41.0.rc2
+
