@@ -1,0 +1,177 @@
+From 9d05a42eb4b85a7a446cb20aa60b3c2c0519f45b Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Thu, 8 Jun 2023 17:51:57 -0700
+Subject: [PATCH 39/45] mm: implement folio wait under VMA lock
+
+Follow the same pattern as mmap_lock when waiting for folio by dropping
+VMA lock before the wait and retrying once folio is available.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ include/linux/pagemap.h | 14 ++++++++++----
+ mm/filemap.c            | 43 ++++++++++++++++++++++-------------------
+ mm/memory.c             | 13 ++++++++-----
+ 3 files changed, 41 insertions(+), 29 deletions(-)
+
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 0acb8e1fb..80fe2fad0 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -893,8 +893,8 @@ static inline bool wake_page_match(struct wait_page_queue *wait_page,
+ 
+ void __folio_lock(struct folio *folio);
+ int __folio_lock_killable(struct folio *folio);
+-bool __folio_lock_or_retry(struct folio *folio, struct mm_struct *mm,
+-				unsigned int flags);
++bool __folio_lock_or_retry(struct folio *folio, struct vm_area_struct *vma,
++			   unsigned int flags, bool *lock_dropped);
+ void unlock_page(struct page *page);
+ void folio_unlock(struct folio *folio);
+ 
+@@ -999,10 +999,16 @@ static inline int folio_lock_killable(struct folio *folio)
+  * __folio_lock_or_retry().
+  */
+ static inline bool folio_lock_or_retry(struct folio *folio,
+-		struct mm_struct *mm, unsigned int flags)
++		struct vm_area_struct *vma, unsigned int flags,
++		bool *lock_dropped)
+ {
+ 	might_sleep();
+-	return folio_trylock(folio) || __folio_lock_or_retry(folio, mm, flags);
++	if (folio_trylock(folio)) {
++		*lock_dropped = false;
++		return true;
++	}
++
++	return __folio_lock_or_retry(folio, vma, flags, lock_dropped);
+ }
+ 
+ /*
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 7d898f267..b1cda4049 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1701,37 +1701,35 @@ static int __folio_lock_async(struct folio *folio, struct wait_page_queue *wait)
+ 
+ /*
+  * Return values:
+- * true - folio is locked; mmap_lock is still held.
++ * true - folio is locked.
+  * false - folio is not locked.
+- *     mmap_lock has been released (mmap_read_unlock(), unless flags had both
+- *     FAULT_FLAG_ALLOW_RETRY and FAULT_FLAG_RETRY_NOWAIT set, in
+- *     which case mmap_lock is still held.
+- *     If flags had FAULT_FLAG_VMA_LOCK set, meaning the operation is performed
+- *     with VMA lock only, the VMA lock is still held.
++ *
++ * lock_dropped indicates whether mmap_lock/VMA lock got dropped.
++ *     mmap_lock/VMA lock is dropped when function fails to lock the folio,
++ *     unless flags had both FAULT_FLAG_ALLOW_RETRY and FAULT_FLAG_RETRY_NOWAIT
++ *     set, in which case mmap_lock/VMA lock is still held.
+  *
+  * If neither ALLOW_RETRY nor KILLABLE are set, will always return true
+- * with the folio locked and the mmap_lock unperturbed.
++ * with the folio locked and the mmap_lock/VMA lock unperturbed.
+  */
+-bool __folio_lock_or_retry(struct folio *folio, struct mm_struct *mm,
+-			 unsigned int flags)
++bool __folio_lock_or_retry(struct folio *folio, struct vm_area_struct *vma,
++			 unsigned int flags, bool *lock_dropped)
+ {
+-	/* Can't do this if not holding mmap_lock */
+-	if (flags & FAULT_FLAG_VMA_LOCK)
+-		return false;
+-
+ 	if (fault_flag_allow_retry_first(flags)) {
+-		/*
+-		 * CAUTION! In this case, mmap_lock is not released
+-		 * even though return 0.
+-		 */
+-		if (flags & FAULT_FLAG_RETRY_NOWAIT)
++		if (flags & FAULT_FLAG_RETRY_NOWAIT) {
++			*lock_dropped = false;
+ 			return false;
++		}
+ 
+-		mmap_read_unlock(mm);
++		if (flags & FAULT_FLAG_VMA_LOCK)
++			vma_end_read(vma);
++		else
++			mmap_read_unlock(vma->vm_mm);
+ 		if (flags & FAULT_FLAG_KILLABLE)
+ 			folio_wait_locked_killable(folio);
+ 		else
+ 			folio_wait_locked(folio);
++		*lock_dropped = true;
+ 		return false;
+ 	}
+ 	if (flags & FAULT_FLAG_KILLABLE) {
+@@ -1739,13 +1737,18 @@ bool __folio_lock_or_retry(struct folio *folio, struct mm_struct *mm,
+ 
+ 		ret = __folio_lock_killable(folio);
+ 		if (ret) {
+-			mmap_read_unlock(mm);
++			if (flags & FAULT_FLAG_VMA_LOCK)
++				vma_end_read(vma);
++			else
++				mmap_read_unlock(vma->vm_mm);
++			*lock_dropped = true;
+ 			return false;
+ 		}
+ 	} else {
+ 		__folio_lock(folio);
+ 	}
+ 
++	*lock_dropped = false;
+ 	return true;
+ }
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index bd40ad975..9bf482b51 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3566,6 +3566,7 @@ static vm_fault_t remove_device_exclusive_entry(struct vm_fault *vmf)
+ 	struct folio *folio = page_folio(vmf->page);
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct mmu_notifier_range range;
++	bool lock_dropped;
+ 
+ 	/*
+ 	 * We need a reference to lock the folio because we don't hold
+@@ -3578,8 +3579,10 @@ static vm_fault_t remove_device_exclusive_entry(struct vm_fault *vmf)
+ 	if (!folio_try_get(folio))
+ 		return 0;
+ 
+-	if (!folio_lock_or_retry(folio, vma->vm_mm, vmf->flags)) {
++	if (!folio_lock_or_retry(folio, vma, vmf->flags, &lock_dropped)) {
+ 		folio_put(folio);
++		if (lock_dropped && vmf->flags & FAULT_FLAG_VMA_LOCK)
++			return VM_FAULT_VMA_UNLOCKED | VM_FAULT_RETRY;
+ 		return VM_FAULT_RETRY;
+ 	}
+ 	mmu_notifier_range_init_owner(&range, MMU_NOTIFY_EXCLUSIVE, 0,
+@@ -3695,7 +3698,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	bool exclusive = false;
+ 	swp_entry_t entry;
+ 	pte_t pte;
+-	int locked;
++	bool lock_dropped;
+ 	vm_fault_t ret = 0;
+ 	void *shadow = NULL;
+ 
+@@ -3828,9 +3831,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		goto out_release;
+ 	}
+ 
+-	locked = folio_lock_or_retry(folio, vma->vm_mm, vmf->flags);
+-
+-	if (!locked) {
++	if (!folio_lock_or_retry(folio, vma, vmf->flags, &lock_dropped)) {
++		if (lock_dropped && vmf->flags & FAULT_FLAG_VMA_LOCK)
++			ret |= VM_FAULT_VMA_UNLOCKED;
+ 		ret |= VM_FAULT_RETRY;
+ 		goto out_release;
+ 	}
+-- 
+2.41.0
+
