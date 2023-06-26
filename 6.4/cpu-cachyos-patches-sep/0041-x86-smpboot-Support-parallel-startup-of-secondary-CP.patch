@@ -1,0 +1,251 @@
+From be76803e0eede759315f1cd16dbb741e93c85efb Mon Sep 17 00:00:00 2001
+From: David Woodhouse <dwmw@amazon.co.uk>
+Date: Fri, 12 May 2023 23:07:55 +0200
+Subject: [PATCH 41/47] x86/smpboot: Support parallel startup of secondary CPUs
+
+In parallel startup mode the APs are kicked alive by the control CPU
+quickly after each other and run through the early startup code in
+parallel. The real-mode startup code is already serialized with a
+bit-spinlock to protect the real-mode stack.
+
+In parallel startup mode the smpboot_control variable obviously cannot
+contain the Linux CPU number so the APs have to determine their Linux CPU
+number on their own. This is required to find the CPUs per CPU offset in
+order to find the idle task stack and other per CPU data.
+
+To achieve this, export the cpuid_to_apicid[] array so that each AP can
+find its own CPU number by searching therein based on its APIC ID.
+
+Introduce a flag in the top bits of smpboot_control which indicates that
+the AP should find its CPU number by reading the APIC ID from the APIC.
+
+This is required because CPUID based APIC ID retrieval can only provide the
+initial APIC ID, which might have been overruled by the firmware. Some AMD
+APUs come up with APIC ID = initial APIC ID + 0x10, so the APIC ID to CPU
+number lookup would fail miserably if based on CPUID. Also virtualization
+can make its own APIC ID assignements. The only requirement is that the
+APIC IDs are consistent with the APCI/MADT table.
+
+For the boot CPU or in case parallel bringup is disabled the control bits
+are empty and the CPU number is directly available in bit 0-23 of
+smpboot_control.
+
+[ tglx: Initial proof of concept patch with bitlock and APIC ID lookup ]
+[ dwmw2: Rework and testing, commit message, CPUID 0x1 and CPU0 support ]
+[ seanc: Fix stray override of initial_gs in common_cpu_up() ]
+[ Oleksandr Natalenko: reported suspend/resume issue fixed in
+  x86_acpi_suspend_lowlevel ]
+[ tglx: Make it read the APIC ID from the APIC instead of using CPUID,
+  	split the bitlock part out ]
+
+Co-developed-by: Thomas Gleixner <tglx@linutronix.de>
+Co-developed-by: Brian Gerst <brgerst@gmail.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Brian Gerst <brgerst@gmail.com>
+Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Michael Kelley <mikelley@microsoft.com>
+---
+ arch/x86/include/asm/apic.h    |  2 ++
+ arch/x86/include/asm/apicdef.h |  5 ++-
+ arch/x86/include/asm/smp.h     |  6 ++++
+ arch/x86/kernel/acpi/sleep.c   |  9 ++++-
+ arch/x86/kernel/apic/apic.c    |  2 +-
+ arch/x86/kernel/head_64.S      | 61 ++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/smpboot.c      |  2 +-
+ 7 files changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/include/asm/apic.h b/arch/x86/include/asm/apic.h
+index 030f5fb1d..98c32aa59 100644
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@ -55,6 +55,8 @@ extern int local_apic_timer_c2_ok;
+ extern int disable_apic;
+ extern unsigned int lapic_timer_period;
+ 
++extern int cpuid_to_apicid[];
++
+ extern enum apic_intr_mode_id apic_intr_mode;
+ enum apic_intr_mode_id {
+ 	APIC_PIC,
+diff --git a/arch/x86/include/asm/apicdef.h b/arch/x86/include/asm/apicdef.h
+index 68d213e83..bf546dfb6 100644
+--- a/arch/x86/include/asm/apicdef.h
++++ b/arch/x86/include/asm/apicdef.h
+@@ -138,7 +138,8 @@
+ #define		APIC_EILVT_MASKED	(1 << 16)
+ 
+ #define APIC_BASE (fix_to_virt(FIX_APIC_BASE))
+-#define APIC_BASE_MSR	0x800
++#define APIC_BASE_MSR		0x800
++#define APIC_X2APIC_ID_MSR	0x802
+ #define XAPIC_ENABLE	(1UL << 11)
+ #define X2APIC_ENABLE	(1UL << 10)
+ 
+@@ -162,6 +163,7 @@
+ #define APIC_CPUID(apicid)	((apicid) & XAPIC_DEST_CPUS_MASK)
+ #define NUM_APIC_CLUSTERS	((BAD_APICID + 1) >> XAPIC_DEST_CPUS_SHIFT)
+ 
++#ifndef __ASSEMBLY__
+ /*
+  * the local APIC register structure, memory mapped. Not terribly well
+  * tested, but we might eventually use this one in the future - the
+@@ -435,4 +437,5 @@ enum apic_delivery_modes {
+ 	APIC_DELIVERY_MODE_EXTINT	= 7,
+ };
+ 
++#endif /* !__ASSEMBLY__ */
+ #endif /* _ASM_X86_APICDEF_H */
+diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
+index c6d5b65b7..42060775a 100644
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -200,4 +200,10 @@ extern unsigned long apic_mmio_base;
+ 
+ #endif /* !__ASSEMBLY__ */
+ 
++/* Control bits for startup_64 */
++#define STARTUP_READ_APICID	0x80000000
++
++/* Top 8 bits are reserved for control */
++#define STARTUP_PARALLEL_MASK	0xFF000000
++
+ #endif /* _ASM_X86_SMP_H */
+diff --git a/arch/x86/kernel/acpi/sleep.c b/arch/x86/kernel/acpi/sleep.c
+index 1328c221a..6dfecb27b 100644
+--- a/arch/x86/kernel/acpi/sleep.c
++++ b/arch/x86/kernel/acpi/sleep.c
+@@ -16,6 +16,7 @@
+ #include <asm/cacheflush.h>
+ #include <asm/realmode.h>
+ #include <asm/hypervisor.h>
++#include <asm/smp.h>
+ 
+ #include <linux/ftrace.h>
+ #include "../../realmode/rm/wakeup.h"
+@@ -127,7 +128,13 @@ int x86_acpi_suspend_lowlevel(void)
+ 	 * value is in the actual %rsp register.
+ 	 */
+ 	current->thread.sp = (unsigned long)temp_stack + sizeof(temp_stack);
+-	smpboot_control = smp_processor_id();
++	/*
++	 * Ensure the CPU knows which one it is when it comes back, if
++	 * it isn't in parallel mode and expected to work that out for
++	 * itself.
++	 */
++	if (!(smpboot_control & STARTUP_PARALLEL_MASK))
++		smpboot_control = smp_processor_id();
+ #endif
+ 	initial_code = (unsigned long)wakeup_long64;
+ 	saved_magic = 0x123456789abcdef0L;
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index d3f6c18cd..209c50525 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -2380,7 +2380,7 @@ static int nr_logical_cpuids = 1;
+ /*
+  * Used to store mapping between logical CPU IDs and APIC IDs.
+  */
+-static int cpuid_to_apicid[] = {
++int cpuid_to_apicid[] = {
+ 	[0 ... NR_CPUS - 1] = -1,
+ };
+ 
+diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+index 17f6ac2bf..c5b928983 100644
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -24,7 +24,9 @@
+ #include "../entry/calling.h"
+ #include <asm/export.h>
+ #include <asm/nospec-branch.h>
++#include <asm/apicdef.h>
+ #include <asm/fixmap.h>
++#include <asm/smp.h>
+ 
+ /*
+  * We are not able to switch in one step to the final KERNEL ADDRESS SPACE
+@@ -234,8 +236,67 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
+ 	ANNOTATE_NOENDBR // above
+ 
+ #ifdef CONFIG_SMP
++	/*
++	 * For parallel boot, the APIC ID is read from the APIC, and then
++	 * used to look up the CPU number.  For booting a single CPU, the
++	 * CPU number is encoded in smpboot_control.
++	 *
++	 * Bit 31	STARTUP_READ_APICID (Read APICID from APIC)
++	 * Bit 0-23	CPU# if STARTUP_xx flags are not set
++	 */
+ 	movl	smpboot_control(%rip), %ecx
++	testl	$STARTUP_READ_APICID, %ecx
++	jnz	.Lread_apicid
++	/*
++	 * No control bit set, single CPU bringup. CPU number is provided
++	 * in bit 0-23. This is also the boot CPU case (CPU number 0).
++	 */
++	andl	$(~STARTUP_PARALLEL_MASK), %ecx
++	jmp	.Lsetup_cpu
++
++.Lread_apicid:
++	/* Check whether X2APIC mode is already enabled */
++	mov	$MSR_IA32_APICBASE, %ecx
++	rdmsr
++	testl	$X2APIC_ENABLE, %eax
++	jnz	.Lread_apicid_msr
++
++	/* Read the APIC ID from the fix-mapped MMIO space. */
++	movq	apic_mmio_base(%rip), %rcx
++	addq	$APIC_ID, %rcx
++	movl	(%rcx), %eax
++	shr	$24, %eax
++	jmp	.Llookup_AP
++
++.Lread_apicid_msr:
++	mov	$APIC_X2APIC_ID_MSR, %ecx
++	rdmsr
++
++.Llookup_AP:
++	/* EAX contains the APIC ID of the current CPU */
++	xorq	%rcx, %rcx
++	leaq	cpuid_to_apicid(%rip), %rbx
++
++.Lfind_cpunr:
++	cmpl	(%rbx,%rcx,4), %eax
++	jz	.Lsetup_cpu
++	inc	%ecx
++#ifdef CONFIG_FORCE_NR_CPUS
++	cmpl	$NR_CPUS, %ecx
++#else
++	cmpl	nr_cpu_ids(%rip), %ecx
++#endif
++	jb	.Lfind_cpunr
++
++	/*  APIC ID not found in the table. Drop the trampoline lock and bail. */
++	movq	trampoline_lock(%rip), %rax
++	movl	$0, (%rax)
++
++1:	cli
++	hlt
++	jmp	1b
+ 
++.Lsetup_cpu:
+ 	/* Get the per cpu offset for the given CPU# which is in ECX */
+ 	movq	__per_cpu_offset(,%rcx,8), %rdx
+ #else
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 51122f0ba..4b97373d8 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -996,7 +996,7 @@ static int do_boot_cpu(int apicid, int cpu, struct task_struct *idle)
+ 	if (IS_ENABLED(CONFIG_X86_32)) {
+ 		early_gdt_descr.address = (unsigned long)get_cpu_gdt_rw(cpu);
+ 		initial_stack  = idle->thread.sp;
+-	} else {
++	} else if (!(smpboot_control & STARTUP_PARALLEL_MASK)) {
+ 		smpboot_control = cpu;
+ 	}
+ 
+-- 
+2.41.0
+
