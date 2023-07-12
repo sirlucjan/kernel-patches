@@ -1,0 +1,146 @@
+From 7ccd03cf6e649f576e7e4060aef012368419bfe3 Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Fri, 30 Jun 2023 14:19:56 -0700
+Subject: [PATCH 05/11] mm: handle swap page faults under per-VMA lock
+
+When page fault is handled under per-VMA lock protection, all swap page
+faults are retried with mmap_lock because folio_lock_or_retry has to drop
+and reacquire mmap_lock if folio could not be immediately locked.
+Follow the same pattern as mmap_lock to drop per-VMA lock when waiting
+for folio and retrying once folio is available.
+With this obstacle removed, enable do_swap_page to operate under
+per-VMA lock protection. Drivers implementing ops->migrate_to_ram might
+still rely on mmap_lock, therefore we have to fall back to mmap_lock in
+that particular case.
+Note that the only time do_swap_page calls synchronous swap_readpage
+is when SWP_SYNCHRONOUS_IO is set, which is only set for
+QUEUE_FLAG_SYNCHRONOUS devices: brd, zram and nvdimms (both btt and
+pmem). Therefore we don't sleep in this path, and there's no need to
+drop the mmap or per-VMA lock.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Tested-by: Alistair Popple <apopple@nvidia.com>
+Reviewed-by: Alistair Popple <apopple@nvidia.com>
+Acked-by: Peter Xu <peterx@redhat.com>
+---
+ include/linux/mm.h | 13 +++++++++++++
+ mm/filemap.c       | 17 ++++++++---------
+ mm/memory.c        | 16 ++++++++++------
+ 3 files changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 9e10485f3..997c00272 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -722,6 +722,14 @@ static inline void vma_mark_detached(struct vm_area_struct *vma, bool detached)
+ 	vma->detached = detached;
+ }
+ 
++static inline void release_fault_lock(struct vm_fault *vmf)
++{
++	if (vmf->flags & FAULT_FLAG_VMA_LOCK)
++		vma_end_read(vmf->vma);
++	else
++		mmap_read_unlock(vmf->vma->vm_mm);
++}
++
+ struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
+ 					  unsigned long address);
+ 
+@@ -738,6 +746,11 @@ static inline void vma_assert_write_locked(struct vm_area_struct *vma) {}
+ static inline void vma_mark_detached(struct vm_area_struct *vma,
+ 				     bool detached) {}
+ 
++static inline void release_fault_lock(struct vm_fault *vmf)
++{
++	mmap_read_unlock(vmf->vma->vm_mm);
++}
++
+ #endif /* CONFIG_PER_VMA_LOCK */
+ 
+ /*
+diff --git a/mm/filemap.c b/mm/filemap.c
+index a8d8f81d8..f3ffad123 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1703,27 +1703,26 @@ static int __folio_lock_async(struct folio *folio, struct wait_page_queue *wait)
+  * Return values:
+  * 0 - folio is locked.
+  * non-zero - folio is not locked.
+- *     mmap_lock has been released (mmap_read_unlock(), unless flags had both
+- *     FAULT_FLAG_ALLOW_RETRY and FAULT_FLAG_RETRY_NOWAIT set, in
+- *     which case mmap_lock is still held.
++ *     mmap_lock or per-VMA lock has been released (mmap_read_unlock() or
++ *     vma_end_read()), unless flags had both FAULT_FLAG_ALLOW_RETRY and
++ *     FAULT_FLAG_RETRY_NOWAIT set, in which case the lock is still held.
+  *
+  * If neither ALLOW_RETRY nor KILLABLE are set, will always return 0
+- * with the folio locked and the mmap_lock unperturbed.
++ * with the folio locked and the mmap_lock/per-VMA lock is left unperturbed.
+  */
+ vm_fault_t __folio_lock_or_retry(struct folio *folio, struct vm_fault *vmf)
+ {
+-	struct mm_struct *mm = vmf->vma->vm_mm;
+ 	unsigned int flags = vmf->flags;
+ 
+ 	if (fault_flag_allow_retry_first(flags)) {
+ 		/*
+-		 * CAUTION! In this case, mmap_lock is not released
+-		 * even though return VM_FAULT_RETRY.
++		 * CAUTION! In this case, mmap_lock/per-VMA lock is not
++		 * released even though returning VM_FAULT_RETRY.
+ 		 */
+ 		if (flags & FAULT_FLAG_RETRY_NOWAIT)
+ 			return VM_FAULT_RETRY;
+ 
+-		mmap_read_unlock(mm);
++		release_fault_lock(vmf);
+ 		if (flags & FAULT_FLAG_KILLABLE)
+ 			folio_wait_locked_killable(folio);
+ 		else
+@@ -1735,7 +1734,7 @@ vm_fault_t __folio_lock_or_retry(struct folio *folio, struct vm_fault *vmf)
+ 
+ 		ret = __folio_lock_killable(folio);
+ 		if (ret) {
+-			mmap_read_unlock(mm);
++			release_fault_lock(vmf);
+ 			return VM_FAULT_RETRY;
+ 		}
+ 	} else {
+diff --git a/mm/memory.c b/mm/memory.c
+index 8272ed9ea..af7678719 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3712,12 +3712,6 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	if (!pte_unmap_same(vmf))
+ 		goto out;
+ 
+-	if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+-		ret = VM_FAULT_RETRY;
+-		vma_end_read(vma);
+-		goto out;
+-	}
+-
+ 	entry = pte_to_swp_entry(vmf->orig_pte);
+ 	if (unlikely(non_swap_entry(entry))) {
+ 		if (is_migration_entry(entry)) {
+@@ -3727,6 +3721,16 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 			vmf->page = pfn_swap_entry_to_page(entry);
+ 			ret = remove_device_exclusive_entry(vmf);
+ 		} else if (is_device_private_entry(entry)) {
++			if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
++				/*
++				 * migrate_to_ram is not yet ready to operate
++				 * under VMA lock.
++				 */
++				vma_end_read(vma);
++				ret = VM_FAULT_RETRY;
++				goto out;
++			}
++
+ 			vmf->page = pfn_swap_entry_to_page(entry);
+ 			vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+ 					vmf->address, &vmf->ptl);
+-- 
+2.41.0.159.g0bfa463d37
+
