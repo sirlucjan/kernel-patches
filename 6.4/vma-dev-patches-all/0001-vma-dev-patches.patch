@@ -1,0 +1,477 @@
+From 636b0dc7c26e1fd5063625bbee0c7173d1581177 Mon Sep 17 00:00:00 2001
+From: Yu Ma <yu.ma@intel.com>
+Date: Wed, 12 Jul 2023 10:57:39 -0400
+Subject: [PATCH 1/4] mm/mmap: move vma operations to mm_struct out of the
+ critical section of file mapping lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+UnixBench/Execl represents a class of workload where bash scripts are
+spawned frequently to do some short jobs. When running multiple parallel
+tasks, hot osq_lock is observed from do_mmap and exit_mmap. Both of them
+come from load_elf_binary through the call chain
+"execl->do_execveat_common->bprm_execve->load_elf_binary". In do_mmap,it will
+call mmap_region to create vma node, initialize it and insert it to vma
+maintain structure in mm_struct and i_mmap tree of the mapping file, then
+increase map_count to record the number of vma nodes used. The hot osq_lock
+is to protect operations on file’s i_mmap tree. For the mm_struct member
+change like vma insertion and map_count update, they do not affect i_mmap
+tree. Move those operations out of the lock's critical section, to reduce
+hold time on the lock.
+
+With this change, on Intel Sapphire Rapids 112C/224T platform, based on
+v6.0-rc6, the 160 parallel score improves by 12%. The patch has no
+obvious performance gain on v6.5-rc1 due to regression of this benchmark
+from this commit f1a7941243c102a44e8847e3b94ff4ff3ec56f25 (mm: convert
+mm's rss stats into percpu_counter). Related discussion and conclusion
+can be referred at the mail thread initiated by 0day as below:
+Link: https://lore.kernel.org/linux-mm/a4aa2e13-7187-600b-c628-7e8fb108def0@intel.com/
+
+Reviewed-by: Tim Chen <tim.c.chen@linux.intel.com>
+Signed-off-by: Yu Ma <yu.ma@intel.com>
+---
+ mm/mmap.c | 11 +++--------
+ 1 file changed, 3 insertions(+), 8 deletions(-)
+
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 30bf7772d..79c0da61b 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -444,14 +444,11 @@ static int vma_link(struct mm_struct *mm, struct vm_area_struct *vma)
+ 	if (vma_iter_prealloc(&vmi))
+ 		return -ENOMEM;
+ 
++	vma_iter_store(&vmi, vma);
++
+ 	if (vma->vm_file) {
+ 		mapping = vma->vm_file->f_mapping;
+ 		i_mmap_lock_write(mapping);
+-	}
+-
+-	vma_iter_store(&vmi, vma);
+-
+-	if (mapping) {
+ 		__vma_link_file(vma, mapping);
+ 		i_mmap_unlock_write(mapping);
+ 	}
+@@ -2803,12 +2800,10 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 
+ 	/* Lock the VMA since it is modified after insertion into VMA tree */
+ 	vma_start_write(vma);
+-	if (vma->vm_file)
+-		i_mmap_lock_write(vma->vm_file->f_mapping);
+-
+ 	vma_iter_store(&vmi, vma);
+ 	mm->map_count++;
+ 	if (vma->vm_file) {
++		i_mmap_lock_write(vma->vm_file->f_mapping);
+ 		if (vma->vm_flags & VM_SHARED)
+ 			mapping_allow_writable(vma->vm_file->f_mapping);
+ 
+-- 
+2.41.0.159.g0bfa463d37
+
+
+From cf3c2901e5f0cb38000848d48486370cca2f4ec2 Mon Sep 17 00:00:00 2001
+From: Jann Horn <jannh@google.com>
+Date: Thu, 20 Jul 2023 21:34:36 +0200
+Subject: [PATCH 2/4] mm: Don't drop VMA locks in mm_drop_all_locks()
+
+Despite its name, mm_drop_all_locks() does not drop _all_ locks; the mmap
+lock is held write-locked by the caller, and the caller is responsible for
+dropping the mmap lock at a later point (which will also release the VMA
+locks).
+Calling vma_end_write_all() here is dangerous because the caller might have
+write-locked a VMA with the expectation that it will stay write-locked
+until the mmap_lock is released, as usual.
+
+This _almost_ becomes a problem in the following scenario:
+
+An anonymous VMA A and an SGX VMA B are mapped adjacent to each other.
+Userspace calls munmap() on a range starting at the start address of A and
+ending in the middle of B.
+
+Hypothetical call graph with additional notes in brackets:
+
+do_vmi_align_munmap
+  [begin first for_each_vma_range loop]
+  vma_start_write [on VMA A]
+  vma_mark_detached [on VMA A]
+  __split_vma [on VMA B]
+    sgx_vma_open [== new->vm_ops->open]
+      sgx_encl_mm_add
+        __mmu_notifier_register [luckily THIS CAN'T ACTUALLY HAPPEN]
+          mm_take_all_locks
+          mm_drop_all_locks
+            vma_end_write_all [drops VMA lock taken on VMA A before]
+  vma_start_write [on VMA B]
+  vma_mark_detached [on VMA B]
+  [end first for_each_vma_range loop]
+  vma_iter_clear_gfp [removes VMAs from maple tree]
+  mmap_write_downgrade
+  unmap_region
+  mmap_read_unlock
+
+In this hypothetical scenario, while do_vmi_align_munmap() thinks it still
+holds a VMA write lock on VMA A, the VMA write lock has actually been
+invalidated inside __split_vma().
+
+The call from sgx_encl_mm_add() to __mmu_notifier_register() can't
+actually happen here, as far as I understand, because we are duplicating an
+existing SGX VMA, but sgx_encl_mm_add() only calls
+__mmu_notifier_register() for the first SGX VMA created in a given process.
+So this could only happen in fork(), not on munmap().
+But in my view it is just pure luck that this can't happen.
+
+Also, we wouldn't actually have any bad consequences from this in
+do_vmi_align_munmap(), because by the time the bug drops the lock on VMA A,
+we've already marked VMA A as detached, which makes it completely
+ineligible for any VMA-locked page faults.
+But again, that's just pure luck.
+
+So remove the vma_end_write_all(), so that VMA write locks are only ever
+released on mmap_write_unlock() or mmap_write_downgrade().
+
+Also add comments to document the locking rules established by this
+patch.
+
+Fixes: eeff9a5d47f8 ("mm/mmap: prevent pagefault handler from racing with mmu_notifier registration")
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Jann Horn <jannh@google.com>
+---
+ include/linux/mm.h        | 5 +++++
+ include/linux/mmap_lock.h | 8 ++++++++
+ mm/mmap.c                 | 7 ++++++-
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 9e10485f3..c774a3531 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -680,6 +680,11 @@ static bool __is_vma_write_locked(struct vm_area_struct *vma, int *mm_lock_seq)
+ 	return (vma->vm_lock_seq == *mm_lock_seq);
+ }
+ 
++/*
++ * Begin writing to a VMA.
++ * Exclude concurrent readers under the per-VMA lock until the currently
++ * write-locked mmap_lock is dropped or downgraded.
++ */
+ static inline void vma_start_write(struct vm_area_struct *vma)
+ {
+ 	int mm_lock_seq;
+diff --git a/include/linux/mmap_lock.h b/include/linux/mmap_lock.h
+index aab8f1b28..0b1d8430a 100644
+--- a/include/linux/mmap_lock.h
++++ b/include/linux/mmap_lock.h
+@@ -73,6 +73,14 @@ static inline void mmap_assert_write_locked(struct mm_struct *mm)
+ }
+ 
+ #ifdef CONFIG_PER_VMA_LOCK
++/*
++ * Drop all currently-held per-VMA locks.
++ * This is called from the mmap_lock implementation directly before releasing
++ * a write-locked mmap_lock (or downgrading it to read-locked).
++ * This should normally NOT be called manually from other places.
++ * If you want to call this manually anyway, keep in mind that this will release
++ * *all* VMA write locks, including ones from further up the stack.
++ */
+ static inline void vma_end_write_all(struct mm_struct *mm)
+ {
+ 	mmap_assert_write_locked(mm);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 79c0da61b..dc031f375 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -3658,6 +3658,12 @@ int mm_take_all_locks(struct mm_struct *mm)
+ 
+ 	mutex_lock(&mm_all_locks_mutex);
+ 
++	/*
++	 * vma_start_write() does not have a complement in mm_drop_all_locks()
++	 * because vma_start_write() is always asymmetrical; it marks a VMA as
++	 * being written to until mmap_write_unlock() or mmap_write_downgrade()
++	 * is reached.
++	 */
+ 	mas_for_each(&mas, vma, ULONG_MAX) {
+ 		if (signal_pending(current))
+ 			goto out_unlock;
+@@ -3754,7 +3760,6 @@ void mm_drop_all_locks(struct mm_struct *mm)
+ 		if (vma->vm_file && vma->vm_file->f_mapping)
+ 			vm_unlock_mapping(vma->vm_file->f_mapping);
+ 	}
+-	vma_end_write_all(mm);
+ 
+ 	mutex_unlock(&mm_all_locks_mutex);
+ }
+-- 
+2.41.0.159.g0bfa463d37
+
+
+From ba643187797b23e699d2bf5ccc34b1e88a92038d Mon Sep 17 00:00:00 2001
+From: Jann Horn <jannh@google.com>
+Date: Fri, 21 Jul 2023 05:46:43 +0200
+Subject: [PATCH 3/4] mm: Lock VMA in dup_anon_vma() before setting ->anon_vma
+
+When VMAs are merged, dup_anon_vma() is called with `dst` pointing to the
+VMA that is being expanded to cover the area previously occupied by another
+VMA. This currently happens while `dst` is not write-locked.
+
+This means that, in the `src->anon_vma && !dst->anon_vma` case, as soon as
+the assignment `dst->anon_vma = src->anon_vma` has happened, concurrent
+page faults can happen on `dst` under the per-VMA lock.
+This is already icky in itself, since such page faults can now install
+pages into `dst` that are attached to an `anon_vma` that is not yet tied
+back to the `anon_vma` with an `anon_vma_chain`.
+But if `anon_vma_clone()` fails due to an out-of-memory error, things get
+much worse: `anon_vma_clone()` then reverts `dst->anon_vma` back to NULL,
+and `dst` remains completely unconnected to the `anon_vma`, even though we
+can have pages in the area covered by `dst` that point to the `anon_vma`.
+
+This means the `anon_vma` of such pages can be freed while the pages are
+still mapped into userspace, which leads to UAF when a helper like
+folio_lock_anon_vma_read() tries to look up the anon_vma of such a page.
+
+This theoretically is a security bug, but I believe it is really hard to
+actually trigger as an unprivileged user because it requires that you can
+make an order-0 GFP_KERNEL allocation fail, and the page allocator tries
+pretty hard to prevent that.
+
+I think doing the vma_start_write() call inside dup_anon_vma() is the most
+straightforward fix for now.
+
+For a kernel-assisted reproducer, see the notes section of the patch mail.
+
+Fixes: 5e31275cc997 ("mm: add per-VMA lock and helper functions to control it")
+Cc: stable@vger.kernel.org
+Cc: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Jann Horn <jannh@google.com>
+---
+ mm/mmap.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/mm/mmap.c b/mm/mmap.c
+index dc031f375..20b554356 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -644,6 +644,7 @@ static inline int dup_anon_vma(struct vm_area_struct *dst,
+ 	 * anon pages imported.
+ 	 */
+ 	if (src->anon_vma && !dst->anon_vma) {
++		vma_start_write(dst);
+ 		dst->anon_vma = src->anon_vma;
+ 		return anon_vma_clone(dst, src);
+ 	}
+-- 
+2.41.0.159.g0bfa463d37
+
+
+From c1867315dddbd064e94dcd7d79243ee9d3b5319e Mon Sep 17 00:00:00 2001
+From: Jann Horn <jannh@google.com>
+Date: Fri, 21 Jul 2023 20:23:50 +0200
+Subject: [PATCH 4/4] mm: Fix memory ordering for mm_lock_seq and vm_lock_seq
+
+mm->mm_lock_seq effectively functions as a read/write lock; therefore it
+must be used with acquire/release semantics.
+
+A specific example is the interaction between userfaultfd_register() and
+lock_vma_under_rcu().
+userfaultfd_register() does the following from the point where it changes
+a VMA's flags to the point where concurrent readers are permitted again
+(in a simple scenario where only a single private VMA is accessed and no
+merging/splitting is involved):
+
+userfaultfd_register
+  userfaultfd_set_vm_flags
+    vm_flags_reset
+      vma_start_write
+        down_write(&vma->vm_lock->lock)
+        vma->vm_lock_seq = mm_lock_seq [marks VMA as busy]
+        up_write(&vma->vm_lock->lock)
+      vm_flags_init
+        [sets VM_UFFD_* in __vm_flags]
+  vma->vm_userfaultfd_ctx.ctx = ctx
+  mmap_write_unlock
+    vma_end_write_all
+      WRITE_ONCE(mm->mm_lock_seq, mm->mm_lock_seq + 1) [unlocks VMA]
+
+There are no memory barriers in between the __vm_flags update and the
+mm->mm_lock_seq update that unlocks the VMA, so the unlock can be reordered
+to above the `vm_flags_init()` call, which means from the perspective of a
+concurrent reader, a VMA can be marked as a userfaultfd VMA while it is not
+VMA-locked. That's bad, we definitely need a store-release for the unlock
+operation.
+
+The non-atomic write to vma->vm_lock_seq in vma_start_write() is mostly
+fine because all accesses to vma->vm_lock_seq that matter are always
+protected by the VMA lock. There is a racy read in vma_start_read() though
+that can tolerate false-positives, so we should be using WRITE_ONCE() to
+keep things tidy and data-race-free (including for KCSAN).
+
+On the other side, lock_vma_under_rcu() works as follows in the relevant
+region for locking and userfaultfd check:
+
+lock_vma_under_rcu
+  vma_start_read
+    vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq) [early bailout]
+    down_read_trylock(&vma->vm_lock->lock)
+    vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq) [main check]
+  userfaultfd_armed
+    checks vma->vm_flags & __VM_UFFD_FLAGS
+
+Here, the interesting aspect is how far down the mm->mm_lock_seq read
+can be reordered - if this read is reordered down below the vma->vm_flags
+access, this could cause lock_vma_under_rcu() to partly operate on
+information that was read while the VMA was supposed to be locked.
+To prevent this kind of downwards bleeding of the mm->mm_lock_seq read, we
+need to read it with a load-acquire.
+
+BACKPORT WARNING: One of the functions changed by this patch (which I've
+written against Linus' tree) is vma_try_start_write(), but this function
+no longer exists in mm/mm-everything. I don't know whether the merged
+version of this patch will be ordered before or after the patch that
+removes vma_try_start_write(). If you're backporting this patch to a
+tree with vma_try_start_write(), make sure this patch changes that
+function.
+
+Fixes: 5e31275cc997 ("mm: add per-VMA lock and helper functions to control it")
+Cc: stable@vger.kernel.org
+Cc: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Jann Horn <jannh@google.com>
+---
+ include/linux/mm.h        | 21 ++++++++++++++++-----
+ include/linux/mm_types.h  | 27 +++++++++++++++++++++++++++
+ include/linux/mmap_lock.h | 10 ++++++++--
+ 3 files changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index c774a3531..e4b535ac4 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -642,7 +642,7 @@ static inline void vma_numab_state_free(struct vm_area_struct *vma) {}
+ static inline bool vma_start_read(struct vm_area_struct *vma)
+ {
+ 	/* Check before locking. A race might cause false locked result. */
+-	if (vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq))
++	if (READ_ONCE(vma->vm_lock_seq) == READ_ONCE(vma->vm_mm->mm_lock_seq))
+ 		return false;
+ 
+ 	if (unlikely(down_read_trylock(&vma->vm_lock->lock) == 0))
+@@ -653,8 +653,13 @@ static inline bool vma_start_read(struct vm_area_struct *vma)
+ 	 * False unlocked result is impossible because we modify and check
+ 	 * vma->vm_lock_seq under vma->vm_lock protection and mm->mm_lock_seq
+ 	 * modification invalidates all existing locks.
++	 *
++	 * We must use ACQUIRE semantics for the mm_lock_seq so that if we are
++	 * racing with vma_end_write_all(), we only start reading from the VMA
++	 * after it has been unlocked.
++	 * This pairs with RELEASE semantics in vma_end_write_all().
+ 	 */
+-	if (unlikely(vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq))) {
++	if (unlikely(vma->vm_lock_seq == smp_load_acquire(&vma->vm_mm->mm_lock_seq))) {
+ 		up_read(&vma->vm_lock->lock);
+ 		return false;
+ 	}
+@@ -676,7 +681,7 @@ static bool __is_vma_write_locked(struct vm_area_struct *vma, int *mm_lock_seq)
+ 	 * current task is holding mmap_write_lock, both vma->vm_lock_seq and
+ 	 * mm->mm_lock_seq can't be concurrently modified.
+ 	 */
+-	*mm_lock_seq = READ_ONCE(vma->vm_mm->mm_lock_seq);
++	*mm_lock_seq = vma->vm_mm->mm_lock_seq;
+ 	return (vma->vm_lock_seq == *mm_lock_seq);
+ }
+ 
+@@ -693,7 +698,13 @@ static inline void vma_start_write(struct vm_area_struct *vma)
+ 		return;
+ 
+ 	down_write(&vma->vm_lock->lock);
+-	vma->vm_lock_seq = mm_lock_seq;
++	/*
++	 * We should use WRITE_ONCE() here because we can have concurrent reads
++	 * from the early lockless pessimistic check in vma_start_read().
++	 * We don't really care about the correctness of that early check, but
++	 * we should use WRITE_ONCE() for cleanliness and to keep KCSAN happy.
++	 */
++	WRITE_ONCE(vma->vm_lock_seq, mm_lock_seq);
+ 	up_write(&vma->vm_lock->lock);
+ }
+ 
+@@ -707,7 +718,7 @@ static inline bool vma_try_start_write(struct vm_area_struct *vma)
+ 	if (!down_write_trylock(&vma->vm_lock->lock))
+ 		return false;
+ 
+-	vma->vm_lock_seq = mm_lock_seq;
++	WRITE_ONCE(vma->vm_lock_seq, mm_lock_seq);
+ 	up_write(&vma->vm_lock->lock);
+ 	return true;
+ }
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index de10fc797..aa2444966 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -514,6 +514,19 @@ struct vm_area_struct {
+ 	};
+ 
+ #ifdef CONFIG_PER_VMA_LOCK
++	/*
++	 * Can only be written (using WRITE_ONCE()) while holding both:
++	 *  - mmap_lock (in write mode)
++	 *  - vm_lock->lock (in write mode)
++	 * Can be read reliably while holding:
++	 *  - vm_lock->lock (in read or write mode)
++	 * Can be read unreliably (for pessimistic bailout) while holding
++	 * nothing (except RCU to keep the VMA struct allocated).
++	 *
++	 * This sequence counter is explicitly allowed to overflow; sequence
++	 * counter reuse can only lead to occasional unnecessary use of the
++	 * slowpath.
++	 */
+ 	int vm_lock_seq;
+ 	struct vma_lock *vm_lock;
+ 
+@@ -679,6 +692,20 @@ struct mm_struct {
+ 					  * by mmlist_lock
+ 					  */
+ #ifdef CONFIG_PER_VMA_LOCK
++		/*
++		 * This field has lock-like semantics; see also
++		 * vma->vm_lock_seq.
++		 * Incrementing the sequence number is equivalent to releasing
++		 * locks on VMAs and requires RELEASE semantics; reading the
++		 * sequence number is part of taking a read lock on a VMA and
++		 * requires ACQUIRE semantics.
++		 *
++		 * Can be written (with RELEASE semantics) while holding
++		 * mmap_lock in write mode.
++		 * Can be read (with ACQUIRE semantics) without holding any
++		 * locks on the MM (but you need to have a VMA locked to be able
++		 * to do anything useful with the result).
++		 */
+ 		int mm_lock_seq;
+ #endif
+ 
+diff --git a/include/linux/mmap_lock.h b/include/linux/mmap_lock.h
+index 0b1d8430a..4745ea859 100644
+--- a/include/linux/mmap_lock.h
++++ b/include/linux/mmap_lock.h
+@@ -84,8 +84,14 @@ static inline void mmap_assert_write_locked(struct mm_struct *mm)
+ static inline void vma_end_write_all(struct mm_struct *mm)
+ {
+ 	mmap_assert_write_locked(mm);
+-	/* No races during update due to exclusive mmap_lock being held */
+-	WRITE_ONCE(mm->mm_lock_seq, mm->mm_lock_seq + 1);
++	/*
++	 * Nobody can concurrently modify mm->mm_lock_seq due to exclusive
++	 * mmap_lock being held.
++	 * We need RELEASE semantics here to ensure that preceding stores into
++	 * the VMA take effect before we unlock it with this store.
++	 * Pairs with ACQUIRE semantics in vma_start_read().
++	 */
++	smp_store_release(&mm->mm_lock_seq, mm->mm_lock_seq + 1);
+ }
+ #else
+ static inline void vma_end_write_all(struct mm_struct *mm) {}
+-- 
+2.41.0.159.g0bfa463d37
+
