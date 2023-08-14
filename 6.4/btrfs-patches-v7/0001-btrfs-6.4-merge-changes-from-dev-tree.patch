@@ -1,0 +1,782 @@
+From 21cf990758a41ce924a4a85c66ebbea691c4bab6 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Mon, 14 Aug 2023 13:28:38 +0200
+Subject: [PATCH] btrfs-6.4: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ fs/btrfs/bio.c         | 30 +++++++-------------
+ fs/btrfs/block-group.c | 17 ++----------
+ fs/btrfs/block-group.h |  2 --
+ fs/btrfs/btrfs_inode.h |  3 --
+ fs/btrfs/disk-io.c     |  6 +---
+ fs/btrfs/extent-tree.c | 62 +++++++++++++-----------------------------
+ fs/btrfs/extent-tree.h | 13 +++------
+ fs/btrfs/extent_io.c   | 13 +++++++--
+ fs/btrfs/file.c        |  9 ------
+ fs/btrfs/fs.h          |  1 -
+ fs/btrfs/inode.c       | 51 ++++++++++++++++++++++++----------
+ fs/btrfs/lzo.c         |  6 ++--
+ fs/btrfs/super.c       |  1 -
+ fs/btrfs/transaction.c | 21 ++++++++++----
+ fs/btrfs/tree-log.c    | 34 +++++++++++------------
+ fs/btrfs/tree-log.h    |  2 +-
+ fs/btrfs/zlib.c        |  2 +-
+ fs/btrfs/zstd.c        |  2 +-
+ 18 files changed, 121 insertions(+), 154 deletions(-)
+
+diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+index b86faf812..2d1c92f62 100644
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -573,27 +573,20 @@ static void run_one_async_free(struct btrfs_work *work)
+ 
+ static bool should_async_write(struct btrfs_bio *bbio)
+ {
+-	/*
+-	 * If the I/O is not issued by fsync and friends, (->sync_writers != 0),
+-	 * then try to defer the submission to a workqueue to parallelize the
+-	 * checksum calculation.
+-	 */
+-	if (atomic_read(&bbio->inode->sync_writers))
++	/* Submit synchronously if the checksum implementation is fast. */
++	if (test_bit(BTRFS_FS_CSUM_IMPL_FAST, &bbio->fs_info->flags))
+ 		return false;
+ 
+ 	/*
+-	 * Submit metadata writes synchronously if the checksum implementation
+-	 * is fast, or we are on a zoned device that wants I/O to be submitted
+-	 * in order.
++	 * Try to defer the submission to a workqueue to parallelize the
++	 * checksum calculation unless the I/O is issued synchronously.
+ 	 */
+-	if (bbio->bio.bi_opf & REQ_META) {
+-		struct btrfs_fs_info *fs_info = bbio->fs_info;
++	if (op_is_sync(bbio->bio.bi_opf))
++		return false;
+ 
+-		if (btrfs_is_zoned(fs_info))
+-			return false;
+-		if (test_bit(BTRFS_FS_CSUM_IMPL_FAST, &fs_info->flags))
+-			return false;
+-	}
++	/* Zoned devices require I/O to be submitted in order. */
++	if ((bbio->bio.bi_opf & REQ_META) && btrfs_is_zoned(bbio->fs_info))
++		return false;
+ 
+ 	return true;
+ }
+@@ -621,10 +614,7 @@ static bool btrfs_wq_submit_bio(struct btrfs_bio *bbio,
+ 
+ 	btrfs_init_work(&async->work, run_one_async_start, run_one_async_done,
+ 			run_one_async_free);
+-	if (op_is_sync(bbio->bio.bi_opf))
+-		btrfs_queue_work(fs_info->hipri_workers, &async->work);
+-	else
+-		btrfs_queue_work(fs_info->workers, &async->work);
++	btrfs_queue_work(fs_info->workers, &async->work);
+ 	return true;
+ }
+ 
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 2a60033d9..ad14dd745 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -441,23 +441,13 @@ void btrfs_wait_block_group_cache_progress(struct btrfs_block_group *cache,
+ 					   u64 num_bytes)
+ {
+ 	struct btrfs_caching_control *caching_ctl;
+-	int progress;
+ 
+ 	caching_ctl = btrfs_get_caching_control(cache);
+ 	if (!caching_ctl)
+ 		return;
+ 
+-	/*
+-	 * We've already failed to allocate from this block group, so even if
+-	 * there's enough space in the block group it isn't contiguous enough to
+-	 * allow for an allocation, so wait for at least the next wakeup tick,
+-	 * or for the thing to be done.
+-	 */
+-	progress = atomic_read(&caching_ctl->progress);
+-
+ 	wait_event(caching_ctl->wait, btrfs_block_group_done(cache) ||
+-		   (progress != atomic_read(&caching_ctl->progress) &&
+-		    (cache->free_space_ctl->free_space >= num_bytes)));
++		   (cache->free_space_ctl->free_space >= num_bytes));
+ 
+ 	btrfs_put_caching_control(caching_ctl);
+ }
+@@ -812,10 +802,8 @@ static int load_extent_tree_free(struct btrfs_caching_control *caching_ctl)
+ 
+ 			if (total_found > CACHING_CTL_WAKE_UP) {
+ 				total_found = 0;
+-				if (wakeup) {
+-					atomic_inc(&caching_ctl->progress);
++				if (wakeup)
+ 					wake_up(&caching_ctl->wait);
+-				}
+ 			}
+ 		}
+ 		path->slots[0]++;
+@@ -922,7 +910,6 @@ int btrfs_cache_block_group(struct btrfs_block_group *cache, bool wait)
+ 	init_waitqueue_head(&caching_ctl->wait);
+ 	caching_ctl->block_group = cache;
+ 	refcount_set(&caching_ctl->count, 2);
+-	atomic_set(&caching_ctl->progress, 0);
+ 	btrfs_init_work(&caching_ctl->work, caching_thread, NULL, NULL);
+ 
+ 	spin_lock(&cache->lock);
+diff --git a/fs/btrfs/block-group.h b/fs/btrfs/block-group.h
+index 471f591db..3195d0b0d 100644
+--- a/fs/btrfs/block-group.h
++++ b/fs/btrfs/block-group.h
+@@ -85,8 +85,6 @@ struct btrfs_caching_control {
+ 	wait_queue_head_t wait;
+ 	struct btrfs_work work;
+ 	struct btrfs_block_group *block_group;
+-	/* Track progress of caching during allocation. */
+-	atomic_t progress;
+ 	refcount_t count;
+ };
+ 
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index ec2ae4406..0849b85b9 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -116,9 +116,6 @@ struct btrfs_inode {
+ 
+ 	unsigned long runtime_flags;
+ 
+-	/* Keep track of who's O_SYNC/fsyncing currently */
+-	atomic_t sync_writers;
+-
+ 	/* full 64 bit generation number, struct vfs_inode doesn't have a big
+ 	 * enough field for this.
+ 	 */
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index f890c4c71..99bebab61 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1992,7 +1992,6 @@ static void btrfs_stop_all_workers(struct btrfs_fs_info *fs_info)
+ {
+ 	btrfs_destroy_workqueue(fs_info->fixup_workers);
+ 	btrfs_destroy_workqueue(fs_info->delalloc_workers);
+-	btrfs_destroy_workqueue(fs_info->hipri_workers);
+ 	btrfs_destroy_workqueue(fs_info->workers);
+ 	if (fs_info->endio_workers)
+ 		destroy_workqueue(fs_info->endio_workers);
+@@ -2187,9 +2186,6 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
+ 
+ 	fs_info->workers =
+ 		btrfs_alloc_workqueue(fs_info, "worker", flags, max_active, 16);
+-	fs_info->hipri_workers =
+-		btrfs_alloc_workqueue(fs_info, "worker-high",
+-				      flags | WQ_HIGHPRI, max_active, 16);
+ 
+ 	fs_info->delalloc_workers =
+ 		btrfs_alloc_workqueue(fs_info, "delalloc",
+@@ -2226,7 +2222,7 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
+ 	fs_info->discard_ctl.discard_workers =
+ 		alloc_workqueue("btrfs_discard", WQ_UNBOUND | WQ_FREEZABLE, 1);
+ 
+-	if (!(fs_info->workers && fs_info->hipri_workers &&
++	if (!(fs_info->workers &&
+ 	      fs_info->delalloc_workers && fs_info->flush_workers &&
+ 	      fs_info->endio_workers && fs_info->endio_meta_workers &&
+ 	      fs_info->compressed_write_workers &&
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 10bffcb37..d14b8b7a3 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -3435,7 +3435,6 @@ btrfs_release_block_group(struct btrfs_block_group *cache,
+  * Helper function for find_free_extent().
+  *
+  * Return -ENOENT to inform caller that we need fallback to unclustered mode.
+- * Return -EAGAIN to inform caller that we need to re-search this block group
+  * Return >0 to inform caller that we find nothing
+  * Return 0 means we have found a location and set ffe_ctl->found_offset.
+  */
+@@ -3516,14 +3515,6 @@ static int find_free_extent_clustered(struct btrfs_block_group *bg,
+ 			trace_btrfs_reserve_extent_cluster(bg, ffe_ctl);
+ 			return 0;
+ 		}
+-	} else if (!ffe_ctl->cached && ffe_ctl->loop > LOOP_CACHING_NOWAIT &&
+-		   !ffe_ctl->retry_clustered) {
+-		spin_unlock(&last_ptr->refill_lock);
+-
+-		ffe_ctl->retry_clustered = true;
+-		btrfs_wait_block_group_cache_progress(bg, ffe_ctl->num_bytes +
+-				ffe_ctl->empty_cluster + ffe_ctl->empty_size);
+-		return -EAGAIN;
+ 	}
+ 	/*
+ 	 * At this point we either didn't find a cluster or we weren't able to
+@@ -3538,7 +3529,6 @@ static int find_free_extent_clustered(struct btrfs_block_group *bg,
+ /*
+  * Return >0 to inform caller that we find nothing
+  * Return 0 when we found an free extent and set ffe_ctrl->found_offset
+- * Return -EAGAIN to inform caller that we need to re-search this block group
+  */
+ static int find_free_extent_unclustered(struct btrfs_block_group *bg,
+ 					struct find_free_extent_ctl *ffe_ctl)
+@@ -3576,25 +3566,8 @@ static int find_free_extent_unclustered(struct btrfs_block_group *bg,
+ 	offset = btrfs_find_space_for_alloc(bg, ffe_ctl->search_start,
+ 			ffe_ctl->num_bytes, ffe_ctl->empty_size,
+ 			&ffe_ctl->max_extent_size);
+-
+-	/*
+-	 * If we didn't find a chunk, and we haven't failed on this block group
+-	 * before, and this block group is in the middle of caching and we are
+-	 * ok with waiting, then go ahead and wait for progress to be made, and
+-	 * set @retry_unclustered to true.
+-	 *
+-	 * If @retry_unclustered is true then we've already waited on this
+-	 * block group once and should move on to the next block group.
+-	 */
+-	if (!offset && !ffe_ctl->retry_unclustered && !ffe_ctl->cached &&
+-	    ffe_ctl->loop > LOOP_CACHING_NOWAIT) {
+-		btrfs_wait_block_group_cache_progress(bg, ffe_ctl->num_bytes +
+-						      ffe_ctl->empty_size);
+-		ffe_ctl->retry_unclustered = true;
+-		return -EAGAIN;
+-	} else if (!offset) {
++	if (!offset)
+ 		return 1;
+-	}
+ 	ffe_ctl->found_offset = offset;
+ 	return 0;
+ }
+@@ -3608,7 +3581,7 @@ static int do_allocation_clustered(struct btrfs_block_group *block_group,
+ 	/* We want to try and use the cluster allocator, so lets look there */
+ 	if (ffe_ctl->last_ptr && ffe_ctl->use_cluster) {
+ 		ret = find_free_extent_clustered(block_group, ffe_ctl, bg_ret);
+-		if (ret >= 0 || ret == -EAGAIN)
++		if (ret >= 0)
+ 			return ret;
+ 		/* ret == -ENOENT case falls through */
+ 	}
+@@ -3824,8 +3797,7 @@ static void release_block_group(struct btrfs_block_group *block_group,
+ {
+ 	switch (ffe_ctl->policy) {
+ 	case BTRFS_EXTENT_ALLOC_CLUSTERED:
+-		ffe_ctl->retry_clustered = false;
+-		ffe_ctl->retry_unclustered = false;
++		ffe_ctl->retry_uncached = false;
+ 		break;
+ 	case BTRFS_EXTENT_ALLOC_ZONED:
+ 		/* Nothing to do */
+@@ -4176,9 +4148,7 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 	ffe_ctl->orig_have_caching_bg = false;
+ 	ffe_ctl->index = btrfs_bg_flags_to_raid_index(ffe_ctl->flags);
+ 	ffe_ctl->loop = 0;
+-	/* For clustered allocation */
+-	ffe_ctl->retry_clustered = false;
+-	ffe_ctl->retry_unclustered = false;
++	ffe_ctl->retry_uncached = false;
+ 	ffe_ctl->cached = 0;
+ 	ffe_ctl->max_extent_size = 0;
+ 	ffe_ctl->total_free_space = 0;
+@@ -4329,16 +4299,13 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 
+ 		bg_ret = NULL;
+ 		ret = do_allocation(block_group, ffe_ctl, &bg_ret);
+-		if (ret == 0) {
+-			if (bg_ret && bg_ret != block_group) {
+-				btrfs_release_block_group(block_group,
+-							  ffe_ctl->delalloc);
+-				block_group = bg_ret;
+-			}
+-		} else if (ret == -EAGAIN) {
+-			goto have_block_group;
+-		} else if (ret > 0) {
++		if (ret > 0)
+ 			goto loop;
++
++		if (bg_ret && bg_ret != block_group) {
++			btrfs_release_block_group(block_group,
++						  ffe_ctl->delalloc);
++			block_group = bg_ret;
+ 		}
+ 
+ 		/* Checks */
+@@ -4379,6 +4346,15 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 		btrfs_release_block_group(block_group, ffe_ctl->delalloc);
+ 		break;
+ loop:
++		if (!ffe_ctl->cached && ffe_ctl->loop > LOOP_CACHING_NOWAIT &&
++		    !ffe_ctl->retry_uncached) {
++			ffe_ctl->retry_uncached = true;
++			btrfs_wait_block_group_cache_progress(block_group,
++						ffe_ctl->num_bytes +
++						ffe_ctl->empty_cluster +
++						ffe_ctl->empty_size);
++			goto have_block_group;
++		}
+ 		release_block_group(block_group, ffe_ctl, ffe_ctl->delalloc);
+ 		cond_resched();
+ 	}
+diff --git a/fs/btrfs/extent-tree.h b/fs/btrfs/extent-tree.h
+index 0c958fc1b..fb26d91dd 100644
+--- a/fs/btrfs/extent-tree.h
++++ b/fs/btrfs/extent-tree.h
+@@ -48,16 +48,11 @@ struct find_free_extent_ctl {
+ 	int loop;
+ 
+ 	/*
+-	 * Whether we're refilling a cluster, if true we need to re-search
+-	 * current block group but don't try to refill the cluster again.
++	 * Set to true if we're retry'ing the allocation on this block group
++	 * after waiting for caching progress, this is so that we retry only
++	 * once before moving on to another block group.
+ 	 */
+-	bool retry_clustered;
+-
+-	/*
+-	 * Whether we're updating free space cache, if true we need to re-search
+-	 * current block group but don't try updating free space cache again.
+-	 */
+-	bool retry_unclustered;
++	bool retry_uncached;
+ 
+ 	/* If current block group is cached */
+ 	int cached;
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 54eed5a8a..1c5f3a8f7 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2351,6 +2351,12 @@ static int extent_write_cache_pages(struct address_space *mapping,
+ 				continue;
+ 			}
+ 
++			if (!folio_test_dirty(folio)) {
++				/* Someone wrote it for us. */
++				folio_unlock(folio);
++				continue;
++			}
++
+ 			if (wbc->sync_mode != WB_SYNC_NONE) {
+ 				if (folio_test_writeback(folio))
+ 					submit_write_bio(bio_ctrl, 0);
+@@ -2370,11 +2376,12 @@ static int extent_write_cache_pages(struct address_space *mapping,
+ 			}
+ 
+ 			/*
+-			 * the filesystem may choose to bump up nr_to_write.
++			 * The filesystem may choose to bump up nr_to_write.
+ 			 * We have to make sure to honor the new nr_to_write
+-			 * at any time
++			 * at any time.
+ 			 */
+-			nr_to_write_done = wbc->nr_to_write <= 0;
++			nr_to_write_done = (wbc->sync_mode == WB_SYNC_NONE &&
++					    wbc->nr_to_write <= 0);
+ 		}
+ 		folio_batch_release(&fbatch);
+ 		cond_resched();
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index f64964739..f53b7b750 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1651,7 +1651,6 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+ 	struct file *file = iocb->ki_filp;
+ 	struct btrfs_inode *inode = BTRFS_I(file_inode(file));
+ 	ssize_t num_written, num_sync;
+-	const bool sync = iocb_is_dsync(iocb);
+ 
+ 	/*
+ 	 * If the fs flips readonly due to some impossible error, although we
+@@ -1664,9 +1663,6 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+ 	if (encoded && (iocb->ki_flags & IOCB_NOWAIT))
+ 		return -EOPNOTSUPP;
+ 
+-	if (sync)
+-		atomic_inc(&inode->sync_writers);
+-
+ 	if (encoded) {
+ 		num_written = btrfs_encoded_write(iocb, from, encoded);
+ 		num_sync = encoded->len;
+@@ -1686,9 +1682,6 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+ 			num_written = num_sync;
+ 	}
+ 
+-	if (sync)
+-		atomic_dec(&inode->sync_writers);
+-
+ 	current->backing_dev_info = NULL;
+ 	return num_written;
+ }
+@@ -1733,9 +1726,7 @@ static int start_ordered_ops(struct inode *inode, loff_t start, loff_t end)
+ 	 * several segments of stripe length (currently 64K).
+ 	 */
+ 	blk_start_plug(&plug);
+-	atomic_inc(&BTRFS_I(inode)->sync_writers);
+ 	ret = btrfs_fdatawrite_range(inode, start, end);
+-	atomic_dec(&BTRFS_I(inode)->sync_writers);
+ 	blk_finish_plug(&plug);
+ 
+ 	return ret;
+diff --git a/fs/btrfs/fs.h b/fs/btrfs/fs.h
+index 0d98fc5f6..840e4def1 100644
+--- a/fs/btrfs/fs.h
++++ b/fs/btrfs/fs.h
+@@ -543,7 +543,6 @@ struct btrfs_fs_info {
+ 	 * A third pool does submit_bio to avoid deadlocking with the other two.
+ 	 */
+ 	struct btrfs_workqueue *workers;
+-	struct btrfs_workqueue *hipri_workers;
+ 	struct btrfs_workqueue *delalloc_workers;
+ 	struct btrfs_workqueue *flush_workers;
+ 	struct workqueue_struct *endio_workers;
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index ace949bc7..e75c20be8 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3254,6 +3254,13 @@ int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered_extent)
+ 			btrfs_free_reserved_extent(fs_info,
+ 					ordered_extent->disk_bytenr,
+ 					ordered_extent->disk_num_bytes, 1);
++			/*
++			 * Actually free the qgroup rsv which was released when
++			 * the ordered extent was created.
++			 */
++			btrfs_qgroup_free_refroot(fs_info, inode->root->root_key.objectid,
++						  ordered_extent->qgroup_rsv,
++						  BTRFS_QGROUP_RSV_DATA);
+ 		}
+ 	}
+ 
+@@ -3369,15 +3376,21 @@ bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
+ void btrfs_add_delayed_iput(struct btrfs_inode *inode)
+ {
+ 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	unsigned long flags;
+ 
+ 	if (atomic_add_unless(&inode->vfs_inode.i_count, -1, 1))
+ 		return;
+ 
+ 	atomic_inc(&fs_info->nr_delayed_iputs);
+-	spin_lock(&fs_info->delayed_iput_lock);
++	/*
++	 * Need to be irq safe here because we can be called from either an irq
++	 * context (see bio.c and btrfs_put_ordered_extent()) or a non-irq
++	 * context.
++	 */
++	spin_lock_irqsave(&fs_info->delayed_iput_lock, flags);
+ 	ASSERT(list_empty(&inode->delayed_iput));
+ 	list_add_tail(&inode->delayed_iput, &fs_info->delayed_iputs);
+-	spin_unlock(&fs_info->delayed_iput_lock);
++	spin_unlock_irqrestore(&fs_info->delayed_iput_lock, flags);
+ 	if (!test_bit(BTRFS_FS_CLEANER_RUNNING, &fs_info->flags))
+ 		wake_up_process(fs_info->cleaner_kthread);
+ }
+@@ -3386,37 +3399,46 @@ static void run_delayed_iput_locked(struct btrfs_fs_info *fs_info,
+ 				    struct btrfs_inode *inode)
+ {
+ 	list_del_init(&inode->delayed_iput);
+-	spin_unlock(&fs_info->delayed_iput_lock);
++	spin_unlock_irq(&fs_info->delayed_iput_lock);
+ 	iput(&inode->vfs_inode);
+ 	if (atomic_dec_and_test(&fs_info->nr_delayed_iputs))
+ 		wake_up(&fs_info->delayed_iputs_wait);
+-	spin_lock(&fs_info->delayed_iput_lock);
++	spin_lock_irq(&fs_info->delayed_iput_lock);
+ }
+ 
+ static void btrfs_run_delayed_iput(struct btrfs_fs_info *fs_info,
+ 				   struct btrfs_inode *inode)
+ {
+ 	if (!list_empty(&inode->delayed_iput)) {
+-		spin_lock(&fs_info->delayed_iput_lock);
++		spin_lock_irq(&fs_info->delayed_iput_lock);
+ 		if (!list_empty(&inode->delayed_iput))
+ 			run_delayed_iput_locked(fs_info, inode);
+-		spin_unlock(&fs_info->delayed_iput_lock);
++		spin_unlock_irq(&fs_info->delayed_iput_lock);
+ 	}
+ }
+ 
+ void btrfs_run_delayed_iputs(struct btrfs_fs_info *fs_info)
+ {
+-
+-	spin_lock(&fs_info->delayed_iput_lock);
++	/*
++	 * btrfs_put_ordered_extent() can run in irq context (see bio.c), which
++	 * calls btrfs_add_delayed_iput() and that needs to lock
++	 * fs_info->delayed_iput_lock. So we need to disable irqs here to
++	 * prevent a deadlock.
++	 */
++	spin_lock_irq(&fs_info->delayed_iput_lock);
+ 	while (!list_empty(&fs_info->delayed_iputs)) {
+ 		struct btrfs_inode *inode;
+ 
+ 		inode = list_first_entry(&fs_info->delayed_iputs,
+ 				struct btrfs_inode, delayed_iput);
+ 		run_delayed_iput_locked(fs_info, inode);
+-		cond_resched_lock(&fs_info->delayed_iput_lock);
++		if (need_resched()) {
++			spin_unlock_irq(&fs_info->delayed_iput_lock);
++			cond_resched();
++			spin_lock_irq(&fs_info->delayed_iput_lock);
++		}
+ 	}
+-	spin_unlock(&fs_info->delayed_iput_lock);
++	spin_unlock_irq(&fs_info->delayed_iput_lock);
+ }
+ 
+ /*
+@@ -4219,7 +4241,7 @@ static int btrfs_unlink(struct inode *dir, struct dentry *dentry)
+ 	}
+ 
+ 	btrfs_record_unlink_dir(trans, BTRFS_I(dir), BTRFS_I(d_inode(dentry)),
+-			0);
++				false);
+ 
+ 	ret = btrfs_unlink_inode(trans, BTRFS_I(dir), BTRFS_I(d_inode(dentry)),
+ 				 &fname.disk_name);
+@@ -8469,7 +8491,6 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
+ 	ei->io_tree.inode = ei;
+ 	extent_io_tree_init(fs_info, &ei->file_extent_tree,
+ 			    IO_TREE_INODE_FILE_EXTENT);
+-	atomic_set(&ei->sync_writers, 0);
+ 	mutex_init(&ei->log_mutex);
+ 	btrfs_ordered_inode_tree_init(&ei->ordered_tree);
+ 	INIT_LIST_HEAD(&ei->delalloc_inodes);
+@@ -8796,9 +8817,9 @@ static int btrfs_rename_exchange(struct inode *old_dir,
+ 
+ 	if (old_dentry->d_parent != new_dentry->d_parent) {
+ 		btrfs_record_unlink_dir(trans, BTRFS_I(old_dir),
+-				BTRFS_I(old_inode), 1);
++					BTRFS_I(old_inode), true);
+ 		btrfs_record_unlink_dir(trans, BTRFS_I(new_dir),
+-				BTRFS_I(new_inode), 1);
++					BTRFS_I(new_inode), true);
+ 	}
+ 
+ 	/* src is a subvolume */
+@@ -9064,7 +9085,7 @@ static int btrfs_rename(struct mnt_idmap *idmap,
+ 
+ 	if (old_dentry->d_parent != new_dentry->d_parent)
+ 		btrfs_record_unlink_dir(trans, BTRFS_I(old_dir),
+-				BTRFS_I(old_inode), 1);
++					BTRFS_I(old_inode), true);
+ 
+ 	if (unlikely(old_ino == BTRFS_FIRST_FREE_OBJECTID)) {
+ 		ret = btrfs_unlink_subvol(trans, BTRFS_I(old_dir), old_dentry);
+diff --git a/fs/btrfs/lzo.c b/fs/btrfs/lzo.c
+index 3a095b9c6..d3fcfc628 100644
+--- a/fs/btrfs/lzo.c
++++ b/fs/btrfs/lzo.c
+@@ -88,9 +88,9 @@ struct list_head *lzo_alloc_workspace(unsigned int level)
+ 	if (!workspace)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	workspace->mem = kvmalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL);
+-	workspace->buf = kvmalloc(WORKSPACE_BUF_LENGTH, GFP_KERNEL);
+-	workspace->cbuf = kvmalloc(WORKSPACE_CBUF_LENGTH, GFP_KERNEL);
++	workspace->mem = kvmalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL | __GFP_NOWARN);
++	workspace->buf = kvmalloc(WORKSPACE_BUF_LENGTH, GFP_KERNEL | __GFP_NOWARN);
++	workspace->cbuf = kvmalloc(WORKSPACE_CBUF_LENGTH, GFP_KERNEL | __GFP_NOWARN);
+ 	if (!workspace->mem || !workspace->buf || !workspace->cbuf)
+ 		goto fail;
+ 
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index efeb1a9d0..8b1c12252 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -1631,7 +1631,6 @@ static void btrfs_resize_thread_pool(struct btrfs_fs_info *fs_info,
+ 	       old_pool_size, new_pool_size);
+ 
+ 	btrfs_workqueue_set_max(fs_info->workers, new_pool_size);
+-	btrfs_workqueue_set_max(fs_info->hipri_workers, new_pool_size);
+ 	btrfs_workqueue_set_max(fs_info->delalloc_workers, new_pool_size);
+ 	btrfs_workqueue_set_max(fs_info->caching_workers, new_pool_size);
+ 	workqueue_set_max_active(fs_info->endio_workers, new_pool_size);
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index eaf7511bb..fe801ccc0 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -593,8 +593,13 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+ 		u64 delayed_refs_bytes = 0;
+ 
+ 		qgroup_reserved = num_items * fs_info->nodesize;
+-		ret = btrfs_qgroup_reserve_meta_pertrans(root, qgroup_reserved,
+-				enforce_qgroups);
++		/*
++		 * Use prealloc for now, as there might be a currently running
++		 * transaction that could free this reserved space prematurely
++		 * by committing.
++		 */
++		ret = btrfs_qgroup_reserve_meta_prealloc(root, qgroup_reserved,
++							 enforce_qgroups, false);
+ 		if (ret)
+ 			return ERR_PTR(ret);
+ 
+@@ -707,6 +712,14 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+ 		h->reloc_reserved = reloc_reserved;
+ 	}
+ 
++	/*
++	 * Now that we have found a transaction to be a part of, convert the
++	 * qgroup reservation from prealloc to pertrans. A different transaction
++	 * can't race in and free our pertrans out from under us.
++	 */
++	if (qgroup_reserved)
++		btrfs_qgroup_convert_reserved_meta(root, qgroup_reserved);
++
+ got_it:
+ 	if (!current->journal_info)
+ 		current->journal_info = h;
+@@ -754,7 +767,7 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+ 		btrfs_block_rsv_release(fs_info, &fs_info->trans_block_rsv,
+ 					num_bytes, NULL);
+ reserve_fail:
+-	btrfs_qgroup_free_meta_pertrans(root, qgroup_reserved);
++	btrfs_qgroup_free_meta_prealloc(root, qgroup_reserved);
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -1062,7 +1075,6 @@ int btrfs_write_marked_extents(struct btrfs_fs_info *fs_info,
+ 	u64 start = 0;
+ 	u64 end;
+ 
+-	atomic_inc(&BTRFS_I(fs_info->btree_inode)->sync_writers);
+ 	while (!find_first_extent_bit(dirty_pages, start, &start, &end,
+ 				      mark, &cached_state)) {
+ 		bool wait_writeback = false;
+@@ -1098,7 +1110,6 @@ int btrfs_write_marked_extents(struct btrfs_fs_info *fs_info,
+ 		cond_resched();
+ 		start = end + 1;
+ 	}
+-	atomic_dec(&BTRFS_I(fs_info->btree_inode)->sync_writers);
+ 	return werr;
+ }
+ 
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index d2755d5e3..ecb73da5d 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -3252,7 +3252,7 @@ int btrfs_free_log_root_tree(struct btrfs_trans_handle *trans,
+  * Returns 1 if the inode was logged before in the transaction, 0 if it was not,
+  * and < 0 on error.
+  */
+-static int inode_logged(struct btrfs_trans_handle *trans,
++static int inode_logged(const struct btrfs_trans_handle *trans,
+ 			struct btrfs_inode *inode,
+ 			struct btrfs_path *path_in)
+ {
+@@ -5303,7 +5303,7 @@ static int btrfs_check_ref_name_override(struct extent_buffer *eb,
+  * multiple times when multiple tasks have joined the same log transaction.
+  */
+ static bool need_log_inode(const struct btrfs_trans_handle *trans,
+-			   const struct btrfs_inode *inode)
++			   struct btrfs_inode *inode)
+ {
+ 	/*
+ 	 * If a directory was not modified, no dentries added or removed, we can
+@@ -5321,7 +5321,7 @@ static bool need_log_inode(const struct btrfs_trans_handle *trans,
+ 	 * logged_trans will be 0, in which case we have to fully log it since
+ 	 * logged_trans is a transient field, not persisted.
+ 	 */
+-	if (inode->logged_trans == trans->transid &&
++	if (inode_logged(trans, inode, NULL) == 1 &&
+ 	    !test_bit(BTRFS_INODE_COPY_EVERYTHING, &inode->runtime_flags))
+ 		return false;
+ 
+@@ -7309,7 +7309,7 @@ int btrfs_recover_log_trees(struct btrfs_root *log_root_tree)
+  */
+ void btrfs_record_unlink_dir(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_inode *dir, struct btrfs_inode *inode,
+-			     int for_rename)
++			     bool for_rename)
+ {
+ 	/*
+ 	 * when we're logging a file, if it hasn't been renamed
+@@ -7325,18 +7325,25 @@ void btrfs_record_unlink_dir(struct btrfs_trans_handle *trans,
+ 	inode->last_unlink_trans = trans->transid;
+ 	mutex_unlock(&inode->log_mutex);
+ 
++	if (!for_rename)
++		return;
++
+ 	/*
+-	 * if this directory was already logged any new
+-	 * names for this file/dir will get recorded
++	 * If this directory was already logged, any new names will be logged
++	 * with btrfs_log_new_name() and old names will be deleted from the log
++	 * tree with btrfs_del_dir_entries_in_log() or with
++	 * btrfs_del_inode_ref_in_log().
+ 	 */
+-	if (dir->logged_trans == trans->transid)
++	if (inode_logged(trans, dir, NULL) == 1)
+ 		return;
+ 
+ 	/*
+-	 * if the inode we're about to unlink was logged,
+-	 * the log will be properly updated for any new names
++	 * If the inode we're about to unlink was logged before, the log will be
++	 * properly updated with the new name with btrfs_log_new_name() and the
++	 * old name removed with btrfs_del_dir_entries_in_log() or with
++	 * btrfs_del_inode_ref_in_log().
+ 	 */
+-	if (inode->logged_trans == trans->transid)
++	if (inode_logged(trans, inode, NULL) == 1)
+ 		return;
+ 
+ 	/*
+@@ -7346,13 +7353,6 @@ void btrfs_record_unlink_dir(struct btrfs_trans_handle *trans,
+ 	 * properly.  So, we have to be conservative and force commits
+ 	 * so the new name gets discovered.
+ 	 */
+-	if (for_rename)
+-		goto record;
+-
+-	/* we can safely do the unlink without any special recording */
+-	return;
+-
+-record:
+ 	mutex_lock(&dir->log_mutex);
+ 	dir->last_unlink_trans = trans->transid;
+ 	mutex_unlock(&dir->log_mutex);
+diff --git a/fs/btrfs/tree-log.h b/fs/btrfs/tree-log.h
+index bdeb52167..a550a8a37 100644
+--- a/fs/btrfs/tree-log.h
++++ b/fs/btrfs/tree-log.h
+@@ -100,7 +100,7 @@ void btrfs_end_log_trans(struct btrfs_root *root);
+ void btrfs_pin_log_trans(struct btrfs_root *root);
+ void btrfs_record_unlink_dir(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_inode *dir, struct btrfs_inode *inode,
+-			     int for_rename);
++			     bool for_rename);
+ void btrfs_record_snapshot_destroy(struct btrfs_trans_handle *trans,
+ 				   struct btrfs_inode *dir);
+ void btrfs_log_new_name(struct btrfs_trans_handle *trans,
+diff --git a/fs/btrfs/zlib.c b/fs/btrfs/zlib.c
+index 8acb05e17..6c231a116 100644
+--- a/fs/btrfs/zlib.c
++++ b/fs/btrfs/zlib.c
+@@ -63,7 +63,7 @@ struct list_head *zlib_alloc_workspace(unsigned int level)
+ 
+ 	workspacesize = max(zlib_deflate_workspacesize(MAX_WBITS, MAX_MEM_LEVEL),
+ 			zlib_inflate_workspacesize());
+-	workspace->strm.workspace = kvzalloc(workspacesize, GFP_KERNEL);
++	workspace->strm.workspace = kvzalloc(workspacesize, GFP_KERNEL | __GFP_NOWARN);
+ 	workspace->level = level;
+ 	workspace->buf = NULL;
+ 	/*
+diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+index f798da267..e7ac4ec80 100644
+--- a/fs/btrfs/zstd.c
++++ b/fs/btrfs/zstd.c
+@@ -356,7 +356,7 @@ struct list_head *zstd_alloc_workspace(unsigned int level)
+ 	workspace->level = level;
+ 	workspace->req_level = level;
+ 	workspace->last_used = jiffies;
+-	workspace->mem = kvmalloc(workspace->size, GFP_KERNEL);
++	workspace->mem = kvmalloc(workspace->size, GFP_KERNEL | __GFP_NOWARN);
+ 	workspace->buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+ 	if (!workspace->mem || !workspace->buf)
+ 		goto fail;
+-- 
+2.42.0.rc0.25.ga82fb66fed
+
