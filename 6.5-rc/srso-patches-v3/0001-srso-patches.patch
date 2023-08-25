@@ -1,0 +1,248 @@
+From 8becbb3c4a2e4191fde10c828f72f82cdd36d94a Mon Sep 17 00:00:00 2001
+From: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Date: Fri, 18 Aug 2023 10:03:05 -0700
+Subject: [PATCH 1/3] x86/fpu: Invalidate FPU state correctly on exec()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The thread flag TIF_NEED_FPU_LOAD indicates that the FPU saved state is
+valid and should be reloaded when returning to userspace. However, the
+kernel will skip doing this if the FPU registers are already valid as
+determined by fpregs_state_valid(). The logic embedded there considers
+the state valid if two cases are both true:
+
+  1: fpu_fpregs_owner_ctx points to the current tasks FPU state
+  2: the last CPU the registers were live in was the current CPU.
+
+This is usually correct logic. A CPU’s fpu_fpregs_owner_ctx is set to
+the current FPU during the fpregs_restore_userregs() operation, so it
+indicates that the registers have been restored on this CPU. But this
+alone doesn’t preclude that the task hasn’t been rescheduled to a
+different CPU, where the registers were modified, and then back to the
+current CPU. To verify that this was not the case the logic relies on the
+second condition. So the assumption is that if the registers have been
+restored, AND they haven’t had the chance to be modified (by being
+loaded on another CPU), then they MUST be valid on the current CPU.
+
+Besides the lazy FPU optimizations, the other cases where the FPU
+registers might not be valid are when the kernel modifies the FPU register
+state or the FPU saved buffer. In this case the operation modifying the
+FPU state needs to let the kernel know the correspondence has been
+broken. The comment in “arch/x86/kernel/fpu/context.h” has:
+/*
+...
+ * If the FPU register state is valid, the kernel can skip restoring the
+ * FPU state from memory.
+ *
+ * Any code that clobbers the FPU registers or updates the in-memory
+ * FPU state for a task MUST let the rest of the kernel know that the
+ * FPU registers are no longer valid for this task.
+ *
+ * Either one of these invalidation functions is enough. Invalidate
+ * a resource you control: CPU if using the CPU for something else
+ * (with preemption disabled), FPU for the current task, or a task that
+ * is prevented from running by the current task.
+ */
+
+However, this is not completely true. When the kernel modifies the
+registers or saved FPU state, it can only rely on
+__fpu_invalidate_fpregs_state(), which wipes the FPU’s last_cpu
+tracking. The exec path instead relies on fpregs_deactivate(), which sets
+the CPU’s FPU context to NULL. This was observed to fail to restore the
+reset FPU state to the registers when returning to userspace in the
+following scenario:
+
+1. A task is executing in userspace on CPU0
+	- CPU0’s FPU context points to tasks
+	- fpu->last_cpu=CPU0
+
+2. The task exec()’s
+
+3. While in the kernel the task is preempted
+	- CPU0 gets a thread executing in the kernel (such that no other
+		FPU context is activated)
+	- Scheduler sets task’s fpu->last_cpu=CPU0 when scheduling out
+
+4. Task is migrated to CPU1
+
+5. Continuing the exec(), the task gets to
+   fpu_flush_thread()->fpu_reset_fpregs()
+	- Sets CPU1’s fpu context to NULL
+	- Copies the init state to the task’s FPU buffer
+	- Sets TIF_NEED_FPU_LOAD on the task
+
+6. The task reschedules back to CPU0 before completing the exec() and
+   returning to userspace
+	- During the reschedule, scheduler finds TIF_NEED_FPU_LOAD is set
+	- Skips saving the registers and updating task’s fpu→last_cpu,
+	  because TIF_NEED_FPU_LOAD is the canonical source.
+
+7. Now CPU0’s FPU context is still pointing to the task’s, and
+   fpu->last_cpu is still CPU0. So fpregs_state_valid() returns true even
+   though the reset FPU state has not been restored.
+
+So the root cause is that exec() is doing the wrong kind of invalidate. It
+should reset fpu->last_cpu via __fpu_invalidate_fpregs_state(). Further,
+fpu__drop() doesn't really seem appropriate as the task (and FPU) are not
+going away, they are just getting reset as part of an exec. So switch to
+__fpu_invalidate_fpregs_state().
+
+Also, delete the misleading comment that says that either kind of
+invalidate will be enough, because it’s not always the case.
+
+Fixes: 33344368cb08 ("x86/fpu: Clean up the fpu__clear() variants")
+Reported-by: Lei Wang <lei4.wang@intel.com>
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Lijun Pan <lijun.pan@intel.com>
+Reviewed-by: Sohil Mehta <sohil.mehta@intel.com>
+Acked-by: Lijun Pan <lijun.pan@intel.com>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20230818170305.502891-1-rick.p.edgecombe@intel.com
+---
+ arch/x86/kernel/fpu/context.h | 3 +--
+ arch/x86/kernel/fpu/core.c    | 2 +-
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kernel/fpu/context.h b/arch/x86/kernel/fpu/context.h
+index af5cbdd9b..f6d856bd5 100644
+--- a/arch/x86/kernel/fpu/context.h
++++ b/arch/x86/kernel/fpu/context.h
+@@ -19,8 +19,7 @@
+  * FPU state for a task MUST let the rest of the kernel know that the
+  * FPU registers are no longer valid for this task.
+  *
+- * Either one of these invalidation functions is enough. Invalidate
+- * a resource you control: CPU if using the CPU for something else
++ * Invalidate a resource you control: CPU if using the CPU for something else
+  * (with preemption disabled), FPU for the current task, or a task that
+  * is prevented from running by the current task.
+  */
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 1015af1ae..98e507cc7 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -679,7 +679,7 @@ static void fpu_reset_fpregs(void)
+ 	struct fpu *fpu = &current->thread.fpu;
+ 
+ 	fpregs_lock();
+-	fpu__drop(fpu);
++	__fpu_invalidate_fpregs_state(fpu);
+ 	/*
+ 	 * This does not change the actual hardware registers. It just
+ 	 * resets the memory image and sets TIF_NEED_FPU_LOAD so a
+-- 
+2.42.0
+
+
+From ba2e369474c512381109d7f4c6e1d9e3c77faa58 Mon Sep 17 00:00:00 2001
+From: Feng Tang <feng.tang@intel.com>
+Date: Wed, 23 Aug 2023 14:57:47 +0800
+Subject: [PATCH 2/3] x86/fpu: Set X86_FEATURE_OSXSAVE feature after enabling
+ OSXSAVE in CR4
+
+0-Day found a 34.6% regression in stress-ng's 'af-alg' test case, and
+bisected it to commit b81fac906a8f ("x86/fpu: Move FPU initialization into
+arch_cpu_finalize_init()"), which optimizes the FPU init order, and moves
+the CR4_OSXSAVE enabling into a later place:
+
+   arch_cpu_finalize_init
+       identify_boot_cpu
+	   identify_cpu
+	       generic_identify
+                   get_cpu_cap --> setup cpu capability
+       ...
+       fpu__init_cpu
+           fpu__init_cpu_xstate
+               cr4_set_bits(X86_CR4_OSXSAVE);
+
+As the FPU is not yet initialized the CPU capability setup fails to set
+X86_FEATURE_OSXSAVE. Many security module like 'camellia_aesni_avx_x86_64'
+depend on this feature and therefore fail to load, causing the regression.
+
+Cure this by setting X86_FEATURE_OSXSAVE feature right after OSXSAVE
+enabling.
+
+[ tglx: Moved it into the actual BSP FPU initialization code and added a comment ]
+
+Fixes: b81fac906a8f ("x86/fpu: Move FPU initialization into arch_cpu_finalize_init()")
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Signed-off-by: Feng Tang <feng.tang@intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/lkml/202307192135.203ac24e-oliver.sang@intel.com
+Link: https://lore.kernel.org/lkml/20230823065747.92257-1-feng.tang@intel.com
+---
+ arch/x86/kernel/fpu/xstate.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 0bab497c9..1afbc4866 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -882,6 +882,13 @@ void __init fpu__init_system_xstate(unsigned int legacy_size)
+ 		goto out_disable;
+ 	}
+ 
++	/*
++	 * CPU capabilities initialization runs before FPU init. So
++	 * X86_FEATURE_OSXSAVE is not set. Now that XSAVE is completely
++	 * functional, set the feature bit so depending code works.
++	 */
++	setup_force_cpu_cap(X86_FEATURE_OSXSAVE);
++
+ 	print_xstate_offset_size();
+ 	pr_info("x86/fpu: Enabled xstate features 0x%llx, context size is %d bytes, using '%s' format.\n",
+ 		fpu_kernel_cfg.max_features,
+-- 
+2.42.0
+
+
+From 2a48a0a42b7c5cba2f9b6e2083c0c33d6b8924ad Mon Sep 17 00:00:00 2001
+From: Josh Poimboeuf <jpoimboe@kernel.org>
+Date: Fri, 25 Aug 2023 00:01:43 -0700
+Subject: [PATCH 3/3] x86/alternatives: Remove faulty optimization
+
+The following commit:
+
+  095b8303f383 ("x86/alternative: Make custom return thunk unconditional")
+
+made '__x86_return_thunk' a placeholder value.  All code setting
+X86_FEATURE_RETHUNK also changes the value of 'x86_return_thunk'.  So
+the optimization at the beginning of apply_returns() is dead code.
+
+Also, before the above-mentioned commit, the optimization actually had a
+bug It bypassed __static_call_fixup(), causing some raw returns to
+remain unpatched in static call trampolines.  Thus the 'Fixes' tag.
+
+Fixes: d2408e043e72 ("x86/alternative: Optimize returns patching")
+Signed-off-by: Josh Poimboeuf <jpoimboe@kernel.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/ca76a2e94217d6fc8e007d2ca79fee219f3168f8.1692919072.git.jpoimboe@kernel.org
+---
+ arch/x86/kernel/alternative.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 099d58d02..34be5fbaf 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -720,14 +720,6 @@ void __init_or_module noinline apply_returns(s32 *start, s32 *end)
+ {
+ 	s32 *s;
+ 
+-	/*
+-	 * Do not patch out the default return thunks if those needed are the
+-	 * ones generated by the compiler.
+-	 */
+-	if (cpu_feature_enabled(X86_FEATURE_RETHUNK) &&
+-	    (x86_return_thunk == __x86_return_thunk))
+-		return;
+-
+ 	for (s = start; s < end; s++) {
+ 		void *dest = NULL, *addr = (void *)s + *s;
+ 		struct insn insn;
+-- 
+2.42.0
+
