@@ -1,0 +1,143 @@
+From 3e277f89af682d9796527803560865e8052e816b Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Wed, 30 Aug 2023 20:56:54 +0800
+Subject: [PATCH 54/54] fork: Use __mt_dup() to duplicate maple tree in
+ dup_mmap()
+
+Use __mt_dup() to duplicate the old maple tree in dup_mmap(), and then
+directly modify the entries of VMAs in the new maple tree, which can
+get better performance. The optimization effect is proportional to the
+number of VMAs.
+
+There is a "spawn" in byte-unixbench[1], which can be used to test the
+performance of fork(). I modified it slightly to make it work with
+different number of VMAs.
+
+Below are the test numbers. There are 21 VMAs by default. The first row
+indicates the number of added VMAs. The following two lines are the
+number of fork() calls every 10 seconds. These numbers are different
+from the test results in v1 because this time the benchmark is bound to
+a CPU. This way the numbers are more stable.
+
+  Increment of VMAs: 0      100     200     400     800     1600    3200    6400
+6.5.0-next-20230829: 111878 75531   53683   35282   20741   11317   6110    3158
+Apply this patchset: 114531 85420   64541   44592   28660   16371   9038    4831
+                     +2.37% +13.09% +20.23% +26.39% +38.18% +44.66% +47.92% +52.98%
+
+[1] https://github.com/kdlucas/byte-unixbench/tree/master
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ kernel/fork.c | 34 ++++++++++++++++++++++++++--------
+ mm/mmap.c     | 14 ++++++++++++--
+ 2 files changed, 38 insertions(+), 10 deletions(-)
+
+diff --git a/kernel/fork.c b/kernel/fork.c
+index d2e12b6d2..3a1c26eed 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -650,7 +650,6 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 	int retval;
+ 	unsigned long charge = 0;
+ 	LIST_HEAD(uf);
+-	VMA_ITERATOR(old_vmi, oldmm, 0);
+ 	VMA_ITERATOR(vmi, mm, 0);
+ 
+ 	uprobe_start_dup_mmap();
+@@ -678,17 +677,39 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 		goto out;
+ 	khugepaged_fork(mm, oldmm);
+ 
+-	retval = vma_iter_bulk_alloc(&vmi, oldmm->map_count);
+-	if (retval)
++	/* Use __mt_dup() to efficiently build an identical maple tree. */
++	retval = __mt_dup(&oldmm->mm_mt, &mm->mm_mt, GFP_NOWAIT | __GFP_NOWARN);
++	if (unlikely(retval))
+ 		goto out;
+ 
+ 	mt_clear_in_rcu(vmi.mas.tree);
+-	for_each_vma(old_vmi, mpnt) {
++	for_each_vma(vmi, mpnt) {
+ 		struct file *file;
+ 
+ 		vma_start_write(mpnt);
+ 		if (mpnt->vm_flags & VM_DONTCOPY) {
+ 			vm_stat_account(mm, mpnt->vm_flags, -vma_pages(mpnt));
++
++			/*
++			 * Since the new tree is exactly the same as the old one,
++			 * we need to remove the unneeded VMAs.
++			 */
++			mas_store(&vmi.mas, NULL);
++
++			/*
++			 * Even removing an entry may require memory allocation,
++			 * and if removal fails, we use XA_ZERO_ENTRY to mark
++			 * from which VMA it failed. The case of encountering
++			 * XA_ZERO_ENTRY will be handled in exit_mmap().
++			 */
++			if (unlikely(mas_is_err(&vmi.mas))) {
++				retval = xa_err(vmi.mas.node);
++				mas_reset(&vmi.mas);
++				if (mas_find(&vmi.mas, ULONG_MAX))
++					mas_store(&vmi.mas, XA_ZERO_ENTRY);
++				goto loop_out;
++			}
++
+ 			continue;
+ 		}
+ 		charge = 0;
+@@ -750,8 +771,7 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 			hugetlb_dup_vma_private(tmp);
+ 
+ 		/* Link the vma into the MT */
+-		if (vma_iter_bulk_store(&vmi, tmp))
+-			goto fail_nomem_vmi_store;
++		mas_store(&vmi.mas, tmp);
+ 
+ 		mm->map_count++;
+ 		if (!(tmp->vm_flags & VM_WIPEONFORK))
+@@ -778,8 +798,6 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 	uprobe_end_dup_mmap();
+ 	return retval;
+ 
+-fail_nomem_vmi_store:
+-	unlink_anon_vmas(tmp);
+ fail_nomem_anon_vma_fork:
+ 	mpol_put(vma_policy(tmp));
+ fail_nomem_policy:
+diff --git a/mm/mmap.c b/mm/mmap.c
+index e8e2be0fe..ccc979d68 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -3189,7 +3189,11 @@ void exit_mmap(struct mm_struct *mm)
+ 	arch_exit_mmap(mm);
+ 
+ 	vma = mas_find(&mas, ULONG_MAX);
+-	if (!vma) {
++	/*
++	 * If dup_mmap() fails to remove a VMA marked VM_DONTCOPY,
++	 * xa_is_zero(vma) may be true.
++	 */
++	if (!vma || xa_is_zero(vma)) {
+ 		/* Can happen if dup_mmap() received an OOM */
+ 		mmap_read_unlock(mm);
+ 		return;
+@@ -3227,7 +3231,13 @@ void exit_mmap(struct mm_struct *mm)
+ 		remove_vma(vma, true);
+ 		count++;
+ 		cond_resched();
+-	} while ((vma = mas_find(&mas, ULONG_MAX)) != NULL);
++		vma = mas_find(&mas, ULONG_MAX);
++		/*
++		 * If xa_is_zero(vma) is true, it means that subsequent VMAs
++		 * donot need to be removed. Can happen if dup_mmap() fails to
++		 * remove a VMA marked VM_DONTCOPY.
++		 */
++	} while (vma != NULL && !xa_is_zero(vma));
+ 
+ 	BUG_ON(count != mm->map_count);
+ 
+-- 
+2.42.0
+
