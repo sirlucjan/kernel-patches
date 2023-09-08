@@ -1,0 +1,1106 @@
+From 106c103c1760c9f15d61f4419b448c9aaa235371 Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Fri, 21 Jul 2023 09:02:06 -0700
+Subject: [PATCH 01/12] btrfs: free qgroup rsv on io failure
+
+If we do a write whose bio suffers an error, we will never reclaim the
+qgroup reserved space for it. We allocate the space in the write_iter
+codepath, then release the reservation as we allocate the ordered
+extent, but we only create a delayed ref if the ordered extent finishes.
+If it has an error, we simply leak the rsv. This is apparent in running
+any error injecting (dmerror) fstests like btrfs/146 or btrfs/160. Such
+tests fail due to dmesg on umount complaining about the leaked qgroup
+data space.
+
+When we clean up other aspects of space on failed ordered_extents, also
+free the qgroup rsv.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+CC: stable@vger.kernel.org # 5.10+
+Signed-off-by: Boris Burkov <boris@bur.io>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/inode.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index aa090b0b5..db2b33a82 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3359,6 +3359,13 @@ int btrfs_finish_one_ordered(struct btrfs_ordered_extent *ordered_extent)
+ 			btrfs_free_reserved_extent(fs_info,
+ 					ordered_extent->disk_bytenr,
+ 					ordered_extent->disk_num_bytes, 1);
++			/*
++			 * Actually free the qgroup rsv which was released when
++			 * the ordered extent was created.
++			 */
++			btrfs_qgroup_free_refroot(fs_info, inode->root->root_key.objectid,
++						  ordered_extent->qgroup_rsv,
++						  BTRFS_QGROUP_RSV_DATA);
+ 		}
+ 	}
+ 
+-- 
+2.42.0
+
+
+From 873956b30ed18c6873253b945f3b1a85348d67ab Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Fri, 21 Jul 2023 09:02:07 -0700
+Subject: [PATCH 02/12] btrfs: fix start transaction qgroup rsv double free
+
+btrfs_start_transaction reserves metadata space of the PERTRANS type
+before it identifies a transaction to start/join. This allows flushing
+when reserving that space without a deadlock. However, it results in a
+race which temporarily breaks qgroup rsv accounting.
+
+T1                                              T2
+start_transaction
+do_stuff
+                                            start_transaction
+                                                qgroup_reserve_meta_pertrans
+commit_transaction
+    qgroup_free_meta_all_pertrans
+                                            hit an error starting txn
+                                            goto reserve_fail
+                                            qgroup_free_meta_pertrans (already freed!)
+
+The basic issue is that there is nothing preventing another commit from
+committing before start_transaction finishes (in fact sometimes we
+intentionally wait for it) so any error path that frees the reserve is
+at risk of this race.
+
+While this exact space was getting freed anyway, and it's not a huge
+deal to double free it (just a warning, the free code catches this), it
+can result in incorrectly freeing some other pertrans reservation in
+this same reservation, which could then lead to spuriously granting
+reservations we might not have the space for. Therefore, I do believe it
+is worth fixing.
+
+To fix it, use the existing prealloc->pertrans conversion mechanism.
+When we first reserve the space, we reserve prealloc space and only when
+we are sure we have a transaction do we convert it to pertrans. This way
+any racing commits do not blow away our reservation, but we still get a
+pertrans reservation that is freed when _this_ transaction gets committed.
+
+This issue can be reproduced by running generic/269 with either qgroups
+or squotas enabled via mkfs on the scratch device.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+CC: stable@vger.kernel.org # 5.10+
+Signed-off-by: Boris Burkov <boris@bur.io>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/transaction.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 91b6c2fdc..5905c85a8 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -591,8 +591,13 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+ 		u64 delayed_refs_bytes = 0;
+ 
+ 		qgroup_reserved = num_items * fs_info->nodesize;
+-		ret = btrfs_qgroup_reserve_meta_pertrans(root, qgroup_reserved,
+-				enforce_qgroups);
++		/*
++		 * Use prealloc for now, as there might be a currently running
++		 * transaction that could free this reserved space prematurely
++		 * by committing.
++		 */
++		ret = btrfs_qgroup_reserve_meta_prealloc(root, qgroup_reserved,
++							 enforce_qgroups, false);
+ 		if (ret)
+ 			return ERR_PTR(ret);
+ 
+@@ -705,6 +710,14 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+ 		h->reloc_reserved = reloc_reserved;
+ 	}
+ 
++	/*
++	 * Now that we have found a transaction to be a part of, convert the
++	 * qgroup reservation from prealloc to pertrans. A different transaction
++	 * can't race in and free our pertrans out from under us.
++	 */
++	if (qgroup_reserved)
++		btrfs_qgroup_convert_reserved_meta(root, qgroup_reserved);
++
+ got_it:
+ 	if (!current->journal_info)
+ 		current->journal_info = h;
+@@ -752,7 +765,7 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+ 		btrfs_block_rsv_release(fs_info, &fs_info->trans_block_rsv,
+ 					num_bytes, NULL);
+ reserve_fail:
+-	btrfs_qgroup_free_meta_pertrans(root, qgroup_reserved);
++	btrfs_qgroup_free_meta_prealloc(root, qgroup_reserved);
+ 	return ERR_PTR(ret);
+ }
+ 
+-- 
+2.42.0
+
+
+From 5a41442644832d65155f0c5f0f13e57403325617 Mon Sep 17 00:00:00 2001
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Mon, 31 Jul 2023 16:28:43 -0400
+Subject: [PATCH 03/12] btrfs: wait on uncached block groups on every
+ allocation loop
+
+My initial fix for the generic/475 hangs was related to metadata, but
+our CI testing uncovered another case where we hang for similar reasons.
+We again have a task with a plug that is holding an outstanding request
+that is keeping the dm device from finishing it's suspend, and that task
+is stuck in the allocator.
+
+This time it is stuck trying to allocate data, but we do not have a
+block group that matches the size class.  The larger loop in the
+allocator looks like this (simplified of course)
+
+find_free_extent
+  for_each_block_group {
+    ffe_ctl->cached == btrfs_block_group_cache_done(bg)
+    if (!ffe_ctl->cached)
+      ffe_ctl->have_caching_bg = true;
+    do_allocation()
+      btrfs_wait_block_group_cache_progress();
+  }
+
+  if (loop == LOOP_CACHING_WAIT && ffe_ctl->have_caching_bg)
+    go search again;
+
+In my earlier fix we were trying to allocate from the block group, but
+we weren't waiting for the progress because we were only waiting for the
+free space to be >= the amount of free space we wanted.  My fix made it
+so we waited for forward progress to be made as well, so we would be
+sure to wait.
+
+This time however we did not have a block group that matched our size
+class, so what was happening was this
+
+find_free_extent
+  for_each_block_group {
+    ffe_ctl->cached == btrfs_block_group_cache_done(bg)
+    if (!ffe_ctl->cached)
+      ffe_ctl->have_caching_bg = true;
+    if (size_class_doesn't_match())
+      goto loop;
+    do_allocation()
+      btrfs_wait_block_group_cache_progress();
+loop:
+    release_block_group(block_group);
+  }
+
+  if (loop == LOOP_CACHING_WAIT && ffe_ctl->have_caching_bg)
+    go search again;
+
+The size_class_doesn't_match() part was true, so we'd just skip this
+block group and never wait for caching, and then because we found a
+caching block group we'd just go back and do the loop again.  We never
+sleep and thus never flush the plug and we have the same deadlock.
+
+Fix the logic for waiting on the block group caching to instead do it
+unconditionally when we goto loop.  This takes the logic out of the
+allocation step, so now the loop looks more like this
+
+find_free_extent
+  for_each_block_group {
+    ffe_ctl->cached == btrfs_block_group_cache_done(bg)
+    if (!ffe_ctl->cached)
+      ffe_ctl->have_caching_bg = true;
+    if (size_class_doesn't_match())
+      goto loop;
+    do_allocation()
+      btrfs_wait_block_group_cache_progress();
+loop:
+    if (loop > LOOP_CACHING_NOWAIT && !ffe_ctl->retry_uncached &&
+        !ffe_ctl->cached) {
+       ffe_ctl->retry_uncached = true;
+       btrfs_wait_block_group_cache_progress();
+    }
+
+    release_block_group(block_group);
+  }
+
+  if (loop == LOOP_CACHING_WAIT && ffe_ctl->have_caching_bg)
+    go search again;
+
+This simplifies the logic a lot, and makes sure that if we're hitting
+uncached block groups we're always waiting on them at some point.
+
+I ran this through 100 iterations of generic/475, as this particular
+case was harder to hit than the previous one.
+
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+---
+ fs/btrfs/extent-tree.c | 62 +++++++++++++-----------------------------
+ fs/btrfs/extent-tree.h | 13 +++------
+ 2 files changed, 23 insertions(+), 52 deletions(-)
+
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index f396a9afa..3cbdb3ca8 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -3427,7 +3427,6 @@ btrfs_release_block_group(struct btrfs_block_group *cache,
+  * Helper function for find_free_extent().
+  *
+  * Return -ENOENT to inform caller that we need fallback to unclustered mode.
+- * Return -EAGAIN to inform caller that we need to re-search this block group
+  * Return >0 to inform caller that we find nothing
+  * Return 0 means we have found a location and set ffe_ctl->found_offset.
+  */
+@@ -3508,14 +3507,6 @@ static int find_free_extent_clustered(struct btrfs_block_group *bg,
+ 			trace_btrfs_reserve_extent_cluster(bg, ffe_ctl);
+ 			return 0;
+ 		}
+-	} else if (!ffe_ctl->cached && ffe_ctl->loop > LOOP_CACHING_NOWAIT &&
+-		   !ffe_ctl->retry_clustered) {
+-		spin_unlock(&last_ptr->refill_lock);
+-
+-		ffe_ctl->retry_clustered = true;
+-		btrfs_wait_block_group_cache_progress(bg, ffe_ctl->num_bytes +
+-				ffe_ctl->empty_cluster + ffe_ctl->empty_size);
+-		return -EAGAIN;
+ 	}
+ 	/*
+ 	 * At this point we either didn't find a cluster or we weren't able to
+@@ -3530,7 +3521,6 @@ static int find_free_extent_clustered(struct btrfs_block_group *bg,
+ /*
+  * Return >0 to inform caller that we find nothing
+  * Return 0 when we found an free extent and set ffe_ctrl->found_offset
+- * Return -EAGAIN to inform caller that we need to re-search this block group
+  */
+ static int find_free_extent_unclustered(struct btrfs_block_group *bg,
+ 					struct find_free_extent_ctl *ffe_ctl)
+@@ -3568,25 +3558,8 @@ static int find_free_extent_unclustered(struct btrfs_block_group *bg,
+ 	offset = btrfs_find_space_for_alloc(bg, ffe_ctl->search_start,
+ 			ffe_ctl->num_bytes, ffe_ctl->empty_size,
+ 			&ffe_ctl->max_extent_size);
+-
+-	/*
+-	 * If we didn't find a chunk, and we haven't failed on this block group
+-	 * before, and this block group is in the middle of caching and we are
+-	 * ok with waiting, then go ahead and wait for progress to be made, and
+-	 * set @retry_unclustered to true.
+-	 *
+-	 * If @retry_unclustered is true then we've already waited on this
+-	 * block group once and should move on to the next block group.
+-	 */
+-	if (!offset && !ffe_ctl->retry_unclustered && !ffe_ctl->cached &&
+-	    ffe_ctl->loop > LOOP_CACHING_NOWAIT) {
+-		btrfs_wait_block_group_cache_progress(bg, ffe_ctl->num_bytes +
+-						      ffe_ctl->empty_size);
+-		ffe_ctl->retry_unclustered = true;
+-		return -EAGAIN;
+-	} else if (!offset) {
++	if (!offset)
+ 		return 1;
+-	}
+ 	ffe_ctl->found_offset = offset;
+ 	return 0;
+ }
+@@ -3600,7 +3573,7 @@ static int do_allocation_clustered(struct btrfs_block_group *block_group,
+ 	/* We want to try and use the cluster allocator, so lets look there */
+ 	if (ffe_ctl->last_ptr && ffe_ctl->use_cluster) {
+ 		ret = find_free_extent_clustered(block_group, ffe_ctl, bg_ret);
+-		if (ret >= 0 || ret == -EAGAIN)
++		if (ret >= 0)
+ 			return ret;
+ 		/* ret == -ENOENT case falls through */
+ 	}
+@@ -3816,8 +3789,7 @@ static void release_block_group(struct btrfs_block_group *block_group,
+ {
+ 	switch (ffe_ctl->policy) {
+ 	case BTRFS_EXTENT_ALLOC_CLUSTERED:
+-		ffe_ctl->retry_clustered = false;
+-		ffe_ctl->retry_unclustered = false;
++		ffe_ctl->retry_uncached = false;
+ 		break;
+ 	case BTRFS_EXTENT_ALLOC_ZONED:
+ 		/* Nothing to do */
+@@ -4168,9 +4140,7 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 	ffe_ctl->orig_have_caching_bg = false;
+ 	ffe_ctl->index = btrfs_bg_flags_to_raid_index(ffe_ctl->flags);
+ 	ffe_ctl->loop = 0;
+-	/* For clustered allocation */
+-	ffe_ctl->retry_clustered = false;
+-	ffe_ctl->retry_unclustered = false;
++	ffe_ctl->retry_uncached = false;
+ 	ffe_ctl->cached = 0;
+ 	ffe_ctl->max_extent_size = 0;
+ 	ffe_ctl->total_free_space = 0;
+@@ -4321,16 +4291,13 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 
+ 		bg_ret = NULL;
+ 		ret = do_allocation(block_group, ffe_ctl, &bg_ret);
+-		if (ret == 0) {
+-			if (bg_ret && bg_ret != block_group) {
+-				btrfs_release_block_group(block_group,
+-							  ffe_ctl->delalloc);
+-				block_group = bg_ret;
+-			}
+-		} else if (ret == -EAGAIN) {
+-			goto have_block_group;
+-		} else if (ret > 0) {
++		if (ret > 0)
+ 			goto loop;
++
++		if (bg_ret && bg_ret != block_group) {
++			btrfs_release_block_group(block_group,
++						  ffe_ctl->delalloc);
++			block_group = bg_ret;
+ 		}
+ 
+ 		/* Checks */
+@@ -4371,6 +4338,15 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 		btrfs_release_block_group(block_group, ffe_ctl->delalloc);
+ 		break;
+ loop:
++		if (!ffe_ctl->cached && ffe_ctl->loop > LOOP_CACHING_NOWAIT &&
++		    !ffe_ctl->retry_uncached) {
++			ffe_ctl->retry_uncached = true;
++			btrfs_wait_block_group_cache_progress(block_group,
++						ffe_ctl->num_bytes +
++						ffe_ctl->empty_cluster +
++						ffe_ctl->empty_size);
++			goto have_block_group;
++		}
+ 		release_block_group(block_group, ffe_ctl, ffe_ctl->delalloc);
+ 		cond_resched();
+ 	}
+diff --git a/fs/btrfs/extent-tree.h b/fs/btrfs/extent-tree.h
+index 429d5c570..b0b289bdb 100644
+--- a/fs/btrfs/extent-tree.h
++++ b/fs/btrfs/extent-tree.h
+@@ -48,16 +48,11 @@ struct find_free_extent_ctl {
+ 	int loop;
+ 
+ 	/*
+-	 * Whether we're refilling a cluster, if true we need to re-search
+-	 * current block group but don't try to refill the cluster again.
++	 * Set to true if we're retry'ing the allocation on this block group
++	 * after waiting for caching progress, this is so that we retry only
++	 * once before moving on to another block group.
+ 	 */
+-	bool retry_clustered;
+-
+-	/*
+-	 * Whether we're updating free space cache, if true we need to re-search
+-	 * current block group but don't try updating free space cache again.
+-	 */
+-	bool retry_unclustered;
++	bool retry_uncached;
+ 
+ 	/* If current block group is cached */
+ 	int cached;
+-- 
+2.42.0
+
+
+From 74af80cf73d48578ef141334ed7de062cb45fc9f Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 24 Jul 2023 06:26:53 -0700
+Subject: [PATCH 04/12] btrfs: don't stop integrity writeback too early
+
+extent_write_cache_pages stops writing pages as soon as nr_to_write hits
+zero.  That is the right thing for opportunistic writeback, but incorrect
+for data integrity writeback, which needs to ensure that no dirty pages
+are left in the range.  Thus only stop the writeback for WB_SYNC_NONE
+if nr_to_write hits 0.
+
+This is a port of write_cache_pages changes in commit 05fe478dd04e
+("mm: write_cache_pages integrity fix").
+
+Note that I've only trigger the problem with other changes to the btrfs
+writeback code, but this condition seems worthwhile fixing anyway.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: David Sterba <dsterba@suse.com>
+[ updated comment ]
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent_io.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 90ad3006e..37b7f4e40 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2005,11 +2005,12 @@ int btree_write_cache_pages(struct address_space *mapping,
+ 			}
+ 
+ 			/*
+-			 * the filesystem may choose to bump up nr_to_write.
++			 * The filesystem may choose to bump up nr_to_write.
+ 			 * We have to make sure to honor the new nr_to_write
+-			 * at any time
++			 * at any time.
+ 			 */
+-			nr_to_write_done = wbc->nr_to_write <= 0;
++			nr_to_write_done = (wbc->sync_mode == WB_SYNC_NONE &&
++					    wbc->nr_to_write <= 0);
+ 		}
+ 		folio_batch_release(&fbatch);
+ 		cond_resched();
+-- 
+2.42.0
+
+
+From f6774f7be37e8ba42ea6786da7c51de3afc2cb1b Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 24 Jul 2023 06:26:54 -0700
+Subject: [PATCH 05/12] btrfs: don't wait for writeback on clean pages in
+ extent_write_cache_pages
+
+__extent_writepage could have started on more pages than the one it was
+called for.  This happens regularly for zoned file systems, and in theory
+could happen for compressed I/O if the worker thread was executed very
+quickly. For such pages extent_write_cache_pages waits for writeback
+to complete before moving on to the next page, which is highly inefficient
+as it blocks the flusher thread.
+
+Port over the PageDirty check that was added to write_cache_pages in
+commit 515f4a037fb ("mm: write_cache_pages optimise page cleaning") to
+fix this.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent_io.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 37b7f4e40..76c9c6f2e 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2175,6 +2175,12 @@ static int extent_write_cache_pages(struct address_space *mapping,
+ 				continue;
+ 			}
+ 
++			if (!folio_test_dirty(folio)) {
++				/* Someone wrote it for us. */
++				folio_unlock(folio);
++				continue;
++			}
++
+ 			if (wbc->sync_mode != WB_SYNC_NONE) {
+ 				if (folio_test_writeback(folio))
+ 					submit_write_bio(bio_ctrl, 0);
+-- 
+2.42.0
+
+
+From d56bf0debbc72953085bf85b8f104031ea9f5c08 Mon Sep 17 00:00:00 2001
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Thu, 24 Aug 2023 16:59:04 -0400
+Subject: [PATCH 06/12] btrfs: check for BTRFS_FS_ERROR in pending ordered
+ assert
+
+If we do fast tree logging we increment a counter on the current
+transaction for every ordered extent we need to wait for.  This means we
+expect the transaction to still be there when we clear pending on the
+ordered extent.  However if we happen to abort the transaction and clean
+it up, there could be no running transaction, and thus we'll trip the
+
+ASSERT(trans)
+
+check.  This is obviously incorrect, and the code properly deals with
+the case that the trans doesn't exist.  Fix this ASSERT() to only fire
+if there's no trans and we don't have BTRFS_FS_ERROR() set on the file
+system.
+
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+---
+ fs/btrfs/ordered-data.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+index a62953228..5b1aac3fc 100644
+--- a/fs/btrfs/ordered-data.c
++++ b/fs/btrfs/ordered-data.c
+@@ -635,7 +635,7 @@ void btrfs_remove_ordered_extent(struct btrfs_inode *btrfs_inode,
+ 			refcount_inc(&trans->use_count);
+ 		spin_unlock(&fs_info->trans_lock);
+ 
+-		ASSERT(trans);
++		ASSERT(trans || BTRFS_FS_ERROR(fs_info));
+ 		if (trans) {
+ 			if (atomic_dec_and_test(&trans->pending_ordered))
+ 				wake_up(&trans->pending_wait);
+-- 
+2.42.0
+
+
+From a3fc2e40d37d49f7cda7e408a2c0aa560b615b45 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 28 Aug 2023 09:06:42 +0100
+Subject: [PATCH 07/12] btrfs: improve error message after failure to add
+ delayed dir index item
+
+If we fail to add a delayed dir index item because there's already another
+item with the same index number, we print an error message (and then BUG).
+However that message isn't very helpful to debug anything because we don't
+know what's the index number and what are the values of index counters in
+the inode and its delayed inode (index_cnt fields of struct btrfs_inode
+and struct btrfs_delayed_node).
+
+So update the error message to include the index number and counters.
+
+We actually had a recent case where this issue was hit by a syzbot report
+(see the link below).
+
+Link: https://lore.kernel.org/linux-btrfs/00000000000036e1290603e097e0@google.com/
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/delayed-inode.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 6d51db066..88db45169 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -1498,9 +1498,10 @@ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 	ret = __btrfs_add_delayed_item(delayed_node, delayed_item);
+ 	if (unlikely(ret)) {
+ 		btrfs_err(trans->fs_info,
+-			  "err add delayed dir index item(name: %.*s) into the insertion tree of the delayed node(root id: %llu, inode id: %llu, errno: %d)",
+-			  name_len, name, delayed_node->root->root_key.objectid,
+-			  delayed_node->inode_id, ret);
++"error adding delayed dir index item, name: %.*s, index: %llu, root: %llu, dir: %llu, dir->index_cnt: %llu, delayed_node->index_cnt: %llu, error: %d",
++			  name_len, name, index, btrfs_root_id(delayed_node->root),
++			  delayed_node->inode_id, dir->index_cnt,
++			  delayed_node->index_cnt, ret);
+ 		BUG();
+ 	}
+ 	mutex_unlock(&delayed_node->mutex);
+-- 
+2.42.0
+
+
+From cfded7fb32d087d9e84e5a0668b06a2fd7c0ce20 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 28 Aug 2023 09:06:43 +0100
+Subject: [PATCH 08/12] btrfs: remove BUG() after failure to insert delayed dir
+ index item
+
+Instead of calling BUG() when we fail to insert a delayed dir index item
+into the delayed node's tree, we can just release all the resources we
+have allocated/acquired before and return the error to the caller. This is
+fine because all existing call chains undo anything they have done before
+calling btrfs_insert_delayed_dir_index() or BUG_ON (when creating pending
+snapshots in the transaction commit path).
+
+So remove the BUG() call and do proper error handling.
+
+This relates to a syzbot report linked below, but does not fix it because
+it only prevents hitting a BUG(), it does not fix the issue where somehow
+we attempt to use twice the same index number for different index items.
+
+Link: https://lore.kernel.org/linux-btrfs/00000000000036e1290603e097e0@google.com/
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/delayed-inode.c | 74 +++++++++++++++++++++++++---------------
+ 1 file changed, 47 insertions(+), 27 deletions(-)
+
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 88db45169..105b1a2e0 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -1413,7 +1413,29 @@ void btrfs_balance_delayed_items(struct btrfs_fs_info *fs_info)
+ 	btrfs_wq_run_delayed_node(delayed_root, fs_info, BTRFS_DELAYED_BATCH);
+ }
+ 
+-/* Will return 0 or -ENOMEM */
++static void btrfs_release_dir_index_item_space(struct btrfs_trans_handle *trans)
++{
++	struct btrfs_fs_info *fs_info = trans->fs_info;
++	const u64 bytes = btrfs_calc_insert_metadata_size(fs_info, 1);
++
++	if (test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags))
++		return;
++
++	/*
++	 * Adding the new dir index item does not require touching another
++	 * leaf, so we can release 1 unit of metadata that was previously
++	 * reserved when starting the transaction. This applies only to
++	 * the case where we had a transaction start and excludes the
++	 * transaction join case (when replaying log trees).
++	 */
++	trace_btrfs_space_reservation(fs_info, "transaction",
++				      trans->transid, bytes, 0);
++	btrfs_block_rsv_release(fs_info, trans->block_rsv, bytes, NULL);
++	ASSERT(trans->bytes_reserved >= bytes);
++	trans->bytes_reserved -= bytes;
++}
++
++/* Will return 0, -ENOMEM or -EEXIST (index number collision, unexpected). */
+ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 				   const char *name, int name_len,
+ 				   struct btrfs_inode *dir,
+@@ -1455,6 +1477,27 @@ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 
+ 	mutex_lock(&delayed_node->mutex);
+ 
++	/*
++	 * First attempt to insert the delayed item. This is to make the error
++	 * handling path simpler in case we fail (-EEXIST). There's no risk of
++	 * any other task coming in and running the delayed item before we do
++	 * the metadata space reservation below, because we are holding the
++	 * delayed node's mutex and that mutex must also be locked before the
++	 * node's delayed items can be run.
++	 */
++	ret = __btrfs_add_delayed_item(delayed_node, delayed_item);
++	if (unlikely(ret)) {
++		btrfs_err(trans->fs_info,
++"error adding delayed dir index item, name: %.*s, index: %llu, root: %llu, dir: %llu, dir->index_cnt: %llu, delayed_node->index_cnt: %llu, error: %d",
++			  name_len, name, index, btrfs_root_id(delayed_node->root),
++			  delayed_node->inode_id, dir->index_cnt,
++			  delayed_node->index_cnt, ret);
++		btrfs_release_delayed_item(delayed_item);
++		btrfs_release_dir_index_item_space(trans);
++		mutex_unlock(&delayed_node->mutex);
++		goto release_node;
++	}
++
+ 	if (delayed_node->index_item_leaves == 0 ||
+ 	    delayed_node->curr_index_batch_size + data_len > leaf_data_size) {
+ 		delayed_node->curr_index_batch_size = data_len;
+@@ -1472,37 +1515,14 @@ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 		 * impossible.
+ 		 */
+ 		if (WARN_ON(ret)) {
+-			mutex_unlock(&delayed_node->mutex);
+ 			btrfs_release_delayed_item(delayed_item);
++			mutex_unlock(&delayed_node->mutex);
+ 			goto release_node;
+ 		}
+ 
+ 		delayed_node->index_item_leaves++;
+-	} else if (!test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags)) {
+-		const u64 bytes = btrfs_calc_insert_metadata_size(fs_info, 1);
+-
+-		/*
+-		 * Adding the new dir index item does not require touching another
+-		 * leaf, so we can release 1 unit of metadata that was previously
+-		 * reserved when starting the transaction. This applies only to
+-		 * the case where we had a transaction start and excludes the
+-		 * transaction join case (when replaying log trees).
+-		 */
+-		trace_btrfs_space_reservation(fs_info, "transaction",
+-					      trans->transid, bytes, 0);
+-		btrfs_block_rsv_release(fs_info, trans->block_rsv, bytes, NULL);
+-		ASSERT(trans->bytes_reserved >= bytes);
+-		trans->bytes_reserved -= bytes;
+-	}
+-
+-	ret = __btrfs_add_delayed_item(delayed_node, delayed_item);
+-	if (unlikely(ret)) {
+-		btrfs_err(trans->fs_info,
+-"error adding delayed dir index item, name: %.*s, index: %llu, root: %llu, dir: %llu, dir->index_cnt: %llu, delayed_node->index_cnt: %llu, error: %d",
+-			  name_len, name, index, btrfs_root_id(delayed_node->root),
+-			  delayed_node->inode_id, dir->index_cnt,
+-			  delayed_node->index_cnt, ret);
+-		BUG();
++	} else {
++		btrfs_release_dir_index_item_space(trans);
+ 	}
+ 	mutex_unlock(&delayed_node->mutex);
+ 
+-- 
+2.42.0
+
+
+From 3d0d3df748593ac7a6aef180bdab83b83d86818e Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 28 Aug 2023 09:06:44 +0100
+Subject: [PATCH 09/12] btrfs: assert delayed node locked when removing delayed
+ item
+
+When removing a delayed item, or releasing which will remove it as well,
+we will modify one of the delayed node's rbtrees and item counter if the
+delayed item is in one of the rbtrees. This require having the delayed
+node's mutex locked, otherwise we will race with other tasks modifying
+the rbtrees and the counter.
+
+This is motivated by a previous version of another patch actually calling
+btrfs_release_delayed_item() after unlocking the delayed node's mutex and
+against a delayed item that is in a rbtree.
+
+So assert at __btrfs_remove_delayed_item() that the delayed node's mutex
+is locked.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/delayed-inode.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 105b1a2e0..41c63c67f 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -412,6 +412,7 @@ static void finish_one_item(struct btrfs_delayed_root *delayed_root)
+ 
+ static void __btrfs_remove_delayed_item(struct btrfs_delayed_item *delayed_item)
+ {
++	struct btrfs_delayed_node *delayed_node = delayed_item->delayed_node;
+ 	struct rb_root_cached *root;
+ 	struct btrfs_delayed_root *delayed_root;
+ 
+@@ -419,18 +420,21 @@ static void __btrfs_remove_delayed_item(struct btrfs_delayed_item *delayed_item)
+ 	if (RB_EMPTY_NODE(&delayed_item->rb_node))
+ 		return;
+ 
+-	delayed_root = delayed_item->delayed_node->root->fs_info->delayed_root;
++	/* If it's in a rbtree, then we need to have delayed node locked. */
++	lockdep_assert_held(&delayed_node->mutex);
++
++	delayed_root = delayed_node->root->fs_info->delayed_root;
+ 
+ 	BUG_ON(!delayed_root);
+ 
+ 	if (delayed_item->type == BTRFS_DELAYED_INSERTION_ITEM)
+-		root = &delayed_item->delayed_node->ins_root;
++		root = &delayed_node->ins_root;
+ 	else
+-		root = &delayed_item->delayed_node->del_root;
++		root = &delayed_node->del_root;
+ 
+ 	rb_erase_cached(&delayed_item->rb_node, root);
+ 	RB_CLEAR_NODE(&delayed_item->rb_node);
+-	delayed_item->delayed_node->count--;
++	delayed_node->count--;
+ 
+ 	finish_one_item(delayed_root);
+ }
+-- 
+2.42.0
+
+
+From 8fe14fd1b70fe82619c9c8e7caf7fea12499e1f2 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 28 Aug 2023 08:38:36 +0100
+Subject: [PATCH 10/12] btrfs: update comment for reservation of metadata space
+ for delayed items
+
+The second comment at btrfs_delayed_item_reserve_metadata() refers to a
+field named "index_items_size" of a delayed inode, however that field
+does not exists - it existed in a previous patch version, but then it
+split into the fields "curr_index_batch_size" and "index_item_leaves"
+in the final patch version that was picked. So update the comment.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/delayed-inode.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 41c63c67f..b0edc5338 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -517,7 +517,7 @@ static int btrfs_delayed_item_reserve_metadata(struct btrfs_trans_handle *trans,
+ 		/*
+ 		 * For insertions we track reserved metadata space by accounting
+ 		 * for the number of leaves that will be used, based on the delayed
+-		 * node's index_items_size field.
++		 * node's curr_index_batch_size and index_item_leaves fields.
+ 		 */
+ 		if (item->type == BTRFS_DELAYED_DELETION_ITEM)
+ 			item->bytes_reserved = num_bytes;
+-- 
+2.42.0
+
+
+From 477274a38d07ba7e00b5a1db986d8e3465e0c0ba Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Tue, 29 Aug 2023 11:34:52 +0100
+Subject: [PATCH 11/12] btrfs: fix lockdep splat and potential deadlock after
+ failure running delayed items
+
+When running delayed items we are holding a delayed node's mutex and then
+we will attempt to modify a subvolume btree to insert/update/delete the
+delayed items. However if have an error during the insertions for example,
+btrfs_insert_delayed_items() may return with a path that has locked extent
+buffers (a leaf at the very least), and then we attempt to release the
+delayed node at __btrfs_run_delayed_items(), which requires taking the
+delayed node's mutex, causing an ABBA type of deadlock. This was reported
+by syzbot and the lockdep splat is the following:
+
+  WARNING: possible circular locking dependency detected
+  6.5.0-rc7-syzkaller-00024-g93f5de5f648d #0 Not tainted
+  ------------------------------------------------------
+  syz-executor.2/13257 is trying to acquire lock:
+  ffff88801835c0c0 (&delayed_node->mutex){+.+.}-{3:3}, at: __btrfs_release_delayed_node+0x9a/0xaa0 fs/btrfs/delayed-inode.c:256
+
+  but task is already holding lock:
+  ffff88802a5ab8e8 (btrfs-tree-00){++++}-{3:3}, at: __btrfs_tree_lock+0x3c/0x2a0 fs/btrfs/locking.c:198
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #1 (btrfs-tree-00){++++}-{3:3}:
+         __lock_release kernel/locking/lockdep.c:5475 [inline]
+         lock_release+0x36f/0x9d0 kernel/locking/lockdep.c:5781
+         up_write+0x79/0x580 kernel/locking/rwsem.c:1625
+         btrfs_tree_unlock_rw fs/btrfs/locking.h:189 [inline]
+         btrfs_unlock_up_safe+0x179/0x3b0 fs/btrfs/locking.c:239
+         search_leaf fs/btrfs/ctree.c:1986 [inline]
+         btrfs_search_slot+0x2511/0x2f80 fs/btrfs/ctree.c:2230
+         btrfs_insert_empty_items+0x9c/0x180 fs/btrfs/ctree.c:4376
+         btrfs_insert_delayed_item fs/btrfs/delayed-inode.c:746 [inline]
+         btrfs_insert_delayed_items fs/btrfs/delayed-inode.c:824 [inline]
+         __btrfs_commit_inode_delayed_items+0xd24/0x2410 fs/btrfs/delayed-inode.c:1111
+         __btrfs_run_delayed_items+0x1db/0x430 fs/btrfs/delayed-inode.c:1153
+         flush_space+0x269/0xe70 fs/btrfs/space-info.c:723
+         btrfs_async_reclaim_metadata_space+0x106/0x350 fs/btrfs/space-info.c:1078
+         process_one_work+0x92c/0x12c0 kernel/workqueue.c:2600
+         worker_thread+0xa63/0x1210 kernel/workqueue.c:2751
+         kthread+0x2b8/0x350 kernel/kthread.c:389
+         ret_from_fork+0x2e/0x60 arch/x86/kernel/process.c:145
+         ret_from_fork_asm+0x11/0x20 arch/x86/entry/entry_64.S:304
+
+  -> #0 (&delayed_node->mutex){+.+.}-{3:3}:
+         check_prev_add kernel/locking/lockdep.c:3142 [inline]
+         check_prevs_add kernel/locking/lockdep.c:3261 [inline]
+         validate_chain kernel/locking/lockdep.c:3876 [inline]
+         __lock_acquire+0x39ff/0x7f70 kernel/locking/lockdep.c:5144
+         lock_acquire+0x1e3/0x520 kernel/locking/lockdep.c:5761
+         __mutex_lock_common+0x1d8/0x2530 kernel/locking/mutex.c:603
+         __mutex_lock kernel/locking/mutex.c:747 [inline]
+         mutex_lock_nested+0x1b/0x20 kernel/locking/mutex.c:799
+         __btrfs_release_delayed_node+0x9a/0xaa0 fs/btrfs/delayed-inode.c:256
+         btrfs_release_delayed_node fs/btrfs/delayed-inode.c:281 [inline]
+         __btrfs_run_delayed_items+0x2b5/0x430 fs/btrfs/delayed-inode.c:1156
+         btrfs_commit_transaction+0x859/0x2ff0 fs/btrfs/transaction.c:2276
+         btrfs_sync_file+0xf56/0x1330 fs/btrfs/file.c:1988
+         vfs_fsync_range fs/sync.c:188 [inline]
+         vfs_fsync fs/sync.c:202 [inline]
+         do_fsync fs/sync.c:212 [inline]
+         __do_sys_fsync fs/sync.c:220 [inline]
+         __se_sys_fsync fs/sync.c:218 [inline]
+         __x64_sys_fsync+0x196/0x1e0 fs/sync.c:218
+         do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+         do_syscall_64+0x41/0xc0 arch/x86/entry/common.c:80
+         entry_SYSCALL_64_after_hwframe+0x63/0xcd
+
+  other info that might help us debug this:
+
+   Possible unsafe locking scenario:
+
+         CPU0                    CPU1
+         ----                    ----
+    lock(btrfs-tree-00);
+                                 lock(&delayed_node->mutex);
+                                 lock(btrfs-tree-00);
+    lock(&delayed_node->mutex);
+
+   *** DEADLOCK ***
+
+  3 locks held by syz-executor.2/13257:
+   #0: ffff88802c1ee370 (btrfs_trans_num_writers){++++}-{0:0}, at: spin_unlock include/linux/spinlock.h:391 [inline]
+   #0: ffff88802c1ee370 (btrfs_trans_num_writers){++++}-{0:0}, at: join_transaction+0xb87/0xe00 fs/btrfs/transaction.c:287
+   #1: ffff88802c1ee398 (btrfs_trans_num_extwriters){++++}-{0:0}, at: join_transaction+0xbb2/0xe00 fs/btrfs/transaction.c:288
+   #2: ffff88802a5ab8e8 (btrfs-tree-00){++++}-{3:3}, at: __btrfs_tree_lock+0x3c/0x2a0 fs/btrfs/locking.c:198
+
+  stack backtrace:
+  CPU: 0 PID: 13257 Comm: syz-executor.2 Not tainted 6.5.0-rc7-syzkaller-00024-g93f5de5f648d #0
+  Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 07/26/2023
+  Call Trace:
+   <TASK>
+   __dump_stack lib/dump_stack.c:88 [inline]
+   dump_stack_lvl+0x1e7/0x2d0 lib/dump_stack.c:106
+   check_noncircular+0x375/0x4a0 kernel/locking/lockdep.c:2195
+   check_prev_add kernel/locking/lockdep.c:3142 [inline]
+   check_prevs_add kernel/locking/lockdep.c:3261 [inline]
+   validate_chain kernel/locking/lockdep.c:3876 [inline]
+   __lock_acquire+0x39ff/0x7f70 kernel/locking/lockdep.c:5144
+   lock_acquire+0x1e3/0x520 kernel/locking/lockdep.c:5761
+   __mutex_lock_common+0x1d8/0x2530 kernel/locking/mutex.c:603
+   __mutex_lock kernel/locking/mutex.c:747 [inline]
+   mutex_lock_nested+0x1b/0x20 kernel/locking/mutex.c:799
+   __btrfs_release_delayed_node+0x9a/0xaa0 fs/btrfs/delayed-inode.c:256
+   btrfs_release_delayed_node fs/btrfs/delayed-inode.c:281 [inline]
+   __btrfs_run_delayed_items+0x2b5/0x430 fs/btrfs/delayed-inode.c:1156
+   btrfs_commit_transaction+0x859/0x2ff0 fs/btrfs/transaction.c:2276
+   btrfs_sync_file+0xf56/0x1330 fs/btrfs/file.c:1988
+   vfs_fsync_range fs/sync.c:188 [inline]
+   vfs_fsync fs/sync.c:202 [inline]
+   do_fsync fs/sync.c:212 [inline]
+   __do_sys_fsync fs/sync.c:220 [inline]
+   __se_sys_fsync fs/sync.c:218 [inline]
+   __x64_sys_fsync+0x196/0x1e0 fs/sync.c:218
+   do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+   do_syscall_64+0x41/0xc0 arch/x86/entry/common.c:80
+   entry_SYSCALL_64_after_hwframe+0x63/0xcd
+  RIP: 0033:0x7f3ad047cae9
+  Code: 28 00 00 00 75 (...)
+  RSP: 002b:00007f3ad12510c8 EFLAGS: 00000246 ORIG_RAX: 000000000000004a
+  RAX: ffffffffffffffda RBX: 00007f3ad059bf80 RCX: 00007f3ad047cae9
+  RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000005
+  RBP: 00007f3ad04c847a R08: 0000000000000000 R09: 0000000000000000
+  R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000000
+  R13: 000000000000000b R14: 00007f3ad059bf80 R15: 00007ffe56af92f8
+   </TASK>
+  ------------[ cut here ]------------
+
+Fix this by releasing the path before relasing the delayed node in the
+error path at __btrfs_run_delayed_items().
+
+Reported-by: syzbot+a379155f07c134ea9879@syzkaller.appspotmail.com
+Link: https://lore.kernel.org/linux-btrfs/000000000000abba27060403b5bd@google.com/
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/delayed-inode.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index b0edc5338..b30691aa1 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -1157,20 +1157,33 @@ static int __btrfs_run_delayed_items(struct btrfs_trans_handle *trans, int nr)
+ 		ret = __btrfs_commit_inode_delayed_items(trans, path,
+ 							 curr_node);
+ 		if (ret) {
+-			btrfs_release_delayed_node(curr_node);
+-			curr_node = NULL;
+ 			btrfs_abort_transaction(trans, ret);
+ 			break;
+ 		}
+ 
+ 		prev_node = curr_node;
+ 		curr_node = btrfs_next_delayed_node(curr_node);
++		/*
++		 * See the comment below about releasing path before releasing
++		 * node. If the commit of delayed items was successful the path
++		 * should always be released, but in case of an error, it may
++		 * point to locked extent buffers (a leaf at the very least).
++		 */
++		ASSERT(path->nodes[0] == NULL);
+ 		btrfs_release_delayed_node(prev_node);
+ 	}
+ 
++	/*
++	 * Release the path to avoid a potential deadlock and lockdep splat when
++	 * releasing the delayed node, as that requires taking the delayed node's
++	 * mutex. If another task starts running delayed items before we take
++	 * the mutex, it will first lock the mutex and then it may try to lock
++	 * the same btree path (leaf).
++	 */
++	btrfs_free_path(path);
++
+ 	if (curr_node)
+ 		btrfs_release_delayed_node(curr_node);
+-	btrfs_free_path(path);
+ 	trans->block_rsv = block_rsv;
+ 
+ 	return ret;
+-- 
+2.42.0
+
+
+From e861d7e1b13aa632ac662e223a6863f34671fb3f Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 4 Sep 2023 12:10:31 +0100
+Subject: [PATCH 12/12] btrfs: fix race between finishing block group creation
+ and its item update
+
+Commit 675dfe1223a6 ("btrfs: fix block group item corruption after
+inserting new block group") fixed one race that resulted in not persisting
+a block group's item when its "used" bytes field decreases to zero.
+However there's another race that can happen in a much shorter time window
+that results in the same problem. The following sequence of steps explains
+how it can happen:
+
+1) Task A creates a metadata block group X, its "used" and "commit_used"
+   fields are initialized to 0;
+
+2) Two extents are allocated from block group X, so its "used" field is
+   updated to 32K, and its "commit_used" field remains as 0;
+
+3) Transaction commit starts, by some task B, and it enters
+   btrfs_start_dirty_block_groups(). There it tries to update the block
+   group item for block group X, which currently has its "used" field with
+   a value of 32K and its "commited_used" field with a value of 0. However
+   that fails since the block group item was not yet inserted, so at
+   update_block_group_item(), the btrfs_search_slot() call returns 1, and
+   then we set 'ret' to -ENOENT. Before jumping to the label 'fail'...
+
+4) The block group item is inserted by task A, when for example
+   btrfs_create_pending_block_groups() is called when releasing its
+   transaction handle. This results in insert_block_group_item() inserting
+   the block group item in the extent tree (or block group tree), with a
+   "used" field having a value of 32K and setting "commit_used", in struct
+   btrfs_block_group, to the same value (32K);
+
+5) Task B jumps to the 'fail' label and then resets the "commit_used"
+   field to 0. At btrfs_start_dirty_block_groups(), because -ENOENT was
+   returned from update_block_group_item(), we add the block group again
+   to the list of dirty block groups, so that we will try again in the
+   critical section of the transaction commit when calling
+   btrfs_write_dirty_block_groups();
+
+6) Later the two extents from block group X are freed, so its "used" field
+   becomes 0;
+
+7) If no more extents are allocated from block group X before we get into
+   btrfs_write_dirty_block_groups(), then when we call
+   update_block_group_item() again for block group X, we will not update
+   the block group item to reflect that it has 0 bytes used, because the
+   "used" and "commit_used" fields in struct btrfs_block_group have the
+   same value, a value of 0.
+
+   As a result after committing the transaction we have an empty block
+   group with its block group item having a 32K value for its "used" field.
+   This will trigger errors from fsck ("btrfs check" command) and after
+   mounting again the fs, the cleaner kthread will not automatically delete
+   the empty block group, since its "used" field is not 0. Possibly there
+   are other issues due to this incosistency.
+
+   When this issue happens, the error reported by fsck is like this:
+
+     [1/7] checking root items
+     [2/7] checking extents
+     block group [1104150528 1073741824] used 39796736 but extent items used 0
+     ERROR: errors found in extent allocation tree or chunk allocation
+     (...)
+
+So fix this by not resetting the "commit_used" field of a block group when
+we don't find the block group item at update_block_group_item().
+
+Fixes: 7248e0cebbef ("btrfs: skip update of block group item if used bytes are the same")
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/block-group.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 82324c327..9d13a7756 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -3014,8 +3014,16 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 	btrfs_mark_buffer_dirty(leaf);
+ fail:
+ 	btrfs_release_path(path);
+-	/* We didn't update the block group item, need to revert @commit_used. */
+-	if (ret < 0) {
++	/*
++	 * We didn't update the block group item, need to revert commit_used
++	 * unless the block group item didn't exist yet - this is to prevent a
++	 * race with a concurrent insertion of the block group item, with
++	 * insert_block_group_item(), that happened just after we attempted to
++	 * update. In that case we would reset commit_used to 0 just after the
++	 * insertion set it to a value greater than 0 - if the block group later
++	 * becomes with 0 used bytes, we would incorrectly skip its update.
++	 */
++	if (ret < 0 && ret != -ENOENT) {
+ 		spin_lock(&cache->lock);
+ 		cache->commit_used = old_commit_used;
+ 		spin_unlock(&cache->lock);
+-- 
+2.42.0
+
