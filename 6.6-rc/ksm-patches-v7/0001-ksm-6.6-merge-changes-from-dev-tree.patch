@@ -1,0 +1,254 @@
+From 176e42c0677243761967cf873b4f4e5d6a3685ec Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Tue, 26 Sep 2023 12:17:20 +0200
+Subject: [PATCH] ksm-6.6: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ Documentation/admin-guide/mm/ksm.rst |  11 +++
+ include/linux/sched/coredump.h       |   7 +-
+ mm/ksm.c                             | 115 +++++++++++++++++++++++++++
+ 3 files changed, 131 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/admin-guide/mm/ksm.rst b/Documentation/admin-guide/mm/ksm.rst
+index 776f244bd..27d949250 100644
+--- a/Documentation/admin-guide/mm/ksm.rst
++++ b/Documentation/admin-guide/mm/ksm.rst
+@@ -155,6 +155,15 @@ stable_node_chains_prune_millisecs
+         scan. It's a noop if not a single KSM page hit the
+         ``max_page_sharing`` yet.
+ 
++smart_scan
++        By default KSM checks every candidate page for each scan. It does
++        not take into account historic information. When smart scan is
++        enabled, pages that have previously not been de-duplicated get
++        skipped. How often these pages are skipped depends on how often
++        de-duplication has already been tried and failed. By default this
++        optimization is disabled. The ``pages_skipped`` metric shows how
++        effetive the setting is.
++
+ The effectiveness of KSM and MADV_MERGEABLE is shown in ``/sys/kernel/mm/ksm/``:
+ 
+ general_profit
+@@ -169,6 +178,8 @@ pages_unshared
+         how many pages unique but repeatedly checked for merging
+ pages_volatile
+         how many pages changing too fast to be placed in a tree
++pages_skipped
++        how many pages did the "smart" page scanning algorithm skip
+ full_scans
+         how many times all mergeable areas have been scanned
+ stable_node_chains
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index 0ee96ea7a..205aa9917 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -87,8 +87,11 @@ static inline int get_dumpable(struct mm_struct *mm)
+ 
+ #define MMF_DISABLE_THP_MASK	(1 << MMF_DISABLE_THP)
+ 
++#define MMF_VM_MERGE_ANY	29
++#define MMF_VM_MERGE_ANY_MASK	(1 << MMF_VM_MERGE_ANY)
++
+ #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+-				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK)
++				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK |\
++				 MMF_VM_MERGE_ANY_MASK)
+ 
+-#define MMF_VM_MERGE_ANY	29
+ #endif /* _LINUX_SCHED_COREDUMP_H */
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 981af9c72..3de130d17 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -56,6 +56,8 @@
+ #define DO_NUMA(x)	do { } while (0)
+ #endif
+ 
++typedef u8 rmap_age_t;
++
+ /**
+  * DOC: Overview
+  *
+@@ -193,6 +195,8 @@ struct ksm_stable_node {
+  * @node: rb node of this rmap_item in the unstable tree
+  * @head: pointer to stable_node heading this list in the stable tree
+  * @hlist: link into hlist of rmap_items hanging off that stable_node
++ * @age: number of scan iterations since creation
++ * @remaining_skips: how many scans to skip
+  */
+ struct ksm_rmap_item {
+ 	struct ksm_rmap_item *rmap_list;
+@@ -205,6 +209,8 @@ struct ksm_rmap_item {
+ 	struct mm_struct *mm;
+ 	unsigned long address;		/* + low bits used for flags below */
+ 	unsigned int oldchecksum;	/* when unstable */
++	rmap_age_t age;
++	rmap_age_t remaining_skips;
+ 	union {
+ 		struct rb_node node;	/* when node of unstable tree */
+ 		struct {		/* when listed from stable tree */
+@@ -281,9 +287,15 @@ static unsigned int zero_checksum __read_mostly;
+ /* Whether to merge empty (zeroed) pages with actual zero pages */
+ static bool ksm_use_zero_pages __read_mostly;
+ 
++/* Skip pages that couldn't be de-duplicated previously  */
++static bool ksm_smart_scan;
++
+ /* The number of zero pages which is placed by KSM */
+ unsigned long ksm_zero_pages;
+ 
++/* The number of pages that have been skipped due to "smart scanning" */
++static unsigned long ksm_pages_skipped;
++
+ #ifdef CONFIG_NUMA
+ /* Zeroed when merging across nodes is not allowed */
+ static unsigned int ksm_merge_across_nodes = 1;
+@@ -2305,6 +2317,74 @@ static struct ksm_rmap_item *get_next_rmap_item(struct ksm_mm_slot *mm_slot,
+ 	return rmap_item;
+ }
+ 
++/*
++ * Calculate skip age for the ksm page age. The age determines how often
++ * de-duplicating has already been tried unsuccessfully. If the age is
++ * smaller, the scanning of this page is skipped for less scans.
++ *
++ * @age: rmap_item age of page
++ */
++static unsigned int skip_age(rmap_age_t age)
++{
++	if (age <= 3)
++		return 1;
++	if (age <= 5)
++		return 2;
++	if (age <= 8)
++		return 4;
++
++	return 8;
++}
++
++/*
++ * Determines if a page should be skipped for the current scan.
++ *
++ * @page: page to check
++ * @rmap_item: associated rmap_item of page
++ */
++static bool should_skip_rmap_item(struct page *page,
++				  struct ksm_rmap_item *rmap_item)
++{
++	rmap_age_t age;
++
++	if (!ksm_smart_scan)
++		return false;
++
++	/*
++	 * Never skip pages that are already KSM; pages cmp_and_merge_page()
++	 * will essentially ignore them, but we still have to process them
++	 * properly.
++	 */
++	if (PageKsm(page))
++		return false;
++
++	age = rmap_item->age;
++	if (age != U8_MAX)
++		rmap_item->age++;
++
++	/*
++	 * Smaller ages are not skipped, they need to get a chance to go
++	 * through the different phases of the KSM merging.
++	 */
++	if (age < 3)
++		return false;
++
++	/*
++	 * Are we still allowed to skip? If not, then don't skip it
++	 * and determine how much more often we are allowed to skip next.
++	 */
++	if (!rmap_item->remaining_skips) {
++		rmap_item->remaining_skips = skip_age(age);
++		return false;
++	}
++
++	/* Skip this page */
++	ksm_pages_skipped++;
++	rmap_item->remaining_skips--;
++	remove_rmap_item_from_tree(rmap_item);
++	return true;
++}
++
+ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ {
+ 	struct mm_struct *mm;
+@@ -2409,6 +2489,10 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ 				if (rmap_item) {
+ 					ksm_scan.rmap_list =
+ 							&rmap_item->rmap_list;
++
++					if (should_skip_rmap_item(*page, rmap_item))
++						goto next_page;
++
+ 					ksm_scan.address += PAGE_SIZE;
+ 				} else
+ 					put_page(*page);
+@@ -3383,6 +3467,13 @@ static ssize_t pages_volatile_show(struct kobject *kobj,
+ }
+ KSM_ATTR_RO(pages_volatile);
+ 
++static ssize_t pages_skipped_show(struct kobject *kobj,
++				  struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", ksm_pages_skipped);
++}
++KSM_ATTR_RO(pages_skipped);
++
+ static ssize_t ksm_zero_pages_show(struct kobject *kobj,
+ 				struct kobj_attribute *attr, char *buf)
+ {
+@@ -3449,6 +3540,28 @@ static ssize_t full_scans_show(struct kobject *kobj,
+ }
+ KSM_ATTR_RO(full_scans);
+ 
++static ssize_t smart_scan_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksm_smart_scan);
++}
++
++static ssize_t smart_scan_store(struct kobject *kobj,
++				struct kobj_attribute *attr,
++				const char *buf, size_t count)
++{
++	int err;
++	bool value;
++
++	err = kstrtobool(buf, &value);
++	if (err)
++		return -EINVAL;
++
++	ksm_smart_scan = value;
++	return count;
++}
++KSM_ATTR(smart_scan);
++
+ static struct attribute *ksm_attrs[] = {
+ 	&sleep_millisecs_attr.attr,
+ 	&pages_to_scan_attr.attr,
+@@ -3458,6 +3571,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&pages_sharing_attr.attr,
+ 	&pages_unshared_attr.attr,
+ 	&pages_volatile_attr.attr,
++	&pages_skipped_attr.attr,
+ 	&ksm_zero_pages_attr.attr,
+ 	&full_scans_attr.attr,
+ #ifdef CONFIG_NUMA
+@@ -3469,6 +3583,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&stable_node_chains_prune_millisecs_attr.attr,
+ 	&use_zero_pages_attr.attr,
+ 	&general_profit_attr.attr,
++	&smart_scan_attr.attr,
+ 	NULL,
+ };
+ 
+-- 
+2.42.0
+
