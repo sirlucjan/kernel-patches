@@ -1,0 +1,575 @@
+From d896558f73fdd6aba68137097b618b10ebf1aba8 Mon Sep 17 00:00:00 2001
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Mon, 31 Jul 2023 16:28:43 -0400
+Subject: [PATCH 1/6] btrfs: wait on uncached block groups on every allocation
+ loop
+
+My initial fix for the generic/475 hangs was related to metadata, but
+our CI testing uncovered another case where we hang for similar reasons.
+We again have a task with a plug that is holding an outstanding request
+that is keeping the dm device from finishing it's suspend, and that task
+is stuck in the allocator.
+
+This time it is stuck trying to allocate data, but we do not have a
+block group that matches the size class.  The larger loop in the
+allocator looks like this (simplified of course)
+
+find_free_extent
+  for_each_block_group {
+    ffe_ctl->cached == btrfs_block_group_cache_done(bg)
+    if (!ffe_ctl->cached)
+      ffe_ctl->have_caching_bg = true;
+    do_allocation()
+      btrfs_wait_block_group_cache_progress();
+  }
+
+  if (loop == LOOP_CACHING_WAIT && ffe_ctl->have_caching_bg)
+    go search again;
+
+In my earlier fix we were trying to allocate from the block group, but
+we weren't waiting for the progress because we were only waiting for the
+free space to be >= the amount of free space we wanted.  My fix made it
+so we waited for forward progress to be made as well, so we would be
+sure to wait.
+
+This time however we did not have a block group that matched our size
+class, so what was happening was this
+
+find_free_extent
+  for_each_block_group {
+    ffe_ctl->cached == btrfs_block_group_cache_done(bg)
+    if (!ffe_ctl->cached)
+      ffe_ctl->have_caching_bg = true;
+    if (size_class_doesn't_match())
+      goto loop;
+    do_allocation()
+      btrfs_wait_block_group_cache_progress();
+loop:
+    release_block_group(block_group);
+  }
+
+  if (loop == LOOP_CACHING_WAIT && ffe_ctl->have_caching_bg)
+    go search again;
+
+The size_class_doesn't_match() part was true, so we'd just skip this
+block group and never wait for caching, and then because we found a
+caching block group we'd just go back and do the loop again.  We never
+sleep and thus never flush the plug and we have the same deadlock.
+
+Fix the logic for waiting on the block group caching to instead do it
+unconditionally when we goto loop.  This takes the logic out of the
+allocation step, so now the loop looks more like this
+
+find_free_extent
+  for_each_block_group {
+    ffe_ctl->cached == btrfs_block_group_cache_done(bg)
+    if (!ffe_ctl->cached)
+      ffe_ctl->have_caching_bg = true;
+    if (size_class_doesn't_match())
+      goto loop;
+    do_allocation()
+      btrfs_wait_block_group_cache_progress();
+loop:
+    if (loop > LOOP_CACHING_NOWAIT && !ffe_ctl->retry_uncached &&
+        !ffe_ctl->cached) {
+       ffe_ctl->retry_uncached = true;
+       btrfs_wait_block_group_cache_progress();
+    }
+
+    release_block_group(block_group);
+  }
+
+  if (loop == LOOP_CACHING_WAIT && ffe_ctl->have_caching_bg)
+    go search again;
+
+This simplifies the logic a lot, and makes sure that if we're hitting
+uncached block groups we're always waiting on them at some point.
+
+I ran this through 100 iterations of generic/475, as this particular
+case was harder to hit than the previous one.
+
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+---
+ fs/btrfs/extent-tree.c | 62 +++++++++++++-----------------------------
+ fs/btrfs/extent-tree.h | 13 +++------
+ 2 files changed, 23 insertions(+), 52 deletions(-)
+
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 0917c5f39..a630583a5 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -3481,7 +3481,6 @@ btrfs_release_block_group(struct btrfs_block_group *cache,
+  * Helper function for find_free_extent().
+  *
+  * Return -ENOENT to inform caller that we need fallback to unclustered mode.
+- * Return -EAGAIN to inform caller that we need to re-search this block group
+  * Return >0 to inform caller that we find nothing
+  * Return 0 means we have found a location and set ffe_ctl->found_offset.
+  */
+@@ -3562,14 +3561,6 @@ static int find_free_extent_clustered(struct btrfs_block_group *bg,
+ 			trace_btrfs_reserve_extent_cluster(bg, ffe_ctl);
+ 			return 0;
+ 		}
+-	} else if (!ffe_ctl->cached && ffe_ctl->loop > LOOP_CACHING_NOWAIT &&
+-		   !ffe_ctl->retry_clustered) {
+-		spin_unlock(&last_ptr->refill_lock);
+-
+-		ffe_ctl->retry_clustered = true;
+-		btrfs_wait_block_group_cache_progress(bg, ffe_ctl->num_bytes +
+-				ffe_ctl->empty_cluster + ffe_ctl->empty_size);
+-		return -EAGAIN;
+ 	}
+ 	/*
+ 	 * At this point we either didn't find a cluster or we weren't able to
+@@ -3584,7 +3575,6 @@ static int find_free_extent_clustered(struct btrfs_block_group *bg,
+ /*
+  * Return >0 to inform caller that we find nothing
+  * Return 0 when we found an free extent and set ffe_ctrl->found_offset
+- * Return -EAGAIN to inform caller that we need to re-search this block group
+  */
+ static int find_free_extent_unclustered(struct btrfs_block_group *bg,
+ 					struct find_free_extent_ctl *ffe_ctl)
+@@ -3622,25 +3612,8 @@ static int find_free_extent_unclustered(struct btrfs_block_group *bg,
+ 	offset = btrfs_find_space_for_alloc(bg, ffe_ctl->search_start,
+ 			ffe_ctl->num_bytes, ffe_ctl->empty_size,
+ 			&ffe_ctl->max_extent_size);
+-
+-	/*
+-	 * If we didn't find a chunk, and we haven't failed on this block group
+-	 * before, and this block group is in the middle of caching and we are
+-	 * ok with waiting, then go ahead and wait for progress to be made, and
+-	 * set @retry_unclustered to true.
+-	 *
+-	 * If @retry_unclustered is true then we've already waited on this
+-	 * block group once and should move on to the next block group.
+-	 */
+-	if (!offset && !ffe_ctl->retry_unclustered && !ffe_ctl->cached &&
+-	    ffe_ctl->loop > LOOP_CACHING_NOWAIT) {
+-		btrfs_wait_block_group_cache_progress(bg, ffe_ctl->num_bytes +
+-						      ffe_ctl->empty_size);
+-		ffe_ctl->retry_unclustered = true;
+-		return -EAGAIN;
+-	} else if (!offset) {
++	if (!offset)
+ 		return 1;
+-	}
+ 	ffe_ctl->found_offset = offset;
+ 	return 0;
+ }
+@@ -3654,7 +3627,7 @@ static int do_allocation_clustered(struct btrfs_block_group *block_group,
+ 	/* We want to try and use the cluster allocator, so lets look there */
+ 	if (ffe_ctl->last_ptr && ffe_ctl->use_cluster) {
+ 		ret = find_free_extent_clustered(block_group, ffe_ctl, bg_ret);
+-		if (ret >= 0 || ret == -EAGAIN)
++		if (ret >= 0)
+ 			return ret;
+ 		/* ret == -ENOENT case falls through */
+ 	}
+@@ -3873,8 +3846,7 @@ static void release_block_group(struct btrfs_block_group *block_group,
+ {
+ 	switch (ffe_ctl->policy) {
+ 	case BTRFS_EXTENT_ALLOC_CLUSTERED:
+-		ffe_ctl->retry_clustered = false;
+-		ffe_ctl->retry_unclustered = false;
++		ffe_ctl->retry_uncached = false;
+ 		break;
+ 	case BTRFS_EXTENT_ALLOC_ZONED:
+ 		/* Nothing to do */
+@@ -4225,9 +4197,7 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 	ffe_ctl->orig_have_caching_bg = false;
+ 	ffe_ctl->index = btrfs_bg_flags_to_raid_index(ffe_ctl->flags);
+ 	ffe_ctl->loop = 0;
+-	/* For clustered allocation */
+-	ffe_ctl->retry_clustered = false;
+-	ffe_ctl->retry_unclustered = false;
++	ffe_ctl->retry_uncached = false;
+ 	ffe_ctl->cached = 0;
+ 	ffe_ctl->max_extent_size = 0;
+ 	ffe_ctl->total_free_space = 0;
+@@ -4378,16 +4348,13 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 
+ 		bg_ret = NULL;
+ 		ret = do_allocation(block_group, ffe_ctl, &bg_ret);
+-		if (ret == 0) {
+-			if (bg_ret && bg_ret != block_group) {
+-				btrfs_release_block_group(block_group,
+-							  ffe_ctl->delalloc);
+-				block_group = bg_ret;
+-			}
+-		} else if (ret == -EAGAIN) {
+-			goto have_block_group;
+-		} else if (ret > 0) {
++		if (ret > 0)
+ 			goto loop;
++
++		if (bg_ret && bg_ret != block_group) {
++			btrfs_release_block_group(block_group,
++						  ffe_ctl->delalloc);
++			block_group = bg_ret;
+ 		}
+ 
+ 		/* Checks */
+@@ -4428,6 +4395,15 @@ static noinline int find_free_extent(struct btrfs_root *root,
+ 		btrfs_release_block_group(block_group, ffe_ctl->delalloc);
+ 		break;
+ loop:
++		if (!ffe_ctl->cached && ffe_ctl->loop > LOOP_CACHING_NOWAIT &&
++		    !ffe_ctl->retry_uncached) {
++			ffe_ctl->retry_uncached = true;
++			btrfs_wait_block_group_cache_progress(block_group,
++						ffe_ctl->num_bytes +
++						ffe_ctl->empty_cluster +
++						ffe_ctl->empty_size);
++			goto have_block_group;
++		}
+ 		release_block_group(block_group, ffe_ctl, ffe_ctl->delalloc);
+ 		cond_resched();
+ 	}
+diff --git a/fs/btrfs/extent-tree.h b/fs/btrfs/extent-tree.h
+index 429d5c570..b0b289bdb 100644
+--- a/fs/btrfs/extent-tree.h
++++ b/fs/btrfs/extent-tree.h
+@@ -48,16 +48,11 @@ struct find_free_extent_ctl {
+ 	int loop;
+ 
+ 	/*
+-	 * Whether we're refilling a cluster, if true we need to re-search
+-	 * current block group but don't try to refill the cluster again.
++	 * Set to true if we're retry'ing the allocation on this block group
++	 * after waiting for caching progress, this is so that we retry only
++	 * once before moving on to another block group.
+ 	 */
+-	bool retry_clustered;
+-
+-	/*
+-	 * Whether we're updating free space cache, if true we need to re-search
+-	 * current block group but don't try updating free space cache again.
+-	 */
+-	bool retry_unclustered;
++	bool retry_uncached;
+ 
+ 	/* If current block group is cached */
+ 	int cached;
+-- 
+2.42.0
+
+
+From e51134bf0e6ec6b1aa7f46370165ee1cdbe4a4d1 Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 24 Jul 2023 06:26:53 -0700
+Subject: [PATCH 2/6] btrfs: don't stop integrity writeback too early
+
+extent_write_cache_pages stops writing pages as soon as nr_to_write hits
+zero.  That is the right thing for opportunistic writeback, but incorrect
+for data integrity writeback, which needs to ensure that no dirty pages
+are left in the range.  Thus only stop the writeback for WB_SYNC_NONE
+if nr_to_write hits 0.
+
+This is a port of write_cache_pages changes in commit 05fe478dd04e
+("mm: write_cache_pages integrity fix").
+
+Note that I've only trigger the problem with other changes to the btrfs
+writeback code, but this condition seems worthwhile fixing anyway.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: David Sterba <dsterba@suse.com>
+[ updated comment ]
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent_io.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 7cc0ed753..10dbb48e9 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -1995,11 +1995,12 @@ int btree_write_cache_pages(struct address_space *mapping,
+ 			}
+ 
+ 			/*
+-			 * the filesystem may choose to bump up nr_to_write.
++			 * The filesystem may choose to bump up nr_to_write.
+ 			 * We have to make sure to honor the new nr_to_write
+-			 * at any time
++			 * at any time.
+ 			 */
+-			nr_to_write_done = wbc->nr_to_write <= 0;
++			nr_to_write_done = (wbc->sync_mode == WB_SYNC_NONE &&
++					    wbc->nr_to_write <= 0);
+ 		}
+ 		folio_batch_release(&fbatch);
+ 		cond_resched();
+-- 
+2.42.0
+
+
+From 2034880475117819352e4d0def7f7190845518af Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 24 Jul 2023 06:26:54 -0700
+Subject: [PATCH 3/6] btrfs: don't wait for writeback on clean pages in
+ extent_write_cache_pages
+
+__extent_writepage could have started on more pages than the one it was
+called for.  This happens regularly for zoned file systems, and in theory
+could happen for compressed I/O if the worker thread was executed very
+quickly. For such pages extent_write_cache_pages waits for writeback
+to complete before moving on to the next page, which is highly inefficient
+as it blocks the flusher thread.
+
+Port over the PageDirty check that was added to write_cache_pages in
+commit 515f4a037fb ("mm: write_cache_pages optimise page cleaning") to
+fix this.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent_io.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 10dbb48e9..764439495 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2168,6 +2168,12 @@ static int extent_write_cache_pages(struct address_space *mapping,
+ 				continue;
+ 			}
+ 
++			if (!folio_test_dirty(folio)) {
++				/* Someone wrote it for us. */
++				folio_unlock(folio);
++				continue;
++			}
++
+ 			if (wbc->sync_mode != WB_SYNC_NONE) {
+ 				if (folio_test_writeback(folio))
+ 					submit_write_bio(bio_ctrl, 0);
+-- 
+2.42.0
+
+
+From 89bac5fee356cbb5d4e8acf4cc08488e7943558f Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 28 Aug 2023 08:38:36 +0100
+Subject: [PATCH 4/6] btrfs: update comment for reservation of metadata space
+ for delayed items
+
+The second comment at btrfs_delayed_item_reserve_metadata() refers to a
+field named "index_items_size" of a delayed inode, however that field
+does not exists - it existed in a previous patch version, but then it
+split into the fields "curr_index_batch_size" and "index_item_leaves"
+in the final patch version that was picked. So update the comment.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/delayed-inode.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 142e0a0f6..b30691aa1 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -517,7 +517,7 @@ static int btrfs_delayed_item_reserve_metadata(struct btrfs_trans_handle *trans,
+ 		/*
+ 		 * For insertions we track reserved metadata space by accounting
+ 		 * for the number of leaves that will be used, based on the delayed
+-		 * node's index_items_size field.
++		 * node's curr_index_batch_size and index_item_leaves fields.
+ 		 */
+ 		if (item->type == BTRFS_DELAYED_DELETION_ITEM)
+ 			item->bytes_reserved = num_bytes;
+-- 
+2.42.0
+
+
+From f5a31d00e3cf30c745175a8ebf390a5a38af0a67 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Sat, 9 Sep 2023 11:34:40 +0100
+Subject: [PATCH 5/6] btrfs: set last dir index to the current last index when
+ opening dir
+
+When opening a directory for reading it, we set the last index where we
+stop iteration to the value in struct btrfs_inode::index_cnt. That value
+does not match the index of the most recently added directory entry but
+it's instead the index number that will be assigned the next directory
+entry.
+
+This means that if after the call to opendir(3) new directory entries are
+added, a readdir(3) call will return the first new directory entry. This
+is fine because POSIX says the following [1]:
+
+  "If a file is removed from or added to the directory after the most
+   recent call to opendir() or rewinddir(), whether a subsequent call to
+   readdir() returns an entry for that file is unspecified."
+
+For example for the test script from commit 9b378f6ad48c ("btrfs: fix
+infinite directory reads"), where we have 2000 files in a directory, ext4
+doesn't return any new directory entry after opendir(3), while xfs returns
+the first 13 new directory entries added after the opendir(3) call.
+
+If we move to a shorter example with an empty directory when opendir(3) is
+called, and 2 files added to the directory after the opendir(3) call, then
+readdir(3) on btrfs will return the first file, ext4 and xfs return the 2
+files (but in a different order). A test program for this, reported by
+Ian Johnson, is the following:
+
+   #include <dirent.h>
+   #include <stdio.h>
+
+   int main(void) {
+     DIR *dir = opendir("test");
+
+     FILE *file;
+     file = fopen("test/1", "w");
+     fwrite("1", 1, 1, file);
+     fclose(file);
+
+     file = fopen("test/2", "w");
+     fwrite("2", 1, 1, file);
+     fclose(file);
+
+     struct dirent *entry;
+     while ((entry = readdir(dir))) {
+        printf("%s\n", entry->d_name);
+     }
+     closedir(dir);
+     return 0;
+   }
+
+To make this less odd, change the behaviour to never return new entries
+that were added after the opendir(3) call. This is done by setting the
+last_index field of the struct btrfs_file_private attached to the
+directory's file handle with a value matching btrfs_inode::index_cnt
+minus 1, since that value always matches the index of the next new
+directory entry and not the index of the most recently added entry.
+
+[1] https://pubs.opengroup.org/onlinepubs/007904875/functions/readdir_r.html
+
+Link: https://lore.kernel.org/linux-btrfs/YR1P0S.NGASEG570GJ8@ianjohnson.dev/
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/inode.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index db2b33a82..7db2efd65 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -5942,7 +5942,8 @@ static int btrfs_get_dir_last_index(struct btrfs_inode *dir, u64 *index)
+ 		}
+ 	}
+ 
+-	*index = dir->index_cnt;
++	/* index_cnt is the index number of next new entry, so decrement it. */
++	*index = dir->index_cnt - 1;
+ 
+ 	return 0;
+ }
+-- 
+2.42.0
+
+
+From 3469da0be03108e2551161cea227f9d3641f180a Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Sat, 9 Sep 2023 12:12:14 +0100
+Subject: [PATCH 6/6] btrfs: refresh dir last index during a rewinddir(3) call
+
+When opening a directory we find what's the index of its last entry and
+then store it in the directory's file handle private data (struct
+btrfs_file_private::last_index), so that in the case new directory entries
+are added to a directory after an opendir(3) call we don't end up in an
+infinite loop (see commit 9b378f6ad48c ("btrfs: fix infinite directory
+reads")) when calling readdir(3).
+
+However once rewinddir(3) is called, POSIX states [1] that any new
+directory entries added after the previous opendir(3) call, must be
+returned by subsequent calls to readdir(3):
+
+  "The rewinddir() function shall reset the position of the directory
+   stream to which dirp refers to the beginning of the directory.
+   It shall also cause the directory stream to refer to the current
+   state of the corresponding directory, as a call to opendir() would
+   have done."
+
+We currently don't refresh the last_index field of the struct
+btrfs_file_private associated to the directory, so after a rewinddir(3)
+we are not returning any new entries added after the opendir(3) call.
+
+Fix this by finding the current last index of the directory when llseek
+is called agains the directory.
+
+This can be reproduced by the following C program provided by Ian Johnson:
+
+   #include <dirent.h>
+   #include <stdio.h>
+
+   int main(void) {
+     DIR *dir = opendir("test");
+
+     FILE *file;
+     file = fopen("test/1", "w");
+     fwrite("1", 1, 1, file);
+     fclose(file);
+
+     file = fopen("test/2", "w");
+     fwrite("2", 1, 1, file);
+     fclose(file);
+
+     rewinddir(dir);
+
+     struct dirent *entry;
+     while ((entry = readdir(dir))) {
+        printf("%s\n", entry->d_name);
+     }
+     closedir(dir);
+     return 0;
+   }
+
+[1] https://pubs.opengroup.org/onlinepubs/9699919799/functions/rewinddir.html
+
+Reported-by: Ian Johnson <ian@ianjohnson.dev>
+Link: https://lore.kernel.org/linux-btrfs/YR1P0S.NGASEG570GJ8@ianjohnson.dev/
+Fixes: 9b378f6ad48c ("btrfs: fix infinite directory reads")
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/inode.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 7db2efd65..f498c1c40 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -5980,6 +5980,19 @@ static int btrfs_opendir(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++static loff_t btrfs_dir_llseek(struct file *file, loff_t offset, int whence)
++{
++	struct btrfs_file_private *private = file->private_data;
++	int ret;
++
++	ret = btrfs_get_dir_last_index(BTRFS_I(file_inode(file)),
++				       &private->last_index);
++	if (ret)
++		return ret;
++
++	return generic_file_llseek(file, offset, whence);
++}
++
+ struct dir_entry {
+ 	u64 ino;
+ 	u64 offset;
+@@ -11060,7 +11073,7 @@ static const struct inode_operations btrfs_dir_inode_operations = {
+ };
+ 
+ static const struct file_operations btrfs_dir_file_operations = {
+-	.llseek		= generic_file_llseek,
++	.llseek		= btrfs_dir_llseek,
+ 	.read		= generic_read_dir,
+ 	.iterate_shared	= btrfs_real_readdir,
+ 	.open		= btrfs_opendir,
+-- 
+2.42.0
+
