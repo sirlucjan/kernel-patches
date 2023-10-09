@@ -1,0 +1,3039 @@
+From 6572f7ac487c72395549b155c7aaa8a993a4d424 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 29 Dec 2022 12:43:42 +0100
+Subject: [PATCH 01/20] Tune mgLRU to protect cache used in the last second
+
+Although not identical to the le9 patches that protect a byte-amount of
+cache through tunables, multigenerational LRU now supports protecting
+cache accessed in the last X milliseconds.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ mm/vmscan.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 6f13394b1..f2a65f9ac 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4595,7 +4595,7 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
+ }
+ 
+ /* to protect the working set of the last N jiffies */
+-static unsigned long lru_gen_min_ttl __read_mostly;
++static unsigned long lru_gen_min_ttl __read_mostly = HZ;
+ 
+ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+ {
+-- 
+2.42.0
+
+
+From 7ab7f9020f0337f1482ead667d23b518f4a9e7db Mon Sep 17 00:00:00 2001
+From: Jaeseon Sim <jason.sim@samsung.com>
+Date: Fri, 15 Sep 2023 18:32:43 +0900
+Subject: [PATCH 02/20] maple_tree: use mas_node_count_gfp on
+ mas_expected_entries
+
+Use mas_node_count_gfp with GFP_KERNEL instead of
+GFP_NOWAIT | __GFP_NOWARN on mas_expected_entries
+in order to allow memory reclaim.
+
+Currently, fork errors occur on low free memory as follows:
+
+ Zygote  : Failed to fork child process: Out of memory (12)
+
+-ENOMEM was returned as following path:
+
+ mas_node_count
+ mas_expected_entries
+ dup_mmap
+ dup_mm
+ copy_mm
+ copy_process
+
+Signed-off-by: Jaeseon Sim <jason.sim@samsung.com>
+---
+ lib/maple_tree.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+index 0e00a84e8..bb24d84a4 100644
+--- a/lib/maple_tree.c
++++ b/lib/maple_tree.c
+@@ -5627,7 +5627,7 @@ int mas_expected_entries(struct ma_state *mas, unsigned long nr_entries)
+ 	/* Internal nodes */
+ 	nr_nodes += DIV_ROUND_UP(nr_nodes, nonleaf_cap);
+ 	/* Add working room for split (2 nodes) + new parents */
+-	mas_node_count(mas, nr_nodes + 3);
++	mas_node_count_gfp(mas, nr_nodes + 3, GFP_KERNEL);
+ 
+ 	/* Detect if allocations run out */
+ 	mas->mas_flags |= MA_STATE_PREALLOC;
+-- 
+2.42.0
+
+
+From 0baef5b2728f35899706ec862b0e89b5c2712bf1 Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Thu, 21 Sep 2023 03:02:39 +0800
+Subject: [PATCH 03/20] workingset: simplify and use a more intuitive model
+
+This basically removed workingset_activation and reduced calls to
+workingset_age_nonresident.
+
+The idea behind this change is a new way to calculate the refault
+distance and prepare for adapting refault distance based re-activation
+for multi-gen LRU.
+
+Currently, refault distance re-activation is based on two assumptions:
+1. Activation of an inactive page will left-shift LRU pages (considering
+   LRU starts from right).
+2. Eviction of an inactive page will left-shift LRU pages.
+
+Assumption 2 is correct, but assumption 1 is not always true, an activated
+page could be anywhere in the LRU list (through mark_page_accessed), it
+only left-shift the pages on its right.
+
+And besides, one page can get activate/deactivated for multiple times.
+
+And multi-gen LRU doesn't fit with this model well, pages are getting
+aged and activated constantly as the generation sliding window slides.
+
+So instead we introduce a simpler idea here: Just presume the evicted
+pages are still in memory, each has an eviction sequence like before.
+Let the `nonresistence_age` still be NA and get increased for each
+eviction, so we get a "Shadow LRU" here of one evicted page:
+
+  Let SP = ((NA's reading @ current) - (NA's reading @ eviction))
+
+                           +-memory available to cache-+
+                           |                           |
+ +-------------------------+===============+===========+
+ | *   shadows  O O  O     |   INACTIVE    |   ACTIVE  |
+ +-+-----------------------+===============+===========+
+   |                       |
+   +-----------------------+
+   |         SP
+ fault page          O -> Hole left by previously faulted in pages
+                     * -> The page corresponding to SP
+
+It can be easily seen that SP stands for how far the current workflow
+could push a page out of available memory. Since all evicted page was
+once head of INACTIVE list, the page could have such an access distance:
+
+  SP + NR_INACTIVE
+
+It *may* get re-activated before getting evicted again if:
+
+  SP + NR_INACTIVE < NR_INACTIVE + NR_ACTIVE
+
+Which can be simplified to:
+
+  SP < NR_ACTIVE
+
+Then the page is worth getting re-activated to start from ACTIVE part,
+since the access distance is shorter than the total memory to make it
+stay.
+
+And since this is only an estimation, based on several hypotheses, and
+it could break the ability of LRU to distinguish a workingset out of
+caches, so throttle this by two factors:
+
+1. Notice previously re-faulted in pages may leave "holes" on the shadow
+   part of LRU, that part is left unhandled on purpose to decrease
+   re-activate rate for pages that have a large SP value (the larger
+   SP value a page has, the more likely it will be affected by such
+   holes).
+2. When the ACTIVE part of LRU is long enough, chanllaging ACTIVE pages
+   by re-activating a one-time faulted previously INACTIVE page may not
+   be a good idea, so throttle the re-activation when ACTIVE > INACTIVE
+   by comparing with INACTIVE instead.
+
+Another effect of the refault activation worth noticing is that, by
+throttling reactivation when ACTIVE part is high, this refault distance
+based re-activation can help hold a portion of the caches in memory
+instead of letting cached get evicted permutably when the cache size is
+larger than total memory, and hotness is similar among all cache pages.
+That's because the established workingset (ACTIVE part) will tend to stay
+since we throttled reactivation, until the workingset itself start to stall.
+
+This is actually similar with the algoritm before, which introduce such
+effect by increasing nonresistence_age in many call paths, trottled
+the reactivation when activition/reactivation is massively happenning.
+
+Combined all above, we have:
+Upon refault, if any of following conditions is met, mark page as active:
+
+- If ACTIVE LRU is low (NR_ACTIVE < NR_INACTIVE), check if:
+  SP < NR_ACTIVE
+
+- If ACTIVE LRU is high (NR_ACTIVE >= NR_INACTIVE), check if:
+  SP < NR_INACTIVE
+
+Code-wise, this is simpler than before since no longer need to do lruvec
+statistic update when activating a page, and so far, a few benchmarks shows
+a similar or better result. And when combined with multi-gen LRU (in
+later commits) it shows a measurable performance gain for some workloads.
+
+Using memtier and fio test from commit ac35a4902374 but scaled down
+to fit in my test environment, and some other test results:
+
+  memtier test (with 16G ramdisk as swap and 4G memcg limit on an i7-9700):
+  memcached -u nobody -m 16384 -s /tmp/memcached.socket \
+    -a 0766 -t 12 -B binary &
+  memtier_benchmark -S /tmp/memcached.socket -P memcache_binary -n allkeys\
+    --key-minimum=1 --key-maximum=32000000 --key-pattern=P:P -c 1 \
+    -t 12 --ratio 1:0 --pipeline 8 -d 2000 -x 6
+
+  fio test 1 (with 16G ramdisk on 28G VM on an i7-9700):
+  fio -name=refault --numjobs=12 --directory=/mnt --size=1024m \
+    --buffered=1 --ioengine=io_uring --iodepth=128 \
+    --iodepth_batch_submit=32 --iodepth_batch_complete=32 \
+    --rw=randread --random_distribution=random --norandommap \
+    --time_based --ramp_time=5m --runtime=5m --group_reporting
+
+  fio test 2 (with 16G ramdisk on 28G VM on an i7-9700):
+  fio -name=mglru --numjobs=10 --directory=/mnt --size=1536m \
+    --buffered=1 --ioengine=io_uring --iodepth=128 \
+    --iodepth_batch_submit=32 --iodepth_batch_complete=32 \
+    --rw=randread --random_distribution=zipf:1.2 --norandommap \
+    --time_based --ramp_time=10m --runtime=5m --group_reporting
+
+  mysql (using oltp_read_only from sysbench, with 12G of buffer pool
+  in a 10G memcg):
+  sysbench /usr/share/sysbench/oltp_read_only.lua <auth and db params> \
+    --tables=36 --table-size=2000000 --threads=12 --time=1800
+
+  kernel build test done with 3G memcg limit on an i7-9700.
+
+Before (Average of 6 test run):
+fio: IOPS=5125.5k
+fio2: IOPS=7291.16k
+memcached: 57600.926 ops/s
+mysql: 6491.5 tps
+kernel-build: 1817.13499 seconds
+
+After (Average of 6 test run):
+fio: IOPS=5137.5k
+fio2: IOPS=7300.67k
+memcached: 57878.422 ops/s
+mysql: 6491.1 tps
+kernel-build: 1813.66231 seconds
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ include/linux/swap.h |   2 -
+ mm/swap.c            |   1 -
+ mm/vmscan.c          |   2 -
+ mm/workingset.c      | 155 ++++++++++++++++++-------------------------
+ 4 files changed, 64 insertions(+), 96 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 493487ed7..ca51d7984 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -344,10 +344,8 @@ static inline swp_entry_t page_swap_entry(struct page *page)
+ 
+ /* linux/mm/workingset.c */
+ bool workingset_test_recent(void *shadow, bool file, bool *workingset);
+-void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages);
+ void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg);
+ void workingset_refault(struct folio *folio, void *shadow);
+-void workingset_activation(struct folio *folio);
+ 
+ /* Only track the nodes of mappings with shadow entries */
+ void workingset_update_node(struct xa_node *node);
+diff --git a/mm/swap.c b/mm/swap.c
+index cd8f0150b..685b446fd 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -482,7 +482,6 @@ void folio_mark_accessed(struct folio *folio)
+ 		else
+ 			__lru_cache_activate_folio(folio);
+ 		folio_clear_referenced(folio);
+-		workingset_activation(folio);
+ 	}
+ 	if (folio_test_idle(folio))
+ 		folio_clear_idle(folio);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index f2a65f9ac..0fdf46323 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2539,8 +2539,6 @@ static unsigned int move_folios_to_lru(struct lruvec *lruvec,
+ 		lruvec_add_folio(lruvec, folio);
+ 		nr_pages = folio_nr_pages(folio);
+ 		nr_moved += nr_pages;
+-		if (folio_test_active(folio))
+-			workingset_age_nonresident(lruvec, nr_pages);
+ 	}
+ 
+ 	/*
+diff --git a/mm/workingset.c b/mm/workingset.c
+index da58a26d0..8613945fc 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -64,74 +64,64 @@
+  * thrashing on the inactive list, after which refaulting pages can be
+  * activated optimistically to compete with the existing active pages.
+  *
+- * Approximating inactive page access frequency - Observations:
++ * For such approximation, we introduce a counter `nonresistence_age` (NA)
++ * here. This counter increases each time a page is evicted, and each evicted
++ * page will have a shadow that stores the counter reading at the eviction
++ * time as a timestamp. So when an evicted page was faulted again, we have:
+  *
+- * 1. When a page is accessed for the first time, it is added to the
+- *    head of the inactive list, slides every existing inactive page
+- *    towards the tail by one slot, and pushes the current tail page
+- *    out of memory.
++ *   Let SP = ((NA's reading @ current) - (NA's reading @ eviction))
+  *
+- * 2. When a page is accessed for the second time, it is promoted to
+- *    the active list, shrinking the inactive list by one slot.  This
+- *    also slides all inactive pages that were faulted into the cache
+- *    more recently than the activated page towards the tail of the
+- *    inactive list.
++ *                            +-memory available to cache-+
++ *                            |                           |
++ *  +-------------------------+===============+===========+
++ *  | *   shadows  O O  O     |   INACTIVE    |   ACTIVE  |
++ *  +-+-----------------------+===============+===========+
++ *    |                       |
++ *    +-----------------------+
++ *    |         SP
++ *  fault page          O -> Hole left by previously faulted in pages
++ *                      * -> The page corresponding to SP
+  *
+- * Thus:
++ * Here SP can stands for how far the current workflow could push a page
++ * out of available memory. Since all evicted page was once head of
++ * INACTIVE list, the page could have such an access distance of:
+  *
+- * 1. The sum of evictions and activations between any two points in
+- *    time indicate the minimum number of inactive pages accessed in
+- *    between.
++ *   SP + NR_INACTIVE
+  *
+- * 2. Moving one inactive page N page slots towards the tail of the
+- *    list requires at least N inactive page accesses.
++ * So if:
+  *
+- * Combining these:
++ *   SP + NR_INACTIVE < NR_INACTIVE + NR_ACTIVE
+  *
+- * 1. When a page is finally evicted from memory, the number of
+- *    inactive pages accessed while the page was in cache is at least
+- *    the number of page slots on the inactive list.
++ * Which can be simplified to:
+  *
+- * 2. In addition, measuring the sum of evictions and activations (E)
+- *    at the time of a page's eviction, and comparing it to another
+- *    reading (R) at the time the page faults back into memory tells
+- *    the minimum number of accesses while the page was not cached.
+- *    This is called the refault distance.
++ *   SP < NR_ACTIVE
+  *
+- * Because the first access of the page was the fault and the second
+- * access the refault, we combine the in-cache distance with the
+- * out-of-cache distance to get the complete minimum access distance
+- * of this page:
++ * Then the page is worth getting re-activated to start from ACTIVE part,
++ * since the access distance is shorter than total memory to make it stay.
+  *
+- *      NR_inactive + (R - E)
++ * And since this is only an estimation, based on several hypotheses, and
++ * it could break the ability of LRU to distinguish a workingset out of
++ * caches, so throttle this by two factors:
+  *
+- * And knowing the minimum access distance of a page, we can easily
+- * tell if the page would be able to stay in cache assuming all page
+- * slots in the cache were available:
++ * 1. Notice that re-faulted in pages may leave "holes" on the shadow
++ *    part of LRU, that part is left unhandled on purpose to decrease
++ *    re-activate rate for pages that have a large SP value (the larger
++ *    SP value a page have, the more likely it will be affected by such
++ *    holes).
++ * 2. When the ACTIVE part of LRU is long enough, challenging ACTIVE pages
++ *    by re-activating a one-time faulted previously INACTIVE page may not
++ *    be a good idea, so throttle the re-activation when ACTIVE > INACTIVE
++ *    by comparing with INACTIVE instead.
+  *
+- *   NR_inactive + (R - E) <= NR_inactive + NR_active
++ * Combined all above, we have:
++ * Upon refault, if any of the following conditions is met, mark the page
++ * as active:
+  *
+- * If we have swap we should consider about NR_inactive_anon and
+- * NR_active_anon, so for page cache and anonymous respectively:
+- *
+- *   NR_inactive_file + (R - E) <= NR_inactive_file + NR_active_file
+- *   + NR_inactive_anon + NR_active_anon
+- *
+- *   NR_inactive_anon + (R - E) <= NR_inactive_anon + NR_active_anon
+- *   + NR_inactive_file + NR_active_file
+- *
+- * Which can be further simplified to:
+- *
+- *   (R - E) <= NR_active_file + NR_inactive_anon + NR_active_anon
+- *
+- *   (R - E) <= NR_active_anon + NR_inactive_file + NR_active_file
+- *
+- * Put into words, the refault distance (out-of-cache) can be seen as
+- * a deficit in inactive list space (in-cache).  If the inactive list
+- * had (R - E) more page slots, the page would not have been evicted
+- * in between accesses, but activated instead.  And on a full system,
+- * the only thing eating into inactive list space is active pages.
++ * - If ACTIVE LRU is low (NR_ACTIVE < NR_INACTIVE), check if:
++ *   SP < NR_ACTIVE
+  *
++ * - If ACTIVE LRU is high (NR_ACTIVE >= NR_INACTIVE), check if:
++ *   SP < NR_INACTIVE
+  *
+  *		Refaulting inactive pages
+  *
+@@ -419,8 +409,10 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset)
+ 	struct mem_cgroup *eviction_memcg;
+ 	struct lruvec *eviction_lruvec;
+ 	unsigned long refault_distance;
+-	unsigned long workingset_size;
++	unsigned long inactive_file;
++	unsigned long inactive_anon;
+ 	unsigned long refault;
++	unsigned long active;
+ 	int memcgid;
+ 	struct pglist_data *pgdat;
+ 	unsigned long eviction;
+@@ -479,21 +471,27 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset)
+ 	 * workingset competition needs to consider anon or not depends
+ 	 * on having free swap space.
+ 	 */
+-	workingset_size = lruvec_page_state(eviction_lruvec, NR_ACTIVE_FILE);
+-	if (!file) {
+-		workingset_size += lruvec_page_state(eviction_lruvec,
+-						     NR_INACTIVE_FILE);
+-	}
++	active = lruvec_page_state(eviction_lruvec, NR_ACTIVE_FILE);
++	inactive_file = lruvec_page_state(eviction_lruvec, NR_INACTIVE_FILE);
++
+ 	if (mem_cgroup_get_nr_swap_pages(eviction_memcg) > 0) {
+-		workingset_size += lruvec_page_state(eviction_lruvec,
++		active += lruvec_page_state(eviction_lruvec,
+ 						     NR_ACTIVE_ANON);
+-		if (file) {
+-			workingset_size += lruvec_page_state(eviction_lruvec,
+-						     NR_INACTIVE_ANON);
+-		}
++		inactive_anon = lruvec_page_state(eviction_lruvec,
++						  NR_INACTIVE_ANON);
++	} else {
++		inactive_anon = 0;
+ 	}
+ 
+-	return refault_distance <= workingset_size;
++	/*
++	 * When there are already enough active pages, be less aggressive
++	 * on reactivating pages, challenge an large set of established
++	 * active pages with one time refaulted page may not be a good idea.
++	 */
++	if (active >= inactive_anon + inactive_file)
++		return refault_distance < inactive_anon + inactive_file;
++	else
++		return refault_distance < active + (file ? inactive_anon : inactive_file);
+ }
+ 
+ /**
+@@ -543,7 +541,6 @@ void workingset_refault(struct folio *folio, void *shadow)
+ 		goto out;
+ 
+ 	folio_set_active(folio);
+-	workingset_age_nonresident(lruvec, nr);
+ 	mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file, nr);
+ 
+ 	/* Folio was active prior to eviction */
+@@ -560,30 +557,6 @@ void workingset_refault(struct folio *folio, void *shadow)
+ 	rcu_read_unlock();
+ }
+ 
+-/**
+- * workingset_activation - note a page activation
+- * @folio: Folio that is being activated.
+- */
+-void workingset_activation(struct folio *folio)
+-{
+-	struct mem_cgroup *memcg;
+-
+-	rcu_read_lock();
+-	/*
+-	 * Filter non-memcg pages here, e.g. unmap can call
+-	 * mark_page_accessed() on VDSO pages.
+-	 *
+-	 * XXX: See workingset_refault() - this should return
+-	 * root_mem_cgroup even for !CONFIG_MEMCG.
+-	 */
+-	memcg = folio_memcg_rcu(folio);
+-	if (!mem_cgroup_disabled() && !memcg)
+-		goto out;
+-	workingset_age_nonresident(folio_lruvec(folio), folio_nr_pages(folio));
+-out:
+-	rcu_read_unlock();
+-}
+-
+ /*
+  * Shadow entries reflect the share of the working set that does not
+  * fit into memory, so their number depends on the access pattern of
+-- 
+2.42.0
+
+
+From 73c45f4bac5f9307f926b0240a623b9b1c604c62 Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Thu, 21 Sep 2023 03:02:40 +0800
+Subject: [PATCH 04/20] workingset: move refault distance checking into to a
+ helper
+
+There isn't any feature change, just move the refault distance checking
+logic into a standalone helper so it can be reused later.
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/workingset.c | 137 ++++++++++++++++++++++++++++--------------------
+ 1 file changed, 79 insertions(+), 58 deletions(-)
+
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 8613945fc..b0704cbfc 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -170,9 +170,10 @@
+  */
+ 
+ #define WORKINGSET_SHIFT 1
+-#define EVICTION_SHIFT	((BITS_PER_LONG - BITS_PER_XA_VALUE) +	\
++#define EVICTION_SHIFT	((BITS_PER_LONG - BITS_PER_XA_VALUE) + \
+ 			 WORKINGSET_SHIFT + NODES_SHIFT + \
+ 			 MEM_CGROUP_ID_SHIFT)
++#define EVICTION_BITS	(BITS_PER_LONG - (EVICTION_SHIFT))
+ #define EVICTION_MASK	(~0UL >> EVICTION_SHIFT)
+ 
+ /*
+@@ -216,6 +217,79 @@ static void unpack_shadow(void *shadow, int *memcgidp, pg_data_t **pgdat,
+ 	*workingsetp = workingset;
+ }
+ 
++/*
++ * Get the refault distance timestamp reading at eviction time.
++ */
++static inline unsigned long lru_eviction(struct lruvec *lruvec,
++					 int bits, int bucket_order)
++{
++	unsigned long eviction = atomic_long_read(&lruvec->nonresident_age);
++
++	eviction >>= bucket_order;
++	eviction &= ~0UL >> (BITS_PER_LONG - bits);
++
++	return eviction;
++}
++
++/*
++ * Calculate and test refault distance.
++ */
++static inline bool lru_test_refault(struct mem_cgroup *memcg,
++				    struct lruvec *lruvec,
++				    unsigned long eviction, bool file,
++				    int bits, int bucket_order)
++{
++	unsigned long refault, distance;
++	unsigned long active, inactive_file, inactive_anon;
++
++	eviction <<= bucket_order;
++	refault = atomic_long_read(&lruvec->nonresident_age);
++
++	/*
++	 * The unsigned subtraction here gives an accurate distance
++	 * across nonresident_age overflows in most cases. There is a
++	 * special case: usually, shadow entries have a short lifetime
++	 * and are either refaulted or reclaimed along with the inode
++	 * before they get too old.  But it is not impossible for the
++	 * nonresident_age to lap a shadow entry in the field, which
++	 * can then result in a false small refault distance, leading
++	 * to a false activation should this old entry actually
++	 * refault again.  However, earlier kernels used to deactivate
++	 * unconditionally with *every* reclaim invocation for the
++	 * longest time, so the occasional inappropriate activation
++	 * leading to pressure on the active list is not a problem.
++	 */
++	distance = (refault - eviction) & (~0UL >> (BITS_PER_LONG - bits));
++
++	/*
++	 * Compare the distance to the existing workingset size. We
++	 * don't activate pages that couldn't stay resident even if
++	 * all the memory was available to the workingset. Whether
++	 * workingset competition needs to consider anon or not depends
++	 * on having free swap space.
++	 */
++	active = lruvec_page_state(lruvec, NR_ACTIVE_FILE);
++	inactive_file = lruvec_page_state(lruvec, NR_INACTIVE_FILE);
++
++	if (mem_cgroup_get_nr_swap_pages(memcg) > 0) {
++		active += lruvec_page_state(lruvec, NR_ACTIVE_ANON);
++		inactive_anon = lruvec_page_state(lruvec, NR_INACTIVE_ANON);
++	} else {
++		inactive_anon = 0;
++	}
++
++	/*
++	 * When there are already enough active pages, be less aggressive
++	 * on reactivating pages, challenge an large set of established
++	 * active pages with one time refaulted page may not be a good idea.
++	 */
++	if (active >= inactive_anon + inactive_file)
++		return distance < inactive_anon + inactive_file;
++	else
++		return distance < active + \
++			(file ? inactive_anon : inactive_file);
++}
++
+ #ifdef CONFIG_LRU_GEN
+ 
+ static void *lru_gen_eviction(struct folio *folio)
+@@ -386,11 +460,10 @@ void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
+ 	lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
+ 	/* XXX: target_memcg can be NULL, go through lruvec */
+ 	memcgid = mem_cgroup_id(lruvec_memcg(lruvec));
+-	eviction = atomic_long_read(&lruvec->nonresident_age);
+-	eviction >>= bucket_order;
++	eviction = lru_eviction(lruvec, EVICTION_BITS, bucket_order);
+ 	workingset_age_nonresident(lruvec, folio_nr_pages(folio));
+ 	return pack_shadow(memcgid, pgdat, eviction,
+-				folio_test_workingset(folio));
++			   folio_test_workingset(folio));
+ }
+ 
+ /**
+@@ -408,11 +481,6 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset)
+ {
+ 	struct mem_cgroup *eviction_memcg;
+ 	struct lruvec *eviction_lruvec;
+-	unsigned long refault_distance;
+-	unsigned long inactive_file;
+-	unsigned long inactive_anon;
+-	unsigned long refault;
+-	unsigned long active;
+ 	int memcgid;
+ 	struct pglist_data *pgdat;
+ 	unsigned long eviction;
+@@ -421,7 +489,6 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset)
+ 		return lru_gen_test_recent(shadow, file, &eviction_lruvec, &eviction, workingset);
+ 
+ 	unpack_shadow(shadow, &memcgid, &pgdat, &eviction, workingset);
+-	eviction <<= bucket_order;
+ 
+ 	/*
+ 	 * Look up the memcg associated with the stored ID. It might
+@@ -442,56 +509,10 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset)
+ 	eviction_memcg = mem_cgroup_from_id(memcgid);
+ 	if (!mem_cgroup_disabled() && !eviction_memcg)
+ 		return false;
+-
+ 	eviction_lruvec = mem_cgroup_lruvec(eviction_memcg, pgdat);
+-	refault = atomic_long_read(&eviction_lruvec->nonresident_age);
+ 
+-	/*
+-	 * Calculate the refault distance
+-	 *
+-	 * The unsigned subtraction here gives an accurate distance
+-	 * across nonresident_age overflows in most cases. There is a
+-	 * special case: usually, shadow entries have a short lifetime
+-	 * and are either refaulted or reclaimed along with the inode
+-	 * before they get too old.  But it is not impossible for the
+-	 * nonresident_age to lap a shadow entry in the field, which
+-	 * can then result in a false small refault distance, leading
+-	 * to a false activation should this old entry actually
+-	 * refault again.  However, earlier kernels used to deactivate
+-	 * unconditionally with *every* reclaim invocation for the
+-	 * longest time, so the occasional inappropriate activation
+-	 * leading to pressure on the active list is not a problem.
+-	 */
+-	refault_distance = (refault - eviction) & EVICTION_MASK;
+-
+-	/*
+-	 * Compare the distance to the existing workingset size. We
+-	 * don't activate pages that couldn't stay resident even if
+-	 * all the memory was available to the workingset. Whether
+-	 * workingset competition needs to consider anon or not depends
+-	 * on having free swap space.
+-	 */
+-	active = lruvec_page_state(eviction_lruvec, NR_ACTIVE_FILE);
+-	inactive_file = lruvec_page_state(eviction_lruvec, NR_INACTIVE_FILE);
+-
+-	if (mem_cgroup_get_nr_swap_pages(eviction_memcg) > 0) {
+-		active += lruvec_page_state(eviction_lruvec,
+-						     NR_ACTIVE_ANON);
+-		inactive_anon = lruvec_page_state(eviction_lruvec,
+-						  NR_INACTIVE_ANON);
+-	} else {
+-		inactive_anon = 0;
+-	}
+-
+-	/*
+-	 * When there are already enough active pages, be less aggressive
+-	 * on reactivating pages, challenge an large set of established
+-	 * active pages with one time refaulted page may not be a good idea.
+-	 */
+-	if (active >= inactive_anon + inactive_file)
+-		return refault_distance < inactive_anon + inactive_file;
+-	else
+-		return refault_distance < active + (file ? inactive_anon : inactive_file);
++	return lru_test_refault(eviction_memcg, eviction_lruvec, eviction,
++				file, EVICTION_BITS, bucket_order);
+ }
+ 
+ /**
+-- 
+2.42.0
+
+
+From d1ff04729c40a7795c02721b3af4275f4bd4dd02 Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Thu, 21 Sep 2023 03:02:41 +0800
+Subject: [PATCH 05/20] workignset: simplify the initilization code
+
+Use the new introduced EVICTION_BITS to replace timestamp_bits, compiler
+should be able to optimize out the previous variable but this should
+make the code more clear and unified.
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/workingset.c | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/mm/workingset.c b/mm/workingset.c
+index b0704cbfc..278c3b9eb 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -772,7 +772,6 @@ static struct lock_class_key shadow_nodes_key;
+ 
+ static int __init workingset_init(void)
+ {
+-	unsigned int timestamp_bits;
+ 	unsigned int max_order;
+ 	int ret;
+ 
+@@ -784,12 +783,11 @@ static int __init workingset_init(void)
+ 	 * some more pages at runtime, so keep working with up to
+ 	 * double the initial memory by using totalram_pages as-is.
+ 	 */
+-	timestamp_bits = BITS_PER_LONG - EVICTION_SHIFT;
+ 	max_order = fls_long(totalram_pages() - 1);
+-	if (max_order > timestamp_bits)
+-		bucket_order = max_order - timestamp_bits;
++	if (max_order > EVICTION_BITS)
++		bucket_order = max_order - EVICTION_BITS;
+ 	pr_info("workingset: timestamp_bits=%d max_order=%d bucket_order=%u\n",
+-	       timestamp_bits, max_order, bucket_order);
++		EVICTION_BITS, max_order, bucket_order);
+ 
+ 	ret = prealloc_shrinker(&workingset_shadow_shrinker, "mm-shadow");
+ 	if (ret)
+-- 
+2.42.0
+
+
+From b98359c3b77aec0629a07594d6feebfa62bb516a Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Thu, 21 Sep 2023 03:02:42 +0800
+Subject: [PATCH 06/20] workingset: simplify lru_gen_test_recent
+
+Simplify the code, move some common path into its caller, prepare for
+following commits.
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/workingset.c | 30 +++++++++++++-----------------
+ 1 file changed, 13 insertions(+), 17 deletions(-)
+
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 278c3b9eb..87a16b615 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -323,42 +323,38 @@ static void *lru_gen_eviction(struct folio *folio)
+  * Tests if the shadow entry is for a folio that was recently evicted.
+  * Fills in @lruvec, @token, @workingset with the values unpacked from shadow.
+  */
+-static bool lru_gen_test_recent(void *shadow, bool file, struct lruvec **lruvec,
+-				unsigned long *token, bool *workingset)
++static bool lru_gen_test_recent(struct lruvec *lruvec, bool file,
++				unsigned long token)
+ {
+-	int memcg_id;
+ 	unsigned long min_seq;
+-	struct mem_cgroup *memcg;
+-	struct pglist_data *pgdat;
+ 
+-	unpack_shadow(shadow, &memcg_id, &pgdat, token, workingset);
+-
+-	memcg = mem_cgroup_from_id(memcg_id);
+-	*lruvec = mem_cgroup_lruvec(memcg, pgdat);
+-
+-	min_seq = READ_ONCE((*lruvec)->lrugen.min_seq[file]);
+-	return (*token >> LRU_REFS_WIDTH) == (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH));
++	min_seq = READ_ONCE(lruvec->lrugen.min_seq[file]);
++	return (token >> LRU_REFS_WIDTH) == (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH));
+ }
+ 
+ static void lru_gen_refault(struct folio *folio, void *shadow)
+ {
++	int memcgid;
+ 	bool recent;
+-	int hist, tier, refs;
+ 	bool workingset;
+ 	unsigned long token;
++	int hist, tier, refs;
+ 	struct lruvec *lruvec;
++	struct pglist_data *pgdat;
+ 	struct lru_gen_folio *lrugen;
+ 	int type = folio_is_file_lru(folio);
+ 	int delta = folio_nr_pages(folio);
+ 
+ 	rcu_read_lock();
+ 
+-	recent = lru_gen_test_recent(shadow, type, &lruvec, &token, &workingset);
++	unpack_shadow(shadow, &memcgid, &pgdat, &token, &workingset);
++	lruvec = mem_cgroup_lruvec(mem_cgroup_from_id(memcgid), pgdat);
+ 	if (lruvec != folio_lruvec(folio))
+ 		goto unlock;
+ 
+ 	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, delta);
+ 
++	recent = lru_gen_test_recent(lruvec, type, token);
+ 	if (!recent)
+ 		goto unlock;
+ 
+@@ -485,9 +481,6 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset)
+ 	struct pglist_data *pgdat;
+ 	unsigned long eviction;
+ 
+-	if (lru_gen_enabled())
+-		return lru_gen_test_recent(shadow, file, &eviction_lruvec, &eviction, workingset);
+-
+ 	unpack_shadow(shadow, &memcgid, &pgdat, &eviction, workingset);
+ 
+ 	/*
+@@ -511,6 +504,9 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset)
+ 		return false;
+ 	eviction_lruvec = mem_cgroup_lruvec(eviction_memcg, pgdat);
+ 
++	if (lru_gen_enabled())
++		return lru_gen_test_recent(eviction_lruvec, file, eviction);
++
+ 	return lru_test_refault(eviction_memcg, eviction_lruvec, eviction,
+ 				file, EVICTION_BITS, bucket_order);
+ }
+-- 
+2.42.0
+
+
+From 34adb7d9a90d3126709c47a0a8d390001d6ed3f4 Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Thu, 21 Sep 2023 03:02:43 +0800
+Subject: [PATCH 07/20] mm, lru_gen: convert avg_total and avg_refaulted to
+ atomic
+
+No feature change, prepare for later patch.
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ include/linux/mmzone.h |  4 ++--
+ mm/vmscan.c            | 16 ++++++++--------
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 4106fbc5b..d944987b6 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -425,9 +425,9 @@ struct lru_gen_folio {
+ 	/* the multi-gen LRU sizes, eventually consistent */
+ 	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+ 	/* the exponential moving average of refaulted */
+-	unsigned long avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
++	atomic_long_t avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
+ 	/* the exponential moving average of evicted+protected */
+-	unsigned long avg_total[ANON_AND_FILE][MAX_NR_TIERS];
++	atomic_long_t avg_total[ANON_AND_FILE][MAX_NR_TIERS];
+ 	/* the first tier doesn't need protection, hence the minus one */
+ 	unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS - 1];
+ 	/* can be modified without holding the LRU lock */
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 0fdf46323..66b38ce65 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3705,9 +3705,9 @@ static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+ 	int hist = lru_hist_from_seq(lrugen->min_seq[type]);
+ 
+-	pos->refaulted = lrugen->avg_refaulted[type][tier] +
++	pos->refaulted = atomic_long_read(&lrugen->avg_refaulted[type][tier]) +
+ 			 atomic_long_read(&lrugen->refaulted[hist][type][tier]);
+-	pos->total = lrugen->avg_total[type][tier] +
++	pos->total = atomic_long_read(&lrugen->avg_total[type][tier]) +
+ 		     atomic_long_read(&lrugen->evicted[hist][type][tier]);
+ 	if (tier)
+ 		pos->total += lrugen->protected[hist][type][tier - 1];
+@@ -3732,15 +3732,15 @@ static void reset_ctrl_pos(struct lruvec *lruvec, int type, bool carryover)
+ 		if (carryover) {
+ 			unsigned long sum;
+ 
+-			sum = lrugen->avg_refaulted[type][tier] +
++			sum = atomic_long_read(&lrugen->avg_refaulted[type][tier]) +
+ 			      atomic_long_read(&lrugen->refaulted[hist][type][tier]);
+-			WRITE_ONCE(lrugen->avg_refaulted[type][tier], sum / 2);
++			atomic_long_set(&lrugen->avg_refaulted[type][tier], sum / 2);
+ 
+-			sum = lrugen->avg_total[type][tier] +
++			sum = atomic_long_read(&lrugen->avg_total[type][tier]) +
+ 			      atomic_long_read(&lrugen->evicted[hist][type][tier]);
+ 			if (tier)
+ 				sum += lrugen->protected[hist][type][tier - 1];
+-			WRITE_ONCE(lrugen->avg_total[type][tier], sum / 2);
++			atomic_long_set(&lrugen->avg_total[type][tier], sum / 2);
+ 		}
+ 
+ 		if (clear) {
+@@ -5885,8 +5885,8 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
+ 
+ 			if (seq == max_seq) {
+ 				s = "RT ";
+-				n[0] = READ_ONCE(lrugen->avg_refaulted[type][tier]);
+-				n[1] = READ_ONCE(lrugen->avg_total[type][tier]);
++				n[0] = atomic_long_read(&lrugen->avg_refaulted[type][tier]);
++				n[1] = atomic_long_read(&lrugen->avg_total[type][tier]);
+ 			} else if (seq == min_seq[type] || NR_HIST_GENS > 1) {
+ 				s = "rep";
+ 				n[0] = atomic_long_read(&lrugen->refaulted[hist][type][tier]);
+-- 
+2.42.0
+
+
+From be2eb001f81cc088f5d823d91ab100caef574a33 Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Thu, 21 Sep 2023 03:02:44 +0800
+Subject: [PATCH 08/20] workingset, lru_gen: apply refault-distance based
+ re-activation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+I noticed MGLRU not working very well on certain workflows, which is
+observed on some heavily stressed databases. That is when the file
+page workingset size exceeds total memory, and the access distance
+(the left-shift time of a page before it gets activated, considering
+LRU starts from right) of file pages also larger than total memory.
+All file pages are stuck on the oldest generation and getting
+read-in then evicted permutably. Despite anon pages being idle,
+they never get aged. PID controller didn't kickin until there are some
+minor access pattern changes. And file pages are not promoted
+or reused.
+
+Even though the memory can't cover the whole workingset, the
+refault-distance based re-activation can help hold part of the
+workingset in-memory to help reduce the IO workload significantly.
+
+So apply it for MGLRU as well. The updated refault-distance model
+fits well for MGLRU in most cases, if we just consider the last two
+generation as the inactive LRU and the first two generations as
+active LRU.
+
+Some adjustment is done to fit the logic better, also make the
+refault-distance contributed to page tiering and PID refault detection
+of MGLRU:
+
+- If a tier-0 page have a qualified refault-distance, just promote
+  it to higher tier, send it to second oldest gen.
+- If a tier >= 1 page have a qualified refault-distance, mark it as
+  active and send it to youngest gen.
+- Increase the reference of every page that have a qualified
+  refault-distance and increase the PID countroled refault rate
+  of the updated tier, in hope similar paged will be protected
+  next time upon eviction.
+
+NOTE: This also changed the meaning of workingset_* fields in
+/proc/vmstat, workingset_activate_* now stands for the pages
+reactivated or promoted by refault distance checking,
+workingset_restore_* now stands for all pages promoted by
+any reason.
+
+Following benchmark showed 5x improvement. To simulate the optimized
+workflow, I setup a 3-replicated mongodb cluster, each in a different
+cgroup, using 5 gb of wiretiger cache and 10g of oplog, on a 32G VM with
+no limit set. The benchmark is done using
+https://github.com/apavlo/py-tpcc.git, modified to run STOCK_LEVEL
+query only, for simulating slow query and get a stable result.
+
+Test is done on an EPYC 7K62 with 32G RAM with SATA SSD:
+
+- Before (with ZRAM enabled, the result won't change whether
+any kind of swap is on or not):
+$ tpcc.py --config=mongodb.config mongodb --duration=900 --warehouses=500 --clients=30
+==================================================================
+Execution Results after 919 seconds
+------------------------------------------------------------------
+                  Executed        Time (µs)       Rate
+  STOCK_LEVEL     577             27584645283.7   0.02 txn/s
+------------------------------------------------------------------
+  TOTAL           577             27584645283.7   0.02 txn/s
+
+$ cat /proc/vmstat | grep workingset
+workingset_nodes 47860
+workingset_refault_anon 0
+workingset_refault_file 23498953
+workingset_activate_anon 0
+workingset_activate_file 23487840
+workingset_restore_anon 0
+workingset_restore_file 18553646
+workingset_nodereclaim 768
+
+$ free -m
+              total        used        free      shared  buff/cache   available
+Mem:          31849        6829         790          23       24229       24542
+Swap:         31848           0       31848
+
+- Patched: (with ZRAM enabled):
+$ tpcc.py --config=mongodb.config mongodb --duration=900 --warehouses=500 --clients=30
+==================================================================
+Execution Results after 905 seconds
+------------------------------------------------------------------
+                  Executed        Time (µs)       Rate
+  STOCK_LEVEL     2542            27121571486.2   0.09 txn/s
+------------------------------------------------------------------
+  TOTAL           2542            27121571486.2   0.09 txn/s
+
+$ cat /proc/vmstat | grep working
+workingset_nodes 70358
+workingset_refault_anon 16853
+workingset_refault_file 22693601
+workingset_activate_anon 10099
+workingset_activate_file 8565519
+workingset_restore_anon 10127
+workingset_restore_file 8566053
+workingset_nodereclaim 9801
+
+$ free -m
+              total        used        free      shared  buff/cache   available
+Mem:          31849        7093         283           4       24472       24289
+Swap:         31848        1652       30196
+
+The performance is 5x times better than before, and the idle anon pages
+now can get swapped out as expected. The result is also better with
+lower test stress, testing with lower stress also shows a improvement.
+
+I also checked the benchmark with memtier/memcached and fio,
+using similar setup as in commit ac35a4902374 but scaled down to fit in
+my test environment:
+
+  memtier test (16G ramdisk as swap, 4G memcg limit, VM on a EPYC 7K62):
+  memcached -u nobody -m 16384 -s /tmp/memcached.socket -a 0766 \
+    -t 16 -B binary &
+  memtier_benchmark -S /tmp/memcached.socket -P memcache_binary -n allkeys\
+    --key-minimum=1 --key-maximum=36000000 --key-pattern=P:P -c 1 \
+    -t 16 --ratio 1:0 --pipeline 8 -d 600 -x 6
+
+  fio test 1 (16G ramdisk, 4G memcg limit, VM on a EPYC 7K62):
+  fio -name=mglru --numjobs=16 --directory=/mnt --size=1000m \
+    --buffered=1 --ioengine=io_uring --iodepth=128 \
+    --iodepth_batch_submit=32 --iodepth_batch_complete=32 \
+    --rw=randread --random_distribution=zipf:1.2 --norandommap \
+    --time_based --ramp_time=10m --runtime=5m --group_reporting
+
+  fio test 2 (16G ramdisk, 2G memcg limit, VM on a EPYC 7K62):
+  fio -name=mglru --numjobs=16 --directory=/mnt --size=1000m \
+    --buffered=1 --ioengine=io_uring --iodepth=128 \
+    --iodepth_batch_submit=32 --iodepth_batch_complete=32 \
+    --rw=randread --random_distribution=zipf:1.2 --norandommap \
+    --time_based --ramp_time=10m --runtime=5m --group_reporting
+
+  mysql test (15G buffer pool with 16G memcg limit, VM on a EPYC 7K62):
+    sysbench /usr/share/sysbench/oltp_read_only.lua <auth and db params> \
+      --tables=48 --table-size=2000000 --threads=16 --time=1800 run
+
+Before this patch:
+memtier: 37794.71 op/s
+fio 1: 6327.3k iops
+fio 2: 5697.6k iops
+mysql: 146104.98 qps
+
+After this patch:
+memtier: 37792.61 op/s
+fio 1: 6583.3k iops
+fio 2: 5929.2k iops
+mysql: 146055.88 qps
+
+There is no regression on other tests so far, and a performance gain
+is observed on file page heavy tasks.
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/vmscan.c     |  20 +++++---
+ mm/workingset.c | 130 +++++++++++++++++++++++++++++++-----------------
+ 2 files changed, 95 insertions(+), 55 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 66b38ce65..df5f8be23 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3730,17 +3730,21 @@ static void reset_ctrl_pos(struct lruvec *lruvec, int type, bool carryover)
+ 
+ 	for (tier = 0; tier < MAX_NR_TIERS; tier++) {
+ 		if (carryover) {
+-			unsigned long sum;
++			unsigned long refaulted, total;
+ 
+-			sum = atomic_long_read(&lrugen->avg_refaulted[type][tier]) +
+-			      atomic_long_read(&lrugen->refaulted[hist][type][tier]);
+-			atomic_long_set(&lrugen->avg_refaulted[type][tier], sum / 2);
++			refaulted = atomic_long_read(&lrugen->avg_refaulted[type][tier]) +
++				atomic_long_read(&lrugen->refaulted[hist][type][tier]);
+ 
+-			sum = atomic_long_read(&lrugen->avg_total[type][tier]) +
+-			      atomic_long_read(&lrugen->evicted[hist][type][tier]);
++			total = atomic_long_read(&lrugen->avg_total[type][tier]) +
++				atomic_long_read(&lrugen->evicted[hist][type][tier]);
+ 			if (tier)
+-				sum += lrugen->protected[hist][type][tier - 1];
+-			atomic_long_set(&lrugen->avg_total[type][tier], sum / 2);
++				total += lrugen->protected[hist][type][tier - 1];
++
++			/* total could be less than refaulted, see lru_gen_refault */
++			total = max(total, refaulted);
++
++			atomic_long_set(&lrugen->avg_refaulted[type][tier], refaulted / 2);
++			atomic_long_set(&lrugen->avg_total[type][tier], total / 2);
+ 		}
+ 
+ 		if (clear) {
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 87a16b615..e548c8cee 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -175,6 +175,7 @@
+ 			 MEM_CGROUP_ID_SHIFT)
+ #define EVICTION_BITS	(BITS_PER_LONG - (EVICTION_SHIFT))
+ #define EVICTION_MASK	(~0UL >> EVICTION_SHIFT)
++#define LRU_GEN_EVICTION_BITS	(EVICTION_BITS - LRU_REFS_WIDTH - LRU_GEN_WIDTH)
+ 
+ /*
+  * Eviction timestamps need to be able to cover the full range of
+@@ -185,6 +186,7 @@
+  * evictions into coarser buckets by shaving off lower timestamp bits.
+  */
+ static unsigned int bucket_order __read_mostly;
++static unsigned int lru_gen_bucket_order __read_mostly;
+ 
+ static void *pack_shadow(int memcgid, pg_data_t *pgdat, unsigned long eviction,
+ 			 bool workingset)
+@@ -290,6 +292,34 @@ static inline bool lru_test_refault(struct mem_cgroup *memcg,
+ 			(file ? inactive_anon : inactive_file);
+ }
+ 
++/**
++ * workingset_age_nonresident - age non-resident entries as LRU ages
++ * @lruvec: the lruvec that was aged
++ * @nr_pages: the number of pages to count
++ *
++ * As in-memory pages are aged, non-resident pages need to be aged as
++ * well, in order for the refault distances later on to be comparable
++ * to the in-memory dimensions. This function allows reclaim and LRU
++ * operations to drive the non-resident aging along in parallel.
++ */
++void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages)
++{
++	/*
++	 * Reclaiming a cgroup means reclaiming all its children in a
++	 * round-robin fashion. That means that each cgroup has an LRU
++	 * order that is composed of the LRU orders of its child
++	 * cgroups; and every page has an LRU position not just in the
++	 * cgroup that owns it, but in all of that group's ancestors.
++	 *
++	 * So when the physical inactive list of a leaf cgroup ages,
++	 * the virtual inactive lists of all its parents, including
++	 * the root cgroup's, age as well.
++	 */
++	do {
++		atomic_long_add(nr_pages, &lruvec->nonresident_age);
++	} while ((lruvec = parent_lruvec(lruvec)));
++}
++
+ #ifdef CONFIG_LRU_GEN
+ 
+ static void *lru_gen_eviction(struct folio *folio)
+@@ -311,10 +341,14 @@ static void *lru_gen_eviction(struct folio *folio)
+ 	lruvec = mem_cgroup_lruvec(memcg, pgdat);
+ 	lrugen = &lruvec->lrugen;
+ 	min_seq = READ_ONCE(lrugen->min_seq[type]);
++
+ 	token = (min_seq << LRU_REFS_WIDTH) | max(refs - 1, 0);
++	token <<= LRU_GEN_EVICTION_BITS;
++	token |= lru_eviction(lruvec, LRU_GEN_EVICTION_BITS, lru_gen_bucket_order);
+ 
+ 	hist = lru_hist_from_seq(min_seq);
+ 	atomic_long_add(delta, &lrugen->evicted[hist][type][tier]);
++	workingset_age_nonresident(lruvec, folio_nr_pages(folio));
+ 
+ 	return pack_shadow(mem_cgroup_id(memcg), pgdat, token, refs);
+ }
+@@ -329,15 +363,17 @@ static bool lru_gen_test_recent(struct lruvec *lruvec, bool file,
+ 	unsigned long min_seq;
+ 
+ 	min_seq = READ_ONCE(lruvec->lrugen.min_seq[file]);
++	token >>= LRU_GEN_EVICTION_BITS;
+ 	return (token >> LRU_REFS_WIDTH) == (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH));
+ }
+ 
+ static void lru_gen_refault(struct folio *folio, void *shadow)
+ {
+ 	int memcgid;
+-	bool recent;
++	bool refault;
+ 	bool workingset;
+ 	unsigned long token;
++	bool recent = false;
+ 	int hist, tier, refs;
+ 	struct lruvec *lruvec;
+ 	struct pglist_data *pgdat;
+@@ -345,28 +381,36 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
+ 	int type = folio_is_file_lru(folio);
+ 	int delta = folio_nr_pages(folio);
+ 
+-	rcu_read_lock();
+-
+ 	unpack_shadow(shadow, &memcgid, &pgdat, &token, &workingset);
+ 	lruvec = mem_cgroup_lruvec(mem_cgroup_from_id(memcgid), pgdat);
+ 	if (lruvec != folio_lruvec(folio))
+-		goto unlock;
++		return;
+ 
+ 	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, delta);
+-
++	refault = lru_test_refault(lruvec_memcg(lruvec), lruvec, token, type,
++				   LRU_GEN_EVICTION_BITS, lru_gen_bucket_order);
+ 	recent = lru_gen_test_recent(lruvec, type, token);
+-	if (!recent)
+-		goto unlock;
++	if (!recent && !refault)
++		return;
+ 
+ 	lrugen = &lruvec->lrugen;
+-
+ 	hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));
+ 	/* see the comment in folio_lru_refs() */
++	token >>= LRU_GEN_EVICTION_BITS;
+ 	refs = (token & (BIT(LRU_REFS_WIDTH) - 1)) + workingset;
+ 	tier = lru_tier_from_refs(refs);
+ 
+-	atomic_long_add(delta, &lrugen->refaulted[hist][type][tier]);
+-	mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);
++	if (refault) {
++		if (refs)
++			folio_set_active(folio);
++		/*
++		 * Protect higher tier to make it easier
++		 * to stay in a stable workingset and prevent refault.
++		 */
++		if (refs != BIT(LRU_REFS_WIDTH))
++			tier = lru_tier_from_refs(refs + 1);
++		mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);
++	}
+ 
+ 	/*
+ 	 * Count the following two cases as stalls:
+@@ -375,12 +419,25 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
+ 	 * 2. For pages accessed multiple times through file descriptors,
+ 	 *    numbers of accesses might have been out of the range.
+ 	 */
+-	if (lru_gen_in_fault() || refs == BIT(LRU_REFS_WIDTH)) {
+-		folio_set_workingset(folio);
++	if (refault || lru_gen_in_fault() || refs == BIT(LRU_REFS_WIDTH)) {
+ 		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + type, delta);
++		folio_set_workingset(folio);
++	}
++
++	/*
++	 * If recent is false, add to global PID counters since the gen which
++	 * the page evicted is gone already.
++	 */
++	if (recent) {
++		/*
++		 * tier may get increased upon refault, which makes refaulted larger
++		 * than evicted, this will be reset and accounted by reset_ctrl_pos
++		 */
++		atomic_long_add(delta, &lrugen->refaulted[hist][type][tier]);
++	} else {
++		atomic_long_add(delta, &lrugen->avg_total[type][tier]);
++		atomic_long_add(delta, &lrugen->avg_refaulted[type][tier]);
+ 	}
+-unlock:
+-	rcu_read_unlock();
+ }
+ 
+ #else /* !CONFIG_LRU_GEN */
+@@ -402,34 +459,6 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
+ 
+ #endif /* CONFIG_LRU_GEN */
+ 
+-/**
+- * workingset_age_nonresident - age non-resident entries as LRU ages
+- * @lruvec: the lruvec that was aged
+- * @nr_pages: the number of pages to count
+- *
+- * As in-memory pages are aged, non-resident pages need to be aged as
+- * well, in order for the refault distances later on to be comparable
+- * to the in-memory dimensions. This function allows reclaim and LRU
+- * operations to drive the non-resident aging along in parallel.
+- */
+-void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages)
+-{
+-	/*
+-	 * Reclaiming a cgroup means reclaiming all its children in a
+-	 * round-robin fashion. That means that each cgroup has an LRU
+-	 * order that is composed of the LRU orders of its child
+-	 * cgroups; and every page has an LRU position not just in the
+-	 * cgroup that owns it, but in all of that group's ancestors.
+-	 *
+-	 * So when the physical inactive list of a leaf cgroup ages,
+-	 * the virtual inactive lists of all its parents, including
+-	 * the root cgroup's, age as well.
+-	 */
+-	do {
+-		atomic_long_add(nr_pages, &lruvec->nonresident_age);
+-	} while ((lruvec = parent_lruvec(lruvec)));
+-}
+-
+ /**
+  * workingset_eviction - note the eviction of a folio from memory
+  * @target_memcg: the cgroup that is causing the reclaim
+@@ -529,16 +558,16 @@ void workingset_refault(struct folio *folio, void *shadow)
+ 	bool workingset;
+ 	long nr;
+ 
+-	if (lru_gen_enabled()) {
+-		lru_gen_refault(folio, shadow);
+-		return;
+-	}
+-
+ 	/* Flush stats (and potentially sleep) before holding RCU read lock */
+ 	mem_cgroup_flush_stats_ratelimited();
+ 
+ 	rcu_read_lock();
+ 
++	if (lru_gen_enabled()) {
++		lru_gen_refault(folio, shadow);
++		goto out;
++	}
++
+ 	/*
+ 	 * The activation decision for this folio is made at the level
+ 	 * where the eviction occurred, as that is where the LRU order
+@@ -785,6 +814,13 @@ static int __init workingset_init(void)
+ 	pr_info("workingset: timestamp_bits=%d max_order=%d bucket_order=%u\n",
+ 		EVICTION_BITS, max_order, bucket_order);
+ 
++#ifdef CONFIG_LRU_GEN
++	if (max_order > LRU_GEN_EVICTION_BITS)
++		lru_gen_bucket_order = max_order - LRU_GEN_EVICTION_BITS;
++	pr_info("workingset: lru_gen_timestamp_bits=%d lru_gen_bucket_order=%u\n",
++		LRU_GEN_EVICTION_BITS, lru_gen_bucket_order);
++#endif
++
+ 	ret = prealloc_shrinker(&workingset_shadow_shrinker, "mm-shadow");
+ 	if (ret)
+ 		goto err;
+-- 
+2.42.0
+
+
+From cf496054aa68b5d0848a9cfca1d3e201bff52146 Mon Sep 17 00:00:00 2001
+From: Jaewon Kim <jaewon31.kim@samsung.com>
+Date: Tue, 3 Oct 2023 20:41:55 +0900
+Subject: [PATCH 09/20] mm: multi-gen LRU: reuse some legacy trace events
+
+As the legacy lru provides, the mglru needs some trace events for
+debugging. Let's reuse following legacy events for the mglru.
+
+  trace_mm_vmscan_lru_isolate
+  trace_mm_vmscan_lru_shrink_inactive
+
+Here's an example
+  mm_vmscan_lru_isolate: classzone=2 order=0 nr_requested=4096 nr_scanned=64 nr_skipped=0 nr_taken=64 lru=inactive_file
+  mm_vmscan_lru_shrink_inactive: nid=0 nr_scanned=64 nr_reclaimed=63 nr_dirty=0 nr_writeback=0 nr_congested=0 nr_immediate=0 nr_activate_anon=0 nr_activate_file=1 nr_ref_keep=0 nr_unmap_fail=0 priority=2 flags=RECLAIM_WB_FILE|RECLAIM_WB_ASYNC
+
+Signed-off-by: Jaewon Kim <jaewon31.kim@samsung.com>
+Acked-by: Yu Zhao <yuzhao@google.com>
+---
+ mm/vmscan.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index df5f8be23..9c62ebbec 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -5007,6 +5007,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+ 	int sorted = 0;
+ 	int scanned = 0;
+ 	int isolated = 0;
++	int skipped = 0;
+ 	int remaining = MAX_LRU_BATCH;
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+@@ -5020,7 +5021,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+ 
+ 	for (i = MAX_NR_ZONES; i > 0; i--) {
+ 		LIST_HEAD(moved);
+-		int skipped = 0;
++		int skipped_zone = 0;
+ 		int zone = (sc->reclaim_idx + i) % MAX_NR_ZONES;
+ 		struct list_head *head = &lrugen->folios[gen][type][zone];
+ 
+@@ -5042,16 +5043,17 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+ 				isolated += delta;
+ 			} else {
+ 				list_move(&folio->lru, &moved);
+-				skipped += delta;
++				skipped_zone += delta;
+ 			}
+ 
+-			if (!--remaining || max(isolated, skipped) >= MIN_LRU_BATCH)
++			if (!--remaining || max(isolated, skipped_zone) >= MIN_LRU_BATCH)
+ 				break;
+ 		}
+ 
+-		if (skipped) {
++		if (skipped_zone) {
+ 			list_splice(&moved, head);
+-			__count_zid_vm_events(PGSCAN_SKIP, zone, skipped);
++			__count_zid_vm_events(PGSCAN_SKIP, zone, skipped_zone);
++			skipped += skipped_zone;
+ 		}
+ 
+ 		if (!remaining || isolated >= MIN_LRU_BATCH)
+@@ -5066,6 +5068,9 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+ 	__count_memcg_events(memcg, item, isolated);
+ 	__count_memcg_events(memcg, PGREFILL, sorted);
+ 	__count_vm_events(PGSCAN_ANON + type, isolated);
++	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, MAX_LRU_BATCH,
++				scanned, skipped, isolated,
++				type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+ 
+ 	/*
+ 	 * There might not be eligible folios due to reclaim_idx. Check the
+@@ -5196,6 +5201,9 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
+ retry:
+ 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false);
+ 	sc->nr_reclaimed += reclaimed;
++	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
++			scanned, reclaimed, &stat, sc->priority,
++			type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+ 
+ 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
+ 		if (!folio_evictable(folio)) {
+-- 
+2.42.0
+
+
+From 0d3f0d615a3106d48e2ecbb994fde4c58c72bc8d Mon Sep 17 00:00:00 2001
+From: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Date: Fri, 29 Sep 2023 16:13:59 -0400
+Subject: [PATCH 10/20] radix tree test suite: fix allocation calculation in
+ kmem_cache_alloc_bulk()
+
+The bulk allocation is iterating through an array and storing enough
+memory for the entire bulk allocation instead of a single array entry.
+Only allocate an array element of the size set in the kmem_cache.
+
+Link: https://lkml.kernel.org/r/20230929201359.2857583-1-Liam.Howlett@oracle.com
+Fixes: cc86e0c2f306 ("radix tree test suite: add support for slab bulk APIs")
+Signed-off-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Reported-by: Christophe JAILLET <christophe.jaillet@wanadoo.fr>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ tools/testing/radix-tree/linux.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tools/testing/radix-tree/linux.c b/tools/testing/radix-tree/linux.c
+index d587a5589..61fe2601c 100644
+--- a/tools/testing/radix-tree/linux.c
++++ b/tools/testing/radix-tree/linux.c
+@@ -165,9 +165,9 @@ int kmem_cache_alloc_bulk(struct kmem_cache *cachep, gfp_t gfp, size_t size,
+ 		for (i = 0; i < size; i++) {
+ 			if (cachep->align) {
+ 				posix_memalign(&p[i], cachep->align,
+-					       cachep->size * size);
++					       cachep->size);
+ 			} else {
+-				p[i] = malloc(cachep->size * size);
++				p[i] = malloc(cachep->size);
+ 			}
+ 			if (cachep->ctor)
+ 				cachep->ctor(p[i]);
+-- 
+2.42.0
+
+
+From 199951dc646e55e970b15cb00c67416b917f1b75 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:11 +0800
+Subject: [PATCH 11/20] maple_tree: Add mt_free_one() and mt_attr() helpers
+
+Add two helpers:
+1. mt_free_one(), used to free a maple node.
+2. mt_attr(), used to obtain the attributes of maple tree.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ lib/maple_tree.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+index bb24d84a4..ca7039633 100644
+--- a/lib/maple_tree.c
++++ b/lib/maple_tree.c
+@@ -165,6 +165,11 @@ static inline int mt_alloc_bulk(gfp_t gfp, size_t size, void **nodes)
+ 	return kmem_cache_alloc_bulk(maple_node_cache, gfp, size, nodes);
+ }
+ 
++static inline void mt_free_one(struct maple_node *node)
++{
++	kmem_cache_free(maple_node_cache, node);
++}
++
+ static inline void mt_free_bulk(size_t size, void __rcu **nodes)
+ {
+ 	kmem_cache_free_bulk(maple_node_cache, size, (void **)nodes);
+@@ -205,6 +210,11 @@ static unsigned int mas_mt_height(struct ma_state *mas)
+ 	return mt_height(mas->tree);
+ }
+ 
++static inline unsigned int mt_attr(struct maple_tree *mt)
++{
++	return mt->ma_flags & ~MT_FLAGS_HEIGHT_MASK;
++}
++
+ static inline enum maple_type mte_node_type(const struct maple_enode *entry)
+ {
+ 	return ((unsigned long)entry >> MAPLE_NODE_TYPE_SHIFT) &
+@@ -5573,7 +5583,7 @@ void mas_destroy(struct ma_state *mas)
+ 			mt_free_bulk(count, (void __rcu **)&node->slot[1]);
+ 			total -= count;
+ 		}
+-		kmem_cache_free(maple_node_cache, node);
++		mt_free_one(ma_mnode_ptr(node));
+ 		total--;
+ 	}
+ 
+-- 
+2.42.0
+
+
+From ab42162b73d86217f2bb089b4984f13236413906 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:12 +0800
+Subject: [PATCH 12/20] maple_tree: Introduce {mtree,mas}_lock_nested()
+
+In some cases, nested locks may be needed, so {mtree,mas}_lock_nested is
+introduced. For example, when duplicating maple tree, we need to hold
+the locks of two trees, in which case nested locks are needed.
+
+At the same time, add the definition of spin_lock_nested() in tools for
+testing.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ include/linux/maple_tree.h     | 4 ++++
+ tools/include/linux/spinlock.h | 1 +
+ 2 files changed, 5 insertions(+)
+
+diff --git a/include/linux/maple_tree.h b/include/linux/maple_tree.h
+index d01e850b5..f91dbc7fe 100644
+--- a/include/linux/maple_tree.h
++++ b/include/linux/maple_tree.h
+@@ -256,6 +256,8 @@ struct maple_tree {
+ 	struct maple_tree name = MTREE_INIT(name, 0)
+ 
+ #define mtree_lock(mt)		spin_lock((&(mt)->ma_lock))
++#define mtree_lock_nested(mas, subclass) \
++		spin_lock_nested((&(mt)->ma_lock), subclass)
+ #define mtree_unlock(mt)	spin_unlock((&(mt)->ma_lock))
+ 
+ /*
+@@ -406,6 +408,8 @@ struct ma_wr_state {
+ };
+ 
+ #define mas_lock(mas)           spin_lock(&((mas)->tree->ma_lock))
++#define mas_lock_nested(mas, subclass) \
++		spin_lock_nested(&((mas)->tree->ma_lock), subclass)
+ #define mas_unlock(mas)         spin_unlock(&((mas)->tree->ma_lock))
+ 
+ 
+diff --git a/tools/include/linux/spinlock.h b/tools/include/linux/spinlock.h
+index 622266b19..a6cdf25b6 100644
+--- a/tools/include/linux/spinlock.h
++++ b/tools/include/linux/spinlock.h
+@@ -11,6 +11,7 @@
+ #define spin_lock_init(x)	pthread_mutex_init(x, NULL)
+ 
+ #define spin_lock(x)			pthread_mutex_lock(x)
++#define spin_lock_nested(x, subclass)	pthread_mutex_lock(x)
+ #define spin_unlock(x)			pthread_mutex_unlock(x)
+ #define spin_lock_bh(x)			pthread_mutex_lock(x)
+ #define spin_unlock_bh(x)		pthread_mutex_unlock(x)
+-- 
+2.42.0
+
+
+From 6ec2ea59da876479e7348e1c7f7ba67bb199f1e2 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:13 +0800
+Subject: [PATCH 13/20] maple_tree: Introduce interfaces __mt_dup() and
+ mtree_dup()
+
+Introduce interfaces __mt_dup() and mtree_dup(), which are used to
+duplicate a maple tree. They duplicate a maple tree in Depth-First
+Search (DFS) pre-order traversal. It uses memcopy() to copy nodes in the
+source tree and allocate new child nodes in non-leaf nodes. The new node
+is exactly the same as the source node except for all the addresses
+stored in it. It will be faster than traversing all elements in the
+source tree and inserting them one by one into the new tree. The time
+complexity of these two functions is O(n).
+
+The difference between __mt_dup() and mtree_dup() is that mtree_dup()
+handles locks internally.
+
+Analysis of the average time complexity of this algorithm:
+
+For simplicity, let's assume that the maximum branching factor of all
+non-leaf nodes is 16 (in allocation mode, it is 10), and the tree is a
+full tree.
+
+Under the given conditions, if there is a maple tree with n elements,
+the number of its leaves is n/16. From bottom to top, the number of
+nodes in each level is 1/16 of the number of nodes in the level below.
+So the total number of nodes in the entire tree is given by the sum of
+n/16 + n/16^2 + n/16^3 + ... + 1. This is a geometric series, and it has
+log(n) terms with base 16. According to the formula for the sum of a
+geometric series, the sum of this series can be calculated as (n-1)/15.
+Each node has only one parent node pointer, which can be considered as
+an edge. In total, there are (n-1)/15-1 edges.
+
+This algorithm consists of two operations:
+
+1. Traversing all nodes in DFS order.
+2. For each node, making a copy and performing necessary modifications
+   to create a new node.
+
+For the first part, DFS traversal will visit each edge twice. Let
+T(ascend) represent the cost of taking one step downwards, and
+T(descend) represent the cost of taking one step upwards. And both of
+them are constants (although mas_ascend() may not be, as it contains a
+loop, but here we ignore it and treat it as a constant). So the time
+spent on the first part can be represented as
+((n-1)/15-1) * (T(ascend) + T(descend)).
+
+For the second part, each node will be copied, and the cost of copying a
+node is denoted as T(copy_node). For each non-leaf node, it is necessary
+to reallocate all child nodes, and the cost of this operation is denoted
+as T(dup_alloc). The behavior behind memory allocation is complex and
+not specific to the maple tree operation. Here, we assume that the time
+required for a single allocation is constant. Since the size of a node
+is fixed, both of these symbols are also constants. We can calculate
+that the time spent on the second part is
+((n-1)/15) * T(copy_node) + ((n-1)/15 - n/16) * T(dup_alloc).
+
+Adding both parts together, the total time spent by the algorithm can be
+represented as:
+
+((n-1)/15) * (T(ascend) + T(descend) + T(copy_node) + T(dup_alloc)) -
+n/16 * T(dup_alloc) - (T(ascend) + T(descend))
+
+Let C1 = T(ascend) + T(descend) + T(copy_node) + T(dup_alloc)
+Let C2 = T(dup_alloc)
+Let C3 = T(ascend) + T(descend)
+
+Finally, the expression can be simplified as:
+((16 * C1 - 15 * C2) / (15 * 16)) * n - (C1 / 15 + C3).
+
+This is a linear function, so the average time complexity is O(n).
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ include/linux/maple_tree.h |   3 +
+ lib/maple_tree.c           | 286 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 289 insertions(+)
+
+diff --git a/include/linux/maple_tree.h b/include/linux/maple_tree.h
+index f91dbc7fe..a452dd8a1 100644
+--- a/include/linux/maple_tree.h
++++ b/include/linux/maple_tree.h
+@@ -329,6 +329,9 @@ int mtree_store(struct maple_tree *mt, unsigned long index,
+ 		void *entry, gfp_t gfp);
+ void *mtree_erase(struct maple_tree *mt, unsigned long index);
+ 
++int mtree_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
++int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
++
+ void mtree_destroy(struct maple_tree *mt);
+ void __mt_destroy(struct maple_tree *mt);
+ 
+diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+index ca7039633..f4a1019ae 100644
+--- a/lib/maple_tree.c
++++ b/lib/maple_tree.c
+@@ -6475,6 +6475,292 @@ void *mtree_erase(struct maple_tree *mt, unsigned long index)
+ }
+ EXPORT_SYMBOL(mtree_erase);
+ 
++/*
++ * mas_dup_free() - Free an incomplete duplication of a tree.
++ * @mas: The maple state of a incomplete tree.
++ *
++ * The parameter @mas->node passed in indicates that the allocation failed on
++ * this node. This function frees all nodes starting from @mas->node in the
++ * reverse order of mas_dup_build(). There is no need to hold the source tree
++ * lock at this time.
++ */
++static void mas_dup_free(struct ma_state *mas)
++{
++	struct maple_node *node;
++	enum maple_type type;
++	void __rcu **slots;
++	unsigned char count, i;
++
++	/* Maybe the first node allocation failed. */
++	if (mas_is_none(mas))
++		return;
++
++	while (!mte_is_root(mas->node)) {
++		mas_ascend(mas);
++
++		if (mas->offset) {
++			mas->offset--;
++			do {
++				mas_descend(mas);
++				mas->offset = mas_data_end(mas);
++			} while (!mte_is_leaf(mas->node));
++
++			mas_ascend(mas);
++		}
++
++		node = mte_to_node(mas->node);
++		type = mte_node_type(mas->node);
++		slots = ma_slots(node, type);
++		count = mas_data_end(mas) + 1;
++		for (i = 0; i < count; i++)
++			((unsigned long *)slots)[i] &= ~MAPLE_NODE_MASK;
++
++		mt_free_bulk(count, slots);
++	}
++
++	node = mte_to_node(mas->node);
++	mt_free_one(node);
++}
++
++/*
++ * mas_copy_node() - Copy a maple node and replace the parent.
++ * @mas: The maple state of source tree.
++ * @new_mas: The maple state of new tree.
++ * @parent: The parent of the new node.
++ *
++ * Copy @mas->node to @new_mas->node, set @parent to be the parent of
++ * @new_mas->node. If memory allocation fails, @mas is set to -ENOMEM.
++ */
++static inline void mas_copy_node(struct ma_state *mas, struct ma_state *new_mas,
++		struct maple_pnode *parent)
++{
++	struct maple_node *node = mte_to_node(mas->node);
++	struct maple_node *new_node = mte_to_node(new_mas->node);
++	unsigned long val;
++
++	/* Copy the node completely. */
++	memcpy(new_node, node, sizeof(struct maple_node));
++
++	/* Update the parent node pointer. */
++	val = (unsigned long)node->parent & MAPLE_NODE_MASK;
++	new_node->parent = ma_parent_ptr(val | (unsigned long)parent);
++}
++
++/*
++ * mas_dup_alloc() - Allocate child nodes for a maple node.
++ * @mas: The maple state of source tree.
++ * @new_mas: The maple state of new tree.
++ * @gfp: The GFP_FLAGS to use for allocations.
++ *
++ * This function allocates child nodes for @new_mas->node during the duplication
++ * process. If memory allocation fails, @mas is set to -ENOMEM.
++ */
++static inline void mas_dup_alloc(struct ma_state *mas, struct ma_state *new_mas,
++		gfp_t gfp)
++{
++	struct maple_node *node = mte_to_node(mas->node);
++	struct maple_node *new_node = mte_to_node(new_mas->node);
++	enum maple_type type;
++	unsigned char request, count, i;
++	void __rcu **slots;
++	void __rcu **new_slots;
++	unsigned long val;
++
++	/* Allocate memory for child nodes. */
++	type = mte_node_type(mas->node);
++	new_slots = ma_slots(new_node, type);
++	request = mas_data_end(mas) + 1;
++	count = mt_alloc_bulk(gfp, request, (void **)new_slots);
++	if (unlikely(count < request)) {
++		if (count)
++			mt_free_bulk(count, new_slots);
++
++		memset(new_slots, 0, request * sizeof(void *));
++		mas_set_err(mas, -ENOMEM);
++		return;
++	}
++
++	/* Restore node type information in slots. */
++	slots = ma_slots(node, type);
++	for (i = 0; i < count; i++) {
++		val = (unsigned long)mt_slot_locked(mas->tree, slots, i);
++		val &= MAPLE_NODE_MASK;
++		((unsigned long *)new_slots)[i] |= val;
++	}
++}
++
++/*
++ * mas_dup_build() - Build a new maple tree from a source tree
++ * @mas: The maple state of source tree, need to be in MAS_START state.
++ * @new_mas: The maple state of new tree, need to be in MAS_START state.
++ * @gfp: The GFP_FLAGS to use for allocations.
++ *
++ * This function builds a new tree in DFS preorder. If the memory allocation
++ * fails, the error code -ENOMEM will be set in @mas, and @new_mas points to the
++ * last node. mas_dup_free() will free the incomplete duplication of a tree.
++ *
++ * Note that the attributes of the two trees need to be exactly the same, and the
++ * new tree needs to be empty, otherwise -EINVAL will be set in @mas.
++ */
++static inline void mas_dup_build(struct ma_state *mas, struct ma_state *new_mas,
++		gfp_t gfp)
++{
++	struct maple_node *node;
++	struct maple_pnode *parent = NULL;
++	struct maple_enode *root;
++	enum maple_type type;
++
++	if (unlikely(mt_attr(mas->tree) != mt_attr(new_mas->tree)) ||
++	    unlikely(!mtree_empty(new_mas->tree))) {
++		mas_set_err(mas, -EINVAL);
++		return;
++	}
++
++	mas_start(mas);
++	if (mas_is_ptr(mas) || mas_is_none(mas)) {
++		root = mt_root_locked(mas->tree);
++		goto set_new_tree;
++	}
++
++	node = mt_alloc_one(gfp);
++	if (!node) {
++		new_mas->node = MAS_NONE;
++		mas_set_err(mas, -ENOMEM);
++		return;
++	}
++
++	type = mte_node_type(mas->node);
++	root = mt_mk_node(node, type);
++	new_mas->node = root;
++	new_mas->min = 0;
++	new_mas->max = ULONG_MAX;
++	root = mte_mk_root(root);
++
++	while (1) {
++		mas_copy_node(mas, new_mas, parent);
++
++		if (!mte_is_leaf(mas->node)) {
++			/* Only allocate child nodes for non-leaf nodes. */
++			mas_dup_alloc(mas, new_mas, gfp);
++			if (unlikely(mas_is_err(mas)))
++				return;
++		} else {
++			/*
++			 * This is the last leaf node and duplication is
++			 * completed.
++			 */
++			if (mas->max == ULONG_MAX)
++				goto done;
++
++			/* This is not the last leaf node and needs to go up. */
++			do {
++				mas_ascend(mas);
++				mas_ascend(new_mas);
++			} while (mas->offset == mas_data_end(mas));
++
++			/* Move to the next subtree. */
++			mas->offset++;
++			new_mas->offset++;
++		}
++
++		mas_descend(mas);
++		parent = ma_parent_ptr(mte_to_node(new_mas->node));
++		mas_descend(new_mas);
++		mas->offset = 0;
++		new_mas->offset = 0;
++	}
++done:
++	/* Specially handle the parent of the root node. */
++	mte_to_node(root)->parent = ma_parent_ptr(mas_tree_parent(new_mas));
++set_new_tree:
++	/* Make them the same height */
++	new_mas->tree->ma_flags = mas->tree->ma_flags;
++	rcu_assign_pointer(new_mas->tree->ma_root, root);
++}
++
++/**
++ * __mt_dup(): Duplicate an entire maple tree
++ * @mt: The source maple tree
++ * @new: The new maple tree
++ * @gfp: The GFP_FLAGS to use for allocations
++ *
++ * This function duplicates a maple tree in Depth-First Search (DFS) pre-order
++ * traversal. It uses memcopy() to copy nodes in the source tree and allocate
++ * new child nodes in non-leaf nodes. The new node is exactly the same as the
++ * source node except for all the addresses stored in it. It will be faster than
++ * traversing all elements in the source tree and inserting them one by one into
++ * the new tree.
++ * The user needs to ensure that the attributes of the source tree and the new
++ * tree are the same, and the new tree needs to be an empty tree, otherwise
++ * -EINVAL will be returned.
++ * Note that the user needs to manually lock the source tree and the new tree.
++ *
++ * Return: 0 on success, -ENOMEM if memory could not be allocated, -EINVAL If
++ * the attributes of the two trees are different or the new tree is not an empty
++ * tree.
++ */
++int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp)
++{
++	int ret = 0;
++	MA_STATE(mas, mt, 0, 0);
++	MA_STATE(new_mas, new, 0, 0);
++
++	mas_dup_build(&mas, &new_mas, gfp);
++
++	if (unlikely(mas_is_err(&mas))) {
++		ret = xa_err(mas.node);
++		if (ret == -ENOMEM)
++			mas_dup_free(&new_mas);
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL(__mt_dup);
++
++/**
++ * mtree_dup(): Duplicate an entire maple tree
++ * @mt: The source maple tree
++ * @new: The new maple tree
++ * @gfp: The GFP_FLAGS to use for allocations
++ *
++ * This function duplicates a maple tree in Depth-First Search (DFS) pre-order
++ * traversal. It uses memcopy() to copy nodes in the source tree and allocate
++ * new child nodes in non-leaf nodes. The new node is exactly the same as the
++ * source node except for all the addresses stored in it. It will be faster than
++ * traversing all elements in the source tree and inserting them one by one into
++ * the new tree.
++ * The user needs to ensure that the attributes of the source tree and the new
++ * tree are the same, and the new tree needs to be an empty tree, otherwise
++ * -EINVAL will be returned.
++ *
++ * Return: 0 on success, -ENOMEM if memory could not be allocated, -EINVAL If
++ * the attributes of the two trees are different or the new tree is not an empty
++ * tree.
++ */
++int mtree_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp)
++{
++	int ret = 0;
++	MA_STATE(mas, mt, 0, 0);
++	MA_STATE(new_mas, new, 0, 0);
++
++	mas_lock(&new_mas);
++	mas_lock_nested(&mas, SINGLE_DEPTH_NESTING);
++
++	mas_dup_build(&mas, &new_mas, gfp);
++	mas_unlock(&mas);
++
++	if (unlikely(mas_is_err(&mas))) {
++		ret = xa_err(mas.node);
++		if (ret == -ENOMEM)
++			mas_dup_free(&new_mas);
++	}
++
++	mas_unlock(&new_mas);
++
++	return ret;
++}
++EXPORT_SYMBOL(mtree_dup);
++
+ /**
+  * __mt_destroy() - Walk and free all nodes of a locked maple tree.
+  * @mt: The maple tree
+-- 
+2.42.0
+
+
+From 3f3329b2f1e0db2f52084835cdd8f44ef33c9fe7 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:14 +0800
+Subject: [PATCH 14/20] radix tree test suite: Align kmem_cache_alloc_bulk()
+ with kernel behavior.
+
+When kmem_cache_alloc_bulk() fails to allocate, leave the freed pointers
+in the array. This enables a more accurate simulation of the kernel's
+behavior and allows for testing potential double-free scenarios.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ tools/testing/radix-tree/linux.c | 45 +++++++++++++++++++++++---------
+ 1 file changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/tools/testing/radix-tree/linux.c b/tools/testing/radix-tree/linux.c
+index 61fe2601c..4eb442206 100644
+--- a/tools/testing/radix-tree/linux.c
++++ b/tools/testing/radix-tree/linux.c
+@@ -93,13 +93,9 @@ void *kmem_cache_alloc_lru(struct kmem_cache *cachep, struct list_lru *lru,
+ 	return p;
+ }
+ 
+-void kmem_cache_free_locked(struct kmem_cache *cachep, void *objp)
++void __kmem_cache_free_locked(struct kmem_cache *cachep, void *objp)
+ {
+ 	assert(objp);
+-	uatomic_dec(&nr_allocated);
+-	uatomic_dec(&cachep->nr_allocated);
+-	if (kmalloc_verbose)
+-		printf("Freeing %p to slab\n", objp);
+ 	if (cachep->nr_objs > 10 || cachep->align) {
+ 		memset(objp, POISON_FREE, cachep->size);
+ 		free(objp);
+@@ -111,6 +107,15 @@ void kmem_cache_free_locked(struct kmem_cache *cachep, void *objp)
+ 	}
+ }
+ 
++void kmem_cache_free_locked(struct kmem_cache *cachep, void *objp)
++{
++	uatomic_dec(&nr_allocated);
++	uatomic_dec(&cachep->nr_allocated);
++	if (kmalloc_verbose)
++		printf("Freeing %p to slab\n", objp);
++	__kmem_cache_free_locked(cachep, objp);
++}
++
+ void kmem_cache_free(struct kmem_cache *cachep, void *objp)
+ {
+ 	pthread_mutex_lock(&cachep->lock);
+@@ -141,18 +146,17 @@ int kmem_cache_alloc_bulk(struct kmem_cache *cachep, gfp_t gfp, size_t size,
+ 	if (kmalloc_verbose)
+ 		pr_debug("Bulk alloc %lu\n", size);
+ 
+-	if (!(gfp & __GFP_DIRECT_RECLAIM)) {
+-		if (cachep->non_kernel < size)
+-			return 0;
+-
+-		cachep->non_kernel -= size;
+-	}
+-
+ 	pthread_mutex_lock(&cachep->lock);
+ 	if (cachep->nr_objs >= size) {
+ 		struct radix_tree_node *node;
+ 
+ 		for (i = 0; i < size; i++) {
++			if (!(gfp & __GFP_DIRECT_RECLAIM)) {
++				if (!cachep->non_kernel)
++					break;
++				cachep->non_kernel--;
++			}
++
+ 			node = cachep->objs;
+ 			cachep->nr_objs--;
+ 			cachep->objs = node->parent;
+@@ -163,11 +167,19 @@ int kmem_cache_alloc_bulk(struct kmem_cache *cachep, gfp_t gfp, size_t size,
+ 	} else {
+ 		pthread_mutex_unlock(&cachep->lock);
+ 		for (i = 0; i < size; i++) {
++			if (!(gfp & __GFP_DIRECT_RECLAIM)) {
++				if (!cachep->non_kernel)
++					break;
++				cachep->non_kernel--;
++			}
++
+ 			if (cachep->align) {
+ 				posix_memalign(&p[i], cachep->align,
+ 					       cachep->size);
+ 			} else {
+ 				p[i] = malloc(cachep->size);
++				if (!p[i])
++					break;
+ 			}
+ 			if (cachep->ctor)
+ 				cachep->ctor(p[i]);
+@@ -176,6 +188,15 @@ int kmem_cache_alloc_bulk(struct kmem_cache *cachep, gfp_t gfp, size_t size,
+ 		}
+ 	}
+ 
++	if (i < size) {
++		size = i;
++		pthread_mutex_lock(&cachep->lock);
++		for (i = 0; i < size; i++)
++			__kmem_cache_free_locked(cachep, p[i]);
++		pthread_mutex_unlock(&cachep->lock);
++		return 0;
++	}
++
+ 	for (i = 0; i < size; i++) {
+ 		uatomic_inc(&nr_allocated);
+ 		uatomic_inc(&cachep->nr_allocated);
+-- 
+2.42.0
+
+
+From a8fed6b4139f73b3b69a4d2c121cc5ce691c0c31 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:15 +0800
+Subject: [PATCH 15/20] maple_tree: Add test for mtree_dup()
+
+Add test for mtree_dup().
+Test by duplicating different maple trees and then comparing the two
+trees. Includes tests for duplicating full trees and memory allocation
+failures on different nodes.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ tools/testing/radix-tree/maple.c | 361 +++++++++++++++++++++++++++++++
+ 1 file changed, 361 insertions(+)
+
+diff --git a/tools/testing/radix-tree/maple.c b/tools/testing/radix-tree/maple.c
+index e5da1cad7..12b3390e9 100644
+--- a/tools/testing/radix-tree/maple.c
++++ b/tools/testing/radix-tree/maple.c
+@@ -35857,6 +35857,363 @@ static noinline void __init check_locky(struct maple_tree *mt)
+ 	mt_clear_in_rcu(mt);
+ }
+ 
++/*
++ * Compares two nodes except for the addresses stored in the nodes.
++ * Returns zero if they are the same, otherwise returns non-zero.
++ */
++static int __init compare_node(struct maple_enode *enode_a,
++			       struct maple_enode *enode_b)
++{
++	struct maple_node *node_a, *node_b;
++	struct maple_node a, b;
++	void **slots_a, **slots_b; /* Do not use the rcu tag. */
++	enum maple_type type;
++	int i;
++
++	if (((unsigned long)enode_a & MAPLE_NODE_MASK) !=
++	    ((unsigned long)enode_b & MAPLE_NODE_MASK)) {
++		pr_err("The lower 8 bits of enode are different.\n");
++		return -1;
++	}
++
++	type = mte_node_type(enode_a);
++	node_a = mte_to_node(enode_a);
++	node_b = mte_to_node(enode_b);
++	a = *node_a;
++	b = *node_b;
++
++	/* Do not compare addresses. */
++	if (ma_is_root(node_a) || ma_is_root(node_b)) {
++		a.parent = (struct maple_pnode *)((unsigned long)a.parent &
++						  MA_ROOT_PARENT);
++		b.parent = (struct maple_pnode *)((unsigned long)b.parent &
++						  MA_ROOT_PARENT);
++	} else {
++		a.parent = (struct maple_pnode *)((unsigned long)a.parent &
++						  MAPLE_NODE_MASK);
++		b.parent = (struct maple_pnode *)((unsigned long)b.parent &
++						  MAPLE_NODE_MASK);
++	}
++
++	if (a.parent != b.parent) {
++		pr_err("The lower 8 bits of parents are different. %p %p\n",
++			a.parent, b.parent);
++		return -1;
++	}
++
++	/*
++	 * If it is a leaf node, the slots do not contain the node address, and
++	 * no special processing of slots is required.
++	 */
++	if (ma_is_leaf(type))
++		goto cmp;
++
++	slots_a = ma_slots(&a, type);
++	slots_b = ma_slots(&b, type);
++
++	for (i = 0; i < mt_slots[type]; i++) {
++		if (!slots_a[i] && !slots_b[i])
++			break;
++
++		if (!slots_a[i] || !slots_b[i]) {
++			pr_err("The number of slots is different.\n");
++			return -1;
++		}
++
++		/* Do not compare addresses in slots. */
++		((unsigned long *)slots_a)[i] &= MAPLE_NODE_MASK;
++		((unsigned long *)slots_b)[i] &= MAPLE_NODE_MASK;
++	}
++
++cmp:
++	/*
++	 * Compare all contents of two nodes, including parent (except address),
++	 * slots (except address), pivots, gaps and metadata.
++	 */
++	return memcmp(&a, &b, sizeof(struct maple_node));
++}
++
++/*
++ * Compare two trees and return 0 if they are the same, non-zero otherwise.
++ */
++static int __init compare_tree(struct maple_tree *mt_a, struct maple_tree *mt_b)
++{
++	MA_STATE(mas_a, mt_a, 0, 0);
++	MA_STATE(mas_b, mt_b, 0, 0);
++
++	if (mt_a->ma_flags != mt_b->ma_flags) {
++		pr_err("The flags of the two trees are different.\n");
++		return -1;
++	}
++
++	mas_dfs_preorder(&mas_a);
++	mas_dfs_preorder(&mas_b);
++
++	if (mas_is_ptr(&mas_a) || mas_is_ptr(&mas_b)) {
++		if (!(mas_is_ptr(&mas_a) && mas_is_ptr(&mas_b))) {
++			pr_err("One is MAS_ROOT and the other is not.\n");
++			return -1;
++		}
++		return 0;
++	}
++
++	while (!mas_is_none(&mas_a) || !mas_is_none(&mas_b)) {
++
++		if (mas_is_none(&mas_a) || mas_is_none(&mas_b)) {
++			pr_err("One is MAS_NONE and the other is not.\n");
++			return -1;
++		}
++
++		if (mas_a.min != mas_b.min ||
++		    mas_a.max != mas_b.max) {
++			pr_err("mas->min, mas->max do not match.\n");
++			return -1;
++		}
++
++		if (compare_node(mas_a.node, mas_b.node)) {
++			pr_err("The contents of nodes %p and %p are different.\n",
++			       mas_a.node, mas_b.node);
++			mt_dump(mt_a, mt_dump_dec);
++			mt_dump(mt_b, mt_dump_dec);
++			return -1;
++		}
++
++		mas_dfs_preorder(&mas_a);
++		mas_dfs_preorder(&mas_b);
++	}
++
++	return 0;
++}
++
++static __init void mas_subtree_max_range(struct ma_state *mas)
++{
++	unsigned long limit = mas->max;
++	MA_STATE(newmas, mas->tree, 0, 0);
++	void *entry;
++
++	mas_for_each(mas, entry, limit) {
++		if (mas->last - mas->index >=
++		    newmas.last - newmas.index) {
++			newmas = *mas;
++		}
++	}
++
++	*mas = newmas;
++}
++
++/*
++ * build_full_tree() - Build a full tree.
++ * @mt: The tree to build.
++ * @flags: Use @flags to build the tree.
++ * @height: The height of the tree to build.
++ *
++ * Build a tree with full leaf nodes and internal nodes. Note that the height
++ * should not exceed 3, otherwise it will take a long time to build.
++ * Return: zero if the build is successful, non-zero if it fails.
++ */
++static __init int build_full_tree(struct maple_tree *mt, unsigned int flags,
++		int height)
++{
++	MA_STATE(mas, mt, 0, 0);
++	unsigned long step;
++	int ret = 0, cnt = 1;
++	enum maple_type type;
++
++	mt_init_flags(mt, flags);
++	mtree_insert_range(mt, 0, ULONG_MAX, xa_mk_value(5), GFP_KERNEL);
++
++	mtree_lock(mt);
++
++	while (1) {
++		mas_set(&mas, 0);
++		if (mt_height(mt) < height) {
++			mas.max = ULONG_MAX;
++			goto store;
++		}
++
++		while (1) {
++			mas_dfs_preorder(&mas);
++			if (mas_is_none(&mas))
++				goto unlock;
++
++			type = mte_node_type(mas.node);
++			if (mas_data_end(&mas) + 1 < mt_slots[type]) {
++				mas_set(&mas, mas.min);
++				goto store;
++			}
++		}
++store:
++		mas_subtree_max_range(&mas);
++		step = mas.last - mas.index;
++		if (step < 1) {
++			ret = -1;
++			goto unlock;
++		}
++
++		step /= 2;
++		mas.last = mas.index + step;
++		mas_store_gfp(&mas, xa_mk_value(5),
++				GFP_KERNEL);
++		++cnt;
++	}
++unlock:
++	mtree_unlock(mt);
++
++	MT_BUG_ON(mt, mt_height(mt) != height);
++	/* pr_info("height:%u number of elements:%d\n", mt_height(mt), cnt); */
++	return ret;
++}
++
++static noinline void __init check_mtree_dup(struct maple_tree *mt)
++{
++	DEFINE_MTREE(new);
++	int i, j, ret, count = 0;
++	unsigned int rand_seed = 17, rand;
++
++	/* store a value at [0, 0] */
++	mt_init_flags(mt, 0);
++	mtree_store_range(mt, 0, 0, xa_mk_value(0), GFP_KERNEL);
++	ret = mtree_dup(mt, &new, GFP_KERNEL);
++	MT_BUG_ON(&new, ret);
++	mt_validate(&new);
++	if (compare_tree(mt, &new))
++		MT_BUG_ON(&new, 1);
++
++	mtree_destroy(mt);
++	mtree_destroy(&new);
++
++	/* The two trees have different attributes. */
++	mt_init_flags(mt, 0);
++	mt_init_flags(&new, MT_FLAGS_ALLOC_RANGE);
++	ret = mtree_dup(mt, &new, GFP_KERNEL);
++	MT_BUG_ON(&new, ret != -EINVAL);
++	mtree_destroy(mt);
++	mtree_destroy(&new);
++
++	/* The new tree is not empty */
++	mt_init_flags(mt, 0);
++	mt_init_flags(&new, 0);
++	mtree_store(&new, 5, xa_mk_value(5), GFP_KERNEL);
++	ret = mtree_dup(mt, &new, GFP_KERNEL);
++	MT_BUG_ON(&new, ret != -EINVAL);
++	mtree_destroy(mt);
++	mtree_destroy(&new);
++
++	/* Test for duplicating full trees. */
++	for (i = 1; i <= 3; i++) {
++		ret = build_full_tree(mt, 0, i);
++		MT_BUG_ON(mt, ret);
++		mt_init_flags(&new, 0);
++
++		ret = mtree_dup(mt, &new, GFP_KERNEL);
++		MT_BUG_ON(&new, ret);
++		mt_validate(&new);
++		if (compare_tree(mt, &new))
++			MT_BUG_ON(&new, 1);
++
++		mtree_destroy(mt);
++		mtree_destroy(&new);
++	}
++
++	for (i = 1; i <= 3; i++) {
++		ret = build_full_tree(mt, MT_FLAGS_ALLOC_RANGE, i);
++		MT_BUG_ON(mt, ret);
++		mt_init_flags(&new, MT_FLAGS_ALLOC_RANGE);
++
++		ret = mtree_dup(mt, &new, GFP_KERNEL);
++		MT_BUG_ON(&new, ret);
++		mt_validate(&new);
++		if (compare_tree(mt, &new))
++			MT_BUG_ON(&new, 1);
++
++		mtree_destroy(mt);
++		mtree_destroy(&new);
++	}
++
++	/* Test for normal duplicating. */
++	for (i = 0; i < 1000; i += 3) {
++		if (i & 1) {
++			mt_init_flags(mt, 0);
++			mt_init_flags(&new, 0);
++		} else {
++			mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
++			mt_init_flags(&new, MT_FLAGS_ALLOC_RANGE);
++		}
++
++		for (j = 0; j < i; j++) {
++			mtree_store_range(mt, j * 10, j * 10 + 5,
++					  xa_mk_value(j), GFP_KERNEL);
++		}
++
++		ret = mtree_dup(mt, &new, GFP_KERNEL);
++		MT_BUG_ON(&new, ret);
++		mt_validate(&new);
++		if (compare_tree(mt, &new))
++			MT_BUG_ON(&new, 1);
++
++		mtree_destroy(mt);
++		mtree_destroy(&new);
++	}
++
++	/* Test memory allocation failed. */
++	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
++	for (i = 0; i < 30; i += 3) {
++		mtree_store_range(mt, j * 10, j * 10 + 5,
++					  xa_mk_value(j), GFP_KERNEL);
++	}
++
++	/* Failed at the first node. */
++	mt_init_flags(&new, MT_FLAGS_ALLOC_RANGE);
++	mt_set_non_kernel(0);
++	ret = mtree_dup(mt, &new, GFP_NOWAIT);
++	mt_set_non_kernel(0);
++	MT_BUG_ON(&new, ret != -ENOMEM);
++	mtree_destroy(mt);
++	mtree_destroy(&new);
++
++	/* Random maple tree fails at a random node. */
++	for (i = 0; i < 1000; i += 3) {
++		if (i & 1) {
++			mt_init_flags(mt, 0);
++			mt_init_flags(&new, 0);
++		} else {
++			mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
++			mt_init_flags(&new, MT_FLAGS_ALLOC_RANGE);
++		}
++
++		for (j = 0; j < i; j++) {
++			mtree_store_range(mt, j * 10, j * 10 + 5,
++					  xa_mk_value(j), GFP_KERNEL);
++		}
++		/*
++		 * The rand() library function is not used, so we can generate
++		 * the same random numbers on any platform.
++		 */
++		rand_seed = rand_seed * 1103515245 + 12345;
++		rand = rand_seed / 65536 % 128;
++		mt_set_non_kernel(rand);
++
++		ret = mtree_dup(mt, &new, GFP_NOWAIT);
++		mt_set_non_kernel(0);
++		if (ret != 0) {
++			MT_BUG_ON(&new, ret != -ENOMEM);
++			count++;
++			mtree_destroy(mt);
++			continue;
++		}
++
++		mt_validate(&new);
++		if (compare_tree(mt, &new))
++			MT_BUG_ON(&new, 1);
++
++		mtree_destroy(mt);
++		mtree_destroy(&new);
++	}
++
++	/* pr_info("mtree_dup() fail %d times\n", count); */
++	BUG_ON(!count);
++}
++
+ extern void test_kmem_cache_bulk(void);
+ 
+ void farmer_tests(void)
+@@ -35904,6 +36261,10 @@ void farmer_tests(void)
+ 	check_null_expand(&tree);
+ 	mtree_destroy(&tree);
+ 
++	mt_init_flags(&tree, 0);
++	check_mtree_dup(&tree);
++	mtree_destroy(&tree);
++
+ 	/* RCU testing */
+ 	mt_init_flags(&tree, 0);
+ 	check_erase_testset(&tree);
+-- 
+2.42.0
+
+
+From 372ede1535ac525f3e644981a201b5475fff9f43 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:16 +0800
+Subject: [PATCH 16/20] maple_tree: Update the documentation of maple tree
+
+Introduce the new interface mtree_dup() in the documentation.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ Documentation/core-api/maple_tree.rst | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/Documentation/core-api/maple_tree.rst b/Documentation/core-api/maple_tree.rst
+index 45defcf15..285e2d2b2 100644
+--- a/Documentation/core-api/maple_tree.rst
++++ b/Documentation/core-api/maple_tree.rst
+@@ -81,6 +81,9 @@ section.
+ Sometimes it is necessary to ensure the next call to store to a maple tree does
+ not allocate memory, please see :ref:`maple-tree-advanced-api` for this use case.
+ 
++You can use mtree_dup() to duplicate an entire maple tree. It is a more
++efficient way than inserting all elements one by one into a new tree.
++
+ Finally, you can remove all entries from a maple tree by calling
+ mtree_destroy().  If the maple tree entries are pointers, you may wish to free
+ the entries first.
+@@ -112,6 +115,7 @@ Takes ma_lock internally:
+  * mtree_insert()
+  * mtree_insert_range()
+  * mtree_erase()
++ * mtree_dup()
+  * mtree_destroy()
+  * mt_set_in_rcu()
+  * mt_clear_in_rcu()
+-- 
+2.42.0
+
+
+From 5321a5bca79ddece7ce44c63ecb884d681ac6174 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:17 +0800
+Subject: [PATCH 17/20] maple_tree: Skip other tests when BENCH is enabled
+
+Skip other tests when BENCH is enabled so that performance can be
+measured in user space.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ lib/test_maple_tree.c            | 8 ++++----
+ tools/testing/radix-tree/maple.c | 2 ++
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/lib/test_maple_tree.c b/lib/test_maple_tree.c
+index 06959165e..27d424fad 100644
+--- a/lib/test_maple_tree.c
++++ b/lib/test_maple_tree.c
+@@ -3572,10 +3572,6 @@ static int __init maple_tree_seed(void)
+ 
+ 	pr_info("\nTEST STARTING\n\n");
+ 
+-	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+-	check_root_expand(&tree);
+-	mtree_destroy(&tree);
+-
+ #if defined(BENCH_SLOT_STORE)
+ #define BENCH
+ 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+@@ -3633,6 +3629,10 @@ static int __init maple_tree_seed(void)
+ 	goto skip;
+ #endif
+ 
++	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
++	check_root_expand(&tree);
++	mtree_destroy(&tree);
++
+ 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+ 	check_iteration(&tree);
+ 	mtree_destroy(&tree);
+diff --git a/tools/testing/radix-tree/maple.c b/tools/testing/radix-tree/maple.c
+index 12b3390e9..cb5358674 100644
+--- a/tools/testing/radix-tree/maple.c
++++ b/tools/testing/radix-tree/maple.c
+@@ -36299,7 +36299,9 @@ void farmer_tests(void)
+ 
+ void maple_tree_tests(void)
+ {
++#if !defined(BENCH)
+ 	farmer_tests();
++#endif
+ 	maple_tree_seed();
+ 	maple_tree_harvest();
+ }
+-- 
+2.42.0
+
+
+From 200915ddf705f0ce74eab14fa352176c1502a0f6 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:18 +0800
+Subject: [PATCH 18/20] maple_tree: Update check_forking() and bench_forking()
+
+Updated check_forking() and bench_forking() to use __mt_dup() to
+duplicate maple tree.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ lib/test_maple_tree.c | 61 +++++++++++++++++++++----------------------
+ 1 file changed, 30 insertions(+), 31 deletions(-)
+
+diff --git a/lib/test_maple_tree.c b/lib/test_maple_tree.c
+index 27d424fad..bcd07c220 100644
+--- a/lib/test_maple_tree.c
++++ b/lib/test_maple_tree.c
+@@ -1837,36 +1837,37 @@ static noinline void __init check_forking(struct maple_tree *mt)
+ {
+ 
+ 	struct maple_tree newmt;
+-	int i, nr_entries = 134;
++	int i, nr_entries = 134, ret;
+ 	void *val;
+ 	MA_STATE(mas, mt, 0, 0);
+-	MA_STATE(newmas, mt, 0, 0);
++	MA_STATE(newmas, &newmt, 0, 0);
++
++	mt_init_flags(&newmt, MT_FLAGS_ALLOC_RANGE);
+ 
+ 	for (i = 0; i <= nr_entries; i++)
+ 		mtree_store_range(mt, i*10, i*10 + 5,
+ 				  xa_mk_value(i), GFP_KERNEL);
+ 
++
+ 	mt_set_non_kernel(99999);
+-	mt_init_flags(&newmt, MT_FLAGS_ALLOC_RANGE);
+-	newmas.tree = &newmt;
+-	mas_reset(&newmas);
+-	mas_reset(&mas);
+ 	mas_lock(&newmas);
+-	mas.index = 0;
+-	mas.last = 0;
+-	if (mas_expected_entries(&newmas, nr_entries)) {
++	mas_lock_nested(&mas, SINGLE_DEPTH_NESTING);
++
++	ret = __mt_dup(mt, &newmt, GFP_NOWAIT | __GFP_NOWARN);
++	if (ret) {
+ 		pr_err("OOM!");
+ 		BUG_ON(1);
+ 	}
+-	rcu_read_lock();
+-	mas_for_each(&mas, val, ULONG_MAX) {
+-		newmas.index = mas.index;
+-		newmas.last = mas.last;
++
++	mas_set(&newmas, 0);
++	mas_for_each(&newmas, val, ULONG_MAX) {
+ 		mas_store(&newmas, val);
+ 	}
+-	rcu_read_unlock();
+-	mas_destroy(&newmas);
++
++	mas_unlock(&mas);
+ 	mas_unlock(&newmas);
++
++	mas_destroy(&newmas);
+ 	mt_validate(&newmt);
+ 	mt_set_non_kernel(0);
+ 	mtree_destroy(&newmt);
+@@ -1974,12 +1975,11 @@ static noinline void __init check_mas_store_gfp(struct maple_tree *mt)
+ #if defined(BENCH_FORK)
+ static noinline void __init bench_forking(struct maple_tree *mt)
+ {
+-
+ 	struct maple_tree newmt;
+-	int i, nr_entries = 134, nr_fork = 80000;
++	int i, nr_entries = 134, nr_fork = 80000, ret;
+ 	void *val;
+ 	MA_STATE(mas, mt, 0, 0);
+-	MA_STATE(newmas, mt, 0, 0);
++	MA_STATE(newmas, &newmt, 0, 0);
+ 
+ 	for (i = 0; i <= nr_entries; i++)
+ 		mtree_store_range(mt, i*10, i*10 + 5,
+@@ -1988,25 +1988,24 @@ static noinline void __init bench_forking(struct maple_tree *mt)
+ 	for (i = 0; i < nr_fork; i++) {
+ 		mt_set_non_kernel(99999);
+ 		mt_init_flags(&newmt, MT_FLAGS_ALLOC_RANGE);
+-		newmas.tree = &newmt;
+-		mas_reset(&newmas);
+-		mas_reset(&mas);
+-		mas.index = 0;
+-		mas.last = 0;
+-		rcu_read_lock();
++
+ 		mas_lock(&newmas);
+-		if (mas_expected_entries(&newmas, nr_entries)) {
+-			printk("OOM!");
++		mas_lock_nested(&mas, SINGLE_DEPTH_NESTING);
++		ret = __mt_dup(mt, &newmt, GFP_NOWAIT | __GFP_NOWARN);
++		if (ret) {
++			pr_err("OOM!");
+ 			BUG_ON(1);
+ 		}
+-		mas_for_each(&mas, val, ULONG_MAX) {
+-			newmas.index = mas.index;
+-			newmas.last = mas.last;
++
++		mas_set(&newmas, 0);
++		mas_for_each(&newmas, val, ULONG_MAX) {
+ 			mas_store(&newmas, val);
+ 		}
+-		mas_destroy(&newmas);
++
++		mas_unlock(&mas);
+ 		mas_unlock(&newmas);
+-		rcu_read_unlock();
++
++		mas_destroy(&newmas);
+ 		mt_validate(&newmt);
+ 		mt_set_non_kernel(0);
+ 		mtree_destroy(&newmt);
+-- 
+2.42.0
+
+
+From 42d322168686aec8ffab4fd9f02ca8df8c92ff2b Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:19 +0800
+Subject: [PATCH 19/20] maple_tree: Preserve the tree attributes when
+ destroying maple tree
+
+When destroying maple tree, preserve its attributes and then turn it
+into an empty tree. This allows it to be reused without needing to be
+reinitialized.
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ lib/maple_tree.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+index f4a1019ae..a653591bc 100644
+--- a/lib/maple_tree.c
++++ b/lib/maple_tree.c
+@@ -6775,7 +6775,7 @@ void __mt_destroy(struct maple_tree *mt)
+ 	if (xa_is_node(root))
+ 		mte_destroy_walk(root, mt);
+ 
+-	mt->ma_flags = 0;
++	mt->ma_flags = mt_attr(mt);
+ }
+ EXPORT_SYMBOL_GPL(__mt_destroy);
+ 
+-- 
+2.42.0
+
+
+From da729fe9ce5cdff3b49ca5987c79ee357ac59345 Mon Sep 17 00:00:00 2001
+From: Peng Zhang <zhangpeng.00@bytedance.com>
+Date: Mon, 9 Oct 2023 17:03:20 +0800
+Subject: [PATCH 20/20] fork: Use __mt_dup() to duplicate maple tree in
+ dup_mmap()
+
+In dup_mmap(), using __mt_dup() to duplicate the old maple tree and then
+directly replacing the entries of VMAs in the new maple tree can result
+in better performance. __mt_dup() uses DFS pre-order to duplicate the
+maple tree, so it is efficient.
+
+The average time complexity of __mt_dup() is O(n), where n is the number
+of VMAs. The proof of the time complexity is provided in the commit log
+that introduces __mt_dup(). After duplicating the maple tree, each element
+is traversed and replaced (ignoring the cases of deletion, which are rare).
+Since it is only a replacement operation for each element, this process is
+also O(n).
+
+Analyzing the exact time complexity of the previous algorithm is
+challenging because each insertion can involve appending to a node, pushing
+data to adjacent nodes, or even splitting nodes. The frequency of each
+action is difficult to calculate. The worst-case scenario for a single
+insertion is when the tree undergoes splitting at every level. If we
+consider each insertion as the worst-case scenario, we can determine that
+the upper bound of the time complexity is O(n*log(n)), although this is a
+loose upper bound. However, based on the test data, it appears that the
+actual time complexity is likely to be O(n).
+
+As the entire maple tree is duplicated using __mt_dup(), if dup_mmap()
+fails, there will be a portion of VMAs that have not been duplicated in
+the maple tree. This makes it impossible to unmap all VMAs in exit_mmap().
+To solve this problem, undo_dup_mmap() is introduced to handle the failure
+of dup_mmap(). I have carefully tested the failure path and so far it
+seems there are no issues.
+
+There is a "spawn" in byte-unixbench[1], which can be used to test the
+performance of fork(). I modified it slightly to make it work with
+different number of VMAs.
+
+Below are the test results. The first row shows the number of VMAs.
+The second and third rows show the number of fork() calls per ten seconds,
+corresponding to next-20231006 and the this patchset, respectively. The
+test results were obtained with CPU binding to avoid scheduler load
+balancing that could cause unstable results. There are still some
+fluctuations in the test results, but at least they are better than the
+original performance.
+
+21     121   221    421    821    1621   3221   6421   12821  25621  51221
+112100 76261 54227  34035  20195  11112  6017   3161   1606   802    393
+114558 83067 65008  45824  28751  16072  8922   4747   2436   1233   599
+2.19%  8.92% 19.88% 34.64% 42.37% 44.64% 48.28% 50.17% 51.68% 53.74% 52.42%
+
+[1] https://github.com/kdlucas/byte-unixbench/tree/master
+
+Signed-off-by: Peng Zhang <zhangpeng.00@bytedance.com>
+---
+ include/linux/mm.h |  1 +
+ kernel/fork.c      | 34 +++++++++++++++++++++----------
+ mm/internal.h      |  3 ++-
+ mm/memory.c        |  7 ++++---
+ mm/mmap.c          | 50 ++++++++++++++++++++++++++++++++++++++++++++--
+ 5 files changed, 78 insertions(+), 17 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index bf5d0b1b1..dbe3bd59e 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -3236,6 +3236,7 @@ extern void unlink_file_vma(struct vm_area_struct *);
+ extern struct vm_area_struct *copy_vma(struct vm_area_struct **,
+ 	unsigned long addr, unsigned long len, pgoff_t pgoff,
+ 	bool *need_rmap_locks);
++extern void undo_dup_mmap(struct mm_struct *mm, struct vm_area_struct *vma_end);
+ extern void exit_mmap(struct mm_struct *);
+ 
+ static inline int check_data_rlimit(unsigned long rlim,
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 3b6d20dfb..c5fb3488b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -650,7 +650,6 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 	int retval;
+ 	unsigned long charge = 0;
+ 	LIST_HEAD(uf);
+-	VMA_ITERATOR(old_vmi, oldmm, 0);
+ 	VMA_ITERATOR(vmi, mm, 0);
+ 
+ 	uprobe_start_dup_mmap();
+@@ -678,16 +677,25 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 		goto out;
+ 	khugepaged_fork(mm, oldmm);
+ 
+-	retval = vma_iter_bulk_alloc(&vmi, oldmm->map_count);
+-	if (retval)
++	/* Use __mt_dup() to efficiently build an identical maple tree. */
++	retval = __mt_dup(&oldmm->mm_mt, &mm->mm_mt, GFP_KERNEL);
++	if (unlikely(retval))
+ 		goto out;
+ 
+ 	mt_clear_in_rcu(vmi.mas.tree);
+-	for_each_vma(old_vmi, mpnt) {
++	for_each_vma(vmi, mpnt) {
+ 		struct file *file;
+ 
+ 		vma_start_write(mpnt);
+ 		if (mpnt->vm_flags & VM_DONTCOPY) {
++			mas_store_gfp(&vmi.mas, NULL, GFP_KERNEL);
++
++			/* If failed, undo all completed duplications. */
++			if (unlikely(mas_is_err(&vmi.mas))) {
++				retval = xa_err(vmi.mas.node);
++				goto loop_out;
++			}
++
+ 			vm_stat_account(mm, mpnt->vm_flags, -vma_pages(mpnt));
+ 			continue;
+ 		}
+@@ -749,9 +757,11 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 		if (is_vm_hugetlb_page(tmp))
+ 			hugetlb_dup_vma_private(tmp);
+ 
+-		/* Link the vma into the MT */
+-		if (vma_iter_bulk_store(&vmi, tmp))
+-			goto fail_nomem_vmi_store;
++		/*
++		 * Link the vma into the MT. After using __mt_dup(), memory
++		 * allocation is not necessary here, so it cannot fail.
++		 */
++		mas_store(&vmi.mas, tmp);
+ 
+ 		mm->map_count++;
+ 		if (!(tmp->vm_flags & VM_WIPEONFORK))
+@@ -760,15 +770,19 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 		if (tmp->vm_ops && tmp->vm_ops->open)
+ 			tmp->vm_ops->open(tmp);
+ 
+-		if (retval)
++		if (retval) {
++			mpnt = vma_next(&vmi);
+ 			goto loop_out;
++		}
+ 	}
+ 	/* a new mm has just been created */
+ 	retval = arch_dup_mmap(oldmm, mm);
+ loop_out:
+ 	vma_iter_free(&vmi);
+-	if (!retval)
++	if (likely(!retval))
+ 		mt_set_in_rcu(vmi.mas.tree);
++	else
++		undo_dup_mmap(mm, mpnt);
+ out:
+ 	mmap_write_unlock(mm);
+ 	flush_tlb_mm(oldmm);
+@@ -778,8 +792,6 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
+ 	uprobe_end_dup_mmap();
+ 	return retval;
+ 
+-fail_nomem_vmi_store:
+-	unlink_anon_vmas(tmp);
+ fail_nomem_anon_vma_fork:
+ 	mpol_put(vma_policy(tmp));
+ fail_nomem_policy:
+diff --git a/mm/internal.h b/mm/internal.h
+index 30cf724dd..9ce0b833f 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -111,7 +111,8 @@ void folio_activate(struct folio *folio);
+ 
+ void free_pgtables(struct mmu_gather *tlb, struct ma_state *mas,
+ 		   struct vm_area_struct *start_vma, unsigned long floor,
+-		   unsigned long ceiling, bool mm_wr_locked);
++		   unsigned long ceiling, unsigned long tree_end,
++		   bool mm_wr_locked);
+ void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte);
+ 
+ struct zap_details;
+diff --git a/mm/memory.c b/mm/memory.c
+index 6c264d2f9..9c57138fa 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -362,7 +362,8 @@ void free_pgd_range(struct mmu_gather *tlb,
+ 
+ void free_pgtables(struct mmu_gather *tlb, struct ma_state *mas,
+ 		   struct vm_area_struct *vma, unsigned long floor,
+-		   unsigned long ceiling, bool mm_wr_locked)
++		   unsigned long ceiling, unsigned long tree_end,
++		   bool mm_wr_locked)
+ {
+ 	do {
+ 		unsigned long addr = vma->vm_start;
+@@ -372,7 +373,7 @@ void free_pgtables(struct mmu_gather *tlb, struct ma_state *mas,
+ 		 * Note: USER_PGTABLES_CEILING may be passed as ceiling and may
+ 		 * be 0.  This will underflow and is okay.
+ 		 */
+-		next = mas_find(mas, ceiling - 1);
++		next = mas_find(mas, tree_end - 1);
+ 
+ 		/*
+ 		 * Hide vma from rmap and truncate_pagecache before freeing
+@@ -393,7 +394,7 @@ void free_pgtables(struct mmu_gather *tlb, struct ma_state *mas,
+ 			while (next && next->vm_start <= vma->vm_end + PMD_SIZE
+ 			       && !is_vm_hugetlb_page(next)) {
+ 				vma = next;
+-				next = mas_find(mas, ceiling - 1);
++				next = mas_find(mas, tree_end - 1);
+ 				if (mm_wr_locked)
+ 					vma_start_write(vma);
+ 				unlink_anon_vmas(vma);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index b56a7f0c9..5672eb0e9 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2314,7 +2314,7 @@ static void unmap_region(struct mm_struct *mm, struct ma_state *mas,
+ 	mas_set(mas, mt_start);
+ 	free_pgtables(&tlb, mas, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
+ 				 next ? next->vm_start : USER_PGTABLES_CEILING,
+-				 mm_wr_locked);
++				 tree_end, mm_wr_locked);
+ 	tlb_finish_mmu(&tlb);
+ }
+ 
+@@ -3180,6 +3180,52 @@ int vm_brk(unsigned long addr, unsigned long len)
+ }
+ EXPORT_SYMBOL(vm_brk);
+ 
++void undo_dup_mmap(struct mm_struct *mm, struct vm_area_struct *vma_end)
++{
++	unsigned long tree_end = USER_PGTABLES_CEILING;
++	VMA_ITERATOR(vmi, mm, 0);
++	struct vm_area_struct *vma;
++	unsigned long nr_accounted = 0;
++	int count = 0;
++
++	/*
++	 * vma_end points to the first VMA that has not been duplicated. We need
++	 * to unmap all VMAs before it.
++	 * If vma_end is NULL, it means that all VMAs in the maple tree have
++	 * been duplicated, so setting tree_end to USER_PGTABLES_CEILING will
++	 * unmap all VMAs in the maple tree.
++	 */
++	if (vma_end) {
++		tree_end = vma_end->vm_start;
++		if (tree_end == 0)
++			goto destroy;
++	}
++
++	vma = vma_find(&vmi, tree_end);
++	if (!vma)
++		goto destroy;
++
++	arch_unmap(mm, vma->vm_start, tree_end);
++
++	vma_iter_set(&vmi, vma->vm_end);
++	unmap_region(mm, &vmi.mas, vma, NULL, NULL, 0, tree_end, tree_end, true);
++
++	vma_iter_set(&vmi, vma->vm_end);
++	do {
++		if (vma->vm_flags & VM_ACCOUNT)
++			nr_accounted += vma_pages(vma);
++		remove_vma(vma, true);
++		count++;
++		cond_resched();
++	} for_each_vma_range(vmi, vma, tree_end);
++
++	BUG_ON(count != mm->map_count);
++	vm_unacct_memory(nr_accounted);
++
++destroy:
++	__mt_destroy(&mm->mm_mt);
++}
++
+ /* Release all mmaps. */
+ void exit_mmap(struct mm_struct *mm)
+ {
+@@ -3219,7 +3265,7 @@ void exit_mmap(struct mm_struct *mm)
+ 	mt_clear_in_rcu(&mm->mm_mt);
+ 	mas_set(&mas, vma->vm_end);
+ 	free_pgtables(&tlb, &mas, vma, FIRST_USER_ADDRESS,
+-		      USER_PGTABLES_CEILING, true);
++		      USER_PGTABLES_CEILING, USER_PGTABLES_CEILING, true);
+ 	tlb_finish_mmu(&tlb);
+ 
+ 	/*
+-- 
+2.42.0
+
