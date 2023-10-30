@@ -1,0 +1,1067 @@
+From dd980bc53ac72ada753f635b67f9d27ec4b625c1 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Fri, 22 Sep 2023 14:11:40 -0700
+Subject: [PATCH 1/9] mm/ksm: support fork/exec for prctl
+
+Today we have two ways to enable KSM:
+
+1) madvise system call
+   This allows to enable KSM for a memory region for a long time.
+
+2) prctl system call
+   This is a recent addition to enable KSM for the complete process.
+   In addition when a process is forked, the KSM setting is inherited.
+
+This change only affects the second case.
+
+One of the use cases for (2) was to support the ability to enable
+KSM for cgroups. This allows systemd to enable KSM for the seed
+process. By enabling it in the seed process all child processes inherit
+the setting.
+
+This works correctly when the process is forked. However it doesn't
+support fork/exec workflow.
+
+From the previous cover letter:
+
+....
+Use case 3:
+With the madvise call sharing opportunities are only enabled for the
+current process: it is a workload-local decision. A considerable number
+of sharing opportunities may exist across multiple workloads or jobs
+(if they are part of the same security domain). Only a higler level
+entity like a job scheduler or container can know for certain if its
+running one or more instances of a job. That job scheduler however
+doesn't have the necessary internal workload knowledge to make targeted
+madvise calls.
+....
+
+In addition it can also be a bit surprising that fork keeps the KSM
+setting and fork/exec does not.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Fixes: d7597f59d1d3 ("mm: add new api to enable ksm per process")
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Reported-by: Carl Klemm <carl@uvos.xyz>
+Tested-by: Carl Klemm <carl@uvos.xyz>
+---
+ include/linux/sched/coredump.h | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index 0ee96ea7a..205aa9917 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -87,8 +87,11 @@ static inline int get_dumpable(struct mm_struct *mm)
+ 
+ #define MMF_DISABLE_THP_MASK	(1 << MMF_DISABLE_THP)
+ 
++#define MMF_VM_MERGE_ANY	29
++#define MMF_VM_MERGE_ANY_MASK	(1 << MMF_VM_MERGE_ANY)
++
+ #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+-				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK)
++				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK |\
++				 MMF_VM_MERGE_ANY_MASK)
+ 
+-#define MMF_VM_MERGE_ANY	29
+ #endif /* _LINUX_SCHED_COREDUMP_H */
+-- 
+2.42.0
+
+
+From 2caa52896a3995a96aff9524cc13cde4983a4ba5 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Wed, 27 Sep 2023 09:22:19 -0700
+Subject: [PATCH 2/9] mm/ksm: add "smart" page scanning mode
+
+This change adds a "smart" page scanning mode for KSM. So far all the
+candidate pages are continuously scanned to find candidates for
+de-duplication. There are a considerably number of pages that cannot be
+de-duplicated. This is costly in terms of CPU. By using smart scanning
+considerable CPU savings can be achieved.
+
+This change takes the history of scanning pages into account and skips
+the page scanning of certain pages for a while if de-deduplication for
+this page has not been successful in the past.
+
+To do this it introduces two new fields in the ksm_rmap_item structure:
+age and remaining_skips. age, is the KSM age and remaining_skips
+determines how often scanning of this page is skipped. The age field is
+incremented each time the page is scanned and the page cannot be de-
+duplicated. age updated is capped at U8_MAX.
+
+How often a page is skipped is dependent how often de-duplication has
+been tried so far and the number of skips is currently limited to 8.
+This value has shown to be effective with different workloads.
+
+The feature is enabled by default and can be disabled with the new
+smart_scan knob.
+
+The feature has shown to be very effective: upt to 25% of the page scans
+can be eliminated; the pages_to_scan rate can be reduced by 40 - 50% and
+a similar de-duplication rate can be maintained.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+---
+ mm/ksm.c | 103 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 103 insertions(+)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 981af9c72..c0a2e7759 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -56,6 +56,8 @@
+ #define DO_NUMA(x)	do { } while (0)
+ #endif
+ 
++typedef u8 rmap_age_t;
++
+ /**
+  * DOC: Overview
+  *
+@@ -193,6 +195,8 @@ struct ksm_stable_node {
+  * @node: rb node of this rmap_item in the unstable tree
+  * @head: pointer to stable_node heading this list in the stable tree
+  * @hlist: link into hlist of rmap_items hanging off that stable_node
++ * @age: number of scan iterations since creation
++ * @remaining_skips: how many scans to skip
+  */
+ struct ksm_rmap_item {
+ 	struct ksm_rmap_item *rmap_list;
+@@ -205,6 +209,8 @@ struct ksm_rmap_item {
+ 	struct mm_struct *mm;
+ 	unsigned long address;		/* + low bits used for flags below */
+ 	unsigned int oldchecksum;	/* when unstable */
++	rmap_age_t age;
++	rmap_age_t remaining_skips;
+ 	union {
+ 		struct rb_node node;	/* when node of unstable tree */
+ 		struct {		/* when listed from stable tree */
+@@ -281,6 +287,9 @@ static unsigned int zero_checksum __read_mostly;
+ /* Whether to merge empty (zeroed) pages with actual zero pages */
+ static bool ksm_use_zero_pages __read_mostly;
+ 
++/* Skip pages that couldn't be de-duplicated previously  */
++static bool ksm_smart_scan = 1;
++
+ /* The number of zero pages which is placed by KSM */
+ unsigned long ksm_zero_pages;
+ 
+@@ -2305,6 +2314,73 @@ static struct ksm_rmap_item *get_next_rmap_item(struct ksm_mm_slot *mm_slot,
+ 	return rmap_item;
+ }
+ 
++/*
++ * Calculate skip age for the ksm page age. The age determines how often
++ * de-duplicating has already been tried unsuccessfully. If the age is
++ * smaller, the scanning of this page is skipped for less scans.
++ *
++ * @age: rmap_item age of page
++ */
++static unsigned int skip_age(rmap_age_t age)
++{
++	if (age <= 3)
++		return 1;
++	if (age <= 5)
++		return 2;
++	if (age <= 8)
++		return 4;
++
++	return 8;
++}
++
++/*
++ * Determines if a page should be skipped for the current scan.
++ *
++ * @page: page to check
++ * @rmap_item: associated rmap_item of page
++ */
++static bool should_skip_rmap_item(struct page *page,
++				  struct ksm_rmap_item *rmap_item)
++{
++	rmap_age_t age;
++
++	if (!ksm_smart_scan)
++		return false;
++
++	/*
++	 * Never skip pages that are already KSM; pages cmp_and_merge_page()
++	 * will essentially ignore them, but we still have to process them
++	 * properly.
++	 */
++	if (PageKsm(page))
++		return false;
++
++	age = rmap_item->age;
++	if (age != U8_MAX)
++		rmap_item->age++;
++
++	/*
++	 * Smaller ages are not skipped, they need to get a chance to go
++	 * through the different phases of the KSM merging.
++	 */
++	if (age < 3)
++		return false;
++
++	/*
++	 * Are we still allowed to skip? If not, then don't skip it
++	 * and determine how much more often we are allowed to skip next.
++	 */
++	if (!rmap_item->remaining_skips) {
++		rmap_item->remaining_skips = skip_age(age);
++		return false;
++	}
++
++	/* Skip this page */
++	rmap_item->remaining_skips--;
++	remove_rmap_item_from_tree(rmap_item);
++	return true;
++}
++
+ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ {
+ 	struct mm_struct *mm;
+@@ -2409,6 +2485,10 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ 				if (rmap_item) {
+ 					ksm_scan.rmap_list =
+ 							&rmap_item->rmap_list;
++
++					if (should_skip_rmap_item(*page, rmap_item))
++						goto next_page;
++
+ 					ksm_scan.address += PAGE_SIZE;
+ 				} else
+ 					put_page(*page);
+@@ -3449,6 +3529,28 @@ static ssize_t full_scans_show(struct kobject *kobj,
+ }
+ KSM_ATTR_RO(full_scans);
+ 
++static ssize_t smart_scan_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksm_smart_scan);
++}
++
++static ssize_t smart_scan_store(struct kobject *kobj,
++				struct kobj_attribute *attr,
++				const char *buf, size_t count)
++{
++	int err;
++	bool value;
++
++	err = kstrtobool(buf, &value);
++	if (err)
++		return -EINVAL;
++
++	ksm_smart_scan = value;
++	return count;
++}
++KSM_ATTR(smart_scan);
++
+ static struct attribute *ksm_attrs[] = {
+ 	&sleep_millisecs_attr.attr,
+ 	&pages_to_scan_attr.attr,
+@@ -3469,6 +3571,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&stable_node_chains_prune_millisecs_attr.attr,
+ 	&use_zero_pages_attr.attr,
+ 	&general_profit_attr.attr,
++	&smart_scan_attr.attr,
+ 	NULL,
+ };
+ 
+-- 
+2.42.0
+
+
+From e211c0b8b31d0f2d5ae1829b1cc339a9bae6cb06 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Wed, 27 Sep 2023 09:22:20 -0700
+Subject: [PATCH 3/9] mm/ksm: add pages_skipped metric
+
+This change adds the "pages skipped" metric. To be able to evaluate how
+successful smart page scanning is, the pages skipped metric can be
+compared to the pages scanned metric.
+
+The pages skipped metric is a cumulative counter. The counter is stored
+under /sys/kernel/mm/ksm/pages_skipped.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+---
+ mm/ksm.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index c0a2e7759..1df25a66f 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -293,6 +293,9 @@ static bool ksm_smart_scan = 1;
+ /* The number of zero pages which is placed by KSM */
+ unsigned long ksm_zero_pages;
+ 
++/* The number of pages that have been skipped due to "smart scanning" */
++static unsigned long ksm_pages_skipped;
++
+ #ifdef CONFIG_NUMA
+ /* Zeroed when merging across nodes is not allowed */
+ static unsigned int ksm_merge_across_nodes = 1;
+@@ -2376,6 +2379,7 @@ static bool should_skip_rmap_item(struct page *page,
+ 	}
+ 
+ 	/* Skip this page */
++	ksm_pages_skipped++;
+ 	rmap_item->remaining_skips--;
+ 	remove_rmap_item_from_tree(rmap_item);
+ 	return true;
+@@ -3463,6 +3467,13 @@ static ssize_t pages_volatile_show(struct kobject *kobj,
+ }
+ KSM_ATTR_RO(pages_volatile);
+ 
++static ssize_t pages_skipped_show(struct kobject *kobj,
++				  struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", ksm_pages_skipped);
++}
++KSM_ATTR_RO(pages_skipped);
++
+ static ssize_t ksm_zero_pages_show(struct kobject *kobj,
+ 				struct kobj_attribute *attr, char *buf)
+ {
+@@ -3560,6 +3571,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&pages_sharing_attr.attr,
+ 	&pages_unshared_attr.attr,
+ 	&pages_volatile_attr.attr,
++	&pages_skipped_attr.attr,
+ 	&ksm_zero_pages_attr.attr,
+ 	&full_scans_attr.attr,
+ #ifdef CONFIG_NUMA
+-- 
+2.42.0
+
+
+From 7f2eca8ebd2d318e9134edcb3b0f5fde01bb3876 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Wed, 27 Sep 2023 09:22:21 -0700
+Subject: [PATCH 4/9] mm/ksm: document smart scan mode
+
+This adds documentation for the smart scan mode of KSM.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+---
+ Documentation/admin-guide/mm/ksm.rst | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/Documentation/admin-guide/mm/ksm.rst b/Documentation/admin-guide/mm/ksm.rst
+index 776f244bd..2b38a8bb0 100644
+--- a/Documentation/admin-guide/mm/ksm.rst
++++ b/Documentation/admin-guide/mm/ksm.rst
+@@ -155,6 +155,15 @@ stable_node_chains_prune_millisecs
+         scan. It's a noop if not a single KSM page hit the
+         ``max_page_sharing`` yet.
+ 
++smart_scan
++        Historically KSM checked every candidate page for each scan. It did
++        not take into account historic information.  When smart scan is
++        enabled, pages that have previously not been de-duplicated get
++        skipped. How often these pages are skipped depends on how often
++        de-duplication has already been tried and failed. By default this
++        optimization is enabled. The ``pages_skipped`` metric shows how
++        effective the setting is.
++
+ The effectiveness of KSM and MADV_MERGEABLE is shown in ``/sys/kernel/mm/ksm/``:
+ 
+ general_profit
+-- 
+2.42.0
+
+
+From 7b67f72fdd280ef0cce69d606a11116732c8a9e0 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Wed, 27 Sep 2023 09:22:22 -0700
+Subject: [PATCH 5/9] mm/ksm: document pages_skipped sysfs knob
+
+This adds documentation for the new metric pages_skipped.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+---
+ Documentation/admin-guide/mm/ksm.rst | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Documentation/admin-guide/mm/ksm.rst b/Documentation/admin-guide/mm/ksm.rst
+index 2b38a8bb0..0cadde17a 100644
+--- a/Documentation/admin-guide/mm/ksm.rst
++++ b/Documentation/admin-guide/mm/ksm.rst
+@@ -178,6 +178,8 @@ pages_unshared
+         how many pages unique but repeatedly checked for merging
+ pages_volatile
+         how many pages changing too fast to be placed in a tree
++pages_skipped
++        how many pages did the "smart" page scanning algorithm skip
+ full_scans
+         how many times all mergeable areas have been scanned
+ stable_node_chains
+-- 
+2.42.0
+
+
+From 7cc1845cfbf8a2bd8e3d0e9aff929f7f52b9f4f6 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Fri, 27 Oct 2023 17:09:42 -0700
+Subject: [PATCH 6/9] mm/ksm: add ksm advisor
+
+This adds the ksm advisor. The ksm advisor automatically manages the
+pages_to_scan setting to achieve a target scan time. The target scan
+time defines how many seconds it should take to scan all the candidate
+KSM pages. In other words the pages_to_scan rate is changed by the
+advisor to achieve the target scan time. The algorithm has a max and min
+value to:
+- guarantee responsiveness to changes
+- to avoid to spend too much CPU
+
+The respective parameters are:
+- ksm_advisor_target_scan_time (how many seconds a scan should take)
+- ksm_advisor_min_cpu (minimum value for cpu percent usage)
+- ksm_advisor_max_cpu (maximum value for cpu percent usage)
+
+- ksm_advisor_min_pages (minimum value for pages_to_scan per batch)
+- ksm_advisor_max_pages (maximum value for pages_to_scan per batch)
+
+The algorithm calculates the change value based on the target scan time
+and the previous scan time. To avoid pertubations an exponentially
+weighted moving average is applied.
+
+The advisor is managed by three main parameters: target scan time,
+cpu min time and cpu max time for the ksmd background thread. These
+parameters determine how aggresive ksmd scans.
+
+In addition there are min and max values for the pages_to_scan parameter
+to make sure that its initial and max values are not set too low or too
+high. This ensures that it is able to react to changes quickly enough.
+
+The default values are:
+- target scan time: 200 secs
+- min cpu: 15%
+- max cpu: 70%
+- min pages: 500
+- max pages: 30000
+
+By default the advisor is disabled. Currently there are two advisors:
+none and scan_time.
+
+Tests with various workloads have shown considerable CPU savings. Most
+of the workloads I have investigated have more candidate pages during
+startup, once the workload is stable in terms of memory, the number of
+candidate pages is reduced. Without the advisor, the pages_to_scan needs
+to be sized for the maximum number of candidate pages. So having this
+advisor definitely helps in reducing CPU consumption.
+
+For the instagram workload, the advisor achieves a 25% CPU reduction.
+Once the memory is stable, the pages_to_scan parameter gets reduced to
+about 40% of its max value.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+---
+ mm/ksm.c | 159 ++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 158 insertions(+), 1 deletion(-)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 1df25a66f..f08d31968 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -21,6 +21,7 @@
+ #include <linux/sched.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/coredump.h>
++#include <linux/sched/cputime.h>
+ #include <linux/rwsem.h>
+ #include <linux/pagemap.h>
+ #include <linux/rmap.h>
+@@ -248,6 +249,9 @@ static struct kmem_cache *rmap_item_cache;
+ static struct kmem_cache *stable_node_cache;
+ static struct kmem_cache *mm_slot_cache;
+ 
++/* Default number of pages to scan per batch */
++#define DEFAULT_PAGES_TO_SCAN 100
++
+ /* The number of pages scanned */
+ static unsigned long ksm_pages_scanned;
+ 
+@@ -276,7 +280,7 @@ static unsigned int ksm_stable_node_chains_prune_millisecs = 2000;
+ static int ksm_max_page_sharing = 256;
+ 
+ /* Number of pages ksmd should scan in one batch */
+-static unsigned int ksm_thread_pages_to_scan = 100;
++static unsigned int ksm_thread_pages_to_scan = DEFAULT_PAGES_TO_SCAN;
+ 
+ /* Milliseconds ksmd should sleep between batches */
+ static unsigned int ksm_thread_sleep_millisecs = 20;
+@@ -296,6 +300,155 @@ unsigned long ksm_zero_pages;
+ /* The number of pages that have been skipped due to "smart scanning" */
+ static unsigned long ksm_pages_skipped;
+ 
++/* Don't scan more than max pages per batch. */
++static unsigned long ksm_advisor_max_pages = 30000;
++
++/* At least scan this many pages per batch. */
++static unsigned long ksm_advisor_min_pages = 500;
++
++/* Min CPU for scanning pages per scan */
++static unsigned int ksm_advisor_min_cpu =  15;
++
++/* Max CPU for scanning pages per scan */
++static unsigned int ksm_advisor_max_cpu =  70;
++
++/* Target scan time in seconds to analyze all KSM candidate pages. */
++static unsigned long ksm_advisor_target_scan_time = 200;
++
++/* Exponentially weighted moving average. */
++#define EWMA_WEIGHT 30
++
++/**
++ * struct advisor_ctx - metadata for KSM advisor
++ * @start_scan: start time of the current scan
++ * @scan_time: scan time of previous scan
++ * @change: change in percent to pages_to_scan parameter
++ * @cpu_percent: average cpu percent usage of the ksmd thread for the last scan
++ */
++struct advisor_ctx {
++	ktime_t start_scan;
++	unsigned long scan_time;
++	unsigned long change;
++	unsigned long long cpu_time;
++};
++static struct advisor_ctx advisor_ctx;
++
++/* Define different advisor's */
++enum ksm_advisor_type {
++	KSM_ADVISOR_NONE,
++	KSM_ADVISOR_FIRST = KSM_ADVISOR_NONE,
++	KSM_ADVISOR_SCAN_TIME,
++	KSM_ADVISOR_LAST = KSM_ADVISOR_SCAN_TIME
++};
++static enum ksm_advisor_type ksm_advisor;
++
++static void init_advisor(void)
++{
++	advisor_ctx.start_scan = 0;
++	advisor_ctx.scan_time = 0;
++	advisor_ctx.change = 0;
++	advisor_ctx.cpu_time = 0;
++}
++
++/*
++ * Use previous scan time if available, otherwise use current scan time as an
++ * approximation for the previous scan time.
++ */
++static inline unsigned long prev_scan_time(struct advisor_ctx *ctx,
++					   unsigned long scan_time)
++{
++	return ctx->scan_time ? ctx->scan_time : scan_time;
++}
++
++/* Calculate exponential weighted moving average */
++static unsigned long ewma(unsigned long prev, unsigned long curr)
++{
++	return ((100 - EWMA_WEIGHT) * prev + EWMA_WEIGHT * curr) / 100;
++}
++
++/*
++ * The scan time advisor is based on the current scan rate and the target
++ * scan rate.
++ *
++ *      new_pages_to_scan = pages_to_scan * (scan_time / target_scan_time)
++ *
++ * To avoid pertubations it calculates a change factor of previous changes.
++ * A new change factor is calculated for each iteration and it uses an
++ * exponentially weighted moving average. The new pages_to_scan value is
++ * multiplied with that change factor:
++ *
++ *      new_pages_to_scan *= change facor
++ *
++ * In addition the new pages_to_scan value is capped by the max and min
++ * limits.
++ */
++static void scan_time_advisor(unsigned long scan_time)
++{
++	unsigned int cpu_percent;
++	unsigned long cpu_time;
++	unsigned long cpu_time_diff;
++	unsigned long cpu_time_diff_ms;
++	unsigned long pages;
++	unsigned long per_page_cost;
++	unsigned long factor;
++	unsigned long change;
++	unsigned long last_scan_time;
++
++	cpu_time = task_sched_runtime(current);
++	cpu_time_diff = cpu_time - advisor_ctx.cpu_time;
++	cpu_time_diff_ms = cpu_time_diff / 1000 / 1000;
++
++	cpu_percent = (cpu_time_diff_ms * 100) / (scan_time * 1000);
++	cpu_percent = cpu_percent ? cpu_percent : 1;
++	last_scan_time = prev_scan_time(&advisor_ctx, scan_time);
++
++	/* Calculate scan time as percentage of target scan time */
++	factor = ksm_advisor_target_scan_time * 100 / scan_time;
++	factor = factor ? factor : 1;
++
++	/*
++	 * Calculate scan time as percentage of last scan time and use
++	 * exponentially weighted average to smooth it
++	 */
++	change = scan_time * 100 / last_scan_time;
++	change = change ? change : 1;
++	change = ewma(advisor_ctx.change, change);
++
++	/* Calculate new scan rate based on target scan rate. */
++	pages = ksm_thread_pages_to_scan * 100 / factor;
++	/* Update pages_to_scan by weighted change percentage. */
++	pages = pages * change / 100;
++
++	/* Cap new pages_to_scan value */
++	per_page_cost = ksm_thread_pages_to_scan / cpu_percent;
++	per_page_cost = per_page_cost ? per_page_cost : 1;
++
++	pages = min(pages, per_page_cost * ksm_advisor_max_cpu);
++	pages = max(pages, per_page_cost * ksm_advisor_min_cpu);
++	pages = min(pages, ksm_advisor_max_pages);
++
++	/* Update advisor context */
++	advisor_ctx.change = change;
++	advisor_ctx.scan_time = scan_time;
++	advisor_ctx.cpu_time = cpu_time;
++
++	ksm_thread_pages_to_scan = pages;
++}
++
++static void run_advisor(void)
++{
++	if (ksm_advisor == KSM_ADVISOR_SCAN_TIME) {
++		s64 scan_time;
++
++		/* Convert scan time to seconds */
++		scan_time = ktime_ms_delta(ktime_get(), advisor_ctx.start_scan);
++		scan_time = div_s64(scan_time, MSEC_PER_SEC);
++		scan_time = scan_time ? scan_time : 1;
++
++		scan_time_advisor((unsigned long)scan_time);
++	}
++}
++
+ #ifdef CONFIG_NUMA
+ /* Zeroed when merging across nodes is not allowed */
+ static unsigned int ksm_merge_across_nodes = 1;
+@@ -2400,6 +2553,7 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ 
+ 	mm_slot = ksm_scan.mm_slot;
+ 	if (mm_slot == &ksm_mm_head) {
++		advisor_ctx.start_scan = ktime_get();
+ 		trace_ksm_start_scan(ksm_scan.seqnr, ksm_rmap_items);
+ 
+ 		/*
+@@ -2557,6 +2711,8 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
+ 	if (mm_slot != &ksm_mm_head)
+ 		goto next_mm;
+ 
++	run_advisor();
++
+ 	trace_ksm_stop_scan(ksm_scan.seqnr, ksm_rmap_items);
+ 	ksm_scan.seqnr++;
+ 	return NULL;
+@@ -3602,6 +3758,7 @@ static int __init ksm_init(void)
+ 	zero_checksum = calc_checksum(ZERO_PAGE(0));
+ 	/* Default to false for backwards compatibility */
+ 	ksm_use_zero_pages = false;
++	init_advisor();
+ 
+ 	err = ksm_slab_init();
+ 	if (err)
+-- 
+2.42.0
+
+
+From 8aa71e05d6c0f30e03716938bc6fa29cea0099e8 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Fri, 27 Oct 2023 17:09:43 -0700
+Subject: [PATCH 7/9] mm/ksm: add sysfs knobs for advisor
+
+This adds four new knobs for the KSM advisor to influence its behaviour.
+
+The knobs are:
+- advisor_mode:
+    0: no advisor (default)
+    1: scan time advisor
+- advisor_min_cpu: 15 (default, cpu usage percent)
+- advisor_max_cpu: 70 (default, cpu usage percent)
+- advisor_min_pages: 500 (default)
+- advisor_max_pages: 30000 (default)
+- advisor_target_scan_time: 200 (default in seconds)
+
+The new values will take effect on the next scan round.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+---
+ mm/ksm.c | 154 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 154 insertions(+)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index f08d31968..689a86dba 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -350,6 +350,14 @@ static void init_advisor(void)
+ 	advisor_ctx.cpu_time = 0;
+ }
+ 
++static void set_advisor_defaults(void)
++{
++	if (ksm_advisor == KSM_ADVISOR_NONE)
++		ksm_thread_pages_to_scan = DEFAULT_PAGES_TO_SCAN;
++	else if (ksm_advisor == KSM_ADVISOR_SCAN_TIME)
++		ksm_thread_pages_to_scan = ksm_advisor_min_pages;
++}
++
+ /*
+  * Use previous scan time if available, otherwise use current scan time as an
+  * approximation for the previous scan time.
+@@ -3718,6 +3726,146 @@ static ssize_t smart_scan_store(struct kobject *kobj,
+ }
+ KSM_ATTR(smart_scan);
+ 
++static ssize_t advisor_mode_show(struct kobject *kobj,
++				 struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksm_advisor);
++}
++
++static ssize_t advisor_mode_store(struct kobject *kobj,
++				  struct kobj_attribute *attr, const char *buf,
++				  size_t count)
++{
++	unsigned int mode;
++	int err;
++
++	err = kstrtouint(buf, 10, &mode);
++	if (err)
++		return -EINVAL;
++	if (mode > KSM_ADVISOR_LAST)
++		return -EINVAL;
++
++	/* Set advisor default values */
++	ksm_advisor = mode;
++	init_advisor();
++	set_advisor_defaults();
++
++	return count;
++}
++KSM_ATTR(advisor_mode);
++
++static ssize_t advisor_min_cpu_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksm_advisor_min_cpu);
++}
++
++static ssize_t advisor_min_cpu_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int err;
++	unsigned long value;
++
++	err = kstrtoul(buf, 10, &value);
++	if (err)
++		return -EINVAL;
++
++	ksm_advisor_min_cpu = value;
++	return count;
++}
++KSM_ATTR(advisor_min_cpu);
++
++static ssize_t advisor_max_cpu_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksm_advisor_max_cpu);
++}
++
++static ssize_t advisor_max_cpu_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int err;
++	unsigned long value;
++
++	err = kstrtoul(buf, 10, &value);
++	if (err)
++		return -EINVAL;
++
++	ksm_advisor_max_cpu = value;
++	return count;
++}
++KSM_ATTR(advisor_max_cpu);
++
++static ssize_t advisor_min_pages_show(struct kobject *kobj,
++				      struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", ksm_advisor_min_pages);
++}
++
++static ssize_t advisor_min_pages_store(struct kobject *kobj,
++				       struct kobj_attribute *attr,
++				       const char *buf, size_t count)
++{
++	int err;
++	unsigned long value;
++
++	err = kstrtoul(buf, 10, &value);
++	if (err)
++		return -EINVAL;
++
++	ksm_advisor_min_pages = value;
++	return count;
++}
++KSM_ATTR(advisor_min_pages);
++
++static ssize_t advisor_max_pages_show(struct kobject *kobj,
++				      struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", ksm_advisor_max_pages);
++}
++
++static ssize_t advisor_max_pages_store(struct kobject *kobj,
++				       struct kobj_attribute *attr,
++				       const char *buf, size_t count)
++{
++	int err;
++	unsigned long value;
++
++	err = kstrtoul(buf, 10, &value);
++	if (err)
++		return -EINVAL;
++
++	ksm_advisor_max_pages = value;
++	return count;
++}
++KSM_ATTR(advisor_max_pages);
++
++static ssize_t advisor_target_scan_time_show(struct kobject *kobj,
++					     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", ksm_advisor_target_scan_time);
++}
++
++static ssize_t advisor_target_scan_time_store(struct kobject *kobj,
++					      struct kobj_attribute *attr,
++					      const char *buf, size_t count)
++{
++	int err;
++	unsigned long value;
++
++	err = kstrtoul(buf, 10, &value);
++	if (err)
++		return -EINVAL;
++	if (value < 1)
++		return -EINVAL;
++
++	ksm_advisor_target_scan_time = value;
++	return count;
++}
++KSM_ATTR(advisor_target_scan_time);
++
+ static struct attribute *ksm_attrs[] = {
+ 	&sleep_millisecs_attr.attr,
+ 	&pages_to_scan_attr.attr,
+@@ -3740,6 +3888,12 @@ static struct attribute *ksm_attrs[] = {
+ 	&use_zero_pages_attr.attr,
+ 	&general_profit_attr.attr,
+ 	&smart_scan_attr.attr,
++	&advisor_mode_attr.attr,
++	&advisor_min_cpu_attr.attr,
++	&advisor_max_cpu_attr.attr,
++	&advisor_min_pages_attr.attr,
++	&advisor_max_pages_attr.attr,
++	&advisor_target_scan_time_attr.attr,
+ 	NULL,
+ };
+ 
+-- 
+2.42.0
+
+
+From a2fe02e46d0a4a60877ca4255772017193db69e8 Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Fri, 27 Oct 2023 17:09:44 -0700
+Subject: [PATCH 8/9] mm/ksm: add tracepoint for ksm advisor
+
+This adds a new tracepoint for the ksm advisor. It reports the last scan
+time, the new setting of the pages_to_scan parameter and the average cpu
+percent usage of the ksmd background thread for the last scan.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+---
+ include/trace/events/ksm.h | 33 +++++++++++++++++++++++++++++++++
+ mm/ksm.c                   |  1 +
+ 2 files changed, 34 insertions(+)
+
+diff --git a/include/trace/events/ksm.h b/include/trace/events/ksm.h
+index b5ac35c1d..e728647b5 100644
+--- a/include/trace/events/ksm.h
++++ b/include/trace/events/ksm.h
+@@ -245,6 +245,39 @@ TRACE_EVENT(ksm_remove_rmap_item,
+ 			__entry->pfn, __entry->rmap_item, __entry->mm)
+ );
+ 
++/**
++ * ksm_advisor - called after the advisor has run
++ *
++ * @scan_time:		scan time in seconds
++ * @pages_to_scan:	new pages_to_scan value
++ * @cpu_percent:	cpu usage in percent
++ *
++ * Allows to trace the ksm advisor.
++ */
++TRACE_EVENT(ksm_advisor,
++
++	TP_PROTO(s64 scan_time, unsigned long pages_to_scan,
++		 unsigned int cpu_percent),
++
++	TP_ARGS(scan_time, pages_to_scan, cpu_percent),
++
++	TP_STRUCT__entry(
++		__field(s64,		scan_time)
++		__field(unsigned long,	pages_to_scan)
++		__field(unsigned int,	cpu_percent)
++	),
++
++	TP_fast_assign(
++		__entry->scan_time	= scan_time;
++		__entry->pages_to_scan	= pages_to_scan;
++		__entry->cpu_percent	= cpu_percent;
++	),
++
++	TP_printk("ksm scan time %lld pages_to_scan %lu cpu percent %u",
++			__entry->scan_time, __entry->pages_to_scan,
++			__entry->cpu_percent)
++);
++
+ #endif /* _TRACE_KSM_H */
+ 
+ /* This part must be outside protection */
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 689a86dba..ddae29329 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -441,6 +441,7 @@ static void scan_time_advisor(unsigned long scan_time)
+ 	advisor_ctx.cpu_time = cpu_time;
+ 
+ 	ksm_thread_pages_to_scan = pages;
++	trace_ksm_advisor(scan_time, pages, cpu_percent);
+ }
+ 
+ static void run_advisor(void)
+-- 
+2.42.0
+
+
+From f8236b341c01e73ebde541233072175dc4c9262c Mon Sep 17 00:00:00 2001
+From: Stefan Roesch <shr@devkernel.io>
+Date: Fri, 27 Oct 2023 17:09:45 -0700
+Subject: [PATCH 9/9] mm/ksm: document ksm advisor and its sysfs knobs
+
+This documents the KSM advisor and its new knobs in /sys/fs/kernel/mm.
+
+Signed-off-by: Stefan Roesch <shr@devkernel.io>
+---
+ Documentation/admin-guide/mm/ksm.rst | 66 ++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+
+diff --git a/Documentation/admin-guide/mm/ksm.rst b/Documentation/admin-guide/mm/ksm.rst
+index 0cadde17a..2ff1198d7 100644
+--- a/Documentation/admin-guide/mm/ksm.rst
++++ b/Documentation/admin-guide/mm/ksm.rst
+@@ -164,6 +164,33 @@ smart_scan
+         optimization is enabled. The ``pages_skipped`` metric shows how
+         effective the setting is.
+ 
++advisor_mode
++        The ``advisor_mode`` selects the current advisor. Two modes are
++        supported: 0 (None) and 1 (Scan time). The default is None. By
++        setting ``advisor_mode`` to 1, the scan time advisor is enabled.
++        The section about ``advisor`` explains in detail how the scan time
++        advisor works.
++
++advisor_min_cpu
++        specifies the lower limit of the cpu percent usage of the ksmd
++        background thread. The default is 15.
++
++adivsor_max_cpu
++        specifies the upper limit of the cpu percent usage of the ksmd
++        background thread. The default is 70.
++
++advisor_target_scan_time
++        specifies the target scan time in seconds to scan all the candidate
++        pages. The default value is 200 seconds.
++
++advisor_min_pages
++        specifies the lower limit of the ``pages_to_scan`` parameter of the
++        scan time advisor. The default is 500.
++
++adivsor_max_pages
++        specifies the upper limit of the ``pages_to_scan`` parameter of the
++        scan time advisor. The default is 30000.
++
+ The effectiveness of KSM and MADV_MERGEABLE is shown in ``/sys/kernel/mm/ksm/``:
+ 
+ general_profit
+@@ -263,6 +290,45 @@ ksm_swpin_copy
+ 	note that KSM page might be copied when swapping in because do_swap_page()
+ 	cannot do all the locking needed to reconstitute a cross-anon_vma KSM page.
+ 
++Advisor
++=======
++
++The number of candidate pages for KSM is dynamic. It can be often observed
++that during the startup of an application more candidate pages need to be
++processed. Without an advisor the ``pages_to_scan`` parameter needs to be
++sized for the maximum number of candidate pages. The scan time advisor can
++changes the ``pages_to_scan`` parameter based on demand.
++
++The advisor can be enabled, so KSM can automatically adapt to changes in the
++number of candidate pages to scan. Two advisors are implemented: 0 (None) and
++1 (Scan time). With None no advisor is enabled. The default is None.
++
++The Scan time advisor changes the ``pages_to_scan`` parameter based on the
++observed scan times. The possible values for the ``pages_to_scan`` parameter is
++limited by the ``advisor_min_pages`` and ``advisor_max_pages`` parameters. In
++addition there is also the ``advisor_target_scan_time`` parameter. This
++parameter sets the target time to scan all the KSM candidate pages. The
++parameter ``advisor_target_scan_time`` decides how aggressive the scan time
++advisor scans candidate pages. Lower values make the scan time advisor to scan
++more aggresively. This is the most important parameter for the configuration of
++the scan time advisor.
++
++The Scan time advisor changes the ``pages_to_scan`` parameter based on the
++observed scan times. The possible values for the ``pages_to_scan`` parameter is
++limited by the ``advisor_min_cpu`` and ``advisor_max_cpu`` parameters. In
++addition there is also the ``advisor_target_scan_time`` parameter. This
++parameter sets the target time to scan all the KSM candidate pages. The
++parameter ``advisor_target_scan_time`` decides how aggressive the scan time
++advisor scans candidate pages. Lower values make the scan time advisor to scan
++more aggresively. This is the most important parameter for the configuration of
++the scan time advisor.
++
++The initial value and the maximum value can be changed with ``advisor_min_pages``
++and ``advisor_max_pages``. The default values are sufficient for most workloads.
++
++The ``pages_to_scan`` parameter is re-calculated after a scan has been completed.
++
++
+ --
+ Izik Eidus,
+ Hugh Dickins, 17 Nov 2009
+-- 
+2.42.0
+
