@@ -1,6 +1,6 @@
-From 1571c3415275a590004e859d00d977d395b995cd Mon Sep 17 00:00:00 2001
+From b3ef94fe1e2b88c4e8103a28660211466a9ab689 Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Mon, 13 Nov 2023 13:04:31 +0100
+Date: Mon, 13 Nov 2023 13:44:15 +0100
 Subject: [PATCH] bore-6.7: introduce BORE Scheduler with BPF extensible
  scheduler class
 
@@ -12,7 +12,8 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  Makefile                                      |    8 +-
  drivers/tty/sysrq.c                           |    1 +
  include/asm-generic/vmlinux.lds.h             |    1 +
- include/linux/cgroup.h                        |    4 +-
+ include/linux/cgroup-defs.h                   |    8 +
+ include/linux/cgroup.h                        |    5 +-
  include/linux/sched.h                         |   34 +
  include/linux/sched/ext.h                     |  716 +++
  include/linux/sched/task.h                    |    3 +-
@@ -21,6 +22,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  init/init_task.c                              |   12 +
  kernel/Kconfig.preempt                        |   24 +-
  kernel/bpf/bpf_struct_ops_types.h             |    4 +
+ kernel/cgroup/cgroup.c                        |   97 +-
  kernel/fork.c                                 |   17 +-
  kernel/sched/autogroup.c                      |    4 +
  kernel/sched/build_policy.c                   |    5 +
@@ -84,7 +86,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  tools/sched_ext/scx_userland.c                |  366 ++
  tools/sched_ext/scx_userland.h                |   19 +
  tools/sched_ext/user_exit_info.h              |   50 +
- 78 files changed, 18256 insertions(+), 105 deletions(-)
+ 80 files changed, 18355 insertions(+), 112 deletions(-)
  create mode 100644 Documentation/scheduler/sched-ext.rst
  create mode 100644 include/linux/sched/ext.h
  create mode 100644 kernel/sched/ext.c
@@ -455,8 +457,41 @@ index bae0fe4d4..b4c51e798 100644
  	*(__idle_sched_class)			\
  	__sched_class_lowest = .;
  
+diff --git a/include/linux/cgroup-defs.h b/include/linux/cgroup-defs.h
+index 4a6b6b77c..516bb663e 100644
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -132,12 +132,18 @@ enum {
+ 	CFTYPE_WORLD_WRITABLE	= (1 << 4),	/* (DON'T USE FOR NEW FILES) S_IWUGO */
+ 	CFTYPE_DEBUG		= (1 << 5),	/* create when cgroup_debug */
+ 
++	CFTYPE_HIDDEN		= (1 << 6),	/* file type hidden, see cgroup_show_cftypes() */
++
+ 	/* internal flags, do not use outside cgroup core proper */
+ 	__CFTYPE_ONLY_ON_DFL	= (1 << 16),	/* only on default hierarchy */
+ 	__CFTYPE_NOT_ON_DFL	= (1 << 17),	/* not on default hierarchy */
+ 	__CFTYPE_ADDED		= (1 << 18),
+ };
+ 
++enum cfile_flags {
++	CFILE_HIDDEN		= (1 << 0),	/* file instance hidden */
++};
++
+ /*
+  * cgroup_file is the handle for a file instance created in a cgroup which
+  * is used, for example, to generate file changed notifications.  This can
+@@ -145,7 +151,9 @@ enum {
+  */
+ struct cgroup_file {
+ 	/* do not access any fields from outside cgroup core */
++	struct cftype *cft;
+ 	struct kernfs_node *kn;
++	unsigned int flags;
+ 	unsigned long notified_at;
+ 	struct timer_list notify_timer;
+ };
 diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
-index 0ef0af660..3607d4ee7 100644
+index 0ef0af660..53040f746 100644
 --- a/include/linux/cgroup.h
 +++ b/include/linux/cgroup.h
 @@ -29,8 +29,6 @@
@@ -477,6 +512,14 @@ index 0ef0af660..3607d4ee7 100644
  enum {
  	CSS_TASK_ITER_PROCS    = (1U << 0),  /* walk only threadgroup leaders */
  	CSS_TASK_ITER_THREADED = (1U << 1),  /* walk all threaded css_sets in the domain */
+@@ -113,6 +113,7 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from);
+ int cgroup_add_dfl_cftypes(struct cgroup_subsys *ss, struct cftype *cfts);
+ int cgroup_add_legacy_cftypes(struct cgroup_subsys *ss, struct cftype *cfts);
+ int cgroup_rm_cftypes(struct cftype *cfts);
++void cgroup_show_cftype(struct cftype *cft, bool show);
+ void cgroup_file_notify(struct cgroup_file *cfile);
+ void cgroup_file_show(struct cgroup_file *cfile, bool show);
+ 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index 292c31697..210c26743 100644
 --- a/include/linux/sched.h
@@ -1415,6 +1458,141 @@ index 5678a9ddf..3618769d8 100644
 +BPF_STRUCT_OPS_TYPE(sched_ext_ops)
 +#endif
  #endif
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 1d5b9de3b..1ccb2f28a 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -4222,10 +4222,13 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
+ 		return ret;
+ 	}
+ 
++	kernfs_show(kn, !(cft->flags & CFTYPE_HIDDEN));
++
+ 	if (cft->file_offset) {
+ 		struct cgroup_file *cfile = (void *)css + cft->file_offset;
+ 
+ 		timer_setup(&cfile->notify_timer, cgroup_file_notify_timer, 0);
++		cfile->cft = cft;
+ 
+ 		spin_lock_irq(&cgroup_file_kn_lock);
+ 		cfile->kn = kn;
+@@ -4501,6 +4504,24 @@ void cgroup_file_notify(struct cgroup_file *cfile)
+ 	spin_unlock_irqrestore(&cgroup_file_kn_lock, flags);
+ }
+ 
++static struct kernfs_node *cfile_kn_get(struct cgroup_file *cfile)
++{
++	struct kernfs_node *kn;
++
++	spin_lock_irq(&cgroup_file_kn_lock);
++	kn = cfile->kn;
++	kernfs_get(kn);
++	spin_unlock_irq(&cgroup_file_kn_lock);
++
++	return kn;
++}
++
++static bool cfile_visible(struct cgroup_file *cfile)
++{
++	return !(cfile->cft->flags & CFTYPE_HIDDEN) &&
++		!(cfile->flags & CFILE_HIDDEN);
++}
++
+ /**
+  * cgroup_file_show - show or hide a hidden cgroup file
+  * @cfile: target cgroup_file obtained by setting cftype->file_offset
+@@ -4510,15 +4531,20 @@ void cgroup_file_show(struct cgroup_file *cfile, bool show)
+ {
+ 	struct kernfs_node *kn;
+ 
+-	spin_lock_irq(&cgroup_file_kn_lock);
+-	kn = cfile->kn;
+-	kernfs_get(kn);
+-	spin_unlock_irq(&cgroup_file_kn_lock);
++	mutex_lock(&cgroup_mutex);
+ 
+-	if (kn)
+-		kernfs_show(kn, show);
++	if (show)
++		cfile->flags &= ~CFILE_HIDDEN;
++	else
++		cfile->flags |= CFILE_HIDDEN;
+ 
+-	kernfs_put(kn);
++	kn = cfile_kn_get(cfile);
++	if (kn) {
++		kernfs_show(kn, cfile_visible(cfile));
++		kernfs_put(kn);
++	}
++
++	mutex_unlock(&cgroup_mutex);
+ }
+ 
+ /**
+@@ -5546,6 +5572,63 @@ static void offline_css(struct cgroup_subsys_state *css)
+ 	wake_up_all(&css->cgroup->offline_waitq);
+ }
+ 
++/**
++ * cgroup_show_cftype - show or hide a cgroup file type
++ * @cft: cftype to show or hide
++ * @show: whether to show or hide
++ *
++ * Sets %CFTYPE_HIDDEN and shows/hides the matching files according to @show.
++ * @cft may or may not be added at the time of this call. After hiding, it's
++ * guaranteed that there are no in-flight operations on the hidden files.
++ */
++void cgroup_show_cftype(struct cftype *cft, bool show)
++{
++	struct cgroup_subsys *ss = cft->ss;
++	struct cgroup *root = ss ? &ss->root->cgrp : &cgrp_dfl_root.cgrp;
++	struct cgroup_subsys_state *css;
++
++	mutex_lock(&cgroup_mutex);
++
++	if (show)
++		cft->flags &= ~CFTYPE_HIDDEN;
++	else
++		cft->flags |= CFTYPE_HIDDEN;
++
++	if (!(cft->flags & __CFTYPE_ADDED))
++		goto out_unlock;
++
++	css_for_each_descendant_pre(css, cgroup_css(root, ss)) {
++		struct cgroup *cgrp = css->cgroup;
++		struct kernfs_node *kn;
++
++		if (!(css->flags & CSS_VISIBLE))
++			continue;
++
++		if (cft->file_offset) {
++			struct cgroup_file *cfile =
++				(void *)css + cft->file_offset;
++
++			kn = cfile_kn_get(cfile);
++			if (kn) {
++				kernfs_show(kn, cfile_visible(cfile));
++				kernfs_put(kn);
++			}
++		} else {
++			char buf[CGROUP_FILE_NAME_MAX];
++
++			kn = kernfs_find_and_get(cgrp->kn,
++					cgroup_file_name(cgrp, cft, buf));
++			if (kn) {
++				kernfs_show(kn, show);
++				kernfs_put(kn);
++			}
++		}
++	}
++
++out_unlock:
++	mutex_unlock(&cgroup_mutex);
++}
++
+ /**
+  * css_create - create a cgroup_subsys_state
+  * @cgrp: the cgroup new css will be associated with
 diff --git a/kernel/fork.c b/kernel/fork.c
 index 10917c3e1..08203ddeb 100644
 --- a/kernel/fork.c
@@ -7248,7 +7426,7 @@ index 000000000..27248760f
 +#endif	/* CONFIG_EXT_GROUP_SCHED */
 +#endif	/* CONFIG_CGROUP_SCHED */
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 2048138ce..e6b4cf500 100644
+index 2048138ce..902b4cb64 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -19,6 +19,9 @@
@@ -7382,7 +7560,7 @@ index 2048138ce..e6b4cf500 100644
 +		.mode		= 0644,
 +		.proc_handler	= &proc_dointvec_minmax,
 +		.extra1		= SYSCTL_ZERO,
-+		.extra2		= &seven,
++		.extra2		= &three,
 +	},
 +	{
 +		.procname	= "sched_burst_penalty_offset",
