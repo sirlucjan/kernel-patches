@@ -1,0 +1,292 @@
+From 4433d3e774160d377fd95ea18c7728d300580974 Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Tue, 28 Mar 2023 16:04:02 -0700
+Subject: [PATCH 089/154] btrfs: track owning root in btrfs_ref
+
+While data extents require us to store additional inline refs to track
+the original owner on free, this information is available implicitly for
+metadata. It is found in the owner field of the header of the tree
+block. Even if other trees refer to this block and the original ref goes
+away, we will not rewrite that header field, so it will reliably give the
+original owner.
+
+In addition, there is a relocation case where a new data extent needs to
+have an owning root separate from the referring root wired through
+delayed refs.
+
+To use it for recording simple quota deltas, we need to wire this root
+id through from when we create the delayed ref until we fully process
+it. Store it in the generic btrfs_ref struct of the delayed ref.
+
+Signed-off-by: Boris Burkov <boris@bur.io>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/delayed-ref.h |  9 ++++++---
+ fs/btrfs/extent-tree.c | 21 +++++++++++++--------
+ fs/btrfs/file.c        | 13 ++++++++-----
+ fs/btrfs/inode-item.c  |  3 ++-
+ fs/btrfs/relocation.c  | 18 +++++++++++-------
+ fs/btrfs/tree-log.c    |  3 ++-
+ 6 files changed, 42 insertions(+), 25 deletions(-)
+
+diff --git a/fs/btrfs/delayed-ref.h b/fs/btrfs/delayed-ref.h
+index a7fdb28df..84b37888b 100644
+--- a/fs/btrfs/delayed-ref.h
++++ b/fs/btrfs/delayed-ref.h
+@@ -245,6 +245,7 @@ struct btrfs_ref {
+ #endif
+ 	u64 bytenr;
+ 	u64 len;
++	u64 owning_root;
+ 
+ 	/* Bytenr of the parent tree block */
+ 	u64 parent;
+@@ -295,16 +296,18 @@ static inline u64 btrfs_calc_delayed_ref_csum_bytes(const struct btrfs_fs_info *
+ }
+ 
+ static inline void btrfs_init_generic_ref(struct btrfs_ref *generic_ref,
+-				int action, u64 bytenr, u64 len, u64 parent)
++					  int action, u64 bytenr, u64 len,
++					  u64 parent, u64 owning_root)
+ {
+ 	generic_ref->action = action;
+ 	generic_ref->bytenr = bytenr;
+ 	generic_ref->len = len;
+ 	generic_ref->parent = parent;
++	generic_ref->owning_root = owning_root;
+ }
+ 
+-static inline void btrfs_init_tree_ref(struct btrfs_ref *generic_ref,
+-				int level, u64 root, u64 mod_root, bool skip_qgroup)
++static inline void btrfs_init_tree_ref(struct btrfs_ref *generic_ref, int level,
++				       u64 root, u64 mod_root, bool skip_qgroup)
+ {
+ #ifdef CONFIG_BTRFS_FS_REF_VERIFY
+ 	/* If @real_root not set, use @root as fallback */
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 52efc8e44..2dda3ecb4 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -2452,7 +2452,7 @@ static int __btrfs_mod_ref(struct btrfs_trans_handle *trans,
+ 			num_bytes = btrfs_file_extent_disk_num_bytes(buf, fi);
+ 			key.offset -= btrfs_file_extent_offset(buf, fi);
+ 			btrfs_init_generic_ref(&generic_ref, action, bytenr,
+-					       num_bytes, parent);
++					       num_bytes, parent, ref_root);
+ 			btrfs_init_data_ref(&generic_ref, ref_root, key.objectid,
+ 					    key.offset, root->root_key.objectid,
+ 					    for_reloc);
+@@ -2465,8 +2465,9 @@ static int __btrfs_mod_ref(struct btrfs_trans_handle *trans,
+ 		} else {
+ 			bytenr = btrfs_node_blockptr(buf, i);
+ 			num_bytes = fs_info->nodesize;
++			/* We don't know the owning_root, use 0. */
+ 			btrfs_init_generic_ref(&generic_ref, action, bytenr,
+-					       num_bytes, parent);
++					       num_bytes, parent, 0);
+ 			btrfs_init_tree_ref(&generic_ref, level - 1, ref_root,
+ 					    root->root_key.objectid, for_reloc);
+ 			if (inc)
+@@ -3289,7 +3290,7 @@ void btrfs_free_tree_block(struct btrfs_trans_handle *trans,
+ 	int ret;
+ 
+ 	btrfs_init_generic_ref(&generic_ref, BTRFS_DROP_DELAYED_REF,
+-			       buf->start, buf->len, parent);
++			       buf->start, buf->len, parent, btrfs_header_owner(buf));
+ 	btrfs_init_tree_ref(&generic_ref, btrfs_header_level(buf),
+ 			    root_id, 0, false);
+ 
+@@ -4751,12 +4752,14 @@ int btrfs_alloc_reserved_file_extent(struct btrfs_trans_handle *trans,
+ 				     struct btrfs_key *ins)
+ {
+ 	struct btrfs_ref generic_ref = { 0 };
++	u64 root_objectid = root->root_key.objectid;
++	u64 owning_root = root_objectid;
+ 
+-	BUG_ON(root->root_key.objectid == BTRFS_TREE_LOG_OBJECTID);
++	BUG_ON(root_objectid == BTRFS_TREE_LOG_OBJECTID);
+ 
+ 	btrfs_init_generic_ref(&generic_ref, BTRFS_ADD_DELAYED_EXTENT,
+-			       ins->objectid, ins->offset, 0);
+-	btrfs_init_data_ref(&generic_ref, root->root_key.objectid, owner,
++			       ins->objectid, ins->offset, 0, owning_root);
++	btrfs_init_data_ref(&generic_ref, root_objectid, owner,
+ 			    offset, 0, false);
+ 	btrfs_ref_tree_mod(root->fs_info, &generic_ref);
+ 
+@@ -4982,7 +4985,8 @@ struct extent_buffer *btrfs_alloc_tree_block(struct btrfs_trans_handle *trans,
+ 		extent_op->level = level;
+ 
+ 		btrfs_init_generic_ref(&generic_ref, BTRFS_ADD_DELAYED_EXTENT,
+-				       ins.objectid, ins.offset, parent);
++				       ins.objectid, ins.offset, parent,
++				       btrfs_header_owner(buf));
+ 		btrfs_init_tree_ref(&generic_ref, level, root_objectid,
+ 				    root->root_key.objectid, false);
+ 		btrfs_ref_tree_mod(fs_info, &generic_ref);
+@@ -5403,7 +5407,8 @@ static noinline int do_walk_down(struct btrfs_trans_handle *trans,
+ 		find_next_key(path, level, &wc->drop_progress);
+ 
+ 		btrfs_init_generic_ref(&ref, BTRFS_DROP_DELAYED_REF, bytenr,
+-				       fs_info->nodesize, parent);
++				       fs_info->nodesize, parent,
++				       btrfs_header_owner(next));
+ 		btrfs_init_tree_ref(&ref, level - 1, root->root_key.objectid,
+ 				    0, false);
+ 		ret = btrfs_free_extent(trans, &ref);
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 8065c8a3f..bd9071e3e 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -374,7 +374,8 @@ int btrfs_drop_extents(struct btrfs_trans_handle *trans,
+ 			if (update_refs && disk_bytenr > 0) {
+ 				btrfs_init_generic_ref(&ref,
+ 						BTRFS_ADD_DELAYED_REF,
+-						disk_bytenr, num_bytes, 0);
++						disk_bytenr, num_bytes, 0,
++						root->root_key.objectid);
+ 				btrfs_init_data_ref(&ref,
+ 						root->root_key.objectid,
+ 						new_key.objectid,
+@@ -464,7 +465,8 @@ int btrfs_drop_extents(struct btrfs_trans_handle *trans,
+ 			} else if (update_refs && disk_bytenr > 0) {
+ 				btrfs_init_generic_ref(&ref,
+ 						BTRFS_DROP_DELAYED_REF,
+-						disk_bytenr, num_bytes, 0);
++						disk_bytenr, num_bytes, 0,
++						root->root_key.objectid);
+ 				btrfs_init_data_ref(&ref,
+ 						root->root_key.objectid,
+ 						key.objectid,
+@@ -746,7 +748,7 @@ int btrfs_mark_extent_written(struct btrfs_trans_handle *trans,
+ 		btrfs_mark_buffer_dirty(trans, leaf);
+ 
+ 		btrfs_init_generic_ref(&ref, BTRFS_ADD_DELAYED_REF, bytenr,
+-				       num_bytes, 0);
++				       num_bytes, 0, root->root_key.objectid);
+ 		btrfs_init_data_ref(&ref, root->root_key.objectid, ino,
+ 				    orig_offset, 0, false);
+ 		ret = btrfs_inc_extent_ref(trans, &ref);
+@@ -772,7 +774,7 @@ int btrfs_mark_extent_written(struct btrfs_trans_handle *trans,
+ 	other_start = end;
+ 	other_end = 0;
+ 	btrfs_init_generic_ref(&ref, BTRFS_DROP_DELAYED_REF, bytenr,
+-			       num_bytes, 0);
++			       num_bytes, 0, root->root_key.objectid);
+ 	btrfs_init_data_ref(&ref, root->root_key.objectid, ino, orig_offset,
+ 			    0, false);
+ 	if (extent_mergeable(leaf, path->slots[0] + 1,
+@@ -2304,7 +2306,8 @@ static int btrfs_insert_replace_extent(struct btrfs_trans_handle *trans,
+ 
+ 		btrfs_init_generic_ref(&ref, BTRFS_ADD_DELAYED_REF,
+ 				       extent_info->disk_offset,
+-				       extent_info->disk_len, 0);
++				       extent_info->disk_len, 0,
++				       root->root_key.objectid);
+ 		ref_offset = extent_info->file_offset - extent_info->data_offset;
+ 		btrfs_init_data_ref(&ref, root->root_key.objectid,
+ 				    btrfs_ino(inode), ref_offset, 0, false);
+diff --git a/fs/btrfs/inode-item.c b/fs/btrfs/inode-item.c
+index 143102ef1..7d734830e 100644
+--- a/fs/btrfs/inode-item.c
++++ b/fs/btrfs/inode-item.c
+@@ -676,7 +676,8 @@ int btrfs_truncate_inode_items(struct btrfs_trans_handle *trans,
+ 			bytes_deleted += extent_num_bytes;
+ 
+ 			btrfs_init_generic_ref(&ref, BTRFS_DROP_DELAYED_REF,
+-					extent_start, extent_num_bytes, 0);
++					extent_start, extent_num_bytes, 0,
++					root->root_key.objectid);
+ 			btrfs_init_data_ref(&ref, btrfs_header_owner(leaf),
+ 					control->ino, extent_offset,
+ 					root->root_key.objectid, false);
+diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+index 9b2fc7208..629a75204 100644
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -1159,7 +1159,7 @@ int replace_file_extents(struct btrfs_trans_handle *trans,
+ 
+ 		key.offset -= btrfs_file_extent_offset(leaf, fi);
+ 		btrfs_init_generic_ref(&ref, BTRFS_ADD_DELAYED_REF, new_bytenr,
+-				       num_bytes, parent);
++				       num_bytes, parent, root->root_key.objectid);
+ 		btrfs_init_data_ref(&ref, btrfs_header_owner(leaf),
+ 				    key.objectid, key.offset,
+ 				    root->root_key.objectid, false);
+@@ -1170,7 +1170,7 @@ int replace_file_extents(struct btrfs_trans_handle *trans,
+ 		}
+ 
+ 		btrfs_init_generic_ref(&ref, BTRFS_DROP_DELAYED_REF, bytenr,
+-				       num_bytes, parent);
++				       num_bytes, parent, root->root_key.objectid);
+ 		btrfs_init_data_ref(&ref, btrfs_header_owner(leaf),
+ 				    key.objectid, key.offset,
+ 				    root->root_key.objectid, false);
+@@ -1383,7 +1383,8 @@ int replace_path(struct btrfs_trans_handle *trans, struct reloc_control *rc,
+ 		btrfs_mark_buffer_dirty(trans, path->nodes[level]);
+ 
+ 		btrfs_init_generic_ref(&ref, BTRFS_ADD_DELAYED_REF, old_bytenr,
+-				       blocksize, path->nodes[level]->start);
++				       blocksize, path->nodes[level]->start,
++				       src->root_key.objectid);
+ 		btrfs_init_tree_ref(&ref, level - 1, src->root_key.objectid,
+ 				    0, true);
+ 		ret = btrfs_inc_extent_ref(trans, &ref);
+@@ -1392,7 +1393,7 @@ int replace_path(struct btrfs_trans_handle *trans, struct reloc_control *rc,
+ 			break;
+ 		}
+ 		btrfs_init_generic_ref(&ref, BTRFS_ADD_DELAYED_REF, new_bytenr,
+-				       blocksize, 0);
++				       blocksize, 0, dest->root_key.objectid);
+ 		btrfs_init_tree_ref(&ref, level - 1, dest->root_key.objectid, 0,
+ 				    true);
+ 		ret = btrfs_inc_extent_ref(trans, &ref);
+@@ -1401,8 +1402,9 @@ int replace_path(struct btrfs_trans_handle *trans, struct reloc_control *rc,
+ 			break;
+ 		}
+ 
++		/* We don't know the real owning_root, use 0. */
+ 		btrfs_init_generic_ref(&ref, BTRFS_DROP_DELAYED_REF, new_bytenr,
+-				       blocksize, path->nodes[level]->start);
++				       blocksize, path->nodes[level]->start, 0);
+ 		btrfs_init_tree_ref(&ref, level - 1, src->root_key.objectid,
+ 				    0, true);
+ 		ret = btrfs_free_extent(trans, &ref);
+@@ -1411,8 +1413,9 @@ int replace_path(struct btrfs_trans_handle *trans, struct reloc_control *rc,
+ 			break;
+ 		}
+ 
++		/* We don't know the real owning_root, use 0. */
+ 		btrfs_init_generic_ref(&ref, BTRFS_DROP_DELAYED_REF, old_bytenr,
+-				       blocksize, 0);
++				       blocksize, 0, 0);
+ 		btrfs_init_tree_ref(&ref, level - 1, dest->root_key.objectid,
+ 				    0, true);
+ 		ret = btrfs_free_extent(trans, &ref);
+@@ -2521,7 +2524,8 @@ static int do_relocation(struct btrfs_trans_handle *trans,
+ 
+ 			btrfs_init_generic_ref(&ref, BTRFS_ADD_DELAYED_REF,
+ 					       node->eb->start, blocksize,
+-					       upper->eb->start);
++					       upper->eb->start,
++					       btrfs_header_owner(upper->eb));
+ 			btrfs_init_tree_ref(&ref, node->level,
+ 					    btrfs_header_owner(upper->eb),
+ 					    root->root_key.objectid, false);
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 595982434..146f82e71 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -766,7 +766,8 @@ static noinline int replay_one_extent(struct btrfs_trans_handle *trans,
+ 			} else if (ret == 0) {
+ 				btrfs_init_generic_ref(&ref,
+ 						BTRFS_ADD_DELAYED_REF,
+-						ins.objectid, ins.offset, 0);
++						ins.objectid, ins.offset, 0,
++						root->root_key.objectid);
+ 				btrfs_init_data_ref(&ref,
+ 						root->root_key.objectid,
+ 						key->objectid, offset, 0, false);
+-- 
+2.43.0.rc2
+
