@@ -1,0 +1,125 @@
+From 15542e817c9220067eae839c5201f03f1307c6da Mon Sep 17 00:00:00 2001
+From: David Vernet <void@manifault.com>
+Date: Fri, 1 Dec 2023 10:08:31 -0600
+Subject: [PATCH 47/66] nest: Further fix core compaction
+
+To avoid excess calls to bpf_timer_cancel(), let's record when a core
+has been scheduled for compaction, and only cancel the timer in that
+event. We also record how many times a core has been scheduled for
+compaction, and how often that compaction has been cancelled.
+
+Signed-off-by: David Vernet <void@manifault.com>
+---
+ tools/sched_ext/scx_nest.bpf.c         | 30 ++++++++++++++++----------
+ tools/sched_ext/scx_nest_stats_table.h |  2 ++
+ 2 files changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/tools/sched_ext/scx_nest.bpf.c b/tools/sched_ext/scx_nest.bpf.c
+index c03ab49de..61533e706 100644
+--- a/tools/sched_ext/scx_nest.bpf.c
++++ b/tools/sched_ext/scx_nest.bpf.c
+@@ -84,6 +84,9 @@ struct {
+ struct pcpu_ctx {
+ 	/* The timer used to compact the core from the primary nest. */
+ 	struct bpf_timer timer;
++
++	/* Whether the current core has been scheduled for compaction. */
++	bool scheduled_compaction;
+ };
+ 
+ struct {
+@@ -278,8 +281,12 @@ s32 BPF_STRUCT_OPS(nest_select_cpu, struct task_struct *p, s32 prev_cpu,
+ migrate_primary:
+ 	pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &cpu);
+ 	if (pcpu_ctx) {
+-		if (bpf_timer_cancel(&pcpu_ctx->timer) < 0)
+-			scx_bpf_error("Failed to cancel pcpu timer");
++		if (pcpu_ctx->scheduled_compaction) {
++			if (bpf_timer_cancel(&pcpu_ctx->timer) < 0)
++				scx_bpf_error("Failed to cancel pcpu timer");
++			pcpu_ctx->scheduled_compaction = false;
++			stat_inc(NEST_STAT(CANCELLED_COMPACTION));
++		}
+ 	} else {
+ 		scx_bpf_error("Failed to lookup pcpu ctx");
+ 	}
+@@ -353,6 +360,7 @@ void BPF_STRUCT_OPS(nest_dispatch, s32 cpu, struct task_struct *prev)
+ 	if (!scx_bpf_consume(FALLBACK_DSQ_ID)) {
+ 		stat_inc(NEST_STAT(NOT_CONSUMED));
+ 		if (in_primary) {
++			pcpu_ctx->scheduled_compaction = true;
+ 			/*
+ 			 * The core isn't being used anymore. Set a timer to
+ 			 * remove the core from the nest in p_remove if it's
+@@ -360,19 +368,11 @@ void BPF_STRUCT_OPS(nest_dispatch, s32 cpu, struct task_struct *prev)
+ 			 */
+ 			bpf_timer_start(&pcpu_ctx->timer, p_remove_ns,
+ 					BPF_F_TIMER_CPU_PIN);
++			stat_inc(NEST_STAT(SCHEDULED_COMPACTION));
+ 		}
+ 		return;
+ 	}
+-
+ 	stat_inc(NEST_STAT(CONSUMED));
+-	/*
+-	 * If it's in the primary nest, cancel its timer callback as it's still
+-	 * being used. We don't need to worry about racing with the timer
+-	 * callback as it's pinned to the current CPU, and interrupts are
+-	 * disabled.
+-	 */
+-	if (in_primary && bpf_timer_cancel(&pcpu_ctx->timer) < 0)
+-		scx_bpf_error("Failed to cancel pcpu timer");
+ }
+ 
+ void BPF_STRUCT_OPS(nest_running, struct task_struct *p)
+@@ -429,12 +429,18 @@ static int compact_primary_core(void *map, int *key, struct bpf_timer *timer)
+ {
+ 	struct bpf_cpumask *primary, *reserve;
+ 	s32 cpu = bpf_get_smp_processor_id();
++	struct pcpu_ctx *pcpu_ctx;
+ 
+ 	/*
+ 	 * If we made it to this callback, it means that the timer callback was
+ 	 * never cancelled, and so the core needs to be demoted from the
+ 	 * primary nest.
+ 	 */
++	pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &cpu);
++	if (!pcpu_ctx) {
++		scx_bpf_error("Couldn't lookup pcpu ctx");
++		return 0;
++	}
+ 	bpf_rcu_read_lock();
+ 	primary = primary_cpumask;
+ 	reserve = reserve_cpumask;
+@@ -447,6 +453,7 @@ static int compact_primary_core(void *map, int *key, struct bpf_timer *timer)
+ 	bpf_cpumask_clear_cpu(cpu, primary);
+ 	try_make_core_reserved(cpu, reserve, false);
+ 	bpf_rcu_read_unlock();
++	pcpu_ctx->scheduled_compaction = false;
+ 	return 0;
+ }
+ 
+@@ -489,6 +496,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(nest_init)
+ 			scx_bpf_error("Failed to lookup pcpu_ctx");
+ 			return -ENOENT;
+ 		}
++		ctx->scheduled_compaction = false;
+ 		if (bpf_timer_init(&ctx->timer, &pcpu_ctxs, CLOCK_BOOTTIME)) {
+ 			scx_bpf_error("Failed to initialize pcpu timer");
+ 			return -EINVAL;
+diff --git a/tools/sched_ext/scx_nest_stats_table.h b/tools/sched_ext/scx_nest_stats_table.h
+index ea1265c31..9219423e9 100644
+--- a/tools/sched_ext/scx_nest_stats_table.h
++++ b/tools/sched_ext/scx_nest_stats_table.h
+@@ -10,6 +10,8 @@ NEST_ST(PROMOTED_TO_PRIMARY, STAT_GRP_NEST, "A core was promoted into the primar
+ NEST_ST(PROMOTED_TO_RESERVED, STAT_GRP_NEST, "A core was promoted into the reserve nest")
+ NEST_ST(DEMOTED_TO_RESERVED, STAT_GRP_NEST, "A core was demoted into the reserve nest")
+ NEST_ST(RESERVED_AT_CAPACITY, STAT_GRP_NEST, "Reserved nest was at capacity")
++NEST_ST(SCHEDULED_COMPACTION, STAT_GRP_NEST, "Scheduled a primary core to be compacted")
++NEST_ST(CANCELLED_COMPACTION, STAT_GRP_NEST, "Cancelled a primary core from being compacted at task wakeup time")
+ 
+ NEST_ST(CONSUMED, STAT_GRP_CONSUME, "A task was consumed from the global DSQ")
+ NEST_ST(NOT_CONSUMED, STAT_GRP_CONSUME, "There was no task in the global DSQ")
+-- 
+2.43.0.rc2
+
