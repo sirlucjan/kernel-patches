@@ -1,0 +1,495 @@
+From 1a1c87a54340611b9ccf30c7827cb03485ee5bbd Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Wed, 13 Dec 2023 21:23:55 +0100
+Subject: [PATCH] bcachefs-6.7: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ fs/bcachefs/btree_cache.c           |  8 +++-----
+ fs/bcachefs/btree_io.c              |  4 ++--
+ fs/bcachefs/btree_io.h              |  3 ---
+ fs/bcachefs/btree_key_cache.c       |  2 --
+ fs/bcachefs/btree_update.c          | 16 ++++++++++++++++
+ fs/bcachefs/btree_update_interior.c | 11 +++++++++++
+ fs/bcachefs/data_update.c           |  7 ++++---
+ fs/bcachefs/dirent.c                | 19 +++++++++++--------
+ fs/bcachefs/dirent.h                |  1 +
+ fs/bcachefs/extents.c               |  3 ++-
+ fs/bcachefs/fs-ioctl.c              |  2 +-
+ fs/bcachefs/fs.c                    | 22 +++++++++++++++++-----
+ fs/bcachefs/inode.c                 | 15 ++++++++++-----
+ fs/bcachefs/journal.c               |  8 ++++----
+ fs/bcachefs/journal.h               |  1 +
+ fs/bcachefs/journal_io.c            |  1 +
+ fs/bcachefs/journal_reclaim.c       |  3 +++
+ fs/bcachefs/recovery.c              |  2 +-
+ fs/bcachefs/reflink.c               |  8 ++++++++
+ fs/bcachefs/sysfs.c                 |  8 ++++----
+ 20 files changed, 100 insertions(+), 44 deletions(-)
+
+diff --git a/fs/bcachefs/btree_cache.c b/fs/bcachefs/btree_cache.c
+index 47e7770d0..79495cd7a 100644
+--- a/fs/bcachefs/btree_cache.c
++++ b/fs/bcachefs/btree_cache.c
+@@ -9,6 +9,7 @@
+ #include "debug.h"
+ #include "errcode.h"
+ #include "error.h"
++#include "journal.h"
+ #include "trace.h"
+ 
+ #include <linux/prefetch.h>
+@@ -424,14 +425,11 @@ void bch2_fs_btree_cache_exit(struct bch_fs *c)
+ 		BUG_ON(btree_node_read_in_flight(b) ||
+ 		       btree_node_write_in_flight(b));
+ 
+-		if (btree_node_dirty(b))
+-			bch2_btree_complete_write(c, b, btree_current_write(b));
+-		clear_btree_node_dirty_acct(c, b);
+-
+ 		btree_node_data_free(c, b);
+ 	}
+ 
+-	BUG_ON(atomic_read(&c->btree_cache.dirty));
++	BUG_ON(!bch2_journal_error(&c->journal) &&
++	       atomic_read(&c->btree_cache.dirty));
+ 
+ 	list_splice(&bc->freed_pcpu, &bc->freed_nonpcpu);
+ 
+diff --git a/fs/bcachefs/btree_io.c b/fs/bcachefs/btree_io.c
+index 57c20390e..5a720f0cd 100644
+--- a/fs/bcachefs/btree_io.c
++++ b/fs/bcachefs/btree_io.c
+@@ -1704,8 +1704,8 @@ int bch2_btree_root_read(struct bch_fs *c, enum btree_id id,
+ 	return bch2_trans_run(c, __bch2_btree_root_read(trans, id, k, level));
+ }
+ 
+-void bch2_btree_complete_write(struct bch_fs *c, struct btree *b,
+-			      struct btree_write *w)
++static void bch2_btree_complete_write(struct bch_fs *c, struct btree *b,
++				      struct btree_write *w)
+ {
+ 	unsigned long old, new, v = READ_ONCE(b->will_make_reachable);
+ 
+diff --git a/fs/bcachefs/btree_io.h b/fs/bcachefs/btree_io.h
+index 7e03dd76f..e0d7fa5b1 100644
+--- a/fs/bcachefs/btree_io.h
++++ b/fs/bcachefs/btree_io.h
+@@ -134,9 +134,6 @@ void bch2_btree_node_read(struct bch_fs *, struct btree *, bool);
+ int bch2_btree_root_read(struct bch_fs *, enum btree_id,
+ 			 const struct bkey_i *, unsigned);
+ 
+-void bch2_btree_complete_write(struct bch_fs *, struct btree *,
+-			      struct btree_write *);
+-
+ bool bch2_btree_post_write_cleanup(struct bch_fs *, struct btree *);
+ 
+ enum btree_write_flags {
+diff --git a/fs/bcachefs/btree_key_cache.c b/fs/bcachefs/btree_key_cache.c
+index 37fbf22de..1b7a5668d 100644
+--- a/fs/bcachefs/btree_key_cache.c
++++ b/fs/bcachefs/btree_key_cache.c
+@@ -992,8 +992,6 @@ void bch2_fs_btree_key_cache_exit(struct btree_key_cache *bc)
+ 	list_for_each_entry_safe(ck, n, &items, list) {
+ 		cond_resched();
+ 
+-		bch2_journal_pin_drop(&c->journal, &ck->journal);
+-
+ 		list_del(&ck->list);
+ 		kfree(ck->k);
+ 		six_lock_exit(&ck->c.lock);
+diff --git a/fs/bcachefs/btree_update.c b/fs/bcachefs/btree_update.c
+index 324767c0d..25fdca00b 100644
+--- a/fs/bcachefs/btree_update.c
++++ b/fs/bcachefs/btree_update.c
+@@ -554,6 +554,19 @@ int __must_check bch2_trans_update_seq(struct btree_trans *trans, u64 seq,
+ 						 BTREE_UPDATE_PREJOURNAL);
+ }
+ 
++static noinline int bch2_btree_insert_clone_trans(struct btree_trans *trans,
++						  enum btree_id btree,
++						  struct bkey_i *k)
++{
++	struct bkey_i *n = bch2_trans_kmalloc(trans, bkey_bytes(&k->k));
++	int ret = PTR_ERR_OR_ZERO(n);
++	if (ret)
++		return ret;
++
++	bkey_copy(n, k);
++	return bch2_btree_insert_trans(trans, btree, n, 0);
++}
++
+ int __must_check bch2_trans_update_buffered(struct btree_trans *trans,
+ 					    enum btree_id btree,
+ 					    struct bkey_i *k)
+@@ -564,6 +577,9 @@ int __must_check bch2_trans_update_buffered(struct btree_trans *trans,
+ 	EBUG_ON(trans->nr_wb_updates > trans->wb_updates_size);
+ 	EBUG_ON(k->k.u64s > BTREE_WRITE_BUFERED_U64s_MAX);
+ 
++	if (unlikely(trans->journal_replay_not_finished))
++		return bch2_btree_insert_clone_trans(trans, btree, k);
++
+ 	trans_for_each_wb_update(trans, i) {
+ 		if (i->btree == btree && bpos_eq(i->k.k.p, k->k.p)) {
+ 			bkey_copy(&i->k, k);
+diff --git a/fs/bcachefs/btree_update_interior.c b/fs/bcachefs/btree_update_interior.c
+index 669741727..26be38ab6 100644
+--- a/fs/bcachefs/btree_update_interior.c
++++ b/fs/bcachefs/btree_update_interior.c
+@@ -1056,6 +1056,17 @@ bch2_btree_update_start(struct btree_trans *trans, struct btree_path *path,
+ 	flags &= ~BCH_WATERMARK_MASK;
+ 	flags |= watermark;
+ 
++	if (!(flags & BTREE_INSERT_JOURNAL_RECLAIM) &&
++	    watermark < c->journal.watermark) {
++		struct journal_res res = { 0 };
++
++		ret = drop_locks_do(trans,
++			bch2_journal_res_get(&c->journal, &res, 1,
++					     watermark|JOURNAL_RES_GET_CHECK));
++		if (ret)
++			return ERR_PTR(ret);
++	}
++
+ 	while (1) {
+ 		nr_nodes[!!update_level] += 1 + split;
+ 		update_level++;
+diff --git a/fs/bcachefs/data_update.c b/fs/bcachefs/data_update.c
+index 71aa5e597..b05457d28 100644
+--- a/fs/bcachefs/data_update.c
++++ b/fs/bcachefs/data_update.c
+@@ -471,7 +471,7 @@ int bch2_extent_drop_ptrs(struct btree_trans *trans,
+ 	 * we aren't using the extent overwrite path to delete, we're
+ 	 * just using the normal key deletion path:
+ 	 */
+-	if (bkey_deleted(&n->k))
++	if (bkey_deleted(&n->k) && !(iter->flags & BTREE_ITER_IS_EXTENTS))
+ 		n->k.size = 0;
+ 
+ 	return bch2_trans_relock(trans) ?:
+@@ -560,7 +560,8 @@ int bch2_data_update_init(struct btree_trans *trans,
+ 				move_ctxt_wait_event(ctxt,
+ 						(locked = bch2_bucket_nocow_trylock(&c->nocow_locks,
+ 									  PTR_BUCKET_POS(c, &p.ptr), 0)) ||
+-						!atomic_read(&ctxt->read_sectors));
++						(!atomic_read(&ctxt->read_sectors) &&
++						 !atomic_read(&ctxt->write_sectors)));
+ 
+ 				if (!locked)
+ 					bch2_bucket_nocow_lock(&c->nocow_locks,
+@@ -591,7 +592,7 @@ int bch2_data_update_init(struct btree_trans *trans,
+ 		m->data_opts.rewrite_ptrs = 0;
+ 		/* if iter == NULL, it's just a promote */
+ 		if (iter)
+-			ret = bch2_extent_drop_ptrs(trans, iter, k, data_opts);
++			ret = bch2_extent_drop_ptrs(trans, iter, k, m->data_opts);
+ 		goto done;
+ 	}
+ 
+diff --git a/fs/bcachefs/dirent.c b/fs/bcachefs/dirent.c
+index 1a0f2d571..2bfff0da7 100644
+--- a/fs/bcachefs/dirent.c
++++ b/fs/bcachefs/dirent.c
+@@ -485,20 +485,15 @@ u64 bch2_dirent_lookup(struct bch_fs *c, subvol_inum dir,
+ 	return ret;
+ }
+ 
+-int bch2_empty_dir_trans(struct btree_trans *trans, subvol_inum dir)
++int bch2_empty_dir_snapshot(struct btree_trans *trans, u64 dir, u32 snapshot)
+ {
+ 	struct btree_iter iter;
+ 	struct bkey_s_c k;
+-	u32 snapshot;
+ 	int ret;
+ 
+-	ret = bch2_subvolume_get_snapshot(trans, dir.subvol, &snapshot);
+-	if (ret)
+-		return ret;
+-
+ 	for_each_btree_key_upto_norestart(trans, iter, BTREE_ID_dirents,
+-			   SPOS(dir.inum, 0, snapshot),
+-			   POS(dir.inum, U64_MAX), 0, k, ret)
++			   SPOS(dir, 0, snapshot),
++			   POS(dir, U64_MAX), 0, k, ret)
+ 		if (k.k->type == KEY_TYPE_dirent) {
+ 			ret = -ENOTEMPTY;
+ 			break;
+@@ -508,6 +503,14 @@ int bch2_empty_dir_trans(struct btree_trans *trans, subvol_inum dir)
+ 	return ret;
+ }
+ 
++int bch2_empty_dir_trans(struct btree_trans *trans, subvol_inum dir)
++{
++	u32 snapshot;
++
++	return bch2_subvolume_get_snapshot(trans, dir.subvol, &snapshot) ?:
++		bch2_empty_dir_snapshot(trans, dir.inum, snapshot);
++}
++
+ int bch2_readdir(struct bch_fs *c, subvol_inum inum, struct dir_context *ctx)
+ {
+ 	struct btree_trans *trans = bch2_trans_get(c);
+diff --git a/fs/bcachefs/dirent.h b/fs/bcachefs/dirent.h
+index cd262bf4d..1e3431990 100644
+--- a/fs/bcachefs/dirent.h
++++ b/fs/bcachefs/dirent.h
+@@ -64,6 +64,7 @@ u64 bch2_dirent_lookup(struct bch_fs *, subvol_inum,
+ 		       const struct bch_hash_info *,
+ 		       const struct qstr *, subvol_inum *);
+ 
++int bch2_empty_dir_snapshot(struct btree_trans *, u64, u32);
+ int bch2_empty_dir_trans(struct btree_trans *, subvol_inum);
+ int bch2_readdir(struct bch_fs *, subvol_inum, struct dir_context *);
+ 
+diff --git a/fs/bcachefs/extents.c b/fs/bcachefs/extents.c
+index f6c92df55..9d8afcb59 100644
+--- a/fs/bcachefs/extents.c
++++ b/fs/bcachefs/extents.c
+@@ -1294,7 +1294,8 @@ unsigned bch2_bkey_ptrs_need_rebalance(struct bch_fs *c, struct bkey_s_c k,
+ 		unsigned i = 0;
+ 
+ 		bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+-			if (p.crc.compression_type == BCH_COMPRESSION_TYPE_incompressible) {
++			if (p.crc.compression_type == BCH_COMPRESSION_TYPE_incompressible ||
++			    p.ptr.unwritten) {
+ 				rewrite_ptrs = 0;
+ 				goto incompressible;
+ 			}
+diff --git a/fs/bcachefs/fs-ioctl.c b/fs/bcachefs/fs-ioctl.c
+index 5a39bcb59..a70b7a030 100644
+--- a/fs/bcachefs/fs-ioctl.c
++++ b/fs/bcachefs/fs-ioctl.c
+@@ -413,7 +413,7 @@ static long __bch2_ioctl_subvolume_create(struct bch_fs *c, struct file *filp,
+ 
+ 	if ((arg.flags & BCH_SUBVOL_SNAPSHOT_CREATE) &&
+ 	    !arg.src_ptr)
+-		snapshot_src.subvol = to_bch_ei(dir)->ei_inode.bi_subvol;
++		snapshot_src.subvol = inode_inum(to_bch_ei(dir)).subvol;
+ 
+ 	inode = __bch2_create(file_mnt_idmap(filp), to_bch_ei(dir),
+ 			      dst_dentry, arg.mode|S_IFDIR,
+diff --git a/fs/bcachefs/fs.c b/fs/bcachefs/fs.c
+index 4d51be813..ba93e32d7 100644
+--- a/fs/bcachefs/fs.c
++++ b/fs/bcachefs/fs.c
+@@ -1143,24 +1143,33 @@ static int bch2_encode_fh(struct inode *vinode, u32 *fh, int *len,
+ {
+ 	struct bch_inode_info *inode	= to_bch_ei(vinode);
+ 	struct bch_inode_info *dir	= to_bch_ei(vdir);
+-
+-	if (*len < sizeof(struct bcachefs_fid_with_parent) / sizeof(u32))
+-		return FILEID_INVALID;
++	int min_len;
+ 
+ 	if (!S_ISDIR(inode->v.i_mode) && dir) {
+ 		struct bcachefs_fid_with_parent *fid = (void *) fh;
+ 
++		min_len = sizeof(*fid) / sizeof(u32);
++		if (*len < min_len) {
++			*len = min_len;
++			return FILEID_INVALID;
++		}
++
+ 		fid->fid = bch2_inode_to_fid(inode);
+ 		fid->dir = bch2_inode_to_fid(dir);
+ 
+-		*len = sizeof(*fid) / sizeof(u32);
++		*len = min_len;
+ 		return FILEID_BCACHEFS_WITH_PARENT;
+ 	} else {
+ 		struct bcachefs_fid *fid = (void *) fh;
+ 
++		min_len = sizeof(*fid) / sizeof(u32);
++		if (*len < min_len) {
++			*len = min_len;
++			return FILEID_INVALID;
++		}
+ 		*fid = bch2_inode_to_fid(inode);
+ 
+-		*len = sizeof(*fid) / sizeof(u32);
++		*len = min_len;
+ 		return FILEID_BCACHEFS_WITHOUT_PARENT;
+ 	}
+ }
+@@ -1733,6 +1742,9 @@ static int bch2_unfreeze(struct super_block *sb)
+ 	struct bch_fs *c = sb->s_fs_info;
+ 	int ret;
+ 
++	if (test_bit(BCH_FS_EMERGENCY_RO, &c->flags))
++		return 0;
++
+ 	down_write(&c->state_lock);
+ 	ret = bch2_fs_read_write(c);
+ 	up_write(&c->state_lock);
+diff --git a/fs/bcachefs/inode.c b/fs/bcachefs/inode.c
+index c7849b075..9309cfeec 100644
+--- a/fs/bcachefs/inode.c
++++ b/fs/bcachefs/inode.c
+@@ -7,6 +7,7 @@
+ #include "btree_update.h"
+ #include "buckets.h"
+ #include "compress.h"
++#include "dirent.h"
+ #include "error.h"
+ #include "extents.h"
+ #include "extent_update.h"
+@@ -1093,11 +1094,15 @@ static int may_delete_deleted_inode(struct btree_trans *trans,
+ 	if (ret)
+ 		goto out;
+ 
+-	if (fsck_err_on(S_ISDIR(inode.bi_mode), c,
+-			deleted_inode_is_dir,
+-			"directory %llu:%u in deleted_inodes btree",
+-			pos.offset, pos.snapshot))
+-		goto delete;
++	if (S_ISDIR(inode.bi_mode)) {
++		ret = bch2_empty_dir_snapshot(trans, pos.offset, pos.snapshot);
++		if (fsck_err_on(ret == -ENOTEMPTY, c, deleted_inode_is_dir,
++				"non empty directory %llu:%u in deleted_inodes btree",
++				pos.offset, pos.snapshot))
++			goto delete;
++		if (ret)
++			goto out;
++	}
+ 
+ 	if (fsck_err_on(!(inode.bi_flags & BCH_INODE_unlinked), c,
+ 			deleted_inode_not_unlinked,
+diff --git a/fs/bcachefs/journal.c b/fs/bcachefs/journal.c
+index 489b34046..8cf238be6 100644
+--- a/fs/bcachefs/journal.c
++++ b/fs/bcachefs/journal.c
+@@ -249,7 +249,7 @@ static bool journal_entry_want_write(struct journal *j)
+ 	return ret;
+ }
+ 
+-static bool journal_entry_close(struct journal *j)
++bool bch2_journal_entry_close(struct journal *j)
+ {
+ 	bool ret;
+ 
+@@ -383,7 +383,7 @@ static bool journal_quiesced(struct journal *j)
+ 	bool ret = atomic64_read(&j->seq) == j->seq_ondisk;
+ 
+ 	if (!ret)
+-		journal_entry_close(j);
++		bch2_journal_entry_close(j);
+ 	return ret;
+ }
+ 
+@@ -436,7 +436,7 @@ static int __journal_res_get(struct journal *j, struct journal_res *res,
+ 
+ 	/*
+ 	 * Recheck after taking the lock, so we don't race with another thread
+-	 * that just did journal_entry_open() and call journal_entry_close()
++	 * that just did journal_entry_open() and call bch2_journal_entry_close()
+ 	 * unnecessarily
+ 	 */
+ 	if (journal_res_get_fast(j, res, flags)) {
+@@ -1041,7 +1041,7 @@ void bch2_fs_journal_stop(struct journal *j)
+ 	bch2_journal_reclaim_stop(j);
+ 	bch2_journal_flush_all_pins(j);
+ 
+-	wait_event(j->wait, journal_entry_close(j));
++	wait_event(j->wait, bch2_journal_entry_close(j));
+ 
+ 	/*
+ 	 * Always write a new journal entry, to make sure the clock hands are up
+diff --git a/fs/bcachefs/journal.h b/fs/bcachefs/journal.h
+index 4c513fca5..2f768e11a 100644
+--- a/fs/bcachefs/journal.h
++++ b/fs/bcachefs/journal.h
+@@ -266,6 +266,7 @@ static inline union journal_res_state journal_state_buf_put(struct journal *j, u
+ 	return s;
+ }
+ 
++bool bch2_journal_entry_close(struct journal *);
+ void bch2_journal_buf_put_final(struct journal *, u64, bool);
+ 
+ static inline void __bch2_journal_buf_put(struct journal *j, unsigned idx, u64 seq)
+diff --git a/fs/bcachefs/journal_io.c b/fs/bcachefs/journal_io.c
+index 0f17fc5f8..5de1b68fb 100644
+--- a/fs/bcachefs/journal_io.c
++++ b/fs/bcachefs/journal_io.c
+@@ -1599,6 +1599,7 @@ static CLOSURE_CALLBACK(journal_write_done)
+ 	} while ((v = atomic64_cmpxchg(&j->reservations.counter,
+ 				       old.v, new.v)) != old.v);
+ 
++	bch2_journal_reclaim_fast(j);
+ 	bch2_journal_space_available(j);
+ 
+ 	closure_wake_up(&w->wait);
+diff --git a/fs/bcachefs/journal_reclaim.c b/fs/bcachefs/journal_reclaim.c
+index e63c6eda8..ec712104a 100644
+--- a/fs/bcachefs/journal_reclaim.c
++++ b/fs/bcachefs/journal_reclaim.c
+@@ -776,6 +776,9 @@ static int journal_flush_done(struct journal *j, u64 seq_to_flush,
+ 			       (1U << JOURNAL_PIN_btree), 0, 0, 0))
+ 		*did_work = true;
+ 
++	if (seq_to_flush > journal_cur_seq(j))
++		bch2_journal_entry_close(j);
++
+ 	spin_lock(&j->lock);
+ 	/*
+ 	 * If journal replay hasn't completed, the unreplayed journal entries
+diff --git a/fs/bcachefs/recovery.c b/fs/bcachefs/recovery.c
+index 770ced1c6..c7d9074c8 100644
+--- a/fs/bcachefs/recovery.c
++++ b/fs/bcachefs/recovery.c
+@@ -144,7 +144,7 @@ static int bch2_journal_replay(struct bch_fs *c)
+ 	u64 start_seq	= c->journal_replay_seq_start;
+ 	u64 end_seq	= c->journal_replay_seq_start;
+ 	size_t i;
+-	int ret;
++	int ret = 0;
+ 
+ 	move_gap(keys->d, keys->nr, keys->size, keys->gap, keys->nr);
+ 	keys->gap = keys->nr;
+diff --git a/fs/bcachefs/reflink.c b/fs/bcachefs/reflink.c
+index 6e1bfe9fe..37d16e04e 100644
+--- a/fs/bcachefs/reflink.c
++++ b/fs/bcachefs/reflink.c
+@@ -121,6 +121,14 @@ int bch2_trans_mark_reflink_v(struct btree_trans *trans,
+ {
+ 	check_indirect_extent_deleting(new, &flags);
+ 
++	if (old.k->type == KEY_TYPE_reflink_v &&
++	    new->k.type == KEY_TYPE_reflink_v &&
++	    old.k->u64s == new->k.u64s &&
++	    !memcmp(bkey_s_c_to_reflink_v(old).v->start,
++		    bkey_i_to_reflink_v(new)->v.start,
++		    bkey_val_bytes(&new->k) - 8))
++		return 0;
++
+ 	return bch2_trans_mark_extent(trans, btree_id, level, old, new, flags);
+ }
+ 
+diff --git a/fs/bcachefs/sysfs.c b/fs/bcachefs/sysfs.c
+index ab743115f..f3cb7115b 100644
+--- a/fs/bcachefs/sysfs.c
++++ b/fs/bcachefs/sysfs.c
+@@ -276,8 +276,8 @@ static int bch2_compression_stats_to_text(struct printbuf *out, struct bch_fs *c
+ 		if (!btree_type_has_ptrs(id))
+ 			continue;
+ 
+-		for_each_btree_key(trans, iter, id, POS_MIN,
+-				   BTREE_ITER_ALL_SNAPSHOTS, k, ret) {
++		ret = for_each_btree_key2(trans, iter, id, POS_MIN,
++					  BTREE_ITER_ALL_SNAPSHOTS, k, ({
+ 			struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
+ 			const union bch_extent_entry *entry;
+ 			struct extent_ptr_decoded p;
+@@ -309,8 +309,8 @@ static int bch2_compression_stats_to_text(struct printbuf *out, struct bch_fs *c
+ 				nr_uncompressed_extents++;
+ 			else if (compressed)
+ 				nr_compressed_extents++;
+-		}
+-		bch2_trans_iter_exit(trans, &iter);
++			0;
++		}));
+ 	}
+ 
+ 	bch2_trans_put(trans);
+-- 
+2.43.0.rc2
+
