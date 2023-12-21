@@ -1,0 +1,134 @@
+From 91c7c9c2dd41cdb537ae0ff7a841907363f47ed0 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Thu, 28 Sep 2023 11:12:50 +0100
+Subject: [PATCH 136/152] btrfs: stop reserving excessive space for block group
+ item insertions
+
+Space for block group item insertions, necessary after allocating a new
+block group, is reserved in the delayed refs block reserve. Currently we
+do this by incrementing the transaction handle's delayed_ref_updates
+counter and then calling btrfs_update_delayed_refs_rsv(), which will
+increase the size of the delayed refs block reserve by an amount that
+corresponds to the same amount we use for delayed refs, given by
+btrfs_calc_delayed_ref_bytes().
+
+That is an excessive amount because it corresponds to the amount of space
+needed to insert one item in a btree (btrfs_calc_insert_metadata_size())
+times 2 when the free space tree feature is enabled. All we need is an
+amount as given by btrfs_calc_insert_metadata_size(), since we only need to
+insert a block group item in the extent tree (or block group tree if this
+feature is enabled). By using btrfs_calc_insert_metadata_size() we will
+need to reserve 2 times less space when using the free space tree, putting
+less pressure on space reservation.
+
+So use helpers to reserve and release space for block group item
+insertions that use btrfs_calc_insert_metadata_size() for calculation of
+the space.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/block-group.c |  5 ++---
+ fs/btrfs/delayed-ref.c | 35 +++++++++++++++++++++++++++++++++++
+ fs/btrfs/delayed-ref.h |  2 ++
+ fs/btrfs/transaction.c |  2 +-
+ 4 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 9d17b0580..6e5dc68ff 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -2709,7 +2709,7 @@ void btrfs_create_pending_block_groups(struct btrfs_trans_handle *trans)
+ 
+ 		/* Already aborted the transaction if it failed. */
+ next:
+-		btrfs_delayed_refs_rsv_release(fs_info, 1, 0);
++		btrfs_dec_delayed_refs_rsv_bg_inserts(fs_info);
+ 		list_del_init(&block_group->bg_list);
+ 		clear_bit(BLOCK_GROUP_FLAG_NEW, &block_group->runtime_flags);
+ 	}
+@@ -2819,8 +2819,7 @@ struct btrfs_block_group *btrfs_make_block_group(struct btrfs_trans_handle *tran
+ #endif
+ 
+ 	list_add_tail(&cache->bg_list, &trans->new_bgs);
+-	trans->delayed_ref_updates++;
+-	btrfs_update_delayed_refs_rsv(trans);
++	btrfs_inc_delayed_refs_rsv_bg_inserts(fs_info);
+ 
+ 	set_avail_alloc_bits(fs_info, type);
+ 	return cache;
+diff --git a/fs/btrfs/delayed-ref.c b/fs/btrfs/delayed-ref.c
+index de8434795..9223934d9 100644
+--- a/fs/btrfs/delayed-ref.c
++++ b/fs/btrfs/delayed-ref.c
+@@ -125,6 +125,41 @@ void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans)
+ 	trans->delayed_ref_csum_deletions = 0;
+ }
+ 
++/*
++ * Adjust the size of the delayed refs block reserve for 1 block group item
++ * insertion, used after allocating a block group.
++ */
++void btrfs_inc_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info)
++{
++	struct btrfs_block_rsv *delayed_rsv = &fs_info->delayed_refs_rsv;
++
++	spin_lock(&delayed_rsv->lock);
++	/*
++	 * Inserting a block group item does not require changing the free space
++	 * tree, only the extent tree or the block group tree, so this is all we
++	 * need.
++	 */
++	delayed_rsv->size += btrfs_calc_insert_metadata_size(fs_info, 1);
++	delayed_rsv->full = false;
++	spin_unlock(&delayed_rsv->lock);
++}
++
++/*
++ * Adjust the size of the delayed refs block reserve to release space for 1
++ * block group item insertion.
++ */
++void btrfs_dec_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info)
++{
++	struct btrfs_block_rsv *delayed_rsv = &fs_info->delayed_refs_rsv;
++	const u64 num_bytes = btrfs_calc_insert_metadata_size(fs_info, 1);
++	u64 released;
++
++	released = btrfs_block_rsv_release(fs_info, delayed_rsv, num_bytes, NULL);
++	if (released > 0)
++		trace_btrfs_space_reservation(fs_info, "delayed_refs_rsv",
++					      0, released, 0);
++}
++
+ /*
+  * Adjust the size of the delayed refs block reserve for 1 block group item
+  * update.
+diff --git a/fs/btrfs/delayed-ref.h b/fs/btrfs/delayed-ref.h
+index 250e8742a..62d679d40 100644
+--- a/fs/btrfs/delayed-ref.h
++++ b/fs/btrfs/delayed-ref.h
+@@ -436,6 +436,8 @@ int btrfs_check_delayed_seq(struct btrfs_fs_info *fs_info, u64 seq);
+ 
+ void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info, int nr_refs, int nr_csums);
+ void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans);
++void btrfs_inc_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info);
++void btrfs_dec_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info);
+ void btrfs_inc_delayed_refs_rsv_bg_updates(struct btrfs_fs_info *fs_info);
+ void btrfs_dec_delayed_refs_rsv_bg_updates(struct btrfs_fs_info *fs_info);
+ int btrfs_delayed_refs_rsv_refill(struct btrfs_fs_info *fs_info,
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 301769f03..352d7f12d 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -2133,7 +2133,7 @@ static void btrfs_cleanup_pending_block_groups(struct btrfs_trans_handle *trans)
+        struct btrfs_block_group *block_group, *tmp;
+ 
+        list_for_each_entry_safe(block_group, tmp, &trans->new_bgs, bg_list) {
+-               btrfs_delayed_refs_rsv_release(fs_info, 1, 0);
++               btrfs_dec_delayed_refs_rsv_bg_inserts(fs_info);
+                list_del_init(&block_group->bg_list);
+        }
+ }
+-- 
+2.43.0.rc2
+
