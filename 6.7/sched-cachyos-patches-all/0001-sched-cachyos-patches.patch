@@ -1,0 +1,1628 @@
+From 158c858f08a680cfdd0b4adcea76caecc9056bd8 Mon Sep 17 00:00:00 2001
+From: Abel Wu <wuyun.abel@bytedance.com>
+Date: Wed, 15 Nov 2023 11:36:45 +0800
+Subject: [PATCH 01/10] sched/eevdf: Sort the rbtree by virtual deadline
+
+Sort the task timeline by virtual deadline and keep the min_vruntime
+in the augmented tree, so we can avoid doubling the worst case cost
+and make full use of the cached leftmost node to enable O(1) fastpath
+picking in next patch.
+
+Signed-off-by: Abel Wu <wuyun.abel@bytedance.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20231115033647.80785-3-wuyun.abel@bytedance.com
+---
+ include/linux/sched.h |   2 +-
+ kernel/sched/debug.c  |  11 ++-
+ kernel/sched/fair.c   | 168 +++++++++++++++++-------------------------
+ kernel/sched/sched.h  |   1 +
+ 4 files changed, 77 insertions(+), 105 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 292c31697..cd56d4018 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -553,7 +553,7 @@ struct sched_entity {
+ 	struct load_weight		load;
+ 	struct rb_node			run_node;
+ 	u64				deadline;
+-	u64				min_deadline;
++	u64				min_vruntime;
+ 
+ 	struct list_head		group_node;
+ 	unsigned int			on_rq;
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 4580a4507..168eecc20 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -628,8 +628,8 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
+ 
+ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
+ {
+-	s64 left_vruntime = -1, min_vruntime, right_vruntime = -1, spread;
+-	struct sched_entity *last, *first;
++	s64 left_vruntime = -1, min_vruntime, right_vruntime = -1, left_deadline = -1, spread;
++	struct sched_entity *last, *first, *root;
+ 	struct rq *rq = cpu_rq(cpu);
+ 	unsigned long flags;
+ 
+@@ -644,15 +644,20 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
+ 			SPLIT_NS(cfs_rq->exec_clock));
+ 
+ 	raw_spin_rq_lock_irqsave(rq, flags);
++	root = __pick_root_entity(cfs_rq);
++	if (root)
++		left_vruntime = root->min_vruntime;
+ 	first = __pick_first_entity(cfs_rq);
+ 	if (first)
+-		left_vruntime = first->vruntime;
++		left_deadline = first->deadline;
+ 	last = __pick_last_entity(cfs_rq);
+ 	if (last)
+ 		right_vruntime = last->vruntime;
+ 	min_vruntime = cfs_rq->min_vruntime;
+ 	raw_spin_rq_unlock_irqrestore(rq, flags);
+ 
++	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_deadline",
++			SPLIT_NS(left_deadline));
+ 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_vruntime",
+ 			SPLIT_NS(left_vruntime));
+ 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "min_vruntime",
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d7a3c63a2..2621f5ad6 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -551,7 +551,11 @@ static inline u64 min_vruntime(u64 min_vruntime, u64 vruntime)
+ static inline bool entity_before(const struct sched_entity *a,
+ 				 const struct sched_entity *b)
+ {
+-	return (s64)(a->vruntime - b->vruntime) < 0;
++	/*
++	 * Tiebreak on vruntime seems unnecessary since it can
++	 * hardly happen.
++	 */
++	return (s64)(a->deadline - b->deadline) < 0;
+ }
+ 
+ static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
+@@ -720,7 +724,7 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+  * Note: using 'avg_vruntime() > se->vruntime' is inacurate due
+  *       to the loss in precision caused by the division.
+  */
+-int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
++static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
+ {
+ 	struct sched_entity *curr = cfs_rq->curr;
+ 	s64 avg = cfs_rq->avg_vruntime;
+@@ -733,7 +737,12 @@ int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 		load += weight;
+ 	}
+ 
+-	return avg >= entity_key(cfs_rq, se) * load;
++	return avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load;
++}
++
++int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	return vruntime_eligible(cfs_rq, se->vruntime);
+ }
+ 
+ static u64 __update_min_vruntime(struct cfs_rq *cfs_rq, u64 vruntime)
+@@ -752,9 +761,8 @@ static u64 __update_min_vruntime(struct cfs_rq *cfs_rq, u64 vruntime)
+ 
+ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ {
+-	struct sched_entity *se = __pick_first_entity(cfs_rq);
++	struct sched_entity *se = __pick_root_entity(cfs_rq);
+ 	struct sched_entity *curr = cfs_rq->curr;
+-
+ 	u64 vruntime = cfs_rq->min_vruntime;
+ 
+ 	if (curr) {
+@@ -766,9 +774,9 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ 
+ 	if (se) {
+ 		if (!curr)
+-			vruntime = se->vruntime;
++			vruntime = se->min_vruntime;
+ 		else
+-			vruntime = min_vruntime(vruntime, se->vruntime);
++			vruntime = min_vruntime(vruntime, se->min_vruntime);
+ 	}
+ 
+ 	/* ensure we never gain time by being placed backwards. */
+@@ -781,34 +789,34 @@ static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
+ 	return entity_before(__node_2_se(a), __node_2_se(b));
+ }
+ 
+-#define deadline_gt(field, lse, rse) ({ (s64)((lse)->field - (rse)->field) > 0; })
++#define vruntime_gt(field, lse, rse) ({ (s64)((lse)->field - (rse)->field) > 0; })
+ 
+-static inline void __update_min_deadline(struct sched_entity *se, struct rb_node *node)
++static inline void __min_vruntime_update(struct sched_entity *se, struct rb_node *node)
+ {
+ 	if (node) {
+ 		struct sched_entity *rse = __node_2_se(node);
+-		if (deadline_gt(min_deadline, se, rse))
+-			se->min_deadline = rse->min_deadline;
++		if (vruntime_gt(min_vruntime, se, rse))
++			se->min_vruntime = rse->min_vruntime;
+ 	}
+ }
+ 
+ /*
+- * se->min_deadline = min(se->deadline, left->min_deadline, right->min_deadline)
++ * se->min_vruntime = min(se->vruntime, {left,right}->min_vruntime)
+  */
+-static inline bool min_deadline_update(struct sched_entity *se, bool exit)
++static inline bool min_vruntime_update(struct sched_entity *se, bool exit)
+ {
+-	u64 old_min_deadline = se->min_deadline;
++	u64 old_min_vruntime = se->min_vruntime;
+ 	struct rb_node *node = &se->run_node;
+ 
+-	se->min_deadline = se->deadline;
+-	__update_min_deadline(se, node->rb_right);
+-	__update_min_deadline(se, node->rb_left);
++	se->min_vruntime = se->vruntime;
++	__min_vruntime_update(se, node->rb_right);
++	__min_vruntime_update(se, node->rb_left);
+ 
+-	return se->min_deadline == old_min_deadline;
++	return se->min_vruntime == old_min_vruntime;
+ }
+ 
+-RB_DECLARE_CALLBACKS(static, min_deadline_cb, struct sched_entity,
+-		     run_node, min_deadline, min_deadline_update);
++RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
++		     run_node, min_vruntime, min_vruntime_update);
+ 
+ /*
+  * Enqueue an entity into the rb-tree:
+@@ -816,18 +824,28 @@ RB_DECLARE_CALLBACKS(static, min_deadline_cb, struct sched_entity,
+ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+ 	avg_vruntime_add(cfs_rq, se);
+-	se->min_deadline = se->deadline;
++	se->min_vruntime = se->vruntime;
+ 	rb_add_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
+-				__entity_less, &min_deadline_cb);
++				__entity_less, &min_vruntime_cb);
+ }
+ 
+ static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+ 	rb_erase_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
+-				  &min_deadline_cb);
++				  &min_vruntime_cb);
+ 	avg_vruntime_sub(cfs_rq, se);
+ }
+ 
++struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq)
++{
++	struct rb_node *root = cfs_rq->tasks_timeline.rb_root.rb_node;
++
++	if (!root)
++		return NULL;
++
++	return __node_2_se(root);
++}
++
+ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
+ {
+ 	struct rb_node *left = rb_first_cached(&cfs_rq->tasks_timeline);
+@@ -850,23 +868,28 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
+  *     with the earliest virtual deadline.
+  *
+  * We can do this in O(log n) time due to an augmented RB-tree. The
+- * tree keeps the entries sorted on service, but also functions as a
+- * heap based on the deadline by keeping:
++ * tree keeps the entries sorted on deadline, but also functions as a
++ * heap based on the vruntime by keeping:
+  *
+- *  se->min_deadline = min(se->deadline, se->{left,right}->min_deadline)
++ *  se->min_vruntime = min(se->vruntime, se->{left,right}->min_vruntime)
+  *
+- * Which allows an EDF like search on (sub)trees.
++ * Which allows tree pruning through eligibility.
+  */
+-static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq)
++static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ {
+ 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
+ 	struct sched_entity *curr = cfs_rq->curr;
+ 	struct sched_entity *best = NULL;
+-	struct sched_entity *best_left = NULL;
++
++	/*
++	 * We can safely skip eligibility check if there is only one entity
++	 * in this cfs_rq, saving some cycles.
++	 */
++	if (cfs_rq->nr_running == 1)
++		return curr && curr->on_rq ? curr : __node_2_se(node);
+ 
+ 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
+ 		curr = NULL;
+-	best = curr;
+ 
+ 	/*
+ 	 * Once selected, run a task until it either becomes non-eligible or
+@@ -875,95 +898,38 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq)
+ 	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
+ 		return curr;
+ 
++	/* Heap search for the EEVD entity */
+ 	while (node) {
+ 		struct sched_entity *se = __node_2_se(node);
++		struct rb_node *left = node->rb_left;
+ 
+ 		/*
+-		 * If this entity is not eligible, try the left subtree.
++		 * Eligible entities in left subtree are always better
++		 * choices, since they have earlier deadlines.
+ 		 */
+-		if (!entity_eligible(cfs_rq, se)) {
+-			node = node->rb_left;
++		if (left && vruntime_eligible(cfs_rq,
++					__node_2_se(left)->min_vruntime)) {
++			node = left;
+ 			continue;
+ 		}
+ 
+ 		/*
+-		 * Now we heap search eligible trees for the best (min_)deadline
++		 * The left subtree either is empty or has no eligible
++		 * entity, so check the current node since it is the one
++		 * with earliest deadline that might be eligible.
+ 		 */
+-		if (!best || deadline_gt(deadline, best, se))
++		if (entity_eligible(cfs_rq, se)) {
+ 			best = se;
+-
+-		/*
+-		 * Every se in a left branch is eligible, keep track of the
+-		 * branch with the best min_deadline
+-		 */
+-		if (node->rb_left) {
+-			struct sched_entity *left = __node_2_se(node->rb_left);
+-
+-			if (!best_left || deadline_gt(min_deadline, best_left, left))
+-				best_left = left;
+-
+-			/*
+-			 * min_deadline is in the left branch. rb_left and all
+-			 * descendants are eligible, so immediately switch to the second
+-			 * loop.
+-			 */
+-			if (left->min_deadline == se->min_deadline)
+-				break;
+-		}
+-
+-		/* min_deadline is at this node, no need to look right */
+-		if (se->deadline == se->min_deadline)
+ 			break;
+-
+-		/* else min_deadline is in the right branch. */
+-		node = node->rb_right;
+-	}
+-
+-	/*
+-	 * We ran into an eligible node which is itself the best.
+-	 * (Or nr_running == 0 and both are NULL)
+-	 */
+-	if (!best_left || (s64)(best_left->min_deadline - best->deadline) > 0)
+-		return best;
+-
+-	/*
+-	 * Now best_left and all of its children are eligible, and we are just
+-	 * looking for deadline == min_deadline
+-	 */
+-	node = &best_left->run_node;
+-	while (node) {
+-		struct sched_entity *se = __node_2_se(node);
+-
+-		/* min_deadline is the current node */
+-		if (se->deadline == se->min_deadline)
+-			return se;
+-
+-		/* min_deadline is in the left branch */
+-		if (node->rb_left &&
+-		    __node_2_se(node->rb_left)->min_deadline == se->min_deadline) {
+-			node = node->rb_left;
+-			continue;
+ 		}
+ 
+-		/* else min_deadline is in the right branch */
+ 		node = node->rb_right;
+ 	}
+-	return NULL;
+-}
+ 
+-static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+-{
+-	struct sched_entity *se = __pick_eevdf(cfs_rq);
+-
+-	if (!se) {
+-		struct sched_entity *left = __pick_first_entity(cfs_rq);
+-		if (left) {
+-			pr_err("EEVDF scheduling fail, picking leftmost\n");
+-			return left;
+-		}
+-	}
++	if (!best || (curr && entity_before(curr, best)))
++		best = curr;
+ 
+-	return se;
++	return best;
+ }
+ 
+ #ifdef CONFIG_SCHED_DEBUG
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 2e5a95486..539c7e763 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2822,6 +2822,7 @@ DEFINE_LOCK_GUARD_2(double_rq_lock, struct rq,
+ 		    double_rq_lock(_T->lock, _T->lock2),
+ 		    double_rq_unlock(_T->lock, _T->lock2))
+ 
++extern struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq);
+ extern struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq);
+ extern struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq);
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From 836207afd88265f4ee1b3b2ccf87d367e341dac9 Mon Sep 17 00:00:00 2001
+From: Abel Wu <wuyun.abel@bytedance.com>
+Date: Wed, 15 Nov 2023 11:36:46 +0800
+Subject: [PATCH 02/10] sched/eevdf: O(1) fastpath for task selection
+
+Since the RB-tree is now sorted by deadline, let's first try the
+leftmost entity which has the earliest virtual deadline. I've done
+some benchmarks to see its effectiveness.
+
+All the benchmarks are done inside a normal cpu cgroup in a clean
+environment with cpu turbo disabled, on a dual-CPU Intel Xeon(R)
+Platinum 8260 with 2 NUMA nodes each of which has 24C/48T.
+
+  hackbench: process/thread + pipe/socket + 1/2/4/8 groups
+  netperf:   TCP/UDP + STREAM/RR + 24/48/72/96/192 threads
+  tbench:    loopback 24/48/72/96/192 threads
+  schbench:  1/2/4/8 mthreads
+
+  direct:    cfs_rq has only one entity
+  parity:    RUN_TO_PARITY
+  fast:      O(1) fastpath
+  slow:	     heap search
+
+    (%)		direct	parity	fast	slow
+  hackbench	92.95	2.02	4.91	0.12
+  netperf	68.08	6.60	24.18	1.14
+  tbench	67.55	11.22	20.61	0.62
+  schbench	69.91	2.65	25.73	1.71
+
+The above results indicate that this fastpath really makes task
+selection more efficient.
+
+Signed-off-by: Abel Wu <wuyun.abel@bytedance.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20231115033647.80785-4-wuyun.abel@bytedance.com
+---
+ kernel/sched/fair.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 2621f5ad6..3506a522d 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -878,6 +878,7 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
+ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ {
+ 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
++	struct sched_entity *se = __pick_first_entity(cfs_rq);
+ 	struct sched_entity *curr = cfs_rq->curr;
+ 	struct sched_entity *best = NULL;
+ 
+@@ -886,7 +887,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ 	 * in this cfs_rq, saving some cycles.
+ 	 */
+ 	if (cfs_rq->nr_running == 1)
+-		return curr && curr->on_rq ? curr : __node_2_se(node);
++		return curr && curr->on_rq ? curr : se;
+ 
+ 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
+ 		curr = NULL;
+@@ -898,9 +899,14 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ 	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
+ 		return curr;
+ 
++	/* Pick the leftmost entity if it's eligible */
++	if (se && entity_eligible(cfs_rq, se)) {
++		best = se;
++		goto found;
++	}
++
+ 	/* Heap search for the EEVD entity */
+ 	while (node) {
+-		struct sched_entity *se = __node_2_se(node);
+ 		struct rb_node *left = node->rb_left;
+ 
+ 		/*
+@@ -913,6 +919,8 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ 			continue;
+ 		}
+ 
++		se = __node_2_se(node);
++
+ 		/*
+ 		 * The left subtree either is empty or has no eligible
+ 		 * entity, so check the current node since it is the one
+@@ -925,7 +933,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ 
+ 		node = node->rb_right;
+ 	}
+-
++found:
+ 	if (!best || (curr && entity_before(curr, best)))
+ 		best = curr;
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From c7981f3257d8e3ff72eea5d6e589483fb0607972 Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Mon, 11 Dec 2023 11:48:49 +0100
+Subject: [PATCH 03/10] sched/topology: Add a new arch_scale_freq_ref() method
+
+Create a new method to get a unique and fixed max frequency. Currently
+cpuinfo.max_freq or the highest (or last) state of performance domain are
+used as the max frequency when computing the frequency for a level of
+utilization, but:
+
+  - cpuinfo_max_freq can change at runtime. boost is one example of
+    such change.
+
+  - cpuinfo.max_freq and last item of the PD can be different leading to
+    different results between cpufreq and energy model.
+
+We need to save the reference frequency that has been used when computing
+the CPUs capacity and use this fixed and coherent value to convert between
+frequency and CPU's capacity.
+
+In fact, we already save the frequency that has been used when computing
+the capacity of each CPU. We extend the precision to save kHz instead of
+MHz currently and we modify the type to be aligned with other variables
+used when converting frequency to capacity and the other way.
+
+[ mingo: Minor edits. ]
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Tested-by: Lukasz Luba <lukasz.luba@arm.com>
+Reviewed-by: Lukasz Luba <lukasz.luba@arm.com>
+Acked-by: Sudeep Holla <sudeep.holla@arm.com>
+Link: https://lore.kernel.org/r/20231211104855.558096-2-vincent.guittot@linaro.org
+---
+ arch/arm/include/asm/topology.h   |  1 +
+ arch/arm64/include/asm/topology.h |  1 +
+ arch/riscv/include/asm/topology.h |  1 +
+ drivers/base/arch_topology.c      | 29 ++++++++++++++---------------
+ include/linux/arch_topology.h     |  7 +++++++
+ include/linux/sched/topology.h    |  8 ++++++++
+ 6 files changed, 32 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm/include/asm/topology.h b/arch/arm/include/asm/topology.h
+index c7d2510e5..853c4f81b 100644
+--- a/arch/arm/include/asm/topology.h
++++ b/arch/arm/include/asm/topology.h
+@@ -13,6 +13,7 @@
+ #define arch_set_freq_scale topology_set_freq_scale
+ #define arch_scale_freq_capacity topology_get_freq_scale
+ #define arch_scale_freq_invariant topology_scale_freq_invariant
++#define arch_scale_freq_ref topology_get_freq_ref
+ #endif
+ 
+ /* Replace task scheduler's default cpu-invariant accounting */
+diff --git a/arch/arm64/include/asm/topology.h b/arch/arm64/include/asm/topology.h
+index 9fab663dd..a323b109b 100644
+--- a/arch/arm64/include/asm/topology.h
++++ b/arch/arm64/include/asm/topology.h
+@@ -23,6 +23,7 @@ void update_freq_counters_refs(void);
+ #define arch_set_freq_scale topology_set_freq_scale
+ #define arch_scale_freq_capacity topology_get_freq_scale
+ #define arch_scale_freq_invariant topology_scale_freq_invariant
++#define arch_scale_freq_ref topology_get_freq_ref
+ 
+ #ifdef CONFIG_ACPI_CPPC_LIB
+ #define arch_init_invariance_cppc topology_init_cpu_capacity_cppc
+diff --git a/arch/riscv/include/asm/topology.h b/arch/riscv/include/asm/topology.h
+index e316ab3b7..61183688b 100644
+--- a/arch/riscv/include/asm/topology.h
++++ b/arch/riscv/include/asm/topology.h
+@@ -9,6 +9,7 @@
+ #define arch_set_freq_scale		topology_set_freq_scale
+ #define arch_scale_freq_capacity	topology_get_freq_scale
+ #define arch_scale_freq_invariant	topology_scale_freq_invariant
++#define arch_scale_freq_ref		topology_get_freq_ref
+ 
+ /* Replace task scheduler's default cpu-invariant accounting */
+ #define arch_scale_cpu_capacity	topology_get_cpu_scale
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index b741b5ba8..0c9ae5b15 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -19,6 +19,7 @@
+ #include <linux/init.h>
+ #include <linux/rcupdate.h>
+ #include <linux/sched.h>
++#include <linux/units.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/thermal_pressure.h>
+@@ -26,7 +27,8 @@
+ static DEFINE_PER_CPU(struct scale_freq_data __rcu *, sft_data);
+ static struct cpumask scale_freq_counters_mask;
+ static bool scale_freq_invariant;
+-static DEFINE_PER_CPU(u32, freq_factor) = 1;
++DEFINE_PER_CPU(unsigned long, capacity_freq_ref) = 1;
++EXPORT_PER_CPU_SYMBOL_GPL(capacity_freq_ref);
+ 
+ static bool supports_scale_freq_counters(const struct cpumask *cpus)
+ {
+@@ -170,9 +172,9 @@ DEFINE_PER_CPU(unsigned long, thermal_pressure);
+  * operating on stale data when hot-plug is used for some CPUs. The
+  * @capped_freq reflects the currently allowed max CPUs frequency due to
+  * thermal capping. It might be also a boost frequency value, which is bigger
+- * than the internal 'freq_factor' max frequency. In such case the pressure
+- * value should simply be removed, since this is an indication that there is
+- * no thermal throttling. The @capped_freq must be provided in kHz.
++ * than the internal 'capacity_freq_ref' max frequency. In such case the
++ * pressure value should simply be removed, since this is an indication that
++ * there is no thermal throttling. The @capped_freq must be provided in kHz.
+  */
+ void topology_update_thermal_pressure(const struct cpumask *cpus,
+ 				      unsigned long capped_freq)
+@@ -183,10 +185,7 @@ void topology_update_thermal_pressure(const struct cpumask *cpus,
+ 
+ 	cpu = cpumask_first(cpus);
+ 	max_capacity = arch_scale_cpu_capacity(cpu);
+-	max_freq = per_cpu(freq_factor, cpu);
+-
+-	/* Convert to MHz scale which is used in 'freq_factor' */
+-	capped_freq /= 1000;
++	max_freq = arch_scale_freq_ref(cpu);
+ 
+ 	/*
+ 	 * Handle properly the boost frequencies, which should simply clean
+@@ -279,13 +278,13 @@ void topology_normalize_cpu_scale(void)
+ 
+ 	capacity_scale = 1;
+ 	for_each_possible_cpu(cpu) {
+-		capacity = raw_capacity[cpu] * per_cpu(freq_factor, cpu);
++		capacity = raw_capacity[cpu] * per_cpu(capacity_freq_ref, cpu);
+ 		capacity_scale = max(capacity, capacity_scale);
+ 	}
+ 
+ 	pr_debug("cpu_capacity: capacity_scale=%llu\n", capacity_scale);
+ 	for_each_possible_cpu(cpu) {
+-		capacity = raw_capacity[cpu] * per_cpu(freq_factor, cpu);
++		capacity = raw_capacity[cpu] * per_cpu(capacity_freq_ref, cpu);
+ 		capacity = div64_u64(capacity << SCHED_CAPACITY_SHIFT,
+ 			capacity_scale);
+ 		topology_set_cpu_scale(cpu, capacity);
+@@ -321,15 +320,15 @@ bool __init topology_parse_cpu_capacity(struct device_node *cpu_node, int cpu)
+ 			cpu_node, raw_capacity[cpu]);
+ 
+ 		/*
+-		 * Update freq_factor for calculating early boot cpu capacities.
++		 * Update capacity_freq_ref for calculating early boot CPU capacities.
+ 		 * For non-clk CPU DVFS mechanism, there's no way to get the
+ 		 * frequency value now, assuming they are running at the same
+-		 * frequency (by keeping the initial freq_factor value).
++		 * frequency (by keeping the initial capacity_freq_ref value).
+ 		 */
+ 		cpu_clk = of_clk_get(cpu_node, 0);
+ 		if (!PTR_ERR_OR_ZERO(cpu_clk)) {
+-			per_cpu(freq_factor, cpu) =
+-				clk_get_rate(cpu_clk) / 1000;
++			per_cpu(capacity_freq_ref, cpu) =
++				clk_get_rate(cpu_clk) / HZ_PER_KHZ;
+ 			clk_put(cpu_clk);
+ 		}
+ 	} else {
+@@ -411,7 +410,7 @@ init_cpu_capacity_callback(struct notifier_block *nb,
+ 	cpumask_andnot(cpus_to_visit, cpus_to_visit, policy->related_cpus);
+ 
+ 	for_each_cpu(cpu, policy->related_cpus)
+-		per_cpu(freq_factor, cpu) = policy->cpuinfo.max_freq / 1000;
++		per_cpu(capacity_freq_ref, cpu) = policy->cpuinfo.max_freq;
+ 
+ 	if (cpumask_empty(cpus_to_visit)) {
+ 		topology_normalize_cpu_scale();
+diff --git a/include/linux/arch_topology.h b/include/linux/arch_topology.h
+index a07b510e7..32c24ff4f 100644
+--- a/include/linux/arch_topology.h
++++ b/include/linux/arch_topology.h
+@@ -27,6 +27,13 @@ static inline unsigned long topology_get_cpu_scale(int cpu)
+ 
+ void topology_set_cpu_scale(unsigned int cpu, unsigned long capacity);
+ 
++DECLARE_PER_CPU(unsigned long, capacity_freq_ref);
++
++static inline unsigned long topology_get_freq_ref(int cpu)
++{
++	return per_cpu(capacity_freq_ref, cpu);
++}
++
+ DECLARE_PER_CPU(unsigned long, arch_freq_scale);
+ 
+ static inline unsigned long topology_get_freq_scale(int cpu)
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index de545ba85..a6e04b4a2 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -279,6 +279,14 @@ void arch_update_thermal_pressure(const struct cpumask *cpus,
+ { }
+ #endif
+ 
++#ifndef arch_scale_freq_ref
++static __always_inline
++unsigned int arch_scale_freq_ref(int cpu)
++{
++	return 0;
++}
++#endif
++
+ static inline int task_node(const struct task_struct *p)
+ {
+ 	return cpu_to_node(task_cpu(p));
+-- 
+2.43.0.232.ge79552d197
+
+
+From 72556c5187913cd99c2d9decdfd33519b4ac8862 Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Mon, 11 Dec 2023 11:48:50 +0100
+Subject: [PATCH 04/10] cpufreq: Use the fixed and coherent frequency for
+ scaling capacity
+
+cpuinfo.max_freq can change at runtime because of boost as an example. This
+implies that the value could be different from the frequency that has been
+used to compute the capacity of a CPU.
+
+The new arch_scale_freq_ref() returns a fixed and coherent frequency
+that can be used to compute the capacity for a given frequency.
+
+[ Also fix a arch_set_freq_scale()  newline style wart in <linux/cpufreq.h>. ]
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Tested-by: Lukasz Luba <lukasz.luba@arm.com>
+Reviewed-by: Lukasz Luba <lukasz.luba@arm.com>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Acked-by: Rafael J. Wysocki <rafael@kernel.org>
+Link: https://lore.kernel.org/r/20231211104855.558096-3-vincent.guittot@linaro.org
+---
+ drivers/cpufreq/cpufreq.c | 4 ++--
+ include/linux/cpufreq.h   | 1 +
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 934d35f57..44db4f59c 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -454,7 +454,7 @@ void cpufreq_freq_transition_end(struct cpufreq_policy *policy,
+ 
+ 	arch_set_freq_scale(policy->related_cpus,
+ 			    policy->cur,
+-			    policy->cpuinfo.max_freq);
++			    arch_scale_freq_ref(policy->cpu));
+ 
+ 	spin_lock(&policy->transition_lock);
+ 	policy->transition_ongoing = false;
+@@ -2174,7 +2174,7 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
+ 
+ 	policy->cur = freq;
+ 	arch_set_freq_scale(policy->related_cpus, freq,
+-			    policy->cpuinfo.max_freq);
++			    arch_scale_freq_ref(policy->cpu));
+ 	cpufreq_stats_record_transition(policy, freq);
+ 
+ 	if (trace_cpu_frequency_enabled()) {
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 1c5ca92a0..afda5f24d 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -1203,6 +1203,7 @@ void arch_set_freq_scale(const struct cpumask *cpus,
+ {
+ }
+ #endif
++
+ /* the following are really really optional */
+ extern struct freq_attr cpufreq_freq_attr_scaling_available_freqs;
+ extern struct freq_attr cpufreq_freq_attr_scaling_boost_freqs;
+-- 
+2.43.0.232.ge79552d197
+
+
+From 47a2af99ba245cbc9067aaec55c5b8f726730cfa Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 8 Jan 2024 16:26:11 +0100
+Subject: [PATCH 05/10] cpufreq/schedutil: Use a fixed reference frequency
+
+cpuinfo.max_freq can change at runtime because of boost as an example. This
+implies that the value could be different than the one that has been
+used when computing the capacity of a CPU.
+
+The new arch_scale_freq_ref() returns a fixed and coherent reference
+frequency that can be used when computing a frequency based on utilization.
+
+Use this arch_scale_freq_ref() when available and fallback to
+policy otherwise.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Reviewed-by: Lukasz Luba <lukasz.luba@arm.com>
+Tested-by: Lukasz Luba <lukasz.luba@arm.com>
+Acked-by: Rafael J. Wysocki <rafael@kernel.org>
+Reviewed-by: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ kernel/sched/cpufreq_schedutil.c | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 588817635..5f8729c41 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -114,6 +114,28 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy)
+ 	}
+ }
+ 
++/**
++ * get_capacity_ref_freq - get the reference frequency that has been used to
++ * correlate frequency and compute capacity for a given cpufreq policy. We use
++ * the CPU managing it for the arch_scale_freq_ref() call in the function.
++ * @policy: the cpufreq policy of the CPU in question.
++ *
++ * Return: the reference CPU frequency to compute a capacity.
++ */
++static __always_inline
++unsigned long get_capacity_ref_freq(struct cpufreq_policy *policy)
++{
++	unsigned int freq = arch_scale_freq_ref(policy->cpu);
++
++	if (freq)
++		return freq;
++
++	if (arch_scale_freq_invariant())
++		return policy->cpuinfo.max_freq;
++
++	return policy->cur;
++}
++
+ /**
+  * get_next_freq - Compute a new frequency for a given cpufreq policy.
+  * @sg_policy: schedutil policy object to compute the new frequency for.
+@@ -140,10 +162,10 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
+ 				  unsigned long util, unsigned long max)
+ {
+ 	struct cpufreq_policy *policy = sg_policy->policy;
+-	unsigned int freq = arch_scale_freq_invariant() ?
+-				policy->cpuinfo.max_freq : policy->cur;
++	unsigned int freq;
+ 
+ 	util = map_util_perf(util);
++	freq = get_capacity_ref_freq(policy);
+ 	freq = map_util_freq(util, freq, max);
+ 
+ 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
+-- 
+2.43.0.232.ge79552d197
+
+
+From 86e1bb5a5b8b411aa60c44e0227e5247474f5197 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 8 Jan 2024 16:27:51 +0100
+Subject: [PATCH 06/10] energy_model: Use a fixed reference frequency
+
+The last item of a performance domain is not always the performance point
+that has been used to compute CPU's capacity. This can lead to different
+target frequency compared with other part of the system like schedutil and
+would result in wrong energy estimation.
+
+A new arch_scale_freq_ref() is available to return a fixed and coherent
+frequency reference that can be used when computing the CPU's frequency
+for an level of utilization. Use this function to get this reference
+frequency.
+
+Energy model is never used without defining arch_scale_freq_ref() but
+can be compiled. Define a default arch_scale_freq_ref() returning 0
+in such case.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Reviewed-by: Lukasz Luba <lukasz.luba@arm.com>
+Tested-by: Lukasz Luba <lukasz.luba@arm.com>
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ include/linux/energy_model.h | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/energy_model.h b/include/linux/energy_model.h
+index b9caa01df..c19e7effe 100644
+--- a/include/linux/energy_model.h
++++ b/include/linux/energy_model.h
+@@ -224,7 +224,7 @@ static inline unsigned long em_cpu_energy(struct em_perf_domain *pd,
+ 				unsigned long max_util, unsigned long sum_util,
+ 				unsigned long allowed_cpu_cap)
+ {
+-	unsigned long freq, scale_cpu;
++	unsigned long freq, ref_freq, scale_cpu;
+ 	struct em_perf_state *ps;
+ 	int cpu;
+ 
+@@ -241,11 +241,11 @@ static inline unsigned long em_cpu_energy(struct em_perf_domain *pd,
+ 	 */
+ 	cpu = cpumask_first(to_cpumask(pd->cpus));
+ 	scale_cpu = arch_scale_cpu_capacity(cpu);
+-	ps = &pd->table[pd->nr_perf_states - 1];
++	ref_freq = arch_scale_freq_ref(cpu);
+ 
+ 	max_util = map_util_perf(max_util);
+ 	max_util = min(max_util, allowed_cpu_cap);
+-	freq = map_util_freq(max_util, ps->frequency, scale_cpu);
++	freq = map_util_freq(max_util, ref_freq, scale_cpu);
+ 
+ 	/*
+ 	 * Find the lowest performance state of the Energy Model above the
+-- 
+2.43.0.232.ge79552d197
+
+
+From d5520a31c197df3813d8028ede1e67ddcf13ed66 Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Mon, 11 Dec 2023 11:48:53 +0100
+Subject: [PATCH 07/10] cpufreq/cppc: Move and rename
+ cppc_cpufreq_{perf_to_khz|khz_to_perf}()
+
+Move and rename cppc_cpufreq_perf_to_khz() and cppc_cpufreq_khz_to_perf() to
+use them outside cppc_cpufreq in topology_init_cpu_capacity_cppc().
+
+Modify the interface to use struct cppc_perf_caps *caps instead of
+struct cppc_cpudata *cpu_data as we only use the fields of cppc_perf_caps.
+
+cppc_cpufreq was converting the lowest and nominal freq from MHz to kHz
+before using them. We move this conversion inside cppc_perf_to_khz and
+cppc_khz_to_perf to make them generic and usable outside cppc_cpufreq.
+
+No functional change
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Tested-by: Pierre Gondois <pierre.gondois@arm.com>
+Acked-by: Rafael J. Wysocki <rafael@kernel.org>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Link: https://lore.kernel.org/r/20231211104855.558096-6-vincent.guittot@linaro.org
+---
+ drivers/acpi/cppc_acpi.c       | 104 ++++++++++++++++++++++++
+ drivers/cpufreq/cppc_cpufreq.c | 139 ++++-----------------------------
+ include/acpi/cppc_acpi.h       |   2 +
+ 3 files changed, 123 insertions(+), 122 deletions(-)
+
+diff --git a/drivers/acpi/cppc_acpi.c b/drivers/acpi/cppc_acpi.c
+index 7ff269a78..d155a86a8 100644
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -39,6 +39,9 @@
+ #include <linux/rwsem.h>
+ #include <linux/wait.h>
+ #include <linux/topology.h>
++#include <linux/dmi.h>
++#include <linux/units.h>
++#include <asm/unaligned.h>
+ 
+ #include <acpi/cppc_acpi.h>
+ 
+@@ -1760,3 +1763,104 @@ unsigned int cppc_get_transition_latency(int cpu_num)
+ 	return latency_ns;
+ }
+ EXPORT_SYMBOL_GPL(cppc_get_transition_latency);
++
++/* Minimum struct length needed for the DMI processor entry we want */
++#define DMI_ENTRY_PROCESSOR_MIN_LENGTH	48
++
++/* Offset in the DMI processor structure for the max frequency */
++#define DMI_PROCESSOR_MAX_SPEED		0x14
++
++/* Callback function used to retrieve the max frequency from DMI */
++static void cppc_find_dmi_mhz(const struct dmi_header *dm, void *private)
++{
++	const u8 *dmi_data = (const u8 *)dm;
++	u16 *mhz = (u16 *)private;
++
++	if (dm->type == DMI_ENTRY_PROCESSOR &&
++	    dm->length >= DMI_ENTRY_PROCESSOR_MIN_LENGTH) {
++		u16 val = (u16)get_unaligned((const u16 *)
++				(dmi_data + DMI_PROCESSOR_MAX_SPEED));
++		*mhz = val > *mhz ? val : *mhz;
++	}
++}
++
++/* Look up the max frequency in DMI */
++static u64 cppc_get_dmi_max_khz(void)
++{
++	u16 mhz = 0;
++
++	dmi_walk(cppc_find_dmi_mhz, &mhz);
++
++	/*
++	 * Real stupid fallback value, just in case there is no
++	 * actual value set.
++	 */
++	mhz = mhz ? mhz : 1;
++
++	return KHZ_PER_MHZ * mhz;
++}
++
++/*
++ * If CPPC lowest_freq and nominal_freq registers are exposed then we can
++ * use them to convert perf to freq and vice versa. The conversion is
++ * extrapolated as an affine function passing by the 2 points:
++ *  - (Low perf, Low freq)
++ *  - (Nominal perf, Nominal freq)
++ */
++unsigned int cppc_perf_to_khz(struct cppc_perf_caps *caps, unsigned int perf)
++{
++	s64 retval, offset = 0;
++	static u64 max_khz;
++	u64 mul, div;
++
++	if (caps->lowest_freq && caps->nominal_freq) {
++		mul = caps->nominal_freq - caps->lowest_freq;
++		mul *= KHZ_PER_MHZ;
++		div = caps->nominal_perf - caps->lowest_perf;
++		offset = caps->nominal_freq * KHZ_PER_MHZ -
++			 div64_u64(caps->nominal_perf * mul, div);
++	} else {
++		if (!max_khz)
++			max_khz = cppc_get_dmi_max_khz();
++		mul = max_khz;
++		div = caps->highest_perf;
++	}
++
++	retval = offset + div64_u64(perf * mul, div);
++	if (retval >= 0)
++		return retval;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cppc_perf_to_khz);
++
++unsigned int cppc_khz_to_perf(struct cppc_perf_caps *caps, unsigned int freq)
++{
++	s64 retval, offset = 0;
++	static u64 max_khz;
++	u64  mul, div;
++
++	if (caps->lowest_freq && caps->nominal_freq) {
++		mul = caps->nominal_perf - caps->lowest_perf;
++		div = caps->nominal_freq - caps->lowest_freq;
++		/*
++		 * We don't need to convert to kHz for computing offset and can
++		 * directly use nominal_freq and lowest_freq as the div64_u64
++		 * will remove the frequency unit.
++		 */
++		offset = caps->nominal_perf -
++			 div64_u64(caps->nominal_freq * mul, div);
++		/* But we need it for computing the perf level. */
++		div *= KHZ_PER_MHZ;
++	} else {
++		if (!max_khz)
++			max_khz = cppc_get_dmi_max_khz();
++		mul = caps->highest_perf;
++		div = max_khz;
++	}
++
++	retval = offset + div64_u64(freq * mul, div);
++	if (retval >= 0)
++		return retval;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cppc_khz_to_perf);
+diff --git a/drivers/cpufreq/cppc_cpufreq.c b/drivers/cpufreq/cppc_cpufreq.c
+index fe08ca419..64420d9cf 100644
+--- a/drivers/cpufreq/cppc_cpufreq.c
++++ b/drivers/cpufreq/cppc_cpufreq.c
+@@ -16,7 +16,6 @@
+ #include <linux/delay.h>
+ #include <linux/cpu.h>
+ #include <linux/cpufreq.h>
+-#include <linux/dmi.h>
+ #include <linux/irq_work.h>
+ #include <linux/kthread.h>
+ #include <linux/time.h>
+@@ -27,12 +26,6 @@
+ 
+ #include <acpi/cppc_acpi.h>
+ 
+-/* Minimum struct length needed for the DMI processor entry we want */
+-#define DMI_ENTRY_PROCESSOR_MIN_LENGTH	48
+-
+-/* Offset in the DMI processor structure for the max frequency */
+-#define DMI_PROCESSOR_MAX_SPEED		0x14
+-
+ /*
+  * This list contains information parsed from per CPU ACPI _CPC and _PSD
+  * structures: e.g. the highest and lowest supported performance, capabilities,
+@@ -291,97 +284,9 @@ static inline void cppc_freq_invariance_exit(void)
+ }
+ #endif /* CONFIG_ACPI_CPPC_CPUFREQ_FIE */
+ 
+-/* Callback function used to retrieve the max frequency from DMI */
+-static void cppc_find_dmi_mhz(const struct dmi_header *dm, void *private)
+-{
+-	const u8 *dmi_data = (const u8 *)dm;
+-	u16 *mhz = (u16 *)private;
+-
+-	if (dm->type == DMI_ENTRY_PROCESSOR &&
+-	    dm->length >= DMI_ENTRY_PROCESSOR_MIN_LENGTH) {
+-		u16 val = (u16)get_unaligned((const u16 *)
+-				(dmi_data + DMI_PROCESSOR_MAX_SPEED));
+-		*mhz = val > *mhz ? val : *mhz;
+-	}
+-}
+-
+-/* Look up the max frequency in DMI */
+-static u64 cppc_get_dmi_max_khz(void)
+-{
+-	u16 mhz = 0;
+-
+-	dmi_walk(cppc_find_dmi_mhz, &mhz);
+-
+-	/*
+-	 * Real stupid fallback value, just in case there is no
+-	 * actual value set.
+-	 */
+-	mhz = mhz ? mhz : 1;
+-
+-	return (1000 * mhz);
+-}
+-
+-/*
+- * If CPPC lowest_freq and nominal_freq registers are exposed then we can
+- * use them to convert perf to freq and vice versa. The conversion is
+- * extrapolated as an affine function passing by the 2 points:
+- *  - (Low perf, Low freq)
+- *  - (Nominal perf, Nominal perf)
+- */
+-static unsigned int cppc_cpufreq_perf_to_khz(struct cppc_cpudata *cpu_data,
+-					     unsigned int perf)
+-{
+-	struct cppc_perf_caps *caps = &cpu_data->perf_caps;
+-	s64 retval, offset = 0;
+-	static u64 max_khz;
+-	u64 mul, div;
+-
+-	if (caps->lowest_freq && caps->nominal_freq) {
+-		mul = caps->nominal_freq - caps->lowest_freq;
+-		div = caps->nominal_perf - caps->lowest_perf;
+-		offset = caps->nominal_freq - div64_u64(caps->nominal_perf * mul, div);
+-	} else {
+-		if (!max_khz)
+-			max_khz = cppc_get_dmi_max_khz();
+-		mul = max_khz;
+-		div = caps->highest_perf;
+-	}
+-
+-	retval = offset + div64_u64(perf * mul, div);
+-	if (retval >= 0)
+-		return retval;
+-	return 0;
+-}
+-
+-static unsigned int cppc_cpufreq_khz_to_perf(struct cppc_cpudata *cpu_data,
+-					     unsigned int freq)
+-{
+-	struct cppc_perf_caps *caps = &cpu_data->perf_caps;
+-	s64 retval, offset = 0;
+-	static u64 max_khz;
+-	u64  mul, div;
+-
+-	if (caps->lowest_freq && caps->nominal_freq) {
+-		mul = caps->nominal_perf - caps->lowest_perf;
+-		div = caps->nominal_freq - caps->lowest_freq;
+-		offset = caps->nominal_perf - div64_u64(caps->nominal_freq * mul, div);
+-	} else {
+-		if (!max_khz)
+-			max_khz = cppc_get_dmi_max_khz();
+-		mul = caps->highest_perf;
+-		div = max_khz;
+-	}
+-
+-	retval = offset + div64_u64(freq * mul, div);
+-	if (retval >= 0)
+-		return retval;
+-	return 0;
+-}
+-
+ static int cppc_cpufreq_set_target(struct cpufreq_policy *policy,
+ 				   unsigned int target_freq,
+ 				   unsigned int relation)
+-
+ {
+ 	struct cppc_cpudata *cpu_data = policy->driver_data;
+ 	unsigned int cpu = policy->cpu;
+@@ -389,7 +294,7 @@ static int cppc_cpufreq_set_target(struct cpufreq_policy *policy,
+ 	u32 desired_perf;
+ 	int ret = 0;
+ 
+-	desired_perf = cppc_cpufreq_khz_to_perf(cpu_data, target_freq);
++	desired_perf = cppc_khz_to_perf(&cpu_data->perf_caps, target_freq);
+ 	/* Return if it is exactly the same perf */
+ 	if (desired_perf == cpu_data->perf_ctrls.desired_perf)
+ 		return ret;
+@@ -417,7 +322,7 @@ static unsigned int cppc_cpufreq_fast_switch(struct cpufreq_policy *policy,
+ 	u32 desired_perf;
+ 	int ret;
+ 
+-	desired_perf = cppc_cpufreq_khz_to_perf(cpu_data, target_freq);
++	desired_perf = cppc_khz_to_perf(&cpu_data->perf_caps, target_freq);
+ 	cpu_data->perf_ctrls.desired_perf = desired_perf;
+ 	ret = cppc_set_perf(cpu, &cpu_data->perf_ctrls);
+ 
+@@ -530,7 +435,7 @@ static int cppc_get_cpu_power(struct device *cpu_dev,
+ 	min_step = min_cap / CPPC_EM_CAP_STEP;
+ 	max_step = max_cap / CPPC_EM_CAP_STEP;
+ 
+-	perf_prev = cppc_cpufreq_khz_to_perf(cpu_data, *KHz);
++	perf_prev = cppc_khz_to_perf(perf_caps, *KHz);
+ 	step = perf_prev / perf_step;
+ 
+ 	if (step > max_step)
+@@ -550,8 +455,8 @@ static int cppc_get_cpu_power(struct device *cpu_dev,
+ 			perf = step * perf_step;
+ 	}
+ 
+-	*KHz = cppc_cpufreq_perf_to_khz(cpu_data, perf);
+-	perf_check = cppc_cpufreq_khz_to_perf(cpu_data, *KHz);
++	*KHz = cppc_perf_to_khz(perf_caps, perf);
++	perf_check = cppc_khz_to_perf(perf_caps, *KHz);
+ 	step_check = perf_check / perf_step;
+ 
+ 	/*
+@@ -561,8 +466,8 @@ static int cppc_get_cpu_power(struct device *cpu_dev,
+ 	 */
+ 	while ((*KHz == prev_freq) || (step_check != step)) {
+ 		perf++;
+-		*KHz = cppc_cpufreq_perf_to_khz(cpu_data, perf);
+-		perf_check = cppc_cpufreq_khz_to_perf(cpu_data, *KHz);
++		*KHz = cppc_perf_to_khz(perf_caps, perf);
++		perf_check = cppc_khz_to_perf(perf_caps, *KHz);
+ 		step_check = perf_check / perf_step;
+ 	}
+ 
+@@ -591,7 +496,7 @@ static int cppc_get_cpu_cost(struct device *cpu_dev, unsigned long KHz,
+ 	perf_caps = &cpu_data->perf_caps;
+ 	max_cap = arch_scale_cpu_capacity(cpu_dev->id);
+ 
+-	perf_prev = cppc_cpufreq_khz_to_perf(cpu_data, KHz);
++	perf_prev = cppc_khz_to_perf(perf_caps, KHz);
+ 	perf_step = CPPC_EM_CAP_STEP * perf_caps->highest_perf / max_cap;
+ 	step = perf_prev / perf_step;
+ 
+@@ -679,10 +584,6 @@ static struct cppc_cpudata *cppc_cpufreq_get_cpu_data(unsigned int cpu)
+ 		goto free_mask;
+ 	}
+ 
+-	/* Convert the lowest and nominal freq from MHz to KHz */
+-	cpu_data->perf_caps.lowest_freq *= 1000;
+-	cpu_data->perf_caps.nominal_freq *= 1000;
+-
+ 	list_add(&cpu_data->node, &cpu_data_list);
+ 
+ 	return cpu_data;
+@@ -724,20 +625,16 @@ static int cppc_cpufreq_cpu_init(struct cpufreq_policy *policy)
+ 	 * Set min to lowest nonlinear perf to avoid any efficiency penalty (see
+ 	 * Section 8.4.7.1.1.5 of ACPI 6.1 spec)
+ 	 */
+-	policy->min = cppc_cpufreq_perf_to_khz(cpu_data,
+-					       caps->lowest_nonlinear_perf);
+-	policy->max = cppc_cpufreq_perf_to_khz(cpu_data,
+-					       caps->nominal_perf);
++	policy->min = cppc_perf_to_khz(caps, caps->lowest_nonlinear_perf);
++	policy->max = cppc_perf_to_khz(caps, caps->nominal_perf);
+ 
+ 	/*
+ 	 * Set cpuinfo.min_freq to Lowest to make the full range of performance
+ 	 * available if userspace wants to use any perf between lowest & lowest
+ 	 * nonlinear perf
+ 	 */
+-	policy->cpuinfo.min_freq = cppc_cpufreq_perf_to_khz(cpu_data,
+-							    caps->lowest_perf);
+-	policy->cpuinfo.max_freq = cppc_cpufreq_perf_to_khz(cpu_data,
+-							    caps->nominal_perf);
++	policy->cpuinfo.min_freq = cppc_perf_to_khz(caps, caps->lowest_perf);
++	policy->cpuinfo.max_freq = cppc_perf_to_khz(caps, caps->nominal_perf);
+ 
+ 	policy->transition_delay_us = cppc_cpufreq_get_transition_delay_us(cpu);
+ 	policy->shared_type = cpu_data->shared_type;
+@@ -773,7 +670,7 @@ static int cppc_cpufreq_cpu_init(struct cpufreq_policy *policy)
+ 		boost_supported = true;
+ 
+ 	/* Set policy->cur to max now. The governors will adjust later. */
+-	policy->cur = cppc_cpufreq_perf_to_khz(cpu_data, caps->highest_perf);
++	policy->cur = cppc_perf_to_khz(caps, caps->highest_perf);
+ 	cpu_data->perf_ctrls.desired_perf =  caps->highest_perf;
+ 
+ 	ret = cppc_set_perf(cpu, &cpu_data->perf_ctrls);
+@@ -863,7 +760,7 @@ static unsigned int cppc_cpufreq_get_rate(unsigned int cpu)
+ 	delivered_perf = cppc_perf_from_fbctrs(cpu_data, &fb_ctrs_t0,
+ 					       &fb_ctrs_t1);
+ 
+-	return cppc_cpufreq_perf_to_khz(cpu_data, delivered_perf);
++	return cppc_perf_to_khz(&cpu_data->perf_caps, delivered_perf);
+ }
+ 
+ static int cppc_cpufreq_set_boost(struct cpufreq_policy *policy, int state)
+@@ -878,11 +775,9 @@ static int cppc_cpufreq_set_boost(struct cpufreq_policy *policy, int state)
+ 	}
+ 
+ 	if (state)
+-		policy->max = cppc_cpufreq_perf_to_khz(cpu_data,
+-						       caps->highest_perf);
++		policy->max = cppc_perf_to_khz(caps, caps->highest_perf);
+ 	else
+-		policy->max = cppc_cpufreq_perf_to_khz(cpu_data,
+-						       caps->nominal_perf);
++		policy->max = cppc_perf_to_khz(caps, caps->nominal_perf);
+ 	policy->cpuinfo.max_freq = policy->max;
+ 
+ 	ret = freq_qos_update_request(policy->max_freq_req, policy->max);
+@@ -937,7 +832,7 @@ static unsigned int hisi_cppc_cpufreq_get_rate(unsigned int cpu)
+ 	if (ret < 0)
+ 		return -EIO;
+ 
+-	return cppc_cpufreq_perf_to_khz(cpu_data, desired_perf);
++	return cppc_perf_to_khz(&cpu_data->perf_caps, desired_perf);
+ }
+ 
+ static void cppc_check_hisi_workaround(void)
+diff --git a/include/acpi/cppc_acpi.h b/include/acpi/cppc_acpi.h
+index 6126c977e..3a0995f8b 100644
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -144,6 +144,8 @@ extern int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls);
+ extern int cppc_set_enable(int cpu, bool enable);
+ extern int cppc_get_perf_caps(int cpu, struct cppc_perf_caps *caps);
+ extern bool cppc_perf_ctrs_in_pcc(void);
++extern unsigned int cppc_perf_to_khz(struct cppc_perf_caps *caps, unsigned int perf);
++extern unsigned int cppc_khz_to_perf(struct cppc_perf_caps *caps, unsigned int freq);
+ extern bool acpi_cpc_valid(void);
+ extern bool cppc_allow_fast_switch(void);
+ extern int acpi_get_psd_map(unsigned int cpu, struct cppc_cpudata *cpu_data);
+-- 
+2.43.0.232.ge79552d197
+
+
+From 8827557916bb701f3edeff0fc9b7d941791214b1 Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Mon, 11 Dec 2023 11:48:54 +0100
+Subject: [PATCH 08/10] cpufreq/cppc: Set the frequency used for computing the
+ capacity
+
+Save the frequency associated to the performance that has been used when
+initializing the capacity of CPUs.
+
+Also, cppc cpufreq driver can register an artificial energy model. In such
+case, it needs the frequency for this compute capacity.
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Tested-by: Pierre Gondois <pierre.gondois@arm.com>
+Acked-by: Sudeep Holla <sudeep.holla@arm.com>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Link: https://lore.kernel.org/r/20231211104855.558096-7-vincent.guittot@linaro.org
+---
+ drivers/base/arch_topology.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index 0c9ae5b15..1aa76b5c9 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -349,6 +349,7 @@ bool __init topology_parse_cpu_capacity(struct device_node *cpu_node, int cpu)
+ 
+ void topology_init_cpu_capacity_cppc(void)
+ {
++	u64 capacity, capacity_scale = 0;
+ 	struct cppc_perf_caps perf_caps;
+ 	int cpu;
+ 
+@@ -365,6 +366,10 @@ void topology_init_cpu_capacity_cppc(void)
+ 		    (perf_caps.highest_perf >= perf_caps.nominal_perf) &&
+ 		    (perf_caps.highest_perf >= perf_caps.lowest_perf)) {
+ 			raw_capacity[cpu] = perf_caps.highest_perf;
++			capacity_scale = max_t(u64, capacity_scale, raw_capacity[cpu]);
++
++			per_cpu(capacity_freq_ref, cpu) = cppc_perf_to_khz(&perf_caps, raw_capacity[cpu]);
++
+ 			pr_debug("cpu_capacity: CPU%d cpu_capacity=%u (raw).\n",
+ 				 cpu, raw_capacity[cpu]);
+ 			continue;
+@@ -375,7 +380,15 @@ void topology_init_cpu_capacity_cppc(void)
+ 		goto exit;
+ 	}
+ 
+-	topology_normalize_cpu_scale();
++	for_each_possible_cpu(cpu) {
++		capacity = raw_capacity[cpu];
++		capacity = div64_u64(capacity << SCHED_CAPACITY_SHIFT,
++				     capacity_scale);
++		topology_set_cpu_scale(cpu, capacity);
++		pr_debug("cpu_capacity: CPU%d cpu_capacity=%lu\n",
++			cpu, topology_get_cpu_scale(cpu));
++	}
++
+ 	schedule_work(&update_topology_flags_work);
+ 	pr_debug("cpu_capacity: cpu_capacity initialization done\n");
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From 104dfa62890af5e79eabcdc3d3548a3de6e6d68c Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Mon, 11 Dec 2023 11:48:55 +0100
+Subject: [PATCH 09/10] arm64/amu: Use capacity_ref_freq() to set AMU ratio
+
+Use the new capacity_ref_freq() method to set the ratio that is used by AMU for
+computing the arch_scale_freq_capacity().
+This helps to keep everything aligned using the same reference for
+computing CPUs capacity.
+
+The default value of the ratio (stored in per_cpu(arch_max_freq_scale))
+ensures that arch_scale_freq_capacity() returns max capacity until it is
+set to its correct value with the cpu capacity and capacity_ref_freq().
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Sudeep Holla <sudeep.holla@arm.com>
+Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20231211104855.558096-8-vincent.guittot@linaro.org
+---
+ arch/arm64/kernel/topology.c  | 26 +++++++++++++-------------
+ drivers/base/arch_topology.c  | 12 +++++++++++-
+ include/linux/arch_topology.h |  1 +
+ 3 files changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 817d788cd..1a2c72f3e 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -82,7 +82,12 @@ int __init parse_acpi_topology(void)
+ #undef pr_fmt
+ #define pr_fmt(fmt) "AMU: " fmt
+ 
+-static DEFINE_PER_CPU_READ_MOSTLY(unsigned long, arch_max_freq_scale);
++/*
++ * Ensure that amu_scale_freq_tick() will return SCHED_CAPACITY_SCALE until
++ * the CPU capacity and its associated frequency have been correctly
++ * initialized.
++ */
++static DEFINE_PER_CPU_READ_MOSTLY(unsigned long, arch_max_freq_scale) =  1UL << (2 * SCHED_CAPACITY_SHIFT);
+ static DEFINE_PER_CPU(u64, arch_const_cycles_prev);
+ static DEFINE_PER_CPU(u64, arch_core_cycles_prev);
+ static cpumask_var_t amu_fie_cpus;
+@@ -112,14 +117,14 @@ static inline bool freq_counters_valid(int cpu)
+ 	return true;
+ }
+ 
+-static int freq_inv_set_max_ratio(int cpu, u64 max_rate, u64 ref_rate)
++void freq_inv_set_max_ratio(int cpu, u64 max_rate)
+ {
+-	u64 ratio;
++	u64 ratio, ref_rate = arch_timer_get_rate();
+ 
+ 	if (unlikely(!max_rate || !ref_rate)) {
+-		pr_debug("CPU%d: invalid maximum or reference frequency.\n",
++		WARN_ONCE(1, "CPU%d: invalid maximum or reference frequency.\n",
+ 			 cpu);
+-		return -EINVAL;
++		return;
+ 	}
+ 
+ 	/*
+@@ -139,12 +144,10 @@ static int freq_inv_set_max_ratio(int cpu, u64 max_rate, u64 ref_rate)
+ 	ratio = div64_u64(ratio, max_rate);
+ 	if (!ratio) {
+ 		WARN_ONCE(1, "Reference frequency too low.\n");
+-		return -EINVAL;
++		return;
+ 	}
+ 
+-	per_cpu(arch_max_freq_scale, cpu) = (unsigned long)ratio;
+-
+-	return 0;
++	WRITE_ONCE(per_cpu(arch_max_freq_scale, cpu), (unsigned long)ratio);
+ }
+ 
+ static void amu_scale_freq_tick(void)
+@@ -195,10 +198,7 @@ static void amu_fie_setup(const struct cpumask *cpus)
+ 		return;
+ 
+ 	for_each_cpu(cpu, cpus) {
+-		if (!freq_counters_valid(cpu) ||
+-		    freq_inv_set_max_ratio(cpu,
+-					   cpufreq_get_hw_max_freq(cpu) * 1000ULL,
+-					   arch_timer_get_rate()))
++		if (!freq_counters_valid(cpu))
+ 			return;
+ 	}
+ 
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index 1aa76b5c9..5aaa08656 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -344,6 +344,10 @@ bool __init topology_parse_cpu_capacity(struct device_node *cpu_node, int cpu)
+ 	return !ret;
+ }
+ 
++void __weak freq_inv_set_max_ratio(int cpu, u64 max_rate)
++{
++}
++
+ #ifdef CONFIG_ACPI_CPPC_LIB
+ #include <acpi/cppc_acpi.h>
+ 
+@@ -381,6 +385,9 @@ void topology_init_cpu_capacity_cppc(void)
+ 	}
+ 
+ 	for_each_possible_cpu(cpu) {
++		freq_inv_set_max_ratio(cpu,
++				       per_cpu(capacity_freq_ref, cpu) * HZ_PER_KHZ);
++
+ 		capacity = raw_capacity[cpu];
+ 		capacity = div64_u64(capacity << SCHED_CAPACITY_SHIFT,
+ 				     capacity_scale);
+@@ -422,8 +429,11 @@ init_cpu_capacity_callback(struct notifier_block *nb,
+ 
+ 	cpumask_andnot(cpus_to_visit, cpus_to_visit, policy->related_cpus);
+ 
+-	for_each_cpu(cpu, policy->related_cpus)
++	for_each_cpu(cpu, policy->related_cpus) {
+ 		per_cpu(capacity_freq_ref, cpu) = policy->cpuinfo.max_freq;
++		freq_inv_set_max_ratio(cpu,
++				       per_cpu(capacity_freq_ref, cpu) * HZ_PER_KHZ);
++	}
+ 
+ 	if (cpumask_empty(cpus_to_visit)) {
+ 		topology_normalize_cpu_scale();
+diff --git a/include/linux/arch_topology.h b/include/linux/arch_topology.h
+index 32c24ff4f..a63d61ca5 100644
+--- a/include/linux/arch_topology.h
++++ b/include/linux/arch_topology.h
+@@ -99,6 +99,7 @@ void update_siblings_masks(unsigned int cpu);
+ void remove_cpu_topology(unsigned int cpuid);
+ void reset_cpu_topology(void);
+ int parse_acpi_topology(void);
++void freq_inv_set_max_ratio(int cpu, u64 max_rate);
+ #endif
+ 
+ #endif /* _LINUX_ARCH_TOPOLOGY_H_ */
+-- 
+2.43.0.232.ge79552d197
+
+
+From bef0268da2a4a7d10d87a10eabb4f354bc39e048 Mon Sep 17 00:00:00 2001
+From: Pierre Gondois <pierre.gondois@arm.com>
+Date: Wed, 6 Dec 2023 10:00:43 +0100
+Subject: [PATCH 10/10] sched/fair: Use all little CPUs for CPU-bound workloads
+
+Running N CPU-bound tasks on an N CPUs platform:
+
+- with asymmetric CPU capacity
+
+- not being a DynamIq system (i.e. having a PKG level sched domain
+  without the SD_SHARE_PKG_RESOURCES flag set)
+
+.. might result in a task placement where two tasks run on a big CPU
+and none on a little CPU. This placement could be more optimal by
+using all CPUs.
+
+Testing platform:
+
+  Juno-r2:
+    - 2 big CPUs (1-2), maximum capacity of 1024
+    - 4 little CPUs (0,3-5), maximum capacity of 383
+
+Testing workload ([1]):
+
+  Spawn 6 CPU-bound tasks. During the first 100ms (step 1), each tasks
+  is affine to a CPU, except for:
+
+    - one little CPU which is left idle.
+    - one big CPU which has 2 tasks affine.
+
+  After the 100ms (step 2), remove the cpumask affinity.
+
+Behavior before the patch:
+
+  During step 2, the load balancer running from the idle CPU tags sched
+  domains as:
+
+  - little CPUs: 'group_has_spare'. Cf. group_has_capacity() and
+    group_is_overloaded(), 3 CPU-bound tasks run on a 4 CPUs
+    sched-domain, and the idle CPU provides enough spare capacity
+    regarding the imbalance_pct
+
+  - big CPUs: 'group_overloaded'. Indeed, 3 tasks run on a 2 CPUs
+    sched-domain, so the following path is used:
+
+      group_is_overloaded()
+      \-if (sgs->sum_nr_running <= sgs->group_weight) return true;
+
+    The following path which would change the migration type to
+    'migrate_task' is not taken:
+
+      calculate_imbalance()
+      \-if (env->idle != CPU_NOT_IDLE && env->imbalance == 0)
+
+    as the local group has some spare capacity, so the imbalance
+    is not 0.
+
+  The migration type requested is 'migrate_util' and the busiest
+  runqueue is the big CPU's runqueue having 2 tasks (each having a
+  utilization of 512). The idle little CPU cannot pull one of these
+  task as its capacity is too small for the task. The following path
+  is used:
+
+   detach_tasks()
+   \-case migrate_util:
+     \-if (util > env->imbalance) goto next;
+
+After the patch:
+
+As the number of failed balancing attempts grows (with
+'nr_balance_failed'), progressively make it easier to migrate
+a big task to the idling little CPU. A similar mechanism is
+used for the 'migrate_load' migration type.
+
+Improvement:
+
+Running the testing workload [1] with the step 2 representing
+a ~10s load for a big CPU:
+
+  Before patch: ~19.3s
+  After patch:  ~18s (-6.7%)
+
+Similar issue reported at:
+
+  https://lore.kernel.org/lkml/20230716014125.139577-1-qyousef@layalina.io/
+
+Suggested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Pierre Gondois <pierre.gondois@arm.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Reviewed-by: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Acked-by: Qais Yousef <qyousef@layalina.io>
+Link: https://lore.kernel.org/r/20231206090043.634697-1-pierre.gondois@arm.com
+---
+ kernel/sched/fair.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3506a522d..e5b248182 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9034,7 +9034,7 @@ static int detach_tasks(struct lb_env *env)
+ 		case migrate_util:
+ 			util = task_util_est(p);
+ 
+-			if (util > env->imbalance)
++			if (shr_bound(util, env->sd->nr_balance_failed) > env->imbalance)
+ 				goto next;
+ 
+ 			env->imbalance -= util;
+-- 
+2.43.0.232.ge79552d197
+
