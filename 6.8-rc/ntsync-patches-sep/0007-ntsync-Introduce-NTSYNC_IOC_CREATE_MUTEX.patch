@@ -1,0 +1,171 @@
+From dd3ab0c29c4631548316237716a3f65f61f513ec Mon Sep 17 00:00:00 2001
+From: Elizabeth Figura <zfigura@codeweavers.com>
+Date: Fri, 5 Mar 2021 11:41:10 -0600
+Subject: [PATCH 07/32] ntsync: Introduce NTSYNC_IOC_CREATE_MUTEX.
+
+This corresponds to the NT syscall NtCreateMutant().
+---
+ drivers/misc/ntsync.c       | 72 +++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/ntsync.h |  8 +++++
+ 2 files changed, 80 insertions(+)
+
+diff --git a/drivers/misc/ntsync.c b/drivers/misc/ntsync.c
+index 2685363fa..d48f2ef41 100644
+--- a/drivers/misc/ntsync.c
++++ b/drivers/misc/ntsync.c
+@@ -16,6 +16,7 @@
+ 
+ enum ntsync_type {
+ 	NTSYNC_TYPE_SEM,
++	NTSYNC_TYPE_MUTEX,
+ };
+ 
+ struct ntsync_obj {
+@@ -60,6 +61,10 @@ struct ntsync_obj {
+ 			__u32 count;
+ 			__u32 max;
+ 		} sem;
++		struct {
++			__u32 count;
++			__u32 owner;
++		} mutex;
+ 	} u;
+ };
+ 
+@@ -188,6 +193,10 @@ static bool is_signaled(struct ntsync_obj *obj, __u32 owner)
+ 	switch (obj->type) {
+ 	case NTSYNC_TYPE_SEM:
+ 		return !!obj->u.sem.count;
++	case NTSYNC_TYPE_MUTEX:
++		if (obj->u.mutex.owner && obj->u.mutex.owner != owner)
++			return false;
++		return obj->u.mutex.count < UINT_MAX;
+ 	}
+ 
+ 	WARN(1, "bad object type %#x\n", obj->type);
+@@ -230,6 +239,10 @@ static void try_wake_all(struct ntsync_device *dev, struct ntsync_q *q,
+ 			case NTSYNC_TYPE_SEM:
+ 				obj->u.sem.count--;
+ 				break;
++			case NTSYNC_TYPE_MUTEX:
++				obj->u.mutex.count++;
++				obj->u.mutex.owner = q->owner;
++				break;
+ 			}
+ 		}
+ 		wake_up_process(q->task);
+@@ -271,6 +284,28 @@ static void try_wake_any_sem(struct ntsync_obj *sem)
+ 	}
+ }
+ 
++static void try_wake_any_mutex(struct ntsync_obj *mutex)
++{
++	struct ntsync_q_entry *entry;
++
++	lockdep_assert_held(&mutex->lock);
++
++	list_for_each_entry(entry, &mutex->any_waiters, node) {
++		struct ntsync_q *q = entry->q;
++
++		if (mutex->u.mutex.count == UINT_MAX)
++			break;
++		if (mutex->u.mutex.owner && mutex->u.mutex.owner != q->owner)
++			continue;
++
++		if (atomic_cmpxchg(&q->signaled, -1, entry->index) == -1) {
++			mutex->u.mutex.count++;
++			mutex->u.mutex.owner = q->owner;
++			wake_up_process(q->task);
++		}
++	}
++}
++
+ static int ntsync_create_sem(struct ntsync_device *dev, void __user *argp)
+ {
+ 	struct ntsync_sem_args __user *user_args = argp;
+@@ -303,6 +338,38 @@ static int ntsync_create_sem(struct ntsync_device *dev, void __user *argp)
+ 	return put_user(id, &user_args->sem);
+ }
+ 
++static int ntsync_create_mutex(struct ntsync_device *dev, void __user *argp)
++{
++	struct ntsync_mutex_args __user *user_args = argp;
++	struct ntsync_mutex_args args;
++	struct ntsync_obj *mutex;
++	__u32 id;
++	int ret;
++
++	if (copy_from_user(&args, argp, sizeof(args)))
++		return -EFAULT;
++
++	if (!args.owner != !args.count)
++		return -EINVAL;
++
++	mutex = kzalloc(sizeof(*mutex), GFP_KERNEL);
++	if (!mutex)
++		return -ENOMEM;
++
++	init_obj(mutex);
++	mutex->type = NTSYNC_TYPE_MUTEX;
++	mutex->u.mutex.count = args.count;
++	mutex->u.mutex.owner = args.owner;
++
++	ret = xa_alloc(&dev->objects, &id, mutex, xa_limit_32b, GFP_KERNEL);
++	if (ret < 0) {
++		kfree(mutex);
++		return ret;
++	}
++
++	return put_user(id, &user_args->mutex);
++}
++
+ static int ntsync_delete(struct ntsync_device *dev, void __user *argp)
+ {
+ 	struct ntsync_obj *obj;
+@@ -497,6 +564,9 @@ static void try_wake_any_obj(struct ntsync_obj *obj)
+ 	case NTSYNC_TYPE_SEM:
+ 		try_wake_any_sem(obj);
+ 		break;
++	case NTSYNC_TYPE_MUTEX:
++		try_wake_any_mutex(obj);
++		break;
+ 	}
+ }
+ 
+@@ -662,6 +732,8 @@ static long ntsync_char_ioctl(struct file *file, unsigned int cmd,
+ 	void __user *argp = (void __user *)parm;
+ 
+ 	switch (cmd) {
++	case NTSYNC_IOC_CREATE_MUTEX:
++		return ntsync_create_mutex(dev, argp);
+ 	case NTSYNC_IOC_CREATE_SEM:
+ 		return ntsync_create_sem(dev, argp);
+ 	case NTSYNC_IOC_DELETE:
+diff --git a/include/uapi/linux/ntsync.h b/include/uapi/linux/ntsync.h
+index a5bed5a39..26d1b3d48 100644
+--- a/include/uapi/linux/ntsync.h
++++ b/include/uapi/linux/ntsync.h
+@@ -16,6 +16,12 @@ struct ntsync_sem_args {
+ 	__u32 max;
+ };
+ 
++struct ntsync_mutex_args {
++	__u32 mutex;
++	__u32 owner;
++	__u32 count;
++};
++
+ struct ntsync_wait_args {
+ 	__u64 timeout;
+ 	__u64 objs;
+@@ -38,5 +44,7 @@ struct ntsync_wait_args {
+ 					      struct ntsync_wait_args)
+ #define NTSYNC_IOC_WAIT_ALL		_IOWR(NTSYNC_IOC_BASE, 4, \
+ 					      struct ntsync_wait_args)
++#define NTSYNC_IOC_CREATE_MUTEX		_IOWR(NTSYNC_IOC_BASE, 5, \
++					      struct ntsync_mutex_args)
+ 
+ #endif
+-- 
+2.43.0.232.ge79552d197
+
