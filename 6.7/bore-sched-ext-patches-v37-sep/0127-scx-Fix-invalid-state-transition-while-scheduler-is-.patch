@@ -1,0 +1,127 @@
+From f4e9d5a0bcd47d7efa7feb106e6ba3de15519e94 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 7 Feb 2024 15:11:55 -1000
+Subject: [PATCH 127/129] scx: Fix invalid state transition while scheduler is
+ loaded
+
+Trying to load a scheduler while `stress-ng --race-sched 8 --timeout 30` is
+running easily triggers the following warning.
+
+  sched_ext: Invalid task state transition 0 -> 3 for stress-ng-race-[8698]
+  WARNING: CPU: 1 PID: 1527 at kernel/sched/ext.c:2378 scx_set_task_state+0xb2/0x1a0
+  CPU: 1 PID: 1527 Comm: stress-ng-race- Not tainted 6.7.0-work-00411-gc1c1b3b1133b-dirty #404
+  Sched_ext: rustland (enabled+all), task: runnable_at=-76ms
+  RIP: 0010:scx_set_task_state+0xb2/0x1a0
+  ...
+  Call Trace:
+   <TASK>
+   scx_ops_enable_task+0xd5/0x180
+   switching_to_scx+0x17/0xa0
+   __sched_setscheduler+0x623/0x810
+   do_sched_setscheduler+0xea/0x170
+   __x64_sys_sched_setscheduler+0x1c/0x30
+   do_syscall_64+0x40/0xe0
+   entry_SYSCALL_64_after_hwframe+0x46/0x4e
+
+This race happens when sched_setscheudler() syscall races SCX ops_enable
+path on a DEAD task. If the task is DEAD, scx_ops_enable() directly calls
+scx_ops_exit_task() instead of enabling it. If another task was already in
+the middle of sched_setscheduler() with the task's reference acquired, it
+then can proceed to __sched_setscheduler() which will then call
+scx_ops_enable_task(). However, the task has already been exited, so it ends
+trying to transition the task from SCX_TASK_NONE to SCX_TASK_ENABLED
+triggering the above warning.
+
+This is because the ops_enable path is leaving the task in an inconsistent
+state - scx_enabled() && scx_switching_all, so scx_should_scx(p) but p is
+SCX_TASK_NONE instead of READY or ENABLED. If the task gets freed
+afterwards, it's fine, but if there's an attribute change operation which
+gets inbetween, that operation ends up trying to enable SCX on the
+unprepared dead task.
+
+The reason why both ops_enable and disable paths handle DEAD tasks
+specially, I think, is historical. Before scx_tasks was introduced, the
+paths used the usual tasklist iteration. However, tasks are removed from
+tasklist before the task transitions to DEAD, so depending on the timing, a
+DEAD task may show up in one iteration and disappear for the next one e.g.
+while disabling is in progress without any way to detect the event. My
+memory is hazy, so the details may not be accurate. Anyways, there were
+issues around reliably iterating DEAD tasks and thus there was code to skip
+them.
+
+With scx_tasks, we're strongly synchronized against tasks being destoryed,
+so this is no longer a concern, so it's likely that we can just remove this
+special handling and things will just work.
+
+After this patch, the kernel is surviving load/unload torture test but it's
+possible that I'm completely misremembering things, in which case, we'll
+have to relearn why TASK_DEAD has to be special.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 30 ++++++++++--------------------
+ 1 file changed, 10 insertions(+), 20 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 434740712..eec94ca5a 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -3351,21 +3351,16 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
+ 	while ((p = scx_task_iter_next_filtered_locked(&sti))) {
+ 		const struct sched_class *old_class = p->sched_class;
+ 		struct sched_enq_and_set_ctx ctx;
+-		bool alive = READ_ONCE(p->__state) != TASK_DEAD;
+ 
+ 		sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE, &ctx);
+ 
+ 		p->scx.slice = min_t(u64, p->scx.slice, SCX_SLICE_DFL);
+-
+ 		__setscheduler_prio(p, p->prio);
+-		if (alive)
+-			check_class_changing(task_rq(p), p, old_class);
++		check_class_changing(task_rq(p), p, old_class);
+ 
+ 		sched_enq_and_set_task(&ctx);
+ 
+-		if (alive)
+-			check_class_changed(task_rq(p), p, old_class, p->prio);
+-
++		check_class_changed(task_rq(p), p, old_class, p->prio);
+ 		scx_ops_exit_task(p);
+ 	}
+ 	scx_task_iter_exit(&sti);
+@@ -3834,23 +3829,18 @@ static int scx_ops_enable(struct sched_ext_ops *ops)
+ 
+ 	scx_task_iter_init(&sti);
+ 	while ((p = scx_task_iter_next_filtered_locked(&sti))) {
+-		if (READ_ONCE(p->__state) != TASK_DEAD) {
+-			const struct sched_class *old_class = p->sched_class;
+-			struct sched_enq_and_set_ctx ctx;
++		const struct sched_class *old_class = p->sched_class;
++		struct sched_enq_and_set_ctx ctx;
+ 
+-			sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE,
+-					       &ctx);
++		sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE, &ctx);
+ 
+-			scx_set_task_state(p, SCX_TASK_READY);
+-			__setscheduler_prio(p, p->prio);
+-			check_class_changing(task_rq(p), p, old_class);
++		scx_set_task_state(p, SCX_TASK_READY);
++		__setscheduler_prio(p, p->prio);
++		check_class_changing(task_rq(p), p, old_class);
+ 
+-			sched_enq_and_set_task(&ctx);
++		sched_enq_and_set_task(&ctx);
+ 
+-			check_class_changed(task_rq(p), p, old_class, p->prio);
+-		} else {
+-			scx_ops_exit_task(p);
+-		}
++		check_class_changed(task_rq(p), p, old_class, p->prio);
+ 	}
+ 	scx_task_iter_exit(&sti);
+ 
+-- 
+2.43.0.232.ge79552d197
+
