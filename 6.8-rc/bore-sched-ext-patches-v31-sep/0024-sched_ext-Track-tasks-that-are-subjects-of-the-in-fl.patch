@@ -1,0 +1,258 @@
+From a3884e84a07562275256d51522a323fbb0a9d2fe Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj () kernel ! org>
+Date: Sat, 11 Nov 2023 02:47:50 +0000
+Subject: [PATCH 024/148] sched_ext: Track tasks that are subjects of the
+ in-flight SCX operation
+
+When some SCX operations are in flight, it is known that the subject task's
+rq lock is held throughout which makes it safe to access certain fields of
+the task - e.g. its current task_group. We want to add SCX kfunc helpers
+that can make use of this guarantee - e.g. to help determining the currently
+associated CPU cgroup from the task's current task_group.
+
+As it'd be dangerous call such a helper on a task which isn't rq lock
+protected, the helper should be able to verify the input task and reject
+accordingly. This patch adds sched_ext_entity.kf_tasks[] that track the
+tasks which are currently being operated on by a terminal SCX operation. The
+new SCX_CALL_OP_[2]TASK[_RET]() can be used when invoking SCX operations
+which take tasks as arguments and the scx_kf_allowed_on_arg_tasks() can be
+used by kfunc helpers to verify the input task status.
+
+Note that as sched_ext_entity.kf_tasks[] can't handle nesting, the tracking
+is currently only limited to terminal SCX operations. If needed in the
+future, this restriction can be removed by moving the tracking to the task
+side with a couple per-task counters.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: David Vernet <dvernet@meta.com>
+---
+ include/linux/sched/ext.h |  2 +
+ kernel/sched/ext.c        | 91 +++++++++++++++++++++++++++++++--------
+ 2 files changed, 76 insertions(+), 17 deletions(-)
+
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index 771553bfd..604d89226 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -449,6 +449,7 @@ enum scx_kf_mask {
+ 	SCX_KF_REST		= 1 << 5, /* other rq-locked operations */
+ 
+ 	__SCX_KF_RQ_LOCKED	= SCX_KF_DISPATCH | SCX_KF_ENQUEUE | SCX_KF_REST,
++	__SCX_KF_TERMINAL	= SCX_KF_ENQUEUE | SCX_KF_REST,
+ };
+ 
+ /*
+@@ -464,6 +465,7 @@ struct sched_ext_entity {
+ 	s32			sticky_cpu;
+ 	s32			holding_cpu;
+ 	u32			kf_mask;	/* see scx_kf_mask above */
++	struct task_struct	*kf_tasks[2];	/* see SCX_CALL_OP_TASK() */
+ 	atomic_long_t		ops_state;
+ 	unsigned long		runnable_at;
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index b5adb4673..aa7569004 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -245,6 +245,47 @@ do {										\
+ 	__ret;									\
+ })
+ 
++/*
++ * Some kfuncs are allowed only on the tasks that are subjects of the
++ * in-progress scx_ops operation for, e.g., locking guarantees. To enforce such
++ * restrictions, the following SCX_CALL_OP_*() variants should be used when
++ * invoking scx_ops operations that take task arguments. These can only be used
++ * for non-nesting operations due to the way the tasks are tracked.
++ *
++ * kfuncs which can only operate on such tasks can in turn use
++ * scx_kf_allowed_on_arg_tasks() to test whether the invocation is allowed on
++ * the specific task.
++ */
++#define SCX_CALL_OP_TASK(mask, op, task, args...)				\
++do {										\
++	BUILD_BUG_ON(mask & ~__SCX_KF_TERMINAL);				\
++	current->scx.kf_tasks[0] = task;					\
++	SCX_CALL_OP(mask, op, task, ##args);					\
++	current->scx.kf_tasks[0] = NULL;					\
++} while (0)
++
++#define SCX_CALL_OP_TASK_RET(mask, op, task, args...)				\
++({										\
++	__typeof__(scx_ops.op(task, ##args)) __ret;				\
++	BUILD_BUG_ON(mask & ~__SCX_KF_TERMINAL);				\
++	current->scx.kf_tasks[0] = task;					\
++	__ret = SCX_CALL_OP_RET(mask, op, task, ##args);			\
++	current->scx.kf_tasks[0] = NULL;					\
++	__ret;									\
++})
++
++#define SCX_CALL_OP_2TASKS_RET(mask, op, task0, task1, args...)			\
++({										\
++	__typeof__(scx_ops.op(task0, task1, ##args)) __ret;			\
++	BUILD_BUG_ON(mask & ~__SCX_KF_TERMINAL);				\
++	current->scx.kf_tasks[0] = task0;					\
++	current->scx.kf_tasks[1] = task1;					\
++	__ret = SCX_CALL_OP_RET(mask, op, task0, task1, ##args);		\
++	current->scx.kf_tasks[0] = NULL;					\
++	current->scx.kf_tasks[1] = NULL;					\
++	__ret;									\
++})
++
+ /* @mask is constant, always inline to cull unnecessary branches */
+ static __always_inline bool scx_kf_allowed(u32 mask)
+ {
+@@ -275,6 +316,22 @@ static __always_inline bool scx_kf_allowed(u32 mask)
+ 	return true;
+ }
+ 
++/* see SCX_CALL_OP_TASK() */
++static __always_inline bool scx_kf_allowed_on_arg_tasks(u32 mask,
++							struct task_struct *p)
++{
++	if (!scx_kf_allowed(__SCX_KF_RQ_LOCKED))
++		return false;
++
++	if (unlikely((p != current->scx.kf_tasks[0] &&
++		      p != current->scx.kf_tasks[1]))) {
++		scx_ops_error("called on a task not being operated on");
++		return false;
++	}
++
++	return true;
++}
++
+ /**
+  * scx_task_iter_init - Initialize a task iterator
+  * @iter: iterator to init
+@@ -716,7 +773,7 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 	WARN_ON_ONCE(*ddsp_taskp);
+ 	*ddsp_taskp = p;
+ 
+-	SCX_CALL_OP(SCX_KF_ENQUEUE, enqueue, p, enq_flags);
++	SCX_CALL_OP_TASK(SCX_KF_ENQUEUE, enqueue, p, enq_flags);
+ 
+ 	/*
+ 	 * If not directly dispatched, QUEUEING isn't clear yet and dispatch or
+@@ -788,7 +845,7 @@ static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags
+ 	add_nr_running(rq, 1);
+ 
+ 	if (SCX_HAS_OP(runnable))
+-		SCX_CALL_OP(SCX_KF_REST, runnable, p, enq_flags);
++		SCX_CALL_OP_TASK(SCX_KF_REST, runnable, p, enq_flags);
+ 
+ 	do_enqueue_task(rq, p, enq_flags, sticky_cpu);
+ }
+@@ -813,7 +870,7 @@ static void ops_dequeue(struct task_struct *p, u64 deq_flags)
+ 		BUG();
+ 	case SCX_OPSS_QUEUED:
+ 		if (SCX_HAS_OP(dequeue))
+-			SCX_CALL_OP(SCX_KF_REST, dequeue, p, deq_flags);
++			SCX_CALL_OP_TASK(SCX_KF_REST, dequeue, p, deq_flags);
+ 
+ 		if (atomic_long_try_cmpxchg(&p->scx.ops_state, &opss,
+ 					    SCX_OPSS_NONE))
+@@ -864,11 +921,11 @@ static void dequeue_task_scx(struct rq *rq, struct task_struct *p, int deq_flags
+ 	 */
+ 	if (SCX_HAS_OP(stopping) && task_current(rq, p)) {
+ 		update_curr_scx(rq);
+-		SCX_CALL_OP(SCX_KF_REST, stopping, p, false);
++		SCX_CALL_OP_TASK(SCX_KF_REST, stopping, p, false);
+ 	}
+ 
+ 	if (SCX_HAS_OP(quiescent))
+-		SCX_CALL_OP(SCX_KF_REST, quiescent, p, deq_flags);
++		SCX_CALL_OP_TASK(SCX_KF_REST, quiescent, p, deq_flags);
+ 
+ 	if (deq_flags & SCX_DEQ_SLEEP)
+ 		p->scx.flags |= SCX_TASK_DEQD_FOR_SLEEP;
+@@ -887,7 +944,7 @@ static void yield_task_scx(struct rq *rq)
+ 	struct task_struct *p = rq->curr;
+ 
+ 	if (SCX_HAS_OP(yield))
+-		SCX_CALL_OP_RET(SCX_KF_REST, yield, p, NULL);
++		SCX_CALL_OP_2TASKS_RET(SCX_KF_REST, yield, p, NULL);
+ 	else
+ 		p->scx.slice = 0;
+ }
+@@ -897,7 +954,7 @@ static bool yield_to_task_scx(struct rq *rq, struct task_struct *to)
+ 	struct task_struct *from = rq->curr;
+ 
+ 	if (SCX_HAS_OP(yield))
+-		return SCX_CALL_OP_RET(SCX_KF_REST, yield, from, to);
++		return SCX_CALL_OP_2TASKS_RET(SCX_KF_REST, yield, from, to);
+ 	else
+ 		return false;
+ }
+@@ -1409,7 +1466,7 @@ static void set_next_task_scx(struct rq *rq, struct task_struct *p, bool first)
+ 
+ 	/* see dequeue_task_scx() on why we skip when !QUEUED */
+ 	if (SCX_HAS_OP(running) && (p->scx.flags & SCX_TASK_QUEUED))
+-		SCX_CALL_OP(SCX_KF_REST, running, p);
++		SCX_CALL_OP_TASK(SCX_KF_REST, running, p);
+ 
+ 	watchdog_unwatch_task(p, true);
+ 
+@@ -1465,7 +1522,7 @@ static void put_prev_task_scx(struct rq *rq, struct task_struct *p)
+ 
+ 	/* see dequeue_task_scx() on why we skip when !QUEUED */
+ 	if (SCX_HAS_OP(stopping) && (p->scx.flags & SCX_TASK_QUEUED))
+-		SCX_CALL_OP(SCX_KF_REST, stopping, p, true);
++		SCX_CALL_OP_TASK(SCX_KF_REST, stopping, p, true);
+ 
+ 	/*
+ 	 * If we're being called from put_prev_task_balance(), balance_scx() may
+@@ -1656,8 +1713,8 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
+ 	if (SCX_HAS_OP(select_cpu)) {
+ 		s32 cpu;
+ 
+-		cpu = SCX_CALL_OP_RET(SCX_KF_REST, select_cpu, p, prev_cpu,
+-				      wake_flags);
++		cpu = SCX_CALL_OP_TASK_RET(SCX_KF_REST, select_cpu, p, prev_cpu,
++					   wake_flags);
+ 		if (ops_cpu_valid(cpu)) {
+ 			return cpu;
+ 		} else {
+@@ -1683,8 +1740,8 @@ static void set_cpus_allowed_scx(struct task_struct *p,
+ 	 * designation pointless. Cast it away when calling the operation.
+ 	 */
+ 	if (SCX_HAS_OP(set_cpumask))
+-		SCX_CALL_OP(SCX_KF_REST, set_cpumask, p,
+-			    (struct cpumask *)p->cpus_ptr);
++		SCX_CALL_OP_TASK(SCX_KF_REST, set_cpumask, p,
++				 (struct cpumask *)p->cpus_ptr);
+ }
+ 
+ static void reset_idle_masks(void)
+@@ -1846,7 +1903,7 @@ static void scx_ops_enable_task(struct task_struct *p)
+ 
+ 	if (SCX_HAS_OP(enable)) {
+ 		struct scx_enable_args args = { };
+-		SCX_CALL_OP(SCX_KF_REST, enable, p, &args);
++		SCX_CALL_OP_TASK(SCX_KF_REST, enable, p, &args);
+ 	}
+ 	p->scx.flags &= ~SCX_TASK_OPS_PREPPED;
+ 	p->scx.flags |= SCX_TASK_OPS_ENABLED;
+@@ -1891,7 +1948,7 @@ static void refresh_scx_weight(struct task_struct *p)
+ 	lockdep_assert_rq_held(task_rq(p));
+ 	set_task_scx_weight(p);
+ 	if (SCX_HAS_OP(set_weight))
+-		SCX_CALL_OP(SCX_KF_REST, set_weight, p, p->scx.weight);
++		SCX_CALL_OP_TASK(SCX_KF_REST, set_weight, p, p->scx.weight);
+ }
+ 
+ void scx_pre_fork(struct task_struct *p)
+@@ -1989,8 +2046,8 @@ static void switching_to_scx(struct rq *rq, struct task_struct *p)
+ 	 * different scheduler class. Keep the BPF scheduler up-to-date.
+ 	 */
+ 	if (SCX_HAS_OP(set_cpumask))
+-		SCX_CALL_OP(SCX_KF_REST, set_cpumask, p,
+-			    (struct cpumask *)p->cpus_ptr);
++		SCX_CALL_OP_TASK(SCX_KF_REST, set_cpumask, p,
++				 (struct cpumask *)p->cpus_ptr);
+ }
+ 
+ static void wakeup_preempt_scx(struct rq *rq, struct task_struct *p,int wake_flags) {}
+-- 
+2.43.0.232.ge79552d197
+
