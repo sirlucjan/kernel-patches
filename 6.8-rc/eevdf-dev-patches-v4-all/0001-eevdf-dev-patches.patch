@@ -1,0 +1,279 @@
+From 002693614d760b7a3d6e049d469b358bc80ecaa6 Mon Sep 17 00:00:00 2001
+From: Tiwei Bie <tiwei.btw@antgroup.com>
+Date: Wed, 31 Jan 2024 20:03:40 +0800
+Subject: [PATCH 1/4] sched/fair: Sanity check 'best' in pick_eevdf()
+
+Before commit 2227a957e1d5 ("sched/eevdf: Sort the rbtree by virtual
+deadline"), there was a sanity check to catch unexpected failures in the
+EEVDF scheduling, which was helpful in identifying problems. It would
+be better to restore its previous capability.
+
+Signed-off-by: Tiwei Bie <tiwei.btw@antgroup.com>
+---
+ kernel/sched/fair.c | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 533547e3c..aeb3b8fee 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -878,7 +878,7 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
+ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ {
+ 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
+-	struct sched_entity *se = __pick_first_entity(cfs_rq);
++	struct sched_entity *first = __pick_first_entity(cfs_rq);
+ 	struct sched_entity *curr = cfs_rq->curr;
+ 	struct sched_entity *best = NULL;
+ 
+@@ -887,7 +887,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ 	 * in this cfs_rq, saving some cycles.
+ 	 */
+ 	if (cfs_rq->nr_running == 1)
+-		return curr && curr->on_rq ? curr : se;
++		return curr && curr->on_rq ? curr : first;
+ 
+ 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
+ 		curr = NULL;
+@@ -900,14 +900,15 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ 		return curr;
+ 
+ 	/* Pick the leftmost entity if it's eligible */
+-	if (se && entity_eligible(cfs_rq, se)) {
+-		best = se;
++	if (first && entity_eligible(cfs_rq, first)) {
++		best = first;
+ 		goto found;
+ 	}
+ 
+ 	/* Heap search for the EEVD entity */
+ 	while (node) {
+ 		struct rb_node *left = node->rb_left;
++		struct sched_entity *se;
+ 
+ 		/*
+ 		 * Eligible entities in left subtree are always better
+@@ -937,6 +938,16 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+ 	if (!best || (curr && entity_before(curr, best)))
+ 		best = curr;
+ 
++	/* This is not expected to happen. */
++	if (unlikely(!best)) {
++		if (printk_ratelimit()) {
++			printk_deferred(KERN_ERR
++				"EEVDF scheduling failed on CPU%d, picking leftmost\n",
++				cpu_of(rq_of(cfs_rq)));
++		}
++		best = first;
++	}
++
+ 	return best;
+ }
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From d0fa8692ac5623ba6af9290ef03529793eea13ff Mon Sep 17 00:00:00 2001
+From: Xuewen Yan <xuewen.yan@unisoc.com>
+Date: Tue, 30 Jan 2024 16:06:43 +0800
+Subject: [PATCH 2/4] sched/eevdf: Prevent vlag from exceeding the limit value
+
+There are some scenarios here that will cause vlag to
+exceed eevdf's limit.
+
+1. In set_next_entity, it will stash a copy of deadline
+at the point of pick in vlag, and if the task fork child,
+the child's vlag would inherit parent's vlag, as a result,
+the child's vlag is equal to the deadline. And then,
+when place_entity, because the se's vlag is wrong, it would
+cause vruntime and deadline update error.
+
+2. When reweight_entity, the vlag would be recalculated,
+because the new weights are uncertain, and it may cause
+the vlag to exceed eevdf's limit.
+
+In order to ensure that vlag does not exceed the limit,
+separate the calculation of limit from the update_entity_lag
+and create a new func limit_entity_lag. When the vlag is
+updated, use this func to prevent vlag from exceeding the limit.
+
+And add check whether the se is forked in place_entity, and calc
+the curr's vlag to update the se's vlag.
+
+Signed-off-by: Xuewen Yan <xuewen.yan@unisoc.com>
+---
+ kernel/sched/fair.c | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index aeb3b8fee..984db43e2 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -696,15 +696,22 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
+  *
+  * XXX could add max_slice to the augmented data to track this.
+  */
++static s64 limit_entity_lag(struct sched_entity *se, s64 lag)
++{
++	s64 limit;
++
++	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
++	return clamp(lag, -limit, limit);
++}
++
+ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	s64 lag, limit;
++	s64 lag;
+ 
+ 	SCHED_WARN_ON(!se->on_rq);
+ 	lag = avg_vruntime(cfs_rq) - se->vruntime;
+ 
+-	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
+-	se->vlag = clamp(lag, -limit, limit);
++	se->vlag = limit_entity_lag(se, lag);
+ }
+ 
+ /*
+@@ -3768,6 +3775,7 @@ static void reweight_eevdf(struct cfs_rq *cfs_rq, struct sched_entity *se,
+ 	if (avruntime != se->vruntime) {
+ 		vlag = (s64)(avruntime - se->vruntime);
+ 		vlag = div_s64(vlag * old_weight, weight);
++		vlag = limit_entity_lag(se, vlag);
+ 		se->vruntime = avruntime - vlag;
+ 	}
+ 
+@@ -3815,6 +3823,9 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+ 
+ 	update_load_set(&se->load, weight);
+ 
++	if (!se->on_rq)
++		se-vlag = limit_entity_lag(se, se->vlag);
++
+ #ifdef CONFIG_SMP
+ 	do {
+ 		u32 divider = get_pelt_divider(&se->avg);
+@@ -5188,6 +5199,16 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 
+ 		lag = se->vlag;
+ 
++		/* When fork, the child would inherit parent's vlag,
++		 * but parent's vlag may be euqual to it's deadline.
++		 */
++		if (flag & ENQUEUE_INITIAL) {
++			if (curr)
++				lag = vruntime - curr->vruntime;
++
++			lag = limit_entity_lag(se, lag);
++			se->vlag = lag;
++		}
+ 		/*
+ 		 * If we want to place a task and preserve lag, we have to
+ 		 * consider the effect of the new entity on the weighted
+@@ -5248,6 +5269,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 		if (WARN_ON_ONCE(!load))
+ 			load = 1;
+ 		lag = div_s64(lag, load);
++		lag = limit_entity_lag(se, lag);
+ 	}
+ 
+ 	se->vruntime = vruntime - lag;
+-- 
+2.43.0.232.ge79552d197
+
+
+From 846712f5248d037461c3d1f7bd003eedc112e25a Mon Sep 17 00:00:00 2001
+From: Tianchen Ding <dtcccc@linux.alibaba.com>
+Date: Mon, 4 Mar 2024 11:00:41 +0800
+Subject: [PATCH 3/4] sched/eevdf: Always update V if se->on_rq when
+ reweighting
+
+reweight_eevdf() needs the latest V to do accurate calculation for new
+ve and vd. So update V unconditionally when se is runnable.
+
+Suggested-by: Abel Wu <wuyun.abel@bytedance.com>
+Signed-off-by: Tianchen Ding <dtcccc@linux.alibaba.com>
+---
+ kernel/sched/fair.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 984db43e2..6f00fc1ef 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3803,9 +3803,8 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+ 
+ 	if (se->on_rq) {
+ 		/* commit outstanding execution time */
+-		if (curr)
+-			update_curr(cfs_rq);
+-		else
++		update_curr(cfs_rq);
++		if (!curr)
+ 			__dequeue_entity(cfs_rq, se);
+ 		update_load_sub(&cfs_rq->load, se->load.weight);
+ 	}
+-- 
+2.43.0.232.ge79552d197
+
+
+From 8739c083f477e60864bdc0ffc27713cdc26a9924 Mon Sep 17 00:00:00 2001
+From: Tianchen Ding <dtcccc@linux.alibaba.com>
+Date: Mon, 4 Mar 2024 11:00:42 +0800
+Subject: [PATCH 4/4] sched/eevdf: Fix miscalculation in reweight_entity() when
+ se is not curr
+
+reweight_eevdf() only keeps V unchanged inside itself. When se !=
+cfs_rq->curr, it would be dequeued from rb tree first. So that V is
+changed and the result is wrong. Pass the original V to reweight_eevdf()
+to fix this issue.
+
+Fixes: eab03c23c2a1 ("sched/eevdf: Fix vruntime adjustment on reweight")
+Signed-off-by: Tianchen Ding <dtcccc@linux.alibaba.com>
+---
+ kernel/sched/fair.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6f00fc1ef..156ae24b3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3688,11 +3688,10 @@ static inline void
+ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }
+ #endif
+ 
+-static void reweight_eevdf(struct cfs_rq *cfs_rq, struct sched_entity *se,
++static void reweight_eevdf(struct sched_entity *se, u64 avruntime,
+ 			   unsigned long weight)
+ {
+ 	unsigned long old_weight = se->load.weight;
+-	u64 avruntime = avg_vruntime(cfs_rq);
+ 	s64 vlag, vslice;
+ 
+ 	/*
+@@ -3800,10 +3799,12 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+ 			    unsigned long weight)
+ {
+ 	bool curr = cfs_rq->curr == se;
++	u64 avruntime;
+ 
+ 	if (se->on_rq) {
+ 		/* commit outstanding execution time */
+ 		update_curr(cfs_rq);
++		avruntime = avg_vruntime(cfs_rq);
+ 		if (!curr)
+ 			__dequeue_entity(cfs_rq, se);
+ 		update_load_sub(&cfs_rq->load, se->load.weight);
+@@ -3817,7 +3818,7 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+ 		 */
+ 		se->vlag = div_s64(se->vlag * se->load.weight, weight);
+ 	} else {
+-		reweight_eevdf(cfs_rq, se, weight);
++		reweight_eevdf(se, avruntime, weight);
+ 	}
+ 
+ 	update_load_set(&se->load, weight);
+-- 
+2.43.0.232.ge79552d197
+
