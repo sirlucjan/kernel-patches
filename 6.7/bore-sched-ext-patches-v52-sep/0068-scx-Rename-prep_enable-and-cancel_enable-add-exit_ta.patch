@@ -1,0 +1,311 @@
+From 12ccfd08bf526b63fa95077f4f668545f0d471f5 Mon Sep 17 00:00:00 2001
+From: David Vernet <void@manifault.com>
+Date: Thu, 14 Dec 2023 15:47:03 -0600
+Subject: [PATCH 068/133] scx: Rename prep_enable() and cancel_enable(), add
+ exit_task()
+
+ops.prep_enable() and ops.cancel_enable() have become arguably somewhat
+misnomers in that ops.enable() and ops.disable() may be called multiple
+times throughout a BPF prog being loaded, but ops.prep_enable() and
+ops.cancel_enable() will be called at most once. ops.prep_enable() is
+really more akin to initializing the task rather than preparing for
+ops.enable(), so let's rename it to ops.init_task() and
+ops.cancel_init() to reflect this.
+
+In addition, some schedulers are currently using ops.disable() to clean
+up whatever was initialized in (what was previously) ops.prep_enable().
+This doesn't work now that ops.disable() can be called multiple times,
+so we also need to add a new callback called exit_task() which is called
+exactly once when a task is exiting (if it was previously successfully
+initialized).
+
+Signed-off-by: David Vernet <void@manifault.com>
+---
+ include/linux/sched/ext.h | 53 +++++++++++++++++---------------
+ kernel/sched/ext.c        | 63 ++++++++++++++++++---------------------
+ 2 files changed, 58 insertions(+), 58 deletions(-)
+
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index 732ce6801..73bcb9292 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -123,14 +123,20 @@ enum scx_ops_flags {
+ 				  SCX_OPS_CGROUP_KNOB_WEIGHT,
+ };
+ 
+-/* argument container for ops.enable() and friends */
+-struct scx_enable_args {
++/* argument container for ops.init_task() */
++struct scx_init_task_args {
+ #ifdef CONFIG_EXT_GROUP_SCHED
+ 	/* the cgroup the task is joining */
+ 	struct cgroup		*cgroup;
+ #endif
+ };
+ 
++/* argument container for ops.exit_task() */
++struct scx_exit_task_args {
++	/* Whether the task exited before running on sched_ext. */
++	bool cancelled;
++};
++
+ /* argument container for ops->cgroup_init() */
+ struct scx_cgroup_init_args {
+ 	/* the weight of the cgroup [1..10000] */
+@@ -425,41 +431,40 @@ struct sched_ext_ops {
+ 	void (*cpu_offline)(s32 cpu);
+ 
+ 	/**
+-	 * prep_enable - Prepare to enable BPF scheduling for a task
+-	 * @p: task to prepare BPF scheduling for
+-	 * @args: enable arguments, see the struct definition
++	 * init_task - Initialize a task to run in a BPF scheduler
++	 * @p: task to initialize for BPF scheduling
++	 * @args: init arguments, see the struct definition
+ 	 *
+ 	 * Either we're loading a BPF scheduler or a new task is being forked.
+-	 * Prepare BPF scheduling for @p. This operation may block and can be
+-	 * used for allocations, and is called exactly once for a task.
++	 * Initialize @p for BPF scheduling. This operation may block and can
++	 * be used for allocations, and is called exactly once for a task.
+ 	 *
+ 	 * Return 0 for success, -errno for failure. An error return while
+ 	 * loading will abort loading of the BPF scheduler. During a fork, it
+ 	 * will abort that specific fork.
+ 	 */
+-	s32 (*prep_enable)(struct task_struct *p, struct scx_enable_args *args);
++	s32 (*init_task)(struct task_struct *p,
++			 struct scx_init_task_args *args);
++
++	/**
++	 * exit_task - Exit a previously-running task from the system
++	 * @p: task to exit
++	 *
++	 * @p is exiting or the BPF scheduler is being unloaded. Perform any
++	 * necessary cleanup for @p.
++	 */
++	void (*exit_task)(struct task_struct *p,
++			  struct scx_exit_task_args *args);
+ 
+ 	/**
+ 	 * enable - Enable BPF scheduling for a task
+ 	 * @p: task to enable BPF scheduling for
+-	 * @args: enable arguments, see the struct definition
+ 	 *
+ 	 * Enable @p for BPF scheduling. @p is now in the cgroup specified in
+ 	 * @args. enable() is called on @p any time it enters SCX, and is
+ 	 * always paired with a matching disable().
+ 	 */
+-	void (*enable)(struct task_struct *p, struct scx_enable_args *args);
+-
+-	/**
+-	 * cancel_enable - Cancel prep_enable()
+-	 * @p: task being canceled
+-	 * @args: enable arguments, see the struct definition
+-	 *
+-	 * @p was prep_enable()'d but failed before reaching enable(). Undo the
+-	 * preparation.
+-	 */
+-	void (*cancel_enable)(struct task_struct *p,
+-			      struct scx_enable_args *args);
++	void (*enable)(struct task_struct *p);
+ 
+ 	/**
+ 	 * disable - Disable BPF scheduling for a task
+@@ -722,11 +727,11 @@ struct sched_ext_entity {
+ 	 * If set, reject future sched_setscheduler(2) calls updating the policy
+ 	 * to %SCHED_EXT with -%EACCES.
+ 	 *
+-	 * If set from ops.prep_enable() and the task's policy is already
++	 * If set from ops.init_task() and the task's policy is already
+ 	 * %SCHED_EXT, which can happen while the BPF scheduler is being loaded
+ 	 * or by inhering the parent's policy during fork, the task's policy is
+-	 * rejected and forcefully reverted to %SCHED_NORMAL. The number of such
+-	 * events are reported through /sys/kernel/debug/sched_ext::nr_rejected.
++	 * rejected and forcefully reverted to %SCHED_NORMAL. The number of
++	 * such events are reported through /sys/kernel/debug/sched_ext::nr_rejected.
+ 	 */
+ 	bool			disallow;	/* reject switching into SCX */
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 55cc5f5c9..cace32cbd 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -535,9 +535,9 @@ static bool ops_cpu_valid(s32 cpu)
+  * @err: -errno value to sanitize
+  *
+  * Verify @err is a valid -errno. If not, trigger scx_ops_error() and return
+- * -%EPROTO. This is necessary because returning a rogue -errno up the chain can
+- * cause misbehaviors. For an example, a large negative return from
+- * ops.prep_enable() triggers an oops when passed up the call chain because the
++ * -%EPROTO. This is necessary because returning a rogue -errno up the chain
++ * can cause misbehaviors. For an example, a large negative return from
++ * ops.init_task() triggers an oops when passed up the call chain because the
+  * value fails IS_ERR() test after being encoded with ERR_PTR() and then is
+  * handled as a pointer.
+  */
+@@ -2279,11 +2279,11 @@ static struct cgroup *tg_cgrp(struct task_group *tg)
+ 		return &cgrp_dfl_root.cgrp;
+ }
+ 
+-#define SCX_ENABLE_ARGS_INIT_CGROUP(tg)		.cgroup = tg_cgrp(tg),
++#define SCX_INIT_TASK_ARGS_CGROUP(tg)		.cgroup = tg_cgrp(tg),
+ 
+ #else	/* CONFIG_EXT_GROUP_SCHED */
+ 
+-#define SCX_ENABLE_ARGS_INIT_CGROUP(tg)
++#define SCX_INIT_TASK_ARGS_CGROUP(tg)
+ 
+ #endif	/* CONFIG_EXT_GROUP_SCHED */
+ 
+@@ -2326,20 +2326,20 @@ static void scx_set_task_state(struct task_struct *p, enum scx_task_state state)
+ 	}
+ }
+ 
+-static int scx_ops_prepare_task(struct task_struct *p, struct task_group *tg)
++static int scx_ops_init_task(struct task_struct *p, struct task_group *tg)
+ {
+ 	int ret;
+ 
+ 	p->scx.disallow = false;
+ 
+-	if (SCX_HAS_OP(prep_enable)) {
+-		struct scx_enable_args args = {
+-			SCX_ENABLE_ARGS_INIT_CGROUP(tg)
++	if (SCX_HAS_OP(init_task)) {
++		struct scx_init_task_args args = {
++			SCX_INIT_TASK_ARGS_CGROUP(tg)
+ 		};
+ 
+-		ret = SCX_CALL_OP_RET(SCX_KF_SLEEPABLE, prep_enable, p, &args);
++		ret = SCX_CALL_OP_RET(SCX_KF_SLEEPABLE, init_task, p, &args);
+ 		if (unlikely(ret)) {
+-			ret = ops_sanitize_err("prep_enable", ret);
++			ret = ops_sanitize_err("init_task", ret);
+ 			return ret;
+ 		}
+ 	}
+@@ -2356,8 +2356,8 @@ static int scx_ops_prepare_task(struct task_struct *p, struct task_group *tg)
+ 		 * We're either in fork or load path and @p->policy will be
+ 		 * applied right after. Reverting @p->policy here and rejecting
+ 		 * %SCHED_EXT transitions from scx_check_setscheduler()
+-		 * guarantees that if ops.prep_enable() sets @p->disallow, @p
+-		 * can never be in SCX.
++		 * guarantees that if ops.init_task() sets @p->disallow, @p can
++		 * never be in SCX.
+ 		 */
+ 		if (p->policy == SCHED_EXT) {
+ 			p->policy = SCHED_NORMAL;
+@@ -2387,13 +2387,8 @@ static void scx_ops_enable_task(struct task_struct *p)
+ 	 * doesn't see a stale value if they inspect the task struct.
+ 	 */
+ 	set_task_scx_weight(p);
+-	if (SCX_HAS_OP(enable)) {
+-		struct scx_enable_args args = {
+-			SCX_ENABLE_ARGS_INIT_CGROUP(task_group(p))
+-		};
+-
+-		SCX_CALL_OP_TASK(SCX_KF_REST, enable, p, &args);
+-	}
++	if (SCX_HAS_OP(enable))
++		SCX_CALL_OP_TASK(SCX_KF_REST, enable, p);
+ 	scx_set_task_state(p, SCX_TASK_ENABLED);
+ 
+ 	if (SCX_HAS_OP(set_weight))
+@@ -2412,18 +2407,16 @@ static void scx_ops_disable_task(struct task_struct *p)
+ 
+ static void scx_ops_exit_task(struct task_struct *p)
+ {
+-	lockdep_assert_rq_held(task_rq(p));
++	struct scx_exit_task_args args = {
++		.cancelled = false,
++	};
+ 
++	lockdep_assert_rq_held(task_rq(p));
+ 	switch (scx_get_task_state(p)) {
+ 	case SCX_TASK_NONE:
+ 		return;
+ 	case SCX_TASK_INIT:
+-		if (SCX_HAS_OP(cancel_enable)) {
+-			struct scx_enable_args args = {
+-				SCX_ENABLE_ARGS_INIT_CGROUP(task_group(p))
+-			};
+-			SCX_CALL_OP(SCX_KF_REST, cancel_enable, p, &args);
+-		}
++		args.cancelled = true;
+ 		break;
+ 	case SCX_TASK_READY:
+ 		break;
+@@ -2432,6 +2425,8 @@ static void scx_ops_exit_task(struct task_struct *p)
+ 		break;
+ 	}
+ 
++	if (SCX_HAS_OP(exit_task))
++		SCX_CALL_OP(SCX_KF_REST, exit_task, p, &args);
+ 	scx_set_task_state(p, SCX_TASK_NONE);
+ }
+ 
+@@ -2451,7 +2446,7 @@ int scx_fork(struct task_struct *p)
+ 	percpu_rwsem_assert_held(&scx_fork_rwsem);
+ 
+ 	if (scx_enabled())
+-		return scx_ops_prepare_task(p, task_group(p));
++		return scx_ops_init_task(p, task_group(p));
+ 	else
+ 		return 0;
+ }
+@@ -3368,7 +3363,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops)
+ 		/*
+ 		 * Exit early if ops.init() triggered scx_bpf_error(). Not
+ 		 * strictly necessary as we'll fail transitioning into ENABLING
+-		 * later but that'd be after calling ops.prep_enable() on all
++		 * later but that'd be after calling ops.init_task() on all
+ 		 * tasks and with -EBUSY which isn't very intuitive. Let's exit
+ 		 * early with success so that the condition is notified through
+ 		 * ops.exit() like other scx_bpf_error() invocations.
+@@ -3448,13 +3443,13 @@ static int scx_ops_enable(struct sched_ext_ops *ops)
+ 		get_task_struct(p);
+ 		spin_unlock_irq(&scx_tasks_lock);
+ 
+-		ret = scx_ops_prepare_task(p, task_group(p));
++		ret = scx_ops_init_task(p, task_group(p));
+ 		if (ret) {
+ 			put_task_struct(p);
+ 			spin_lock_irq(&scx_tasks_lock);
+ 			scx_task_iter_exit(&sti);
+ 			spin_unlock_irq(&scx_tasks_lock);
+-			pr_err("sched_ext: ops.prep_enable() failed (%d) for %s[%d] while loading\n",
++			pr_err("sched_ext: ops.init_task() failed (%d) for %s[%d] while loading\n",
+ 			       ret, p->comm, p->pid);
+ 			goto err_disable_unlock;
+ 		}
+@@ -3689,7 +3684,7 @@ static int bpf_scx_check_member(const struct btf_type *t,
+ 	u32 moff = __btf_member_bit_offset(t, member) / 8;
+ 
+ 	switch (moff) {
+-	case offsetof(struct sched_ext_ops, prep_enable):
++	case offsetof(struct sched_ext_ops, init_task):
+ #ifdef CONFIG_EXT_GROUP_SCHED
+ 	case offsetof(struct sched_ext_ops, cgroup_init):
+ 	case offsetof(struct sched_ext_ops, cgroup_exit):
+@@ -3735,7 +3730,7 @@ static int bpf_scx_update(void *kdata, void *old_kdata)
+ 	 * sched_ext does not support updating the actively-loaded BPF
+ 	 * scheduler, as registering a BPF scheduler can always fail if the
+ 	 * scheduler returns an error code for e.g. ops.init(),
+-	 * ops.prep_enable(), etc. Similarly, we can always race with
++	 * ops.init_task(), etc. Similarly, we can always race with
+ 	 * unregistration happening elsewhere, such as with sysrq.
+ 	 */
+ 	return -EOPNOTSUPP;
+@@ -3948,7 +3943,7 @@ static const struct btf_kfunc_id_set scx_kfunc_set_init = {
+  * @node: NUMA node to allocate from
+  *
+  * Create a custom DSQ identified by @dsq_id. Can be called from ops.init(),
+- * ops.prep_enable(), ops.cgroup_init() and ops.cgroup_prep_move().
++ * ops.init_task(), ops.cgroup_init() and ops.cgroup_prep_move().
+  */
+ s32 scx_bpf_create_dsq(u64 dsq_id, s32 node)
+ {
+-- 
+2.43.0.232.ge79552d197
+
