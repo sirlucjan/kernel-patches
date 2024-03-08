@@ -1,0 +1,461 @@
+From a47ec9da8e6c69e84b7dd65dc7d9b1d87af45065 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 6 Mar 2024 23:46:36 -1000
+Subject: [PATCH 165/167] scx: Implement configurable user_exit_info dump
+ buffer size
+
+The default dump buffer size of 32k is okay on smaller and mostly idle
+systems but it's not difficult to run over. Userspace can already
+communicate the desired size through sched_ext_ops.exit_dump_len. This
+commit actually implements dynamic buffer sizing. This unfortunately makes
+user_exit_info interface macro-fest but the usage in schedulers doesn't get
+more complicated at least.
+---
+ kernel/sched/ext.c                           | 27 ++++---
+ tools/sched_ext/include/scx/common.h         |  3 +-
+ tools/sched_ext/include/scx/compat.h         |  3 +-
+ tools/sched_ext/include/scx/user_exit_info.h | 79 ++++++++++++--------
+ tools/sched_ext/scx_central.bpf.c            |  4 +-
+ tools/sched_ext/scx_central.c                |  6 +-
+ tools/sched_ext/scx_flatcg.bpf.c             |  4 +-
+ tools/sched_ext/scx_flatcg.c                 |  6 +-
+ tools/sched_ext/scx_qmap.bpf.c               |  4 +-
+ tools/sched_ext/scx_qmap.c                   |  6 +-
+ tools/sched_ext/scx_simple.bpf.c             |  4 +-
+ tools/sched_ext/scx_simple.c                 |  6 +-
+ 12 files changed, 84 insertions(+), 68 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 9ca195f53..a784bec9c 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -21,7 +21,7 @@ enum scx_internal_consts {
+ 
+ 	SCX_EXIT_BT_LEN			= 64,
+ 	SCX_EXIT_MSG_LEN		= 1024,
+-	SCX_EXIT_DUMP_LEN		= 32768,
++	SCX_EXIT_DUMP_DFL_LEN		= 32768,
+ };
+ 
+ enum scx_ops_enable_state {
+@@ -3270,7 +3270,7 @@ static void free_exit_info(struct scx_exit_info *ei)
+ 	kfree(ei);
+ }
+ 
+-static struct scx_exit_info *alloc_exit_info(void)
++static struct scx_exit_info *alloc_exit_info(size_t exit_dump_len)
+ {
+ 	struct scx_exit_info *ei;
+ 
+@@ -3280,7 +3280,7 @@ static struct scx_exit_info *alloc_exit_info(void)
+ 
+ 	ei->bt = kcalloc(sizeof(ei->bt[0]), SCX_EXIT_BT_LEN, GFP_KERNEL);
+ 	ei->msg = kzalloc(SCX_EXIT_MSG_LEN, GFP_KERNEL);
+-	ei->dump = kzalloc(SCX_EXIT_DUMP_LEN, GFP_KERNEL);
++	ei->dump = kzalloc(exit_dump_len, GFP_KERNEL);
+ 
+ 	if (!ei->bt || !ei->msg || !ei->dump) {
+ 		free_exit_info(ei);
+@@ -3519,7 +3519,7 @@ static void scx_dump_task(struct seq_buf *s, struct task_struct *p, char marker,
+ 	seq_buf_commit(s, used < avail ? used : -1);
+ }
+ 
+-static void scx_dump_state(struct scx_exit_info *ei)
++static void scx_dump_state(struct scx_exit_info *ei, size_t dump_len)
+ {
+ 	const char trunc_marker[] = "\n\n~~~~ TRUNCATED ~~~~\n";
+ 	unsigned long now = jiffies;
+@@ -3528,7 +3528,10 @@ static void scx_dump_state(struct scx_exit_info *ei)
+ 	char *buf;
+ 	int cpu;
+ 
+-	seq_buf_init(&s, ei->dump, SCX_EXIT_DUMP_LEN - sizeof(trunc_marker));
++	if (dump_len <= sizeof(trunc_marker))
++		return;
++
++	seq_buf_init(&s, ei->dump, dump_len - sizeof(trunc_marker));
+ 
+ 	seq_buf_printf(&s, "%s[%d] triggered exit kind %d:\n  %s (%s)\n\n",
+ 		       current->comm, current->pid, ei->kind, ei->reason, ei->msg);
+@@ -3580,15 +3583,14 @@ static void scx_dump_state(struct scx_exit_info *ei)
+ 		rq_unlock(rq, &rf);
+ 	}
+ 
+-	if (seq_buf_has_overflowed(&s)) {
+-		used = strlen(seq_buf_str(&s));
+-		memcpy(ei->dump + used, trunc_marker, sizeof(trunc_marker));
+-	}
++	if (seq_buf_has_overflowed(&s))
++		memcpy(ei->dump + seq_buf_used(&s) - 1, trunc_marker,
++		       sizeof(trunc_marker));
+ }
+ 
+ static void scx_ops_error_irq_workfn(struct irq_work *irq_work)
+ {
+-	scx_dump_state(scx_exit_info);
++	scx_dump_state(scx_exit_info, scx_ops.exit_dump_len);
+ 	schedule_scx_ops_disable_work();
+ }
+ 
+@@ -3678,7 +3680,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops)
+ 	if (ret < 0)
+ 		goto err;
+ 
+-	scx_exit_info = alloc_exit_info();
++	scx_exit_info = alloc_exit_info(ops->exit_dump_len);
+ 	if (!scx_exit_info) {
+ 		ret = -ENOMEM;
+ 		goto err_del;
+@@ -4087,7 +4089,8 @@ static int bpf_scx_init_member(const struct btf_type *t,
+ 		ops->timeout_ms = *(u32 *)(udata + moff);
+ 		return 1;
+ 	case offsetof(struct sched_ext_ops, exit_dump_len):
+-		ops->exit_dump_len = *(u32 *)(udata + moff);
++		ops->exit_dump_len =
++			*(u32 *)(udata + moff) ?: SCX_EXIT_DUMP_DFL_LEN;
+ 		return 1;
+ 	}
+ 
+diff --git a/tools/sched_ext/include/scx/common.h b/tools/sched_ext/include/scx/common.h
+index 2a8820108..8d5a6775f 100644
+--- a/tools/sched_ext/include/scx/common.h
++++ b/tools/sched_ext/include/scx/common.h
+@@ -17,8 +17,6 @@
+ #include <stdint.h>
+ #include <errno.h>
+ 
+-#include "user_exit_info.h"
+-
+ typedef uint8_t u8;
+ typedef uint16_t u16;
+ typedef uint32_t u32;
+@@ -67,6 +65,7 @@ typedef int64_t s64;
+ 			bpf_map__initial_value(skel->maps.elfsec##_##arr, &__sz); \
+ 	} while (0)
+ 
++#include "user_exit_info.h"
+ #include "compat.h"
+ 
+ #endif	/* __SCHED_EXT_COMMON_H */
+diff --git a/tools/sched_ext/include/scx/compat.h b/tools/sched_ext/include/scx/compat.h
+index b66bea556..a9f0c2b95 100644
+--- a/tools/sched_ext/include/scx/compat.h
++++ b/tools/sched_ext/include/scx/compat.h
+@@ -116,7 +116,8 @@ static inline bool __COMPAT_struct_has_field(const char *type, const char *field
+  *   it, the value is ignored and a warning is triggered if the value is
+  *   requested to be non-zero.
+  */
+-#define SCX_OPS_LOAD(__skel, __ops_name, __scx_name) ({				\
++#define SCX_OPS_LOAD(__skel, __ops_name, __scx_name, __uei_name) ({		\
++	UEI_SET_SIZE(__skel, __ops_name, __uei_name);				\
+ 	if (__COMPAT_struct_has_field("sched_ext_ops", "exit_dump_len")) {	\
+ 		bpf_map__set_autocreate((__skel)->maps.__ops_name, true);	\
+ 		bpf_map__set_autocreate((__skel)->maps.__ops_name##___no_exit_dump_len, false); \
+diff --git a/tools/sched_ext/include/scx/user_exit_info.h b/tools/sched_ext/include/scx/user_exit_info.h
+index a51b0baf1..4ccf0d822 100644
+--- a/tools/sched_ext/include/scx/user_exit_info.h
++++ b/tools/sched_ext/include/scx/user_exit_info.h
+@@ -11,16 +11,15 @@
+ #define __USER_EXIT_INFO_H
+ 
+ enum uei_sizes {
+-	UEI_REASON_SIZE	= 128,
+-	UEI_MSG_SIZE	= 1024,
+-	UEI_DUMP_SIZE	= 32768,
++	UEI_REASON_LEN		= 128,
++	UEI_MSG_LEN		= 1024,
++	UEI_DUMP_DFL_LEN	= 32768,
+ };
+ 
+ struct user_exit_info {
+ 	int		kind;
+-	char		reason[UEI_REASON_SIZE];
+-	char		msg[UEI_MSG_SIZE];
+-	char		dump[UEI_DUMP_SIZE];
++	char		reason[UEI_REASON_LEN];
++	char		msg[UEI_MSG_LEN];
+ };
+ 
+ #ifdef __bpf__
+@@ -28,40 +27,54 @@ struct user_exit_info {
+ #include "vmlinux.h"
+ #include <bpf/bpf_core_read.h>
+ 
+-static inline void uei_record(struct user_exit_info *uei,
+-			      const struct scx_exit_info *ei)
+-{
+-	bpf_probe_read_kernel_str(uei->reason, sizeof(uei->reason), ei->reason);
+-	bpf_probe_read_kernel_str(uei->msg, sizeof(uei->msg), ei->msg);
+-	bpf_probe_read_kernel_str(uei->dump, sizeof(uei->dump), ei->dump);
+-	/* use __sync to force memory barrier */
+-	__sync_val_compare_and_swap(&uei->kind, uei->kind, ei->kind);
+-}
++#define UEI_DEFINE(__name)							\
++	char RESIZABLE_ARRAY(data, __name##_dump);				\
++	const volatile u32 __name##_dump_len;					\
++	struct user_exit_info __name SEC(".data")
++
++#define UEI_RECORD(__uei_name, __ei) ({						\
++	bpf_probe_read_kernel_str(__uei_name.reason,				\
++				  sizeof(__uei_name.reason), (__ei)->reason);	\
++	bpf_probe_read_kernel_str(__uei_name.msg,				\
++				  sizeof(__uei_name.msg), (__ei)->msg);		\
++	bpf_probe_read_kernel_str(__uei_name##_dump,				\
++				  __uei_name##_dump_len, (__ei)->dump);		\
++	/* use __sync to force memory barrier */				\
++	__sync_val_compare_and_swap(&__uei_name.kind, __uei_name.kind,		\
++				    (__ei)->kind);				\
++})
+ 
+ #else	/* !__bpf__ */
+ 
+ #include <stdio.h>
+ #include <stdbool.h>
+ 
+-static inline bool uei_exited(struct user_exit_info *uei)
+-{
+-	/* use __sync to force memory barrier */
+-	return __sync_val_compare_and_swap(&uei->kind, -1, -1);
+-}
++/* no need to call the following explicitly if SCX_OPS_LOAD() is used */
++#define UEI_SET_SIZE(__skel, __ops_name, __uei_name) ({				\
++	u32 __len = (__skel)->struct_ops.__ops_name->exit_dump_len ?: UEI_DUMP_DFL_LEN; \
++	(__skel)->rodata->__uei_name##_dump_len = __len;			\
++	RESIZE_ARRAY(data, __uei_name##_dump, __len);				\
++})
++
++#define UEI_EXITED(__skel, __uei_name) ({					\
++	/* use __sync to force memory barrier */				\
++	__sync_val_compare_and_swap(&(__skel)->data->__uei_name.kind, -1, -1);	\
++})
+ 
+-static inline void uei_print(const struct user_exit_info *uei)
+-{
+-	if (uei->dump[0] != '\0') {
+-		fputs("\nDEBUG DUMP\n", stderr);
+-		fputs("================================================================================\n\n", stderr);
+-		fputs(uei->dump, stderr);
+-		fputs("\n================================================================================\n\n", stderr);
+-	}
+-	fprintf(stderr, "EXIT: %s", uei->reason);
+-	if (uei->msg[0] != '\0')
+-		fprintf(stderr, " (%s)", uei->msg);
+-	fputs("\n", stderr);
+-}
++#define UEI_REPORT(__skel, __uei_name) ({					\
++	struct user_exit_info *__uei = &(__skel)->data->__uei_name;		\
++	char *__uei_dump = (__skel)->data_##__uei_name##_dump->__uei_name##_dump; \
++	if (__uei_dump[0] != '\0') {						\
++		fputs("\nDEBUG DUMP\n", stderr);				\
++		fputs("================================================================================\n\n", stderr); \
++		fputs(__uei_dump, stderr);					\
++		fputs("\n================================================================================\n\n", stderr); \
++	}									\
++	fprintf(stderr, "EXIT: %s", __uei->reason);				\
++	if (__uei->msg[0] != '\0')						\
++		fprintf(stderr, " (%s)", __uei->msg);				\
++	fputs("\n", stderr);							\
++})
+ 
+ #endif	/* __bpf__ */
+ #endif	/* __USER_EXIT_INFO_H */
+diff --git a/tools/sched_ext/scx_central.bpf.c b/tools/sched_ext/scx_central.bpf.c
+index 3d9911f81..1ab8a42ed 100644
+--- a/tools/sched_ext/scx_central.bpf.c
++++ b/tools/sched_ext/scx_central.bpf.c
+@@ -64,7 +64,7 @@ u64 nr_total, nr_locals, nr_queued, nr_lost_pids;
+ u64 nr_timers, nr_dispatches, nr_mismatches, nr_retries;
+ u64 nr_overflows;
+ 
+-struct user_exit_info uei;
++UEI_DEFINE(uei);
+ 
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_QUEUE);
+@@ -340,7 +340,7 @@ int BPF_STRUCT_OPS_SLEEPABLE(central_init)
+ 
+ void BPF_STRUCT_OPS(central_exit, struct scx_exit_info *ei)
+ {
+-	uei_record(&uei, ei);
++	UEI_RECORD(uei, ei);
+ }
+ 
+ SCX_OPS_DEFINE(central_ops,
+diff --git a/tools/sched_ext/scx_central.c b/tools/sched_ext/scx_central.c
+index fd186ce28..237a2c6ad 100644
+--- a/tools/sched_ext/scx_central.c
++++ b/tools/sched_ext/scx_central.c
+@@ -70,7 +70,7 @@ int main(int argc, char **argv)
+ 	RESIZE_ARRAY(data, cpu_gimme_task, skel->rodata->nr_cpu_ids);
+ 	RESIZE_ARRAY(data, cpu_started_at, skel->rodata->nr_cpu_ids);
+ 
+-	SCX_OPS_LOAD(skel, central_ops, scx_central);
++	SCX_OPS_LOAD(skel, central_ops, scx_central, uei);
+ 
+ 	/*
+ 	 * Affinitize the loading thread to the central CPU, as:
+@@ -97,7 +97,7 @@ int main(int argc, char **argv)
+ 	if (!skel->data->timer_pinned)
+ 		printf("WARNING : BPF_F_TIMER_CPU_PIN not available, timer not pinned to central\n");
+ 
+-	while (!exit_req && !uei_exited(&skel->bss->uei)) {
++	while (!exit_req && !UEI_EXITED(skel, uei)) {
+ 		printf("[SEQ %llu]\n", seq++);
+ 		printf("total   :%10" PRIu64 "    local:%10" PRIu64 "   queued:%10" PRIu64 "  lost:%10" PRIu64 "\n",
+ 		       skel->bss->nr_total,
+@@ -116,7 +116,7 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	bpf_link__destroy(link);
+-	uei_print(&skel->bss->uei);
++	UEI_REPORT(skel, uei);
+ 	scx_central__destroy(skel);
+ 	return 0;
+ }
+diff --git a/tools/sched_ext/scx_flatcg.bpf.c b/tools/sched_ext/scx_flatcg.bpf.c
+index 9c1c3c4e6..9946b8949 100644
+--- a/tools/sched_ext/scx_flatcg.bpf.c
++++ b/tools/sched_ext/scx_flatcg.bpf.c
+@@ -58,7 +58,7 @@ const volatile u64 cgrp_slice_ns = SCX_SLICE_DFL;
+ const volatile bool fifo_sched;
+ 
+ u64 cvtime_now;
+-struct user_exit_info uei;
++UEI_DEFINE(uei);
+ 
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+@@ -928,7 +928,7 @@ void BPF_STRUCT_OPS(fcg_cgroup_move, struct task_struct *p,
+ 
+ void BPF_STRUCT_OPS(fcg_exit, struct scx_exit_info *ei)
+ {
+-	uei_record(&uei, ei);
++	UEI_RECORD(uei, ei);
+ }
+ 
+ SCX_OPS_DEFINE(flatcg_ops,
+diff --git a/tools/sched_ext/scx_flatcg.c b/tools/sched_ext/scx_flatcg.c
+index 80988014c..a2b440d0a 100644
+--- a/tools/sched_ext/scx_flatcg.c
++++ b/tools/sched_ext/scx_flatcg.c
+@@ -161,10 +161,10 @@ int main(int argc, char **argv)
+ 	       (double)intv_ts.tv_sec + (double)intv_ts.tv_nsec / 1000000000.0,
+ 	       dump_cgrps);
+ 
+-	SCX_OPS_LOAD(skel, flatcg_ops, scx_flatcg);
++	SCX_OPS_LOAD(skel, flatcg_ops, scx_flatcg, uei);
+ 	link = SCX_OPS_ATTACH(skel, flatcg_ops);
+ 
+-	while (!exit_req && !uei_exited(&skel->bss->uei)) {
++	while (!exit_req && !UEI_EXITED(skel, uei)) {
+ 		__u64 acc_stats[FCG_NR_STATS];
+ 		__u64 stats[FCG_NR_STATS];
+ 		float cpu_util;
+@@ -213,7 +213,7 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	bpf_link__destroy(link);
+-	uei_print(&skel->bss->uei);
++	UEI_REPORT(skel, uei);
+ 	scx_flatcg__destroy(skel);
+ 	return 0;
+ }
+diff --git a/tools/sched_ext/scx_qmap.bpf.c b/tools/sched_ext/scx_qmap.bpf.c
+index 6c0ccae5f..89ac8d126 100644
+--- a/tools/sched_ext/scx_qmap.bpf.c
++++ b/tools/sched_ext/scx_qmap.bpf.c
+@@ -35,7 +35,7 @@ const volatile s32 disallow_tgid;
+ 
+ u32 test_error_cnt;
+ 
+-struct user_exit_info uei;
++UEI_DEFINE(uei);
+ 
+ struct qmap {
+ 	__uint(type, BPF_MAP_TYPE_QUEUE);
+@@ -380,7 +380,7 @@ s32 BPF_STRUCT_OPS(qmap_init)
+ 
+ void BPF_STRUCT_OPS(qmap_exit, struct scx_exit_info *ei)
+ {
+-	uei_record(&uei, ei);
++	UEI_RECORD(uei, ei);
+ }
+ 
+ SCX_OPS_DEFINE(qmap_ops,
+diff --git a/tools/sched_ext/scx_qmap.c b/tools/sched_ext/scx_qmap.c
+index d66748643..0171a5f7d 100644
+--- a/tools/sched_ext/scx_qmap.c
++++ b/tools/sched_ext/scx_qmap.c
+@@ -88,10 +88,10 @@ int main(int argc, char **argv)
+ 		}
+ 	}
+ 
+-	SCX_OPS_LOAD(skel, qmap_ops, scx_qmap);
++	SCX_OPS_LOAD(skel, qmap_ops, scx_qmap, uei);
+ 	link = SCX_OPS_ATTACH(skel, qmap_ops);
+ 
+-	while (!exit_req && !uei_exited(&skel->bss->uei)) {
++	while (!exit_req && !UEI_EXITED(skel, uei)) {
+ 		long nr_enqueued = skel->bss->nr_enqueued;
+ 		long nr_dispatched = skel->bss->nr_dispatched;
+ 
+@@ -104,7 +104,7 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	bpf_link__destroy(link);
+-	uei_print(&skel->bss->uei);
++	UEI_REPORT(skel, uei);
+ 	scx_qmap__destroy(skel);
+ 	return 0;
+ }
+diff --git a/tools/sched_ext/scx_simple.bpf.c b/tools/sched_ext/scx_simple.bpf.c
+index b1aba9d49..535fe52f5 100644
+--- a/tools/sched_ext/scx_simple.bpf.c
++++ b/tools/sched_ext/scx_simple.bpf.c
+@@ -27,7 +27,7 @@ char _license[] SEC("license") = "GPL";
+ const volatile bool fifo_sched;
+ 
+ static u64 vtime_now;
+-struct user_exit_info uei;
++UEI_DEFINE(uei);
+ 
+ #define SHARED_DSQ 0
+ 
+@@ -134,7 +134,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
+ 
+ void BPF_STRUCT_OPS(simple_exit, struct scx_exit_info *ei)
+ {
+-	uei_record(&uei, ei);
++	UEI_RECORD(uei, ei);
+ }
+ 
+ SCX_OPS_DEFINE(simple_ops,
+diff --git a/tools/sched_ext/scx_simple.c b/tools/sched_ext/scx_simple.c
+index 63e030d08..57abb7b4d 100644
+--- a/tools/sched_ext/scx_simple.c
++++ b/tools/sched_ext/scx_simple.c
+@@ -74,10 +74,10 @@ int main(int argc, char **argv)
+ 		}
+ 	}
+ 
+-	SCX_OPS_LOAD(skel, simple_ops, scx_simple);
++	SCX_OPS_LOAD(skel, simple_ops, scx_simple, uei);
+ 	link = SCX_OPS_ATTACH(skel, simple_ops);
+ 
+-	while (!exit_req && !uei_exited(&skel->bss->uei)) {
++	while (!exit_req && !UEI_EXITED(skel, uei)) {
+ 		__u64 stats[2];
+ 
+ 		read_stats(skel, stats);
+@@ -87,7 +87,7 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	bpf_link__destroy(link);
+-	uei_print(&skel->bss->uei);
++	UEI_REPORT(skel, uei);
+ 	scx_simple__destroy(skel);
+ 	return 0;
+ }
+-- 
+2.43.0.232.ge79552d197
+
