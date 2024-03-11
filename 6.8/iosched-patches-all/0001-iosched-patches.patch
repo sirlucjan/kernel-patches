@@ -1,0 +1,859 @@
+From f01b1c8cb3db4081db7ef2580dea7432b8d64205 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 19 Jan 2024 08:04:42 -0700
+Subject: [PATCH 1/8] block/mq-deadline: pass in queue directly to
+ dd_insert_request()
+
+The hardware queue isn't relevant, deadline only operates on the queue
+itself. Pass in the queue directly rather than the hardware queue, as
+that more clearly explains what is being operated on.
+
+Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/mq-deadline.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index f958e7927..9b7563e9d 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -792,10 +792,9 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
+ /*
+  * add rq to rbtree and fifo
+  */
+-static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
++static void dd_insert_request(struct request_queue *q, struct request *rq,
+ 			      blk_insert_t flags, struct list_head *free)
+ {
+-	struct request_queue *q = hctx->queue;
+ 	struct deadline_data *dd = q->elevator->elevator_data;
+ 	const enum dd_data_dir data_dir = rq_data_dir(rq);
+ 	u16 ioprio = req_get_ioprio(rq);
+@@ -875,7 +874,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
+ 
+ 		rq = list_first_entry(list, struct request, queuelist);
+ 		list_del_init(&rq->queuelist);
+-		dd_insert_request(hctx, rq, flags, &free);
++		dd_insert_request(q, rq, flags, &free);
+ 	}
+ 	spin_unlock(&dd->lock);
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From c0542a72faecd8dcaf74788f14730ba445098e5e Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 18 Jan 2024 10:46:52 -0700
+Subject: [PATCH 2/8] block/mq-deadline: serialize request dispatching
+
+If we're entering request dispatch but someone else is already
+dispatching, then just skip this dispatch. We know IO is inflight and
+this will trigger another dispatch event for any completion. This will
+potentially cause slightly lower queue depth for contended cases, but
+those are slowed down anyway and this should not cause an issue.
+
+By itself, this patch doesn't help a whole lot, as the dispatch
+lock contention reduction is just eating up by the same dd->lock now
+seeing increased insertion contention. But it's required work to be
+able to reduce the lock contention in general.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/mq-deadline.c | 31 ++++++++++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index 9b7563e9d..79bc3b678 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -79,10 +79,20 @@ struct dd_per_prio {
+ 	struct io_stats_per_prio stats;
+ };
+ 
++enum {
++	DD_DISPATCHING	= 0,
++};
++
+ struct deadline_data {
+ 	/*
+ 	 * run time data
+ 	 */
++	struct {
++		spinlock_t lock;
++		spinlock_t zone_lock;
++	} ____cacheline_aligned_in_smp;
++
++	unsigned long run_state;
+ 
+ 	struct dd_per_prio per_prio[DD_PRIO_COUNT];
+ 
+@@ -100,9 +110,6 @@ struct deadline_data {
+ 	int front_merges;
+ 	u32 async_depth;
+ 	int prio_aging_expire;
+-
+-	spinlock_t lock;
+-	spinlock_t zone_lock;
+ };
+ 
+ /* Maps an I/O priority class to a deadline scheduler priority. */
+@@ -600,6 +607,18 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 	struct request *rq;
+ 	enum dd_prio prio;
+ 
++	/*
++	 * If someone else is already dispatching, skip this one. This will
++	 * defer the next dispatch event to when something completes, and could
++	 * potentially lower the queue depth for contended cases.
++	 *
++	 * See the logic in blk_mq_do_dispatch_sched(), which loops and
++	 * retries if nothing is dispatched.
++	 */
++	if (test_bit(DD_DISPATCHING, &dd->run_state) ||
++	    test_and_set_bit_lock(DD_DISPATCHING, &dd->run_state))
++		return NULL;
++
+ 	spin_lock(&dd->lock);
+ 	rq = dd_dispatch_prio_aged_requests(dd, now);
+ 	if (rq)
+@@ -616,6 +635,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 	}
+ 
+ unlock:
++	clear_bit_unlock(DD_DISPATCHING, &dd->run_state);
+ 	spin_unlock(&dd->lock);
+ 
+ 	return rq;
+@@ -706,6 +726,9 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+ 
+ 	eq->elevator_data = dd;
+ 
++	spin_lock_init(&dd->lock);
++	spin_lock_init(&dd->zone_lock);
++
+ 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+ 		struct dd_per_prio *per_prio = &dd->per_prio[prio];
+ 
+@@ -722,8 +745,6 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+ 	dd->last_dir = DD_WRITE;
+ 	dd->fifo_batch = fifo_batch;
+ 	dd->prio_aging_expire = prio_aging_expire;
+-	spin_lock_init(&dd->lock);
+-	spin_lock_init(&dd->zone_lock);
+ 
+ 	/* We dispatch from request queue wide instead of hw queue */
+ 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+-- 
+2.43.0.232.ge79552d197
+
+
+From f990d8b9b6d774114d5d1ca14907318e2bbce880 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 19 Jan 2024 08:16:36 -0700
+Subject: [PATCH 3/8] block/mq-deadline: skip expensive merge lookups if
+ contended
+
+We do several stages of merging in the block layer - the most likely one
+to work is also the cheap one, merging direct in the per-task plug when
+IO is submitted. Getting merges outside of that is a lot less likely,
+but IO schedulers may still maintain internal data structures to
+facilitate merge lookups outside of the plug.
+
+Make mq-deadline skip expensive merge lookups if the queue lock is
+already contended. The likelihood of getting a merge here is not very
+likely, hence it should not be a problem skipping the attempt in the
+also unlikely event that the queue is already contended.
+
+Perf diff shows the difference between a random read/write workload
+with 4 threads doing IO, with expensive merges turned on and off:
+
+    25.00%    +61.94%  [kernel.kallsyms]  [k] queued_spin_lock_slowpath
+
+where we almost quadruple the lock contention by attempting these
+expensive merges.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/mq-deadline.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index 79bc3b678..740b94f36 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -800,7 +800,19 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
+ 	struct request *free = NULL;
+ 	bool ret;
+ 
+-	spin_lock(&dd->lock);
++	/*
++	 * bio merging is called for every bio queued, and it's very easy
++	 * to run into contention because of that. If we fail getting
++	 * the dd lock, just skip this merge attempt. For related IO, the
++	 * plug will be the successful merging point. If we get here, we
++	 * already failed doing the obvious merge. Chances of actually
++	 * getting a merge off this path is a lot slimmer, so skipping an
++	 * occassional lookup that will most likely not succeed anyway should
++	 * not be a problem.
++	 */
++	if (!spin_trylock(&dd->lock))
++		return false;
++
+ 	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
+ 	spin_unlock(&dd->lock);
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From fc70b0d764f07e99ca38c32fee0895472bc4dea5 Mon Sep 17 00:00:00 2001
+From: Bart Van Assche <bvanassche@acm.org>
+Date: Thu, 18 Jan 2024 10:53:34 -0700
+Subject: [PATCH 4/8] block/mq-deadline: use separate insertion lists
+
+[Missing commit message from Bart]
+
+With the previous dispatch and merge optimization, this drastically
+reduces contention for a sample cases of 32 threads doing IO to devices.
+The test case looks as follows:
+
+fio --bs=512 --group_reporting=1 --gtod_reduce=1 --invalidate=1 \
+	--ioengine=io_uring --norandommap --runtime=60 --rw=randread \
+	--thread --time_based=1 --buffered=0 --fixedbufs=1 --numjobs=32 \
+	--iodepth=4 --iodepth_batch_submit=4 --iodepth_batch_complete=4 \
+	--name=scaletest --filename=/dev/$DEV
+
+Before:
+
+Device		IOPS	sys	contention	diff
+====================================================
+null_blk	879K	89%	93.6%
+nvme0n1		901K	86%	94.5%
+
+and after this and the previous two patches:
+
+Device		IOPS	sys	contention	diff
+====================================================
+null_blk	2867K	11.1%	~6.0%		+326%
+nvme0n1		3162K	 9.9%	~5.0%		+350%
+
+which basically eliminates all of the lock contention, it's down to
+more normal levels. The throughput increases show that nicely, with more
+than a 300% improvement for both cases.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/mq-deadline.c | 66 ++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index 740b94f36..1b0de4fc3 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -89,11 +89,15 @@ struct deadline_data {
+ 	 */
+ 	struct {
+ 		spinlock_t lock;
++		spinlock_t insert_lock;
+ 		spinlock_t zone_lock;
+ 	} ____cacheline_aligned_in_smp;
+ 
+ 	unsigned long run_state;
+ 
++	struct list_head at_head;
++	struct list_head at_tail;
++
+ 	struct dd_per_prio per_prio[DD_PRIO_COUNT];
+ 
+ 	/* Data direction of latest dispatched request. */
+@@ -120,6 +124,9 @@ static const enum dd_prio ioprio_class_to_prio[] = {
+ 	[IOPRIO_CLASS_IDLE]	= DD_IDLE_PRIO,
+ };
+ 
++static void dd_insert_request(struct request_queue *q, struct request *rq,
++			      blk_insert_t flags, struct list_head *free);
++
+ static inline struct rb_root *
+ deadline_rb_root(struct dd_per_prio *per_prio, struct request *rq)
+ {
+@@ -592,6 +599,33 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
+ 	return NULL;
+ }
+ 
++static void __dd_do_insert(struct request_queue *q, blk_insert_t flags,
++			   struct list_head *list, struct list_head *free)
++{
++	while (!list_empty(list)) {
++		struct request *rq;
++
++		rq = list_first_entry(list, struct request, queuelist);
++		list_del_init(&rq->queuelist);
++		dd_insert_request(q, rq, flags, free);
++	}
++}
++
++static void dd_do_insert(struct request_queue *q, struct list_head *free)
++{
++	struct deadline_data *dd = q->elevator->elevator_data;
++	LIST_HEAD(at_head);
++	LIST_HEAD(at_tail);
++
++	spin_lock(&dd->insert_lock);
++	list_splice_init(&dd->at_head, &at_head);
++	list_splice_init(&dd->at_tail, &at_tail);
++	spin_unlock(&dd->insert_lock);
++
++	__dd_do_insert(q, BLK_MQ_INSERT_AT_HEAD, &at_head, free);
++	__dd_do_insert(q, 0, &at_tail, free);
++}
++
+ /*
+  * Called from blk_mq_run_hw_queue() -> __blk_mq_sched_dispatch_requests().
+  *
+@@ -602,10 +636,12 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
+  */
+ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ {
+-	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
++	struct request_queue *q = hctx->queue;
++	struct deadline_data *dd = q->elevator->elevator_data;
+ 	const unsigned long now = jiffies;
+ 	struct request *rq;
+ 	enum dd_prio prio;
++	LIST_HEAD(free);
+ 
+ 	/*
+ 	 * If someone else is already dispatching, skip this one. This will
+@@ -620,6 +656,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 		return NULL;
+ 
+ 	spin_lock(&dd->lock);
++	dd_do_insert(q, &free);
+ 	rq = dd_dispatch_prio_aged_requests(dd, now);
+ 	if (rq)
+ 		goto unlock;
+@@ -638,6 +675,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 	clear_bit_unlock(DD_DISPATCHING, &dd->run_state);
+ 	spin_unlock(&dd->lock);
+ 
++	blk_mq_free_requests(&free);
+ 	return rq;
+ }
+ 
+@@ -727,8 +765,12 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+ 	eq->elevator_data = dd;
+ 
+ 	spin_lock_init(&dd->lock);
++	spin_lock_init(&dd->insert_lock);
+ 	spin_lock_init(&dd->zone_lock);
+ 
++	INIT_LIST_HEAD(&dd->at_head);
++	INIT_LIST_HEAD(&dd->at_tail);
++
+ 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+ 		struct dd_per_prio *per_prio = &dd->per_prio[prio];
+ 
+@@ -899,19 +941,13 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
+ {
+ 	struct request_queue *q = hctx->queue;
+ 	struct deadline_data *dd = q->elevator->elevator_data;
+-	LIST_HEAD(free);
+-
+-	spin_lock(&dd->lock);
+-	while (!list_empty(list)) {
+-		struct request *rq;
+ 
+-		rq = list_first_entry(list, struct request, queuelist);
+-		list_del_init(&rq->queuelist);
+-		dd_insert_request(q, rq, flags, &free);
+-	}
+-	spin_unlock(&dd->lock);
+-
+-	blk_mq_free_requests(&free);
++	spin_lock(&dd->insert_lock);
++	if (flags & BLK_MQ_INSERT_AT_HEAD)
++		list_splice_init(list, &dd->at_head);
++	else
++		list_splice_init(list, &dd->at_tail);
++	spin_unlock(&dd->insert_lock);
+ }
+ 
+ /* Callback from inside blk_mq_rq_ctx_init(). */
+@@ -990,6 +1026,10 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
+ 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
+ 	enum dd_prio prio;
+ 
++	if (!list_empty_careful(&dd->at_head) ||
++	    !list_empty_careful(&dd->at_tail))
++		return true;
++
+ 	for (prio = 0; prio <= DD_PRIO_MAX; prio++)
+ 		if (dd_has_work_for_prio(&dd->per_prio[prio]))
+ 			return true;
+-- 
+2.43.0.232.ge79552d197
+
+
+From d93568dcb6dd8164e5d5a05a326256d54830a183 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sat, 20 Jan 2024 14:50:58 -0700
+Subject: [PATCH 5/8] block/bfq: pass in queue directly to dd_insert_request()
+
+The hardware queue isn't relevant, bfq only operates on the queue
+itself. Pass in the queue directly rather than the hardware queue, as
+that more clearly explains what is being operated on.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/bfq-iosched.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 3cce6de46..7d0844247 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -6236,10 +6236,9 @@ static inline void bfq_update_insert_stats(struct request_queue *q,
+ 
+ static struct bfq_queue *bfq_init_rq(struct request *rq);
+ 
+-static void bfq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
++static void bfq_insert_request(struct request_queue *q, struct request *rq,
+ 			       blk_insert_t flags)
+ {
+-	struct request_queue *q = hctx->queue;
+ 	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 	struct bfq_queue *bfqq;
+ 	bool idle_timer_disabled = false;
+@@ -6301,7 +6300,7 @@ static void bfq_insert_requests(struct blk_mq_hw_ctx *hctx,
+ 
+ 		rq = list_first_entry(list, struct request, queuelist);
+ 		list_del_init(&rq->queuelist);
+-		bfq_insert_request(hctx, rq, flags);
++		bfq_insert_request(hctx->queue, rq, flags);
+ 	}
+ }
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From 83d2db8429998d499c881afe2cd9996eb50c38f0 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sat, 20 Jan 2024 14:54:37 -0700
+Subject: [PATCH 6/8] block/bfq: serialize request dispatching
+
+If we're entering request dispatch but someone else is already
+dispatching, then just skip this dispatch. We know IO is inflight and
+this will trigger another dispatch event for any completion. This will
+potentially cause slightly lower queue depth for contended cases, but
+those are slowed down anyway and this should not cause an issue.
+
+By itself, this patch doesn't help a whole lot, as the dispatch
+lock contention reduction is just eating up by the same dd->lock now
+seeing increased insertion contention. But it's required work to be
+able to reduce the lock contention in general.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/bfq-iosched.c | 17 +++++++++++++++--
+ block/bfq-iosched.h | 12 ++++++++++--
+ 2 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 7d0844247..5ef4a4eba 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -5304,6 +5304,18 @@ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 	struct bfq_queue *in_serv_queue;
+ 	bool waiting_rq, idle_timer_disabled = false;
+ 
++	/*
++	 * If someone else is already dispatching, skip this one. This will
++	 * defer the next dispatch event to when something completes, and could
++	 * potentially lower the queue depth for contended cases.
++	 *
++	 * See the logic in blk_mq_do_dispatch_sched(), which loops and
++	 * retries if nothing is dispatched.
++	 */
++	if (test_bit(BFQ_DISPATCHING, &bfqd->run_state) ||
++	    test_and_set_bit_lock(BFQ_DISPATCHING, &bfqd->run_state))
++		return NULL;
++
+ 	spin_lock_irq(&bfqd->lock);
+ 
+ 	in_serv_queue = bfqd->in_service_queue;
+@@ -5315,6 +5327,7 @@ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 			waiting_rq && !bfq_bfqq_wait_request(in_serv_queue);
+ 	}
+ 
++	clear_bit_unlock(BFQ_DISPATCHING, &bfqd->run_state);
+ 	spin_unlock_irq(&bfqd->lock);
+ 	bfq_update_dispatch_stats(hctx->queue, rq,
+ 			idle_timer_disabled ? in_serv_queue : NULL,
+@@ -7210,6 +7223,8 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	q->elevator = eq;
+ 	spin_unlock_irq(&q->queue_lock);
+ 
++	spin_lock_init(&bfqd->lock);
++
+ 	/*
+ 	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
+ 	 * Grab a permanent reference to it, so that the normal code flow
+@@ -7328,8 +7343,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	/* see comments on the definition of next field inside bfq_data */
+ 	bfqd->actuator_load_threshold = 4;
+ 
+-	spin_lock_init(&bfqd->lock);
+-
+ 	/*
+ 	 * The invocation of the next bfq_create_group_hierarchy
+ 	 * function is the head of a chain of function calls
+diff --git a/block/bfq-iosched.h b/block/bfq-iosched.h
+index 467e8cfc4..56ff69f22 100644
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -504,12 +504,22 @@ struct bfq_io_cq {
+ 	unsigned int requests;	/* Number of requests this process has in flight */
+ };
+ 
++enum {
++	BFQ_DISPATCHING	= 0,
++};
++
+ /**
+  * struct bfq_data - per-device data structure.
+  *
+  * All the fields are protected by @lock.
+  */
+ struct bfq_data {
++	struct {
++		spinlock_t lock;
++	} ____cacheline_aligned_in_smp;
++
++	unsigned long run_state;
++
+ 	/* device request queue */
+ 	struct request_queue *queue;
+ 	/* dispatch queue */
+@@ -795,8 +805,6 @@ struct bfq_data {
+ 	/* fallback dummy bfqq for extreme OOM conditions */
+ 	struct bfq_queue oom_bfqq;
+ 
+-	spinlock_t lock;
+-
+ 	/*
+ 	 * bic associated with the task issuing current bio for
+ 	 * merging. This and the next field are used as a support to
+-- 
+2.43.0.232.ge79552d197
+
+
+From 3b9543509c542ffb62231f39548351cfad140cf5 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sat, 20 Jan 2024 14:58:37 -0700
+Subject: [PATCH 7/8] block/bfq: skip expensive merge lookups if contended
+
+We do several stages of merging in the block layer - the most likely one
+to work is also the cheap one, merging direct in the per-task plug when
+IO is submitted. Getting merges outside of that is a lot less likely,
+but IO schedulers may still maintain internal data structures to
+facilitate merge lookups outside of the plug.
+
+Make BFQ skip expensive merge lookups if the queue lock is already
+contended. The likelihood of getting a merge here is not very likely,
+hence it should not be a problem skipping the attempt in the also
+unlikely event that the queue is already contended.
+
+Perf diff shows the difference between a random read/write workload
+with 4 threads doing IO, with expensive merges turned on and off:
+
+    25.00%    +61.94%  [kernel.kallsyms]  [k] queued_spin_lock_slowpath
+
+where we almost quadruple the lock contention by attempting these
+expensive merges.
+
+TODO: re-do numbers for BFQ, but they will look very similar
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/bfq-iosched.c | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 5ef4a4eba..ea16a0c53 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -467,6 +467,21 @@ static struct bfq_io_cq *bfq_bic_lookup(struct request_queue *q)
+ 	return icq;
+ }
+ 
++static struct bfq_io_cq *bfq_bic_try_lookup(struct request_queue *q)
++{
++	if (!current->io_context)
++		return NULL;
++	if (spin_trylock_irq(&q->queue_lock)) {
++		struct bfq_io_cq *icq;
++
++		icq = icq_to_bic(ioc_lookup_icq(q));
++		spin_unlock_irq(&q->queue_lock);
++		return icq;
++	}
++
++	return NULL;
++}
++
+ /*
+  * Scheduler run of queue, if there are requests pending and no one in the
+  * driver that will restart queueing.
+@@ -2454,10 +2469,21 @@ static bool bfq_bio_merge(struct request_queue *q, struct bio *bio,
+ 	 * returned by bfq_bic_lookup does not go away before
+ 	 * bfqd->lock is taken.
+ 	 */
+-	struct bfq_io_cq *bic = bfq_bic_lookup(q);
++	struct bfq_io_cq *bic = bfq_bic_try_lookup(q);
+ 	bool ret;
+ 
+-	spin_lock_irq(&bfqd->lock);
++	/*
++	 * bio merging is called for every bio queued, and it's very easy
++	 * to run into contention because of that. If we fail getting
++	 * the dd lock, just skip this merge attempt. For related IO, the
++	 * plug will be the successful merging point. If we get here, we
++	 * already failed doing the obvious merge. Chances of actually
++	 * getting a merge off this path is a lot slimmer, so skipping an
++	 * occassional lookup that will most likely not succeed anyway should
++	 * not be a problem.
++	 */
++	if (!spin_trylock_irq(&bfqd->lock))
++		return false;
+ 
+ 	if (bic) {
+ 		/*
+-- 
+2.43.0.232.ge79552d197
+
+
+From a02361cae828153d6320e8813fa32bf520f9a5ff Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sat, 20 Jan 2024 15:04:51 -0700
+Subject: [PATCH 8/8] block/bfq: use separate insertion lists
+
+Based on the similar patch for mq-deadline, this uses separate
+insertion lists so we can defer touching dd->lock until dispatch
+time.
+
+This improves the following fio workload:
+
+fio --bs=512 --group_reporting=1 --gtod_reduce=1 --invalidate=1 \
+        --ioengine=io_uring --norandommap --runtime=60 --rw=randread \
+        --thread --time_based=1 --buffered=0 --fixedbufs=1 --numjobs=32 \
+        --iodepth=4 --iodepth_batch_submit=4 --iodepth_batch_complete=4 \
+        --name=/dev/nvme0n1 --filename=/dev/nvme0n1
+
+from:
+
+/dev/nvme0n1: (groupid=0, jobs=32): err= 0: pid=1113: Fri Jan 19 20:59:26 2024
+  read: IOPS=567k, BW=277MiB/s (290MB/s)(1820MiB/6575msec)
+   bw (  KiB/s): min=274824, max=291156, per=100.00%, avg=283930.08, stdev=143.01, samples=416
+   iops        : min=549648, max=582312, avg=567860.31, stdev=286.01, samples=416
+  cpu          : usr=0.18%, sys=86.04%, ctx=866079, majf=0, minf=0
+  IO depths    : 1=0.0%, 2=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=3728344,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=4
+
+with 96% lock contention and 86% sys time, to:
+
+/dev/nvme0n1: (groupid=0, jobs=32): err= 0: pid=8922: Sat Jan 20 11:16:20 2024
+  read: IOPS=1550k, BW=757MiB/s (794MB/s)(19.6GiB/26471msec)
+   bw (  KiB/s): min=754668, max=848896, per=100.00%, avg=775459.33, stdev=624.43, samples=1664
+   iops        : min=1509336, max=1697793, avg=1550918.83, stdev=1248.87, samples=1664
+  cpu          : usr=1.34%, sys=14.49%, ctx=9950560, majf=0, minf=0
+  IO depths    : 1=0.0%, 2=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=41042924,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=4
+
+with ~30% lock contention and 14.5% sys time, by applying the lessons
+learnt with scaling mq-deadline. Patch needs to be split, but it:
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/bfq-iosched.c | 70 ++++++++++++++++++++++++++++++++++-----------
+ block/bfq-iosched.h |  4 +++
+ 2 files changed, 58 insertions(+), 16 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index ea16a0c53..9bd57baa4 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -5174,6 +5174,10 @@ static bool bfq_has_work(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct bfq_data *bfqd = hctx->queue->elevator->elevator_data;
+ 
++	if (!list_empty_careful(&bfqd->at_head) ||
++	    !list_empty_careful(&bfqd->at_tail))
++		return true;
++
+ 	/*
+ 	 * Avoiding lock: a race on bfqd->queued should cause at
+ 	 * most a call to dispatch for nothing
+@@ -5323,12 +5327,44 @@ static inline void bfq_update_dispatch_stats(struct request_queue *q,
+ 					     bool idle_timer_disabled) {}
+ #endif /* CONFIG_BFQ_CGROUP_DEBUG */
+ 
++static void bfq_insert_request(struct request_queue *q, struct request *rq,
++			       blk_insert_t flags, struct list_head *free);
++
++static void __bfq_do_insert(struct request_queue *q, blk_insert_t flags,
++			    struct list_head *list, struct list_head *free)
++{
++	while (!list_empty(list)) {
++		struct request *rq;
++
++		rq = list_first_entry(list, struct request, queuelist);
++		list_del_init(&rq->queuelist);
++		bfq_insert_request(q, rq, flags, free);
++	}
++}
++
++static void bfq_do_insert(struct request_queue *q, struct list_head *free)
++{
++	struct bfq_data *bfqd = q->elevator->elevator_data;
++	LIST_HEAD(at_head);
++	LIST_HEAD(at_tail);
++
++	spin_lock(&bfqd->insert_lock);
++	list_splice_init(&bfqd->at_head, &at_head);
++	list_splice_init(&bfqd->at_tail, &at_tail);
++	spin_unlock(&bfqd->insert_lock);
++
++	__bfq_do_insert(q, BLK_MQ_INSERT_AT_HEAD, &at_head, free);
++	__bfq_do_insert(q, 0, &at_tail, free);
++}
++
+ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ {
+-	struct bfq_data *bfqd = hctx->queue->elevator->elevator_data;
++	struct request_queue *q = hctx->queue;
++	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 	struct request *rq;
+ 	struct bfq_queue *in_serv_queue;
+ 	bool waiting_rq, idle_timer_disabled = false;
++	LIST_HEAD(free);
+ 
+ 	/*
+ 	 * If someone else is already dispatching, skip this one. This will
+@@ -5344,6 +5380,8 @@ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 
+ 	spin_lock_irq(&bfqd->lock);
+ 
++	bfq_do_insert(hctx->queue, &free);
++
+ 	in_serv_queue = bfqd->in_service_queue;
+ 	waiting_rq = in_serv_queue && bfq_bfqq_wait_request(in_serv_queue);
+ 
+@@ -5355,6 +5393,7 @@ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 
+ 	clear_bit_unlock(BFQ_DISPATCHING, &bfqd->run_state);
+ 	spin_unlock_irq(&bfqd->lock);
++	blk_mq_free_requests(&free);
+ 	bfq_update_dispatch_stats(hctx->queue, rq,
+ 			idle_timer_disabled ? in_serv_queue : NULL,
+ 				idle_timer_disabled);
+@@ -6276,25 +6315,20 @@ static inline void bfq_update_insert_stats(struct request_queue *q,
+ static struct bfq_queue *bfq_init_rq(struct request *rq);
+ 
+ static void bfq_insert_request(struct request_queue *q, struct request *rq,
+-			       blk_insert_t flags)
++			       blk_insert_t flags, struct list_head *free)
+ {
+ 	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 	struct bfq_queue *bfqq;
+ 	bool idle_timer_disabled = false;
+ 	blk_opf_t cmd_flags;
+-	LIST_HEAD(free);
+ 
+ #ifdef CONFIG_BFQ_GROUP_IOSCHED
+ 	if (!cgroup_subsys_on_dfl(io_cgrp_subsys) && rq->bio)
+ 		bfqg_stats_update_legacy_io(q, rq);
+ #endif
+-	spin_lock_irq(&bfqd->lock);
+ 	bfqq = bfq_init_rq(rq);
+-	if (blk_mq_sched_try_insert_merge(q, rq, &free)) {
+-		spin_unlock_irq(&bfqd->lock);
+-		blk_mq_free_requests(&free);
++	if (blk_mq_sched_try_insert_merge(q, rq, free))
+ 		return;
+-	}
+ 
+ 	trace_block_rq_insert(rq);
+ 
+@@ -6324,8 +6358,6 @@ static void bfq_insert_request(struct request_queue *q, struct request *rq,
+ 	 * merge).
+ 	 */
+ 	cmd_flags = rq->cmd_flags;
+-	spin_unlock_irq(&bfqd->lock);
+-
+ 	bfq_update_insert_stats(q, bfqq, idle_timer_disabled,
+ 				cmd_flags);
+ }
+@@ -6334,13 +6366,15 @@ static void bfq_insert_requests(struct blk_mq_hw_ctx *hctx,
+ 				struct list_head *list,
+ 				blk_insert_t flags)
+ {
+-	while (!list_empty(list)) {
+-		struct request *rq;
++	struct request_queue *q = hctx->queue;
++	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 
+-		rq = list_first_entry(list, struct request, queuelist);
+-		list_del_init(&rq->queuelist);
+-		bfq_insert_request(hctx->queue, rq, flags);
+-	}
++	spin_lock_irq(&bfqd->insert_lock);
++	if (flags & BLK_MQ_INSERT_AT_HEAD)
++		list_splice_init(list, &bfqd->at_head);
++	else
++		list_splice_init(list, &bfqd->at_tail);
++	spin_unlock_irq(&bfqd->insert_lock);
+ }
+ 
+ static void bfq_update_hw_tag(struct bfq_data *bfqd)
+@@ -7250,6 +7284,10 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	spin_unlock_irq(&q->queue_lock);
+ 
+ 	spin_lock_init(&bfqd->lock);
++	spin_lock_init(&bfqd->insert_lock);
++
++	INIT_LIST_HEAD(&bfqd->at_head);
++	INIT_LIST_HEAD(&bfqd->at_tail);
+ 
+ 	/*
+ 	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
+diff --git a/block/bfq-iosched.h b/block/bfq-iosched.h
+index 56ff69f22..f44f5d4ec 100644
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -516,10 +516,14 @@ enum {
+ struct bfq_data {
+ 	struct {
+ 		spinlock_t lock;
++		spinlock_t insert_lock;
+ 	} ____cacheline_aligned_in_smp;
+ 
+ 	unsigned long run_state;
+ 
++	struct list_head at_head;
++	struct list_head at_tail;
++
+ 	/* device request queue */
+ 	struct request_queue *queue;
+ 	/* dispatch queue */
+-- 
+2.43.0.232.ge79552d197
+
