@@ -1,0 +1,196 @@
+From d2e7cdbd3c26eb504a6d76f81702b225ac1b31ec Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Wed, 24 Jan 2024 02:45:52 +0800
+Subject: [PATCH 4/4] mm, lru_gen: move pages in bulk when aging
+
+Another overhead of aging is page moving. Actually, in most cases,
+pages are being moved to the same gen after folio_inc_gen is called,
+especially the protected pages.  So it's better to move them in bulk.
+
+This also has a good effect on LRU order. Currently when MGLRU
+ages, it walks the LRU backwards, and the protected pages are moved to
+the tail of newer gen one by one, which actually reverses the order of
+pages in LRU. Moving them in batches can help keep their order, only
+in a small scope though, due to the scan limit of MAX_LRU_BATCH pages.
+
+After this commit, we can see a slight performance gain (with
+CONFIG_DEBUG_LIST=n):
+
+Test 1: Ramdisk fio test in a 4G memcg on a EPYC 7K62:
+  fio -name=mglru --numjobs=16 --directory=/mnt --size=960m \
+    --buffered=1 --ioengine=io_uring --iodepth=128 \
+    --iodepth_batch_submit=32 --iodepth_batch_complete=32 \
+    --rw=randread --random_distribution=zipf:0.5 --norandommap \
+    --time_based --ramp_time=1m --runtime=6m --group_reporting
+
+Before:
+bw (  MiB/s): min= 8299, max= 9847, per=100.00%, avg=9388.23, stdev=16.25, samples=11488
+iops        : min=2124544, max=2521056, avg=2403385.82, stdev=4159.07, samples=11488
+
+After (-0.2%):
+bw (  MiB/s): min= 8359, max= 9796, per=100.00%, avg=9367.29, stdev=15.75, samples=11488
+iops        : min=2140113, max=2507928, avg=2398024.65, stdev=4033.07, samples=11488
+
+Test 2: Ramdisk fio hybrid test for 30m in a 4G memcg on a EPYC 7K62 (3 times):
+  fio --buffered=1 --numjobs=8 --size=960m --directory=/mnt \
+    --time_based --ramp_time=1m --runtime=30m \
+    --ioengine=io_uring --iodepth=128 --iodepth_batch_submit=32 \
+    --iodepth_batch_complete=32 --norandommap \
+    --name=mglru-ro --rw=randread --random_distribution=zipf:0.7 \
+    --name=mglru-rw --rw=randrw --random_distribution=zipf:0.7
+
+Before this patch:
+ READ: 6973.3 MiB/s, Stdev: 19.601587
+WRITE: 1302.3 MiB/s, Stdev: 4.988877
+
+After this patch (+0.1%, +0.3%):
+ READ: 6981.0 MiB/s, Stdev: 15.556349
+WRITE: 1305.7 MiB/s, Stdev: 2.357023
+
+Test 3: 30m of MySQL test in 6G memcg for 12 times:
+  echo 'set GLOBAL innodb_buffer_pool_size=16106127360;' | \
+    mysql -u USER -h localhost --password=PASS
+
+  sysbench /usr/share/sysbench/oltp_read_only.lua \
+    --mysql-user=USER --mysql-password=PASS --mysql-db=DB \
+    --tables=48 --table-size=2000000 --threads=16 --time=1800 run
+
+Before this patch
+Avg: 135310.868182 qps. Stdev: 379.200942
+
+After this patch (-0.3%):
+Avg: 135099.210000 qps. Stdev: 351.488863
+
+Test 4: Build linux kernel in 2G memcg with make -j48 with SSD swap
+        (for memory stress, 18 times):
+
+Before this patch:
+Average: 1467.813023. Stdev: 24.232886
+
+After this patch (+0.0%):
+Average: 1464.178154. Stdev: 17.992974
+
+Test 5: Memtier test in a 4G cgroup using brd as swap (20 times):
+  memcached -u nobody -m 16384 -s /tmp/memcached.socket \
+    -a 0766 -t 16 -B binary &
+  memtier_benchmark -S /tmp/memcached.socket \
+    -P memcache_binary -n allkeys \
+    --key-minimum=1 --key-maximum=16000000 -d 1024 \
+    --ratio=1:0 --key-pattern=P:P -c 1 -t 16 --pipeline 8 -x 3
+
+Before this patch:
+Avg: 48389.282500 Ops/sec. Stdev: 3534.470933
+
+After this patch (+1.2%):
+Avg: 48959.374118 Ops/sec. Stdev: 3488.559744
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/vmscan.c | 47 ++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 92e24efc8..7510aacbc 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3129,8 +3129,45 @@ static int folio_update_gen(struct folio *folio, int gen)
+  */
+ struct lru_gen_inc_batch {
+ 	int delta;
++	struct folio *head, *tail;
+ };
+ 
++static inline void lru_gen_inc_bulk_done(struct lru_gen_folio *lrugen,
++					 int bulk_gen, bool type, int zone,
++					 struct lru_gen_inc_batch *batch)
++{
++	if (!batch->head)
++		return;
++
++	list_bulk_move_tail(&lrugen->folios[bulk_gen][type][zone],
++			    &batch->head->lru,
++			    &batch->tail->lru);
++
++	batch->head = NULL;
++}
++
++/*
++ * When aging, protected pages will go to the tail of the same higher
++ * gen, so the can be moved in batches. Besides reduced overhead, this
++ * also avoids changing their LRU order in a small scope.
++ */
++static inline void lru_gen_try_bulk_move(struct lru_gen_folio *lrugen, struct folio *folio,
++					 int bulk_gen, int new_gen, bool type, int zone,
++					 struct lru_gen_inc_batch *batch)
++{
++	/*
++	 * If folio not moving to the bulk_gen, it's raced with promotion
++	 * so it need to go to the head of another LRU.
++	 */
++	if (bulk_gen != new_gen)
++		list_move(&folio->lru, &lrugen->folios[new_gen][type][zone]);
++
++	if (!batch->head)
++		batch->tail = folio;
++
++	batch->head = folio;
++}
++
+ static void lru_gen_inc_batch_done(struct lruvec *lruvec, int gen, int type, int zone,
+ 				   struct lru_gen_inc_batch *batch)
+ {
+@@ -3139,6 +3176,8 @@ static void lru_gen_inc_batch_done(struct lruvec *lruvec, int gen, int type, int
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+ 	enum lru_list lru = type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON;
+ 
++	lru_gen_inc_bulk_done(lrugen, new_gen, type, zone, batch);
++
+ 	if (!delta)
+ 		return;
+ 
+@@ -3720,6 +3759,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+ 	struct lru_gen_inc_batch batch = { };
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+ 	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
++	int bulk_gen = (old_gen + 1) % MAX_NR_GENS;
+ 
+ 	if (type == LRU_GEN_ANON && !can_swap)
+ 		goto done;
+@@ -3748,7 +3788,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+ 			}
+ 
+ 			new_gen = folio_inc_gen(folio, old_gen, false, &batch);
+-			list_move_tail(&folio->lru, &lrugen->folios[new_gen][type][zone]);
++			lru_gen_try_bulk_move(lrugen, folio, bulk_gen, new_gen, type, zone, &batch);
+ 
+ 			if (!--remaining) {
+ 				lru_gen_inc_batch_done(lruvec, old_gen, type, zone, &batch);
+@@ -4286,6 +4326,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 	int tier = lru_tier_from_refs(refs);
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+ 	int old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
++	int bulk_gen = (old_gen + 1) % MAX_NR_GENS;
+ 
+ 	VM_WARN_ON_ONCE_FOLIO(gen >= MAX_NR_GENS, folio);
+ 
+@@ -4319,7 +4360,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 		int hist = lru_hist_from_seq(lrugen->min_seq[type]);
+ 
+ 		gen = folio_inc_gen(folio, old_gen, false, batch);
+-		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
++		lru_gen_try_bulk_move(lrugen, folio, bulk_gen, gen, type, zone, batch);
+ 
+ 		WRITE_ONCE(lrugen->protected[hist][type][tier - 1],
+ 			   lrugen->protected[hist][type][tier - 1] + delta);
+@@ -4329,7 +4370,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 	/* ineligible */
+ 	if (zone > sc->reclaim_idx || skip_cma(folio, sc)) {
+ 		gen = folio_inc_gen(folio, old_gen, false, batch);
+-		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
++		lru_gen_try_bulk_move(lrugen, folio, bulk_gen, gen, type, zone, batch);
+ 		return true;
+ 	}
+ 
+-- 
+2.43.0.232.ge79552d197
+
