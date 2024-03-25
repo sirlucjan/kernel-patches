@@ -1,0 +1,689 @@
+From 2129344abcb7b16b09101219095386076cb96a3f Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:02 +0000
+Subject: [PATCH 1/7] media: uvcvideo: Support timestamp lists of any size
+
+The tail of the list lives at the position before the head. This is
+mathematically noted as:
+```
+(head-1) mod size.
+```
+Unfortunately C, does not have a modulus operator, but a remainder
+operator (%).
+The reminder operation has a different result than the modulus if
+(head -1) is a negative number and size is not a power of two.
+
+Adding size to (head-1) allows the code to run with any value of size.
+
+This does not change the current behaviour of the driver, as the size is
+always a power of two, but avoid tedious debugging if we ever change its
+size.
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 7cbf4692b..659c9e988 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -732,7 +732,7 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 		goto done;
+ 
+ 	first = &clock->samples[clock->head];
+-	last = &clock->samples[(clock->head - 1) % clock->size];
++	last = &clock->samples[(clock->head - 1 + clock->size) % clock->size];
+ 
+ 	/* First step, PTS to SOF conversion. */
+ 	delta_stc = buf->pts - (1UL << 31);
+-- 
+2.43.0.232.ge79552d197
+
+
+From 772e31bd14cea8a519095598ed7348527aca5372 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:03 +0000
+Subject: [PATCH 2/7] media: uvcvideo: Ignore empty TS packets
+
+Some SunplusIT cameras took a borderline interpretation of the UVC 1.5
+standard, and fill the PTS and SCR fields with invalid data if the
+package does not contain data.
+
+"STC must be captured when the first video data of a video frame is put
+on the USB bus."
+
+Some SunplusIT devices send, e.g.,
+
+buffer: 0xa7755c00 len 000012 header:0x8c stc 00000000 sof 0000 pts 00000000
+buffer: 0xa7755c00 len 000012 header:0x8c stc 00000000 sof 0000 pts 00000000
+buffer: 0xa7755c00 len 000668 header:0x8c stc 73779dba sof 070c pts 7376d37a
+
+While the UVC specification meant that the first two packets shouldn't
+have had the SCR bit set in the header.
+
+This borderline/buggy interpretation has been implemented in a variety
+of devices, from directly SunplusIT and from other OEMs that rebrand
+SunplusIT products. So quirking based on VID:PID will be problematic.
+
+All the affected modules have the following extension unit:
+VideoControl Interface Descriptor:
+  guidExtensionCode         {82066163-7050-ab49-b8cc-b3855e8d221d}
+
+But the vendor plans to use that GUID in the future and fix the bug,
+this means that we should use heuristic to figure out the broken
+packets.
+
+This patch takes care of this.
+
+lsusb of one of the affected cameras:
+
+Bus 001 Device 003: ID 1bcf:2a01 Sunplus Innovation Technology Inc.
+Device Descriptor:
+  bLength                18
+  bDescriptorType         1
+  bcdUSB               2.01
+  bDeviceClass          239 Miscellaneous Device
+  bDeviceSubClass         2 ?
+  bDeviceProtocol         1 Interface Association
+  bMaxPacketSize0        64
+  idVendor           0x1bcf Sunplus Innovation Technology Inc.
+  idProduct          0x2a01
+  bcdDevice            0.02
+  iManufacturer           1 SunplusIT Inc
+  iProduct                2 HanChen Wise Camera
+  iSerial                 3 01.00.00
+  bNumConfigurations      1
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 659c9e988..b2e70fcf4 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -478,6 +478,7 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	ktime_t time;
+ 	u16 host_sof;
+ 	u16 dev_sof;
++	u32 dev_stc;
+ 
+ 	switch (data[1] & (UVC_STREAM_PTS | UVC_STREAM_SCR)) {
+ 	case UVC_STREAM_PTS | UVC_STREAM_SCR:
+@@ -526,6 +527,34 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	if (dev_sof == stream->clock.last_sof)
+ 		return;
+ 
++	dev_stc = get_unaligned_le32(&data[header_size - 6]);
++
++	/*
++	 * STC (Source Time Clock) is the clock used by the camera. The UVC 1.5
++	 * standard states that it "must be captured when the first video data
++	 * of a video frame is put on the USB bus". This is generally understood
++	 * as requiring devices to clear the payload header's SCR bit before
++	 * the first packet containing video data.
++	 *
++	 * Most vendors follow that interpretation, but some (namely SunplusIT
++	 * on some devices) always set the `UVC_STREAM_SCR` bit, fill the SCR
++	 * field with 0's,and expect that the driver only processes the SCR if
++	 * there is data in the packet.
++	 *
++	 * Ignore all the hardware timestamp information if we haven't received
++	 * any data for this frame yet, the packet contains no data, and both
++	 * STC and SOF are zero. This heuristics should be safe on compliant
++	 * devices. This should be safe with compliant devices, as in the very
++	 * unlikely case where a UVC 1.1 device would send timing information
++	 * only before the first packet containing data, and both STC and SOF
++	 * happen to be zero for a particular frame, we would only miss one
++	 * clock sample from many and the clock recovery algorithm wouldn't
++	 * suffer from this condition.
++	 */
++	if (buf && buf->bytesused == 0 && len == header_size &&
++	    dev_stc == 0 && dev_sof == 0)
++		return;
++
+ 	stream->clock.last_sof = dev_sof;
+ 
+ 	host_sof = usb_get_current_frame_number(stream->dev->udev);
+@@ -564,7 +593,7 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	spin_lock_irqsave(&stream->clock.lock, flags);
+ 
+ 	sample = &stream->clock.samples[stream->clock.head];
+-	sample->dev_stc = get_unaligned_le32(&data[header_size - 6]);
++	sample->dev_stc = dev_stc;
+ 	sample->dev_sof = dev_sof;
+ 	sample->host_sof = host_sof;
+ 	sample->host_time = time;
+-- 
+2.43.0.232.ge79552d197
+
+
+From 60447958668661b76ad0239398afbe19ff7aa174 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:04 +0000
+Subject: [PATCH 3/7] media: uvcvideo: Quirk for invalid dev_sof in Logitech
+ C922
+
+Logitech C922 internal SOF does not increases at a stable rate of 1kHz.
+This causes that the device_sof and the host_sof run at different rates,
+breaking the clock domain conversion algorithm. Eg:
+
+30 (6) [-] none 30 614400 B 21.245557 21.395214 34.133 fps ts mono/SoE
+31 (7) [-] none 31 614400 B 21.275327 21.427246 33.591 fps ts mono/SoE
+32 (0) [-] none 32 614400 B 21.304739 21.459256 34.000 fps ts mono/SoE
+33 (1) [-] none 33 614400 B 21.334324 21.495274 33.801 fps ts mono/SoE
+* 34 (2) [-] none 34 614400 B 21.529237 21.527297 5.130 fps ts mono/SoE
+* 35 (3) [-] none 35 614400 B 21.649416 21.559306 8.321 fps ts mono/SoE
+36 (4) [-] none 36 614400 B 21.678789 21.595320 34.045 fps ts mono/SoE
+...
+99 (3) [-] none 99 614400 B 23.542226 23.696352 33.541 fps ts mono/SoE
+100 (4) [-] none 100 614400 B 23.571578 23.728404 34.069 fps ts mono/SoE
+101 (5) [-] none 101 614400 B 23.601425 23.760420 33.504 fps ts mono/SoE
+* 102 (6) [-] none 102 614400 B 23.798324 23.796428 5.079 fps ts mono/SoE
+* 103 (7) [-] none 103 614400 B 23.916271 23.828450 8.478 fps ts mono/SoE
+104 (0) [-] none 104 614400 B 23.945720 23.860479 33.957 fps ts mono/SoE
+
+Instead of disabling completely the hardware timestamping for such
+hardware we take the assumption that the packet handling jitter is
+under 2ms and use the host_sof as dev_sof.
+
+We can think of the UVC hardware clock as a system with a coarse clock
+(the SOF) and a fine clock (the PTS). The coarse clock can be replaced
+with a clock on the same frequency, if the jitter of such clock is
+smaller than its sampling rate. That way we can save some of the
+precision of the fine clock.
+
+To probe this point we have run three experiments on the Logitech C922.
+On that experiment we run the camera at 33fps and we analyse the
+difference in msec between a frame and its predecessor. If we display
+the histogram of that value, a thinner histogram will mean a better
+meassurement. The results for:
+- original hw timestamp: https://ibb.co/D1HJJ4x
+- pure software timestamp: https://ibb.co/QC9MgVK
+- modified hw timestamp: https://ibb.co/8s9dBdk
+
+This bug in the camera firmware has been confirmed by the vendor.
+
+lsusb -v
+
+Bus 001 Device 044: ID 046d:085c Logitech, Inc. C922 Pro Stream Webcam
+Device Descriptor:
+  bLength                18
+  bDescriptorType         1
+  bcdUSB               2.00
+  bDeviceClass          239 Miscellaneous Device
+  bDeviceSubClass         2
+  bDeviceProtocol         1 Interface Association
+  bMaxPacketSize0        64
+  idVendor           0x046d Logitech, Inc.
+  idProduct          0x085c C922 Pro Stream Webcam
+  bcdDevice            0.16
+  iManufacturer           0
+  iProduct                2 C922 Pro Stream Webcam
+  iSerial                 1 80B912DF
+  bNumConfigurations      1
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_driver.c |  9 +++++++++
+ drivers/media/usb/uvc/uvc_video.c  | 11 +++++++++++
+ drivers/media/usb/uvc/uvcvideo.h   |  1 +
+ 3 files changed, 21 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index bbd90123a..723e6d568 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2574,6 +2574,15 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+ 	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTORE_CTRLS_ON_INIT) },
++	/* Logitech HD Pro Webcam C922 */
++	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
++				| USB_DEVICE_ID_MATCH_INT_INFO,
++	  .idVendor		= 0x046d,
++	  .idProduct		= 0x085c,
++	  .bInterfaceClass	= USB_CLASS_VIDEO,
++	  .bInterfaceSubClass	= 1,
++	  .bInterfaceProtocol	= 0,
++	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_INVALID_DEVICE_SOF) },
+ 	/* Chicony CNF7129 (Asus EEE 100HE) */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index b2e70fcf4..d6ca383f6 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -558,6 +558,17 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	stream->clock.last_sof = dev_sof;
+ 
+ 	host_sof = usb_get_current_frame_number(stream->dev->udev);
++
++	/*
++	 * On some devices, like the Logitech C922, the device SOF does not run
++	 * at a stable rate of 1kHz. For those devices use the host SOF instead.
++	 * In the tests performed so far, this improves the timestamp precision.
++	 * This is probably explained by a small packet handling jitter from the
++	 * host, but the exact reason hasn't been fully determined.
++	 */
++	if (stream->dev->quirks & UVC_QUIRK_INVALID_DEVICE_SOF)
++		dev_sof = host_sof;
++
+ 	time = uvc_video_get_time();
+ 
+ 	/*
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 6fb0a78b1..cb9dd50bb 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -73,6 +73,7 @@
+ #define UVC_QUIRK_FORCE_Y8		0x00000800
+ #define UVC_QUIRK_FORCE_BPP		0x00001000
+ #define UVC_QUIRK_WAKE_AUTOSUSPEND	0x00002000
++#define UVC_QUIRK_INVALID_DEVICE_SOF	0x00004000
+ 
+ /* Format flags */
+ #define UVC_FMT_FLAG_COMPRESSED		0x00000001
+-- 
+2.43.0.232.ge79552d197
+
+
+From 9fe382409da0fb15ff82fd856b3bb8719724ab3a Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:05 +0000
+Subject: [PATCH 4/7] media: uvcvideo: Allow hw clock updates with buffers not
+ full
+
+With UVC 1.5 we get as little as one clock sample per frame. Which means
+that it takes 32 frames to move from the software timestamp to the
+hardware timestamp method.
+
+This results in abrupt changes in the timestamping after 32 frames (~1
+second), resulting in noticeable artifacts when used for encoding.
+
+With this patch we modify the update algorithm to work with whatever
+amount of values are available.
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index d6ca383f6..af25b9f1b 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -768,10 +768,10 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 
+ 	spin_lock_irqsave(&clock->lock, flags);
+ 
+-	if (clock->count < clock->size)
++	if (clock->count < 2)
+ 		goto done;
+ 
+-	first = &clock->samples[clock->head];
++	first = &clock->samples[(clock->head - clock->count + clock->size) % clock->size];
+ 	last = &clock->samples[(clock->head - 1 + clock->size) % clock->size];
+ 
+ 	/* First step, PTS to SOF conversion. */
+@@ -786,6 +786,18 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 	if (y2 < y1)
+ 		y2 += 2048 << 16;
+ 
++	/*
++	 * Have at least 1/4 of a second of timestamps before we
++	 * try to do any calculation. Otherwise we do not have enough
++	 * precision. This value was determined by running Android CTS
++	 * on different devices.
++	 *
++	 * dev_sof runs at 1KHz, and we have a fixed point precision of
++	 * 16 bits.
++	 */
++	if ((y2 - y1) < ((1000 / 4) << 16))
++		goto done;
++
+ 	y = (u64)(y2 - y1) * (1ULL << 31) + (u64)y1 * (u64)x2
+ 	  - (u64)y2 * (u64)x1;
+ 	y = div_u64(y, x2 - x1);
+-- 
+2.43.0.232.ge79552d197
+
+
+From 656ec760919684b9775415d4a3f86aa2de24fbf4 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:06 +0000
+Subject: [PATCH 5/7] media: uvcvideo: Refactor clock circular buffer
+
+Isolate all the changes related to the clock circular buffer to its own
+function, that way we can make changes easier to the buffer logic.
+
+Also simplify the lock, by removing the circular buffer clock handling
+from uvc_video_clock_decode().
+
+And now that we are at it, unify the API of the clock functions.
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 83 ++++++++++++++-----------------
+ 1 file changed, 36 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index af25b9f1b..5df8f61d3 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -466,19 +466,28 @@ static inline ktime_t uvc_video_get_time(void)
+ 		return ktime_get_real();
+ }
+ 
++static void uvc_video_clock_add_sample(struct uvc_clock *clock,
++				       const struct uvc_clock_sample *sample)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&clock->lock, flags);
++
++	clock->samples[clock->head] = *sample;
++	clock->head = (clock->head + 1) % clock->size;
++	clock->count = min(clock->count + 1, clock->size);
++
++	spin_unlock_irqrestore(&clock->lock, flags);
++}
++
+ static void
+ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 		       const u8 *data, int len)
+ {
+-	struct uvc_clock_sample *sample;
++	struct uvc_clock_sample sample;
+ 	unsigned int header_size;
+ 	bool has_pts = false;
+ 	bool has_scr = false;
+-	unsigned long flags;
+-	ktime_t time;
+-	u16 host_sof;
+-	u16 dev_sof;
+-	u32 dev_stc;
+ 
+ 	switch (data[1] & (UVC_STREAM_PTS | UVC_STREAM_SCR)) {
+ 	case UVC_STREAM_PTS | UVC_STREAM_SCR:
+@@ -523,11 +532,11 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * all the data packets of the same frame contains the same SOF. In that
+ 	 * case only the first one will match the host_sof.
+ 	 */
+-	dev_sof = get_unaligned_le16(&data[header_size - 2]);
+-	if (dev_sof == stream->clock.last_sof)
++	sample.dev_sof = get_unaligned_le16(&data[header_size - 2]);
++	if (sample.dev_sof == stream->clock.last_sof)
+ 		return;
+ 
+-	dev_stc = get_unaligned_le32(&data[header_size - 6]);
++	sample.dev_stc = get_unaligned_le32(&data[header_size - 6]);
+ 
+ 	/*
+ 	 * STC (Source Time Clock) is the clock used by the camera. The UVC 1.5
+@@ -552,12 +561,10 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * suffer from this condition.
+ 	 */
+ 	if (buf && buf->bytesused == 0 && len == header_size &&
+-	    dev_stc == 0 && dev_sof == 0)
++	    sample.dev_stc == 0 && sample.dev_sof == 0)
+ 		return;
+ 
+-	stream->clock.last_sof = dev_sof;
+-
+-	host_sof = usb_get_current_frame_number(stream->dev->udev);
++	sample.host_sof = usb_get_current_frame_number(stream->dev->udev);
+ 
+ 	/*
+ 	 * On some devices, like the Logitech C922, the device SOF does not run
+@@ -567,9 +574,9 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * host, but the exact reason hasn't been fully determined.
+ 	 */
+ 	if (stream->dev->quirks & UVC_QUIRK_INVALID_DEVICE_SOF)
+-		dev_sof = host_sof;
++		sample.dev_sof = sample.host_sof;
+ 
+-	time = uvc_video_get_time();
++	sample.host_time = uvc_video_get_time();
+ 
+ 	/*
+ 	 * The UVC specification allows device implementations that can't obtain
+@@ -592,46 +599,28 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * the 8 LSBs of the delta are kept.
+ 	 */
+ 	if (stream->clock.sof_offset == (u16)-1) {
+-		u16 delta_sof = (host_sof - dev_sof) & 255;
++		u16 delta_sof = (sample.host_sof - sample.dev_sof) & 255;
+ 		if (delta_sof >= 10)
+ 			stream->clock.sof_offset = delta_sof;
+ 		else
+ 			stream->clock.sof_offset = 0;
+ 	}
+ 
+-	dev_sof = (dev_sof + stream->clock.sof_offset) & 2047;
+-
+-	spin_lock_irqsave(&stream->clock.lock, flags);
+-
+-	sample = &stream->clock.samples[stream->clock.head];
+-	sample->dev_stc = dev_stc;
+-	sample->dev_sof = dev_sof;
+-	sample->host_sof = host_sof;
+-	sample->host_time = time;
+-
+-	/* Update the sliding window head and count. */
+-	stream->clock.head = (stream->clock.head + 1) % stream->clock.size;
+-
+-	if (stream->clock.count < stream->clock.size)
+-		stream->clock.count++;
+-
+-	spin_unlock_irqrestore(&stream->clock.lock, flags);
++	sample.dev_sof = (sample.dev_sof + stream->clock.sof_offset) & 2047;
++	uvc_video_clock_add_sample(&stream->clock, &sample);
++	stream->clock.last_sof = sample.dev_sof;
+ }
+ 
+-static void uvc_video_clock_reset(struct uvc_streaming *stream)
++static void uvc_video_clock_reset(struct uvc_clock *clock)
+ {
+-	struct uvc_clock *clock = &stream->clock;
+-
+ 	clock->head = 0;
+ 	clock->count = 0;
+ 	clock->last_sof = -1;
+ 	clock->sof_offset = -1;
+ }
+ 
+-static int uvc_video_clock_init(struct uvc_streaming *stream)
++static int uvc_video_clock_init(struct uvc_clock *clock)
+ {
+-	struct uvc_clock *clock = &stream->clock;
+-
+ 	spin_lock_init(&clock->lock);
+ 	clock->size = 32;
+ 
+@@ -640,15 +629,15 @@ static int uvc_video_clock_init(struct uvc_streaming *stream)
+ 	if (clock->samples == NULL)
+ 		return -ENOMEM;
+ 
+-	uvc_video_clock_reset(stream);
++	uvc_video_clock_reset(clock);
+ 
+ 	return 0;
+ }
+ 
+-static void uvc_video_clock_cleanup(struct uvc_streaming *stream)
++static void uvc_video_clock_cleanup(struct uvc_clock *clock)
+ {
+-	kfree(stream->clock.samples);
+-	stream->clock.samples = NULL;
++	kfree(clock->samples);
++	clock->samples = NULL;
+ }
+ 
+ /*
+@@ -2123,7 +2112,7 @@ int uvc_video_resume(struct uvc_streaming *stream, int reset)
+ 
+ 	stream->frozen = 0;
+ 
+-	uvc_video_clock_reset(stream);
++	uvc_video_clock_reset(&stream->clock);
+ 
+ 	if (!uvc_queue_streaming(&stream->queue))
+ 		return 0;
+@@ -2272,7 +2261,7 @@ int uvc_video_start_streaming(struct uvc_streaming *stream)
+ {
+ 	int ret;
+ 
+-	ret = uvc_video_clock_init(stream);
++	ret = uvc_video_clock_init(&stream->clock);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2290,7 +2279,7 @@ int uvc_video_start_streaming(struct uvc_streaming *stream)
+ error_video:
+ 	usb_set_interface(stream->dev->udev, stream->intfnum, 0);
+ error_commit:
+-	uvc_video_clock_cleanup(stream);
++	uvc_video_clock_cleanup(&stream->clock);
+ 
+ 	return ret;
+ }
+@@ -2318,5 +2307,5 @@ void uvc_video_stop_streaming(struct uvc_streaming *stream)
+ 		usb_clear_halt(stream->dev->udev, pipe);
+ 	}
+ 
+-	uvc_video_clock_cleanup(stream);
++	uvc_video_clock_cleanup(&stream->clock);
+ }
+-- 
+2.43.0.232.ge79552d197
+
+
+From d7c5b5d81493de05248b484dcfa70f90ddc083f0 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:07 +0000
+Subject: [PATCH 6/7] media: uvcvideo: Fix hw timestamp handling for slow FPS
+
+In UVC 1.5 we get a single clock value per frame. With the current
+buffer size of 32, FPS slowers than 32 might roll-over twice.
+
+The current code cannot handle two roll-over and provide invalid
+timestamps.
+
+Remove all the samples from the circular buffer that are more than two
+rollovers old, so the algorithm always provides good timestamps.
+
+Note that we are removing values that are more than one second old,
+which means that there is enough distance between the two points that
+we use for the interpolation to provide good values.
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 24 ++++++++++++++++++++++++
+ drivers/media/usb/uvc/uvcvideo.h  |  1 +
+ 2 files changed, 25 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 5df8f61d3..900b57afa 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -471,8 +471,31 @@ static void uvc_video_clock_add_sample(struct uvc_clock *clock,
+ {
+ 	unsigned long flags;
+ 
++	/*
++	 * If we write new data on the position where we had the last
++	 * overflow, remove the overflow pointer. There is no overflow
++	 * on the whole circular buffer.
++	 */
++	if (clock->head == clock->last_sof_overflow)
++		clock->last_sof_overflow = -1;
++
+ 	spin_lock_irqsave(&clock->lock, flags);
+ 
++	/* Handle overflows */
++	if (clock->count > 0 && clock->last_sof > sample->dev_sof) {
++		/*
++		 * Remove data from the circular buffer that is older than the
++		 * last overflow. We only support one overflow per circular
++		 * buffer.
++		 */
++		if (clock->last_sof_overflow != -1) {
++			clock->count = (clock->head - clock->last_sof_overflow
++					+ clock->count) % clock->count;
++		}
++		clock->last_sof_overflow = clock->head;
++	}
++
++	/* Add sample */
+ 	clock->samples[clock->head] = *sample;
+ 	clock->head = (clock->head + 1) % clock->size;
+ 	clock->count = min(clock->count + 1, clock->size);
+@@ -616,6 +639,7 @@ static void uvc_video_clock_reset(struct uvc_clock *clock)
+ 	clock->head = 0;
+ 	clock->count = 0;
+ 	clock->last_sof = -1;
++	clock->last_sof_overflow = -1;
+ 	clock->sof_offset = -1;
+ }
+ 
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index cb9dd50bb..fb9f97711 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -499,6 +499,7 @@ struct uvc_streaming {
+ 		unsigned int head;
+ 		unsigned int count;
+ 		unsigned int size;
++		unsigned int last_sof_overflow;
+ 
+ 		u16 last_sof;
+ 		u16 sof_offset;
+-- 
+2.43.0.232.ge79552d197
+
+
+From 979f881951a6961f8716a74f5444b60eae63bfda Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Mon, 25 Mar 2024 10:28:00 +0100
+Subject: [PATCH 7/7] media: uvcvideo: Quirk for invalid dev_sof in Logitech
+ C920
+
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ drivers/media/usb/uvc/uvc_driver.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index 723e6d568..444d70898 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2573,7 +2573,8 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceClass	= USB_CLASS_VIDEO,
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTORE_CTRLS_ON_INIT) },
++	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTORE_CTRLS_ON_INIT
++					       | UVC_QUIRK_INVALID_DEVICE_SOF) },
+ 	/* Logitech HD Pro Webcam C922 */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+-- 
+2.43.0.232.ge79552d197
+
