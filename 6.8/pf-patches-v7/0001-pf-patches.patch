@@ -1,0 +1,901 @@
+From 9e47eb564b89933d425703f955bd1515c9a82345 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Thu, 25 Jan 2024 10:26:27 +0000
+Subject: [PATCH 01/12] btrfs: document what the spinlock unused_bgs_lock
+ protects
+
+Add some comments to struct btrfs_fs_info to explicitly document which
+members are protected by the spinlock unused_bgs_lock. It is currently
+used to protect two linked lists, the reclaim_bgs and unused_bgs lists.
+
+So add an explicit comment on top of each list to mention its protected
+by unused_bgs_lock, as well as comment on top of unused_bgs_lock to
+mention the lists it protects.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/fs.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/btrfs/fs.h b/fs/btrfs/fs.h
+index bd59cf0aa..409692606 100644
+--- a/fs/btrfs/fs.h
++++ b/fs/btrfs/fs.h
+@@ -732,10 +732,13 @@ struct btrfs_fs_info {
+ 
+ 	/* Reclaim partially filled block groups in the background */
+ 	struct work_struct reclaim_bgs_work;
++	/* Protected by unused_bgs_lock. */
+ 	struct list_head reclaim_bgs;
+ 	int bg_reclaim_threshold;
+ 
++	/* Protects the lists unused_bgs and reclaim_bgs. */
+ 	spinlock_t unused_bgs_lock;
++	/* Protected by unused_bgs_lock. */
+ 	struct list_head unused_bgs;
+ 	struct mutex unused_bg_unpin_mutex;
+ 	/* Protect block groups that are going to be deleted */
+-- 
+2.43.0.232.ge79552d197
+
+
+From a73cc2dd3eefd0b9d1094b87f404e87909d40a5e Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Thu, 25 Jan 2024 10:26:28 +0000
+Subject: [PATCH 02/12] btrfs: add comment about list_is_singular() use at
+ btrfs_delete_unused_bgs()
+
+At btrfs_delete_unused_bgs(), the use of the list_is_singular() check on
+a block group may not be immediately obvious. It is there to prevent
+losing raid profile information for a block group type (data, metadata or
+system), as that information is removed from
+fs_info->avail_[data|metadata|system]_alloc_bits when the last block group
+of a given type is deleted. So deleting the block group would later result
+in creating block groups of that type with a single profile (because
+fs_info->avail_*_alloc_bits would have a value of 0).
+
+This check was added in commit aefbe9a633b5 ("btrfs: Fix lost-data-profile
+caused by auto removing bg").
+
+So add a comment mentioning the need for the check.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/block-group.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 378d9103a..2dc39e8db 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -1522,6 +1522,13 @@ void btrfs_delete_unused_bgs(struct btrfs_fs_info *fs_info)
+ 			 * outstanding allocations in this block group.  We do
+ 			 * the ro check in case balance is currently acting on
+ 			 * this block group.
++			 *
++			 * Also bail out if this is the only block group for its
++			 * type, because otherwise we would lose profile
++			 * information from fs_info->avail_*_alloc_bits and the
++			 * next block group of this type would be created with a
++			 * "single" profile (even if we're in a raid fs) because
++			 * fs_info->avail_*_alloc_bits would be 0.
+ 			 */
+ 			trace_btrfs_skip_unused_block_group(block_group);
+ 			spin_unlock(&block_group->lock);
+-- 
+2.43.0.232.ge79552d197
+
+
+From 6113f84f757d4e62bdfa26e347a808277e854721 Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Fri, 15 Mar 2024 21:14:29 -0400
+Subject: [PATCH 03/12] btrfs: Fix race in read_extent_buffer_pages()
+
+To prevent concurrent reads for the same extent buffer,
+read_extent_buffer_pages() performs these checks:
+
+    /* (1) */
+    if (test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))
+        return 0;
+
+    /* (2) */
+    if (test_and_set_bit(EXTENT_BUFFER_READING, &eb->bflags))
+        goto done;
+
+At this point, it seems safe to start the actual read operation. Once
+that completes, end_bbio_meta_read() does
+
+    /* (3) */
+    set_extent_buffer_uptodate(eb);
+
+    /* (4) */
+    clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+
+Normally, this is enough to ensure only one read happens, and all other
+callers wait for it to finish before returning.  Unfortunately, there is
+a racey interleaving:
+
+    Thread A | Thread B | Thread C
+    ---------+----------+---------
+       (1)   |          |
+             |    (1)   |
+       (2)   |          |
+       (3)   |          |
+       (4)   |          |
+             |    (2)   |
+             |          |    (1)
+
+When this happens, thread B kicks of an unnecessary read. Worse, thread
+C will see UPTODATE set and return immediately, while the read from
+thread B is still in progress.  This race could result in tree-checker
+errors like this as the extent buffer is concurrently modified:
+
+    BTRFS critical (device dm-0): corrupted node, root=256
+    block=8550954455682405139 owner mismatch, have 11858205567642294356
+    expect [256, 18446744073709551360]
+
+Fix it by testing UPTODATE again after setting the READING bit, and if
+it's been set, skip the unnecessary read.
+
+Fixes: d7172f52e993 ("btrfs: use per-buffer locking for extent_buffer reading")
+Link: https://lore.kernel.org/linux-btrfs/CAHk-=whNdMaN9ntZ47XRKP6DBes2E5w7fi-0U3H2+PS18p+Pzw@mail.gmail.com/
+Link: https://lore.kernel.org/linux-btrfs/f51a6d5d7432455a6a858d51b49ecac183e0bbc9.1706312914.git.wqu@suse.com/
+Link: https://lore.kernel.org/linux-btrfs/c7241ea4-fcc6-48d2-98c8-b5ea790d6c89@gmx.com/
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+ fs/btrfs/extent_io.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 993b74027..77260cb9d 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4319,6 +4319,19 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
+ 	if (test_and_set_bit(EXTENT_BUFFER_READING, &eb->bflags))
+ 		goto done;
+ 
++	/*
++	 * Between the initial test_bit(EXTENT_BUFFER_UPTODATE) and the above
++	 * test_and_set_bit(EXTENT_BUFFER_READING), someone else could have
++	 * started and finished reading the same eb.  In this case, UPTODATE
++	 * will now be set, and we shouldn't read it in again.
++	 */
++	if (unlikely(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))) {
++		clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
++		smp_mb__after_atomic();
++		wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++		return 0;
++	}
++
+ 	clear_bit(EXTENT_BUFFER_READ_ERR, &eb->bflags);
+ 	eb->read_mirror = 0;
+ 	check_buffer_tree_ref(eb);
+-- 
+2.43.0.232.ge79552d197
+
+
+From d2750480469d40d78fd114976080d343d1be0ede Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:53 -0400
+Subject: [PATCH 04/12] btrfs: New helper to clear EXTENT_BUFFER_READING
+
+We are clearing the bit and waking up any waiters in two different
+places.  Factor that code out into a static helper function.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 77260cb9d..9854dede4 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4256,6 +4256,13 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
+ 	}
+ }
+ 
++static void clear_extent_buffer_reading(struct extent_buffer *eb)
++{
++	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
++	smp_mb__after_atomic();
++	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++}
++
+ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ {
+ 	struct extent_buffer *eb = bbio->private;
+@@ -4290,9 +4297,7 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 		bio_offset += len;
+ 	}
+ 
+-	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-	smp_mb__after_atomic();
+-	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++	clear_extent_buffer_reading(eb);
+ 	free_extent_buffer(eb);
+ 
+ 	bio_put(&bbio->bio);
+@@ -4326,9 +4331,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
+ 	 * will now be set, and we shouldn't read it in again.
+ 	 */
+ 	if (unlikely(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))) {
+-		clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-		smp_mb__after_atomic();
+-		wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++		clear_extent_buffer_reading(eb);
+ 		return 0;
+ 	}
+ 
+-- 
+2.43.0.232.ge79552d197
+
+
+From 67c8c29a0508858db6f4bea25ac960918eb63ad2 Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:54 -0400
+Subject: [PATCH 05/12] btrfs: WARN if EXTENT_BUFFER_UPTODATE is set while
+ reading
+
+We recently tracked down a race condition that triggered a read for an
+extent buffer with EXTENT_BUFFER_UPTODATE already set.  While this read
+was in progress, other concurrent readers would see the UPTODATE bit and
+return early as if the read was already complete, making accesses to the
+extent buffer conflict with the read operation that was overwriting it.
+
+Add a WARN_ON() to end_bbio_meta_read() for this situation to make
+similar races easier to spot in the future.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 9854dede4..0434c7a5b 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4271,6 +4271,13 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 	struct folio_iter fi;
+ 	u32 bio_offset = 0;
+ 
++	/*
++	 * If the extent buffer is marked UPTODATE before the read operation
++	 * completes, other calls to read_extent_buffer_pages() will return
++	 * early without waiting for the read to finish, causing data races.
++	 */
++	WARN_ON(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags));
++
+ 	eb->read_mirror = bbio->mirror_num;
+ 
+ 	if (uptodate &&
+-- 
+2.43.0.232.ge79552d197
+
+
+From 6955f91c9d052c7d8ae747cd58c71490c4efb150 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai1@huaweicloud.com>
+Date: Fri, 15 Mar 2024 09:17:56 +0800
+Subject: [PATCH 06/12] md/raid5: fix deadlock between md0_reclaim and
+ md0_raid5
+
+Commit 5e2cf333b7bd ("md/raid5: Wait for MD_SB_CHANGE_PENDING in
+raid5d") introduced a regression, it got reverted through commit
+bed9e27baf52 ("Revert "md/raid5: Wait for MD_SB_CHANGE_PENDING in
+raid5d"). To fix the original issue commit 5e2cf333b7bd was fixing,
+commit d6e035aad6c0 ("md: bypass block throttle for superblock update")
+was created, it avoids md superblock write getting throttled by block
+layer which is good, but md superblock write could be stuck in block
+layer due to block flush as well, and that is what was happening in this
+regression report.
+
+Process "md0_reclaim" got stuck while waiting IO for md superblock write
+done, that IO was marked with REQ_PREFLUSH | REQ_FUA flags, these 3
+steps ( PREFLUSH, DATA and POSTFLUSH ) will be executed before done, the
+hung of this process is because the last step "POSTFLUSH" never done.
+And that was because of  process "md0_raid5" submitted another IO with
+REQ_FUA flag marked just before that step started. To handle that IO,
+blk_insert_flush() will be invoked and hit "REQ_FSEQ_DATA |
+REQ_FSEQ_POSTFLUSH" case where "fq->flush_data_in_flight" will be
+increased. When the IO for md superblock write was to issue "POSTFLUSH"
+step through blk_kick_flush(), it found that "fq->flush_data_in_flight"
+was not zero, so it will skip that step, that is expected, because flush
+will be triggered when "fq->flush_data_in_flight" dropped to zero.
+
+Unfortunately here that inflight data IO from "md0_raid5" will never
+done, because it was added into the blk_plug list of that process, but
+"md0_raid5" run into infinite loop due to "MD_SB_CHANGE_PENDING" which
+made it never had a chance to finish the blk plug until
+"MD_SB_CHANGE_PENDING" was cleared. Process "md0_reclaim" was supposed
+to clear that flag but it was stuck by "md0_raid5", so this is a deadlock.
+
+Once "md0_raid5" starts looping due to "MD_SB_CHANGE_PENDING", it should
+release all its staging IO requests to avoid blocking others.
+
+Reported-by: Dan Moulding <dan@danm.net>
+Fixes: d6e035aad6c0 ("md: bypass block throttle for superblock update")
+Link: https://lore.kernel.org/lkml/d3cdebfe-17c0-4f61-9ad9-71d9de2339b2@oracle.com/
+Link: https://lore.kernel.org/lkml/db4f5f1b-5eba-2cdb-fad0-7aa725cea508@huaweicloud.com/
+---
+ drivers/md/raid5.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 69452e439..48abecc93 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6751,6 +6751,9 @@ static void raid5d(struct md_thread *thread)
+ 		int batch_size, released;
+ 		unsigned int offset;
+ 
++		if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
++			goto skip;
++
+ 		released = release_stripe_list(conf, conf->temp_inactive_list);
+ 		if (released)
+ 			clear_bit(R5_DID_ALLOC, &conf->cache_state);
+@@ -6800,6 +6803,7 @@ static void raid5d(struct md_thread *thread)
+ 			!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags),
+ 			conf->device_lock);
+ 	}
++skip:
+ 	pr_debug("%d stripes handled\n", handled);
+ 
+ 	spin_unlock_irq(&conf->device_lock);
+-- 
+2.43.0.232.ge79552d197
+
+
+From a83f528b21f0d64459afe5d0bf0509735805a091 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 8 Mar 2024 17:37:26 +0800
+Subject: [PATCH 07/12] raid1: fix use-after-free for original bio in
+ raid1_write_request()
+
+r1_bio->bios[] is used to record new bios that will be issued to
+underlying disks, however, in raid1_write_request(), r1_bio->bios[]
+will set to the original bio temporarily. Meanwhile, if blocked rdev
+is set, free_r1bio() will be called causing that all r1_bio->bios[]
+to be freed:
+
+raid1_write_request()
+ r1_bio = alloc_r1bio(mddev, bio); -> r1_bio->bios[] is NULL
+ for (i = 0;  i < disks; i++) -> for each rdev in conf
+  // first rdev is normal
+  r1_bio->bios[0] = bio; -> set to original bio
+  // second rdev is blocked
+  if (test_bit(Blocked, &rdev->flags))
+   break
+
+ if (blocked_rdev)
+  free_r1bio()
+   put_all_bios()
+    bio_put(r1_bio->bios[0]) -> original bio is freed
+
+Test scripts:
+
+mdadm -CR /dev/md0 -l1 -n4 /dev/sd[abcd] --assume-clean
+fio -filename=/dev/md0 -ioengine=libaio -rw=write -bs=4k -numjobs=1 \
+    -iodepth=128 -name=test -direct=1
+echo blocked > /sys/block/md0/md/rd2/state
+
+Test result:
+
+BUG bio-264 (Not tainted): Object already free
+-----------------------------------------------------------------------------
+
+Allocated in mempool_alloc_slab+0x24/0x50 age=1 cpu=1 pid=869
+ kmem_cache_alloc+0x324/0x480
+ mempool_alloc_slab+0x24/0x50
+ mempool_alloc+0x6e/0x220
+ bio_alloc_bioset+0x1af/0x4d0
+ blkdev_direct_IO+0x164/0x8a0
+ blkdev_write_iter+0x309/0x440
+ aio_write+0x139/0x2f0
+ io_submit_one+0x5ca/0xb70
+ __do_sys_io_submit+0x86/0x270
+ __x64_sys_io_submit+0x22/0x30
+ do_syscall_64+0xb1/0x210
+ entry_SYSCALL_64_after_hwframe+0x6c/0x74
+Freed in mempool_free_slab+0x1f/0x30 age=1 cpu=1 pid=869
+ kmem_cache_free+0x28c/0x550
+ mempool_free_slab+0x1f/0x30
+ mempool_free+0x40/0x100
+ bio_free+0x59/0x80
+ bio_put+0xf0/0x220
+ free_r1bio+0x74/0xb0
+ raid1_make_request+0xadf/0x1150
+ md_handle_request+0xc7/0x3b0
+ md_submit_bio+0x76/0x130
+ __submit_bio+0xd8/0x1d0
+ submit_bio_noacct_nocheck+0x1eb/0x5c0
+ submit_bio_noacct+0x169/0xd40
+ submit_bio+0xee/0x1d0
+ blkdev_direct_IO+0x322/0x8a0
+ blkdev_write_iter+0x309/0x440
+ aio_write+0x139/0x2f0
+
+Since that bios for underlying disks are not allocated yet, fix this
+problem by using mempool_free() directly to free the r1_bio.
+
+Fixes: 992db13a4aee ("md/raid1: free the r1bio before waiting for blocked rdev")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ drivers/md/raid1.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 82c9bb404..4f3c35f13 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1474,7 +1474,7 @@ static void raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 		for (j = 0; j < i; j++)
+ 			if (r1_bio->bios[j])
+ 				rdev_dec_pending(conf->mirrors[j].rdev, mddev);
+-		free_r1bio(r1_bio);
++		mempool_free(r1_bio, &conf->r1bio_pool);
+ 		allow_barrier(conf, bio->bi_iter.bi_sector);
+ 
+ 		if (bio->bi_opf & REQ_NOWAIT) {
+-- 
+2.43.0.232.ge79552d197
+
+
+From 85b93ffe9bbcc609ed2fec6ec0d1ae680351ea6b Mon Sep 17 00:00:00 2001
+From: Basavaraj Natikar <Basavaraj.Natikar@amd.com>
+Date: Mon, 4 Mar 2024 11:13:27 +0530
+Subject: [PATCH 08/12] xhci: Allow RPM on the USB controller (1022:43f7) by
+ default
+
+Enable runtime PM by default for older AMD 1022:43f7 xHCI 1.1 host as it
+is proven to work.
+Driver enables runtime PM by default for newer xHCI 1.2 host.
+
+Link: https://lore.kernel.org/all/12335218.O9o76ZdvQC@natalenko.name/
+Cc: Mario Limonciello <mario.limonciello@amd.com>
+Tested-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+Signed-off-by: Basavaraj Natikar <Basavaraj.Natikar@amd.com>
+---
+ drivers/usb/host/xhci-pci.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index b534ca975..c0920e90e 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -307,8 +307,11 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 		xhci->quirks |= XHCI_RESET_ON_RESUME;
+ 	}
+ 
+-	if (pdev->vendor == PCI_VENDOR_ID_AMD)
++	if (pdev->vendor == PCI_VENDOR_ID_AMD) {
+ 		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
++		if (pdev->device == 0x43f7)
++			xhci->quirks |= XHCI_DEFAULT_PM_RUNTIME_ALLOW;
++	}
+ 
+ 	if ((pdev->vendor == PCI_VENDOR_ID_AMD) &&
+ 		((pdev->device == PCI_DEVICE_ID_AMD_PROMONTORYA_4) ||
+-- 
+2.43.0.232.ge79552d197
+
+
+From d799a0ef75bd5a378d77af1e54bf976e5b4ccdfd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 5 Mar 2024 10:36:59 +0200
+Subject: [PATCH 09/12] drm/i915/dsi: Go back to the previous
+ INIT_OTP/DISPLAY_ON order, mostly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reinstate commit 88b065943cb5 ("drm/i915/dsi: Do display on
+sequence later on icl+"), for the most part. Turns out some
+machines (eg. Chuwi Minibook X) really do need that updated order.
+It is also the order the Windows driver uses.
+
+However we can't just undo the revert since that would again
+break Lenovo 82TQ. After staring at the VBT sequences for both
+machines I've concluded that the Lenovo 82TQ sequences look
+somewhat broken:
+ - INIT_OTP is not present at all
+ - what should be in INIT_OTP is found in DISPLAY_ON
+ - what should be in DISPLAY_ON is found in BACKLIGHT_ON
+   (along with the actual backlight stuff)
+
+The Chuwi Minibook X on the other hand has a full complement
+of sequences in its VBT.
+
+So let's try to deal with the broken sequences in the
+Lenovo 82TQ VBT by simply swapping the (non-existent)
+INIT_OTP sequence with the DISPLAY_ON sequence. Thus we
+execute DISPLAY_ON when intending to execute INIT_OTP,
+and execute nothing at all when intending to execute
+DISPLAY_ON. That should be 100% equivalent to the
+revert, for such broken VBTs.
+
+Cc: stable@vger.kernel.org
+Fixes: dc524d05974f ("Revert "drm/i915/dsi: Do display on sequence later on icl+"")
+References: https://gitlab.freedesktop.org/drm/intel/-/issues/10071
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/10334
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240305083659.8396-1-ville.syrjala@linux.intel.com
+Acked-by: Jani Nikula <jani.nikula@intel.com>
+---
+ drivers/gpu/drm/i915/display/icl_dsi.c    |  3 +-
+ drivers/gpu/drm/i915/display/intel_bios.c | 43 +++++++++++++++++++----
+ 2 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/icl_dsi.c b/drivers/gpu/drm/i915/display/icl_dsi.c
+index eda4a8b88..ac456a227 100644
+--- a/drivers/gpu/drm/i915/display/icl_dsi.c
++++ b/drivers/gpu/drm/i915/display/icl_dsi.c
+@@ -1155,7 +1155,6 @@ static void gen11_dsi_powerup_panel(struct intel_encoder *encoder)
+ 	}
+ 
+ 	intel_dsi_vbt_exec_sequence(intel_dsi, MIPI_SEQ_INIT_OTP);
+-	intel_dsi_vbt_exec_sequence(intel_dsi, MIPI_SEQ_DISPLAY_ON);
+ 
+ 	/* ensure all panel commands dispatched before enabling transcoder */
+ 	wait_for_cmds_dispatched_to_panel(encoder);
+@@ -1256,6 +1255,8 @@ static void gen11_dsi_enable(struct intel_atomic_state *state,
+ 	/* step6d: enable dsi transcoder */
+ 	gen11_dsi_enable_transcoder(encoder);
+ 
++	intel_dsi_vbt_exec_sequence(intel_dsi, MIPI_SEQ_DISPLAY_ON);
++
+ 	/* step7: enable backlight */
+ 	intel_backlight_enable(crtc_state, conn_state);
+ 	intel_dsi_vbt_exec_sequence(intel_dsi, MIPI_SEQ_BACKLIGHT_ON);
+diff --git a/drivers/gpu/drm/i915/display/intel_bios.c b/drivers/gpu/drm/i915/display/intel_bios.c
+index aa169b005..8aeaa9e2a 100644
+--- a/drivers/gpu/drm/i915/display/intel_bios.c
++++ b/drivers/gpu/drm/i915/display/intel_bios.c
+@@ -1952,16 +1952,12 @@ static int get_init_otp_deassert_fragment_len(struct drm_i915_private *i915,
+  * these devices we split the init OTP sequence into a deassert sequence and
+  * the actual init OTP part.
+  */
+-static void fixup_mipi_sequences(struct drm_i915_private *i915,
+-				 struct intel_panel *panel)
++static void vlv_fixup_mipi_sequences(struct drm_i915_private *i915,
++				     struct intel_panel *panel)
+ {
+ 	u8 *init_otp;
+ 	int len;
+ 
+-	/* Limit this to VLV for now. */
+-	if (!IS_VALLEYVIEW(i915))
+-		return;
+-
+ 	/* Limit this to v1 vid-mode sequences */
+ 	if (panel->vbt.dsi.config->is_cmd_mode ||
+ 	    panel->vbt.dsi.seq_version != 1)
+@@ -1997,6 +1993,41 @@ static void fixup_mipi_sequences(struct drm_i915_private *i915,
+ 	panel->vbt.dsi.sequence[MIPI_SEQ_INIT_OTP] = init_otp + len - 1;
+ }
+ 
++/*
++ * Some machines (eg. Lenovo 82TQ) appear to have broken
++ * VBT sequences:
++ * - INIT_OTP is not present at all
++ * - what should be in INIT_OTP is in DISPLAY_ON
++ * - what should be in DISPLAY_ON is in BACKLIGHT_ON
++ *   (along with the actual backlight stuff)
++ *
++ * To make those work we simply swap DISPLAY_ON and INIT_OTP.
++ *
++ * TODO: Do we need to limit this to specific machines,
++ *       or examine the contents of the sequences to
++ *       avoid false positives?
++ */
++static void icl_fixup_mipi_sequences(struct drm_i915_private *i915,
++				     struct intel_panel *panel)
++{
++	if (!panel->vbt.dsi.sequence[MIPI_SEQ_INIT_OTP] &&
++	    panel->vbt.dsi.sequence[MIPI_SEQ_DISPLAY_ON]) {
++		drm_dbg_kms(&i915->drm, "Broken VBT: Swapping INIT_OTP and DISPLAY_ON sequences\n");
++
++		swap(panel->vbt.dsi.sequence[MIPI_SEQ_INIT_OTP],
++		     panel->vbt.dsi.sequence[MIPI_SEQ_DISPLAY_ON]);
++	}
++}
++
++static void fixup_mipi_sequences(struct drm_i915_private *i915,
++				 struct intel_panel *panel)
++{
++	if (DISPLAY_VER(i915) >= 11)
++		icl_fixup_mipi_sequences(i915, panel);
++	else if (IS_VALLEYVIEW(i915))
++		vlv_fixup_mipi_sequences(i915, panel);
++}
++
+ static void
+ parse_mipi_sequence(struct drm_i915_private *i915,
+ 		    struct intel_panel *panel)
+-- 
+2.43.0.232.ge79552d197
+
+
+From 1c8bc3b2337473e17e272c25373fba8f512bacb4 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Thu, 29 Feb 2024 11:56:22 +0000
+Subject: [PATCH 10/12] btrfs: reuse cloned extent buffer during fiemap to
+ avoid re-allocations
+
+During fiemap we may have to visit multiples leaves of the subvolume's
+inode tree, and each time we are freeing and allocating an extent buffer
+to use as a clone of each visited leaf. Optimize this by reusing cloned
+extent buffers, to avoid the freeing and re-allocation both of the extent
+buffer structure itself and more importantly of the pages attached to the
+extent buffer.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+---
+ fs/btrfs/extent_io.c | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 0434c7a5b..ac07bef3d 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2756,7 +2756,7 @@ static int emit_last_fiemap_cache(struct fiemap_extent_info *fieinfo,
+ 
+ static int fiemap_next_leaf_item(struct btrfs_inode *inode, struct btrfs_path *path)
+ {
+-	struct extent_buffer *clone;
++	struct extent_buffer *clone = path->nodes[0];
+ 	struct btrfs_key key;
+ 	int slot;
+ 	int ret;
+@@ -2765,29 +2765,45 @@ static int fiemap_next_leaf_item(struct btrfs_inode *inode, struct btrfs_path *p
+ 	if (path->slots[0] < btrfs_header_nritems(path->nodes[0]))
+ 		return 0;
+ 
++	/*
++	 * Add a temporary extra ref to an already cloned extent buffer to
++	 * prevent btrfs_next_leaf() freeing it, we want to reuse it to avoid
++	 * the cost of allocating a new one.
++	 */
++	ASSERT(test_bit(EXTENT_BUFFER_UNMAPPED, &clone->bflags));
++	atomic_inc(&clone->refs);
++
+ 	ret = btrfs_next_leaf(inode->root, path);
+ 	if (ret != 0)
+-		return ret;
++		goto out;
+ 
+ 	/*
+ 	 * Don't bother with cloning if there are no more file extent items for
+ 	 * our inode.
+ 	 */
+ 	btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0]);
+-	if (key.objectid != btrfs_ino(inode) || key.type != BTRFS_EXTENT_DATA_KEY)
+-		return 1;
++	if (key.objectid != btrfs_ino(inode) || key.type != BTRFS_EXTENT_DATA_KEY) {
++		ret = 1;
++		goto out;
++	}
+ 
+ 	/* See the comment at fiemap_search_slot() about why we clone. */
+-	clone = btrfs_clone_extent_buffer(path->nodes[0]);
+-	if (!clone)
+-		return -ENOMEM;
++	copy_extent_buffer_full(clone, path->nodes[0]);
++	/*
++	 * Important to preserve the start field, for the optimizations when
++	 * checking if extents are shared (see extent_fiemap()).
++	 */
++	clone->start = path->nodes[0]->start;
+ 
+ 	slot = path->slots[0];
+ 	btrfs_release_path(path);
+ 	path->nodes[0] = clone;
+ 	path->slots[0] = slot;
++out:
++	if (ret)
++		free_extent_buffer(clone);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /*
+-- 
+2.43.0.232.ge79552d197
+
+
+From 1401a372f7bd7c292b92d955429ad4852f9bf1cc Mon Sep 17 00:00:00 2001
+From: Anand Jain <anand.jain@oracle.com>
+Date: Thu, 7 Mar 2024 19:08:22 +0800
+Subject: [PATCH 11/12] btrfs: do not skip re-registration for the mounted
+ device
+
+There are reports that since version 6.7 update-grub fails to find the
+device of the root on systems without initrd and on a single device.
+
+This looks like the device name changed in the output of
+/proc/self/mountinfo:
+
+6.5-rc5 working
+
+  18 1 0:16 / / rw,noatime - btrfs /dev/sda8 ...
+
+6.7 not working:
+
+  17 1 0:15 / / rw,noatime - btrfs /dev/root ...
+
+and "update-grub" shows this error:
+
+  /usr/sbin/grub-probe: error: cannot find a device for / (is /dev mounted?)
+
+This looks like it's related to the device name, but grub-probe
+recognizes the "/dev/root" path and tries to find the underlying device.
+However there's a special case for some filesystems, for btrfs in
+particular.
+
+The generic root device detection heuristic is not done and it all
+relies on reading the device infos by a btrfs specific ioctl. This ioctl
+returns the device name as it was saved at the time of device scan (in
+this case it's /dev/root).
+
+The change in 6.7 for temp_fsid to allow several single device
+filesystem to exist with the same fsid (and transparently generate a new
+UUID at mount time) was to skip caching/registering such devices.
+
+This also skipped mounted device. One step of scanning is to check if
+the device name hasn't changed, and if yes then update the cached value.
+
+This broke the grub-probe as it always read the device /dev/root and
+couldn't find it in the system. A temporary workaround is to create a
+symlink but this does not survive reboot.
+
+The right fix is to allow updating the device path of a mounted
+filesystem even if this is a single device one.
+
+In the fix, check if the device's major:minor number matches with the
+cached device. If they do, then we can allow the scan to happen so that
+device_list_add() can take care of updating the device path. The file
+descriptor remains unchanged.
+
+This does not affect the temp_fsid feature, the UUID of the mounted
+filesystem remains the same and the matching is based on device major:minor
+which is unique per mounted filesystem.
+
+This covers the path when the device (that exists for all mounted
+devices) name changes, updating /dev/root to /dev/sdx. Any other single
+device with filesystem and is not mounted is still skipped.
+
+Note that if a system is booted and initial mount is done on the
+/dev/root device, this will be the cached name of the device. Only after
+the command "btrfs device scan" it will change as it triggers the
+rename.
+
+The fix was verified by users whose systems were affected.
+
+Fixes: bc27d6f0aa0e ("btrfs: scan but don't register device on single device filesystem")
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=218353
+Link: https://lore.kernel.org/lkml/CAKLYgeJ1tUuqLcsquwuFqjDXPSJpEiokrWK2gisPKDZLs8Y2TQ@mail.gmail.com/
+Tested-by: Alex Romosan <aromosan@gmail.com>
+Tested-by: CHECK_1234543212345@protonmail.com
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Anand Jain <anand.jain@oracle.com>
+---
+ fs/btrfs/volumes.c | 57 ++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index d852d94d5..32158eebc 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -1301,6 +1301,47 @@ int btrfs_forget_devices(dev_t devt)
+ 	return ret;
+ }
+ 
++static bool btrfs_skip_registration(struct btrfs_super_block *disk_super,
++				    const char *path, dev_t devt,
++				    bool mount_arg_dev)
++{
++	struct btrfs_fs_devices *fs_devices;
++
++	/*
++	 * Do not skip device registration for mounted devices with matching
++	 * maj:min but different paths. Booting without initrd relies on
++	 * /dev/root initially, later replaced with the actual root device.
++	 * A successful scan ensures update-grub selects the correct device.
++	 */
++	list_for_each_entry(fs_devices, &fs_uuids, fs_list) {
++		struct btrfs_device *device;
++
++		mutex_lock(&fs_devices->device_list_mutex);
++
++		if (!fs_devices->opened) {
++			mutex_unlock(&fs_devices->device_list_mutex);
++			continue;
++		}
++
++		list_for_each_entry(device, &fs_devices->devices, dev_list) {
++			if ((device->devt == devt) &&
++			    strcmp(device->name->str, path)) {
++				mutex_unlock(&fs_devices->device_list_mutex);
++
++				/* Do not skip registration */
++				return false;
++			}
++		}
++		mutex_unlock(&fs_devices->device_list_mutex);
++	}
++
++	if (!mount_arg_dev && btrfs_super_num_devices(disk_super) == 1 &&
++	    !(btrfs_super_flags(disk_super) & BTRFS_SUPER_FLAG_SEEDING))
++		return true;
++
++	return false;
++}
++
+ /*
+  * Look for a btrfs signature on a device. This may be called out of the mount path
+  * and we are not allowed to call set_blocksize during the scan. The superblock
+@@ -1357,18 +1398,14 @@ struct btrfs_device *btrfs_scan_one_device(const char *path, blk_mode_t flags,
+ 		goto error_bdev_put;
+ 	}
+ 
+-	if (!mount_arg_dev && btrfs_super_num_devices(disk_super) == 1 &&
+-	    !(btrfs_super_flags(disk_super) & BTRFS_SUPER_FLAG_SEEDING)) {
+-		dev_t devt;
++	if (btrfs_skip_registration(disk_super, path, bdev_handle->bdev->bd_dev,
++				    mount_arg_dev)) {
++		pr_debug("BTRFS: skip registering single non-seed device %s (%d:%d)\n",
++			  path, MAJOR(bdev_handle->bdev->bd_dev),
++			  MINOR(bdev_handle->bdev->bd_dev));
+ 
+-		ret = lookup_bdev(path, &devt);
+-		if (ret)
+-			btrfs_warn(NULL, "lookup bdev failed for path %s: %d",
+-				   path, ret);
+-		else
+-			btrfs_free_stale_devices(devt, NULL);
++		btrfs_free_stale_devices(bdev_handle->bdev->bd_dev, NULL);
+ 
+-		pr_debug("BTRFS: skip registering single non-seed device %s\n", path);
+ 		device = NULL;
+ 		goto free_disk_super;
+ 	}
+-- 
+2.43.0.232.ge79552d197
+
+
+From 595bd68239025e8dc86c1ce5790541d231f73b03 Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Fri, 22 Mar 2024 12:36:21 +0100
+Subject: [PATCH 12/12] fs/btrfs: drop inode_to_fs_info() usage
+
+The upstream commit 41044b41ad2c introduced this helper, but I'm not
+pulling it in at this point.
+
+Fixes: aa2f6ac9c1da ("btrfs: qgroup: validate btrfs_qgroup_inherit parameter")
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ fs/btrfs/ioctl.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index bd19aed66..2e74b5563 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -1362,7 +1362,7 @@ static noinline int btrfs_ioctl_snap_create_v2(struct file *file,
+ 	if (vol_args->flags & BTRFS_SUBVOL_RDONLY)
+ 		readonly = true;
+ 	if (vol_args->flags & BTRFS_SUBVOL_QGROUP_INHERIT) {
+-		struct btrfs_fs_info *fs_info = inode_to_fs_info(file_inode(file));
++		struct btrfs_fs_info *fs_info = btrfs_sb(file_inode(file)->i_sb);
+ 
+ 		if (vol_args->size < sizeof(*inherit) ||
+ 		    vol_args->size > PAGE_SIZE) {
+-- 
+2.43.0.232.ge79552d197
+
