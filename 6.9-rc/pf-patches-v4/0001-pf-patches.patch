@@ -1,0 +1,267 @@
+From 812251ae0913e33ff7d5b7c98880a2bf13e3c7a5 Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:53 -0400
+Subject: [PATCH 1/4] btrfs: New helper to clear EXTENT_BUFFER_READING
+
+We are clearing the bit and waking up any waiters in two different
+places.  Factor that code out into a static helper function.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 61594eaf1..46173dcfd 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4270,6 +4270,13 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
+ 	}
+ }
+ 
++static void clear_extent_buffer_reading(struct extent_buffer *eb)
++{
++	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
++	smp_mb__after_atomic();
++	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++}
++
+ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ {
+ 	struct extent_buffer *eb = bbio->private;
+@@ -4304,9 +4311,7 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 		bio_offset += len;
+ 	}
+ 
+-	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-	smp_mb__after_atomic();
+-	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++	clear_extent_buffer_reading(eb);
+ 	free_extent_buffer(eb);
+ 
+ 	bio_put(&bbio->bio);
+@@ -4340,9 +4345,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
+ 	 * will now be set, and we shouldn't read it in again.
+ 	 */
+ 	if (unlikely(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))) {
+-		clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-		smp_mb__after_atomic();
+-		wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++		clear_extent_buffer_reading(eb);
+ 		return 0;
+ 	}
+ 
+-- 
+2.44.0.325.g11c821f2f2
+
+
+From e23ba6f147dd95ed82823300ddda2de7c0612cf7 Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:54 -0400
+Subject: [PATCH 2/4] btrfs: WARN if EXTENT_BUFFER_UPTODATE is set while
+ reading
+
+We recently tracked down a race condition that triggered a read for an
+extent buffer with EXTENT_BUFFER_UPTODATE already set.  While this read
+was in progress, other concurrent readers would see the UPTODATE bit and
+return early as if the read was already complete, making accesses to the
+extent buffer conflict with the read operation that was overwriting it.
+
+Add a WARN_ON() to end_bbio_meta_read() for this situation to make
+similar races easier to spot in the future.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 46173dcfd..0024ea20b 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4285,6 +4285,13 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 	struct folio_iter fi;
+ 	u32 bio_offset = 0;
+ 
++	/*
++	 * If the extent buffer is marked UPTODATE before the read operation
++	 * completes, other calls to read_extent_buffer_pages() will return
++	 * early without waiting for the read to finish, causing data races.
++	 */
++	WARN_ON(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags));
++
+ 	eb->read_mirror = bbio->mirror_num;
+ 
+ 	if (uptodate &&
+-- 
+2.44.0.325.g11c821f2f2
+
+
+From d9281ff1e40532f2eb74e9e6598c8d2c9cfcd305 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai1@huaweicloud.com>
+Date: Fri, 15 Mar 2024 09:17:56 +0800
+Subject: [PATCH 3/4] md/raid5: fix deadlock between md0_reclaim and md0_raid5
+
+Commit 5e2cf333b7bd ("md/raid5: Wait for MD_SB_CHANGE_PENDING in
+raid5d") introduced a regression, it got reverted through commit
+bed9e27baf52 ("Revert "md/raid5: Wait for MD_SB_CHANGE_PENDING in
+raid5d"). To fix the original issue commit 5e2cf333b7bd was fixing,
+commit d6e035aad6c0 ("md: bypass block throttle for superblock update")
+was created, it avoids md superblock write getting throttled by block
+layer which is good, but md superblock write could be stuck in block
+layer due to block flush as well, and that is what was happening in this
+regression report.
+
+Process "md0_reclaim" got stuck while waiting IO for md superblock write
+done, that IO was marked with REQ_PREFLUSH | REQ_FUA flags, these 3
+steps ( PREFLUSH, DATA and POSTFLUSH ) will be executed before done, the
+hung of this process is because the last step "POSTFLUSH" never done.
+And that was because of  process "md0_raid5" submitted another IO with
+REQ_FUA flag marked just before that step started. To handle that IO,
+blk_insert_flush() will be invoked and hit "REQ_FSEQ_DATA |
+REQ_FSEQ_POSTFLUSH" case where "fq->flush_data_in_flight" will be
+increased. When the IO for md superblock write was to issue "POSTFLUSH"
+step through blk_kick_flush(), it found that "fq->flush_data_in_flight"
+was not zero, so it will skip that step, that is expected, because flush
+will be triggered when "fq->flush_data_in_flight" dropped to zero.
+
+Unfortunately here that inflight data IO from "md0_raid5" will never
+done, because it was added into the blk_plug list of that process, but
+"md0_raid5" run into infinite loop due to "MD_SB_CHANGE_PENDING" which
+made it never had a chance to finish the blk plug until
+"MD_SB_CHANGE_PENDING" was cleared. Process "md0_reclaim" was supposed
+to clear that flag but it was stuck by "md0_raid5", so this is a deadlock.
+
+Once "md0_raid5" starts looping due to "MD_SB_CHANGE_PENDING", it should
+release all its staging IO requests to avoid blocking others.
+
+Reported-by: Dan Moulding <dan@danm.net>
+Fixes: d6e035aad6c0 ("md: bypass block throttle for superblock update")
+Link: https://lore.kernel.org/lkml/d3cdebfe-17c0-4f61-9ad9-71d9de2339b2@oracle.com/
+Link: https://lore.kernel.org/lkml/db4f5f1b-5eba-2cdb-fad0-7aa725cea508@huaweicloud.com/
+---
+ drivers/md/raid5.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index d874abfc1..27bdbe146 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6734,6 +6734,9 @@ static void raid5d(struct md_thread *thread)
+ 		int batch_size, released;
+ 		unsigned int offset;
+ 
++		if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
++			goto skip;
++
+ 		released = release_stripe_list(conf, conf->temp_inactive_list);
+ 		if (released)
+ 			clear_bit(R5_DID_ALLOC, &conf->cache_state);
+@@ -6783,6 +6786,7 @@ static void raid5d(struct md_thread *thread)
+ 			!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags),
+ 			conf->device_lock);
+ 	}
++skip:
+ 	pr_debug("%d stripes handled\n", handled);
+ 
+ 	spin_unlock_irq(&conf->device_lock);
+-- 
+2.44.0.325.g11c821f2f2
+
+
+From 97f69389b90d6491badbb6b56e87baf92056a9df Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 8 Mar 2024 17:37:26 +0800
+Subject: [PATCH 4/4] raid1: fix use-after-free for original bio in
+ raid1_write_request()
+
+r1_bio->bios[] is used to record new bios that will be issued to
+underlying disks, however, in raid1_write_request(), r1_bio->bios[]
+will set to the original bio temporarily. Meanwhile, if blocked rdev
+is set, free_r1bio() will be called causing that all r1_bio->bios[]
+to be freed:
+
+raid1_write_request()
+ r1_bio = alloc_r1bio(mddev, bio); -> r1_bio->bios[] is NULL
+ for (i = 0;  i < disks; i++) -> for each rdev in conf
+  // first rdev is normal
+  r1_bio->bios[0] = bio; -> set to original bio
+  // second rdev is blocked
+  if (test_bit(Blocked, &rdev->flags))
+   break
+
+ if (blocked_rdev)
+  free_r1bio()
+   put_all_bios()
+    bio_put(r1_bio->bios[0]) -> original bio is freed
+
+Test scripts:
+
+mdadm -CR /dev/md0 -l1 -n4 /dev/sd[abcd] --assume-clean
+fio -filename=/dev/md0 -ioengine=libaio -rw=write -bs=4k -numjobs=1 \
+    -iodepth=128 -name=test -direct=1
+echo blocked > /sys/block/md0/md/rd2/state
+
+Test result:
+
+BUG bio-264 (Not tainted): Object already free
+-----------------------------------------------------------------------------
+
+Allocated in mempool_alloc_slab+0x24/0x50 age=1 cpu=1 pid=869
+ kmem_cache_alloc+0x324/0x480
+ mempool_alloc_slab+0x24/0x50
+ mempool_alloc+0x6e/0x220
+ bio_alloc_bioset+0x1af/0x4d0
+ blkdev_direct_IO+0x164/0x8a0
+ blkdev_write_iter+0x309/0x440
+ aio_write+0x139/0x2f0
+ io_submit_one+0x5ca/0xb70
+ __do_sys_io_submit+0x86/0x270
+ __x64_sys_io_submit+0x22/0x30
+ do_syscall_64+0xb1/0x210
+ entry_SYSCALL_64_after_hwframe+0x6c/0x74
+Freed in mempool_free_slab+0x1f/0x30 age=1 cpu=1 pid=869
+ kmem_cache_free+0x28c/0x550
+ mempool_free_slab+0x1f/0x30
+ mempool_free+0x40/0x100
+ bio_free+0x59/0x80
+ bio_put+0xf0/0x220
+ free_r1bio+0x74/0xb0
+ raid1_make_request+0xadf/0x1150
+ md_handle_request+0xc7/0x3b0
+ md_submit_bio+0x76/0x130
+ __submit_bio+0xd8/0x1d0
+ submit_bio_noacct_nocheck+0x1eb/0x5c0
+ submit_bio_noacct+0x169/0xd40
+ submit_bio+0xee/0x1d0
+ blkdev_direct_IO+0x322/0x8a0
+ blkdev_write_iter+0x309/0x440
+ aio_write+0x139/0x2f0
+
+Since that bios for underlying disks are not allocated yet, fix this
+problem by using mempool_free() directly to free the r1_bio.
+
+Fixes: 992db13a4aee ("md/raid1: free the r1bio before waiting for blocked rdev")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+---
+ drivers/md/raid1.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index be8ac24f5..7b8a71ca6 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1558,7 +1558,7 @@ static void raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 		for (j = 0; j < i; j++)
+ 			if (r1_bio->bios[j])
+ 				rdev_dec_pending(conf->mirrors[j].rdev, mddev);
+-		free_r1bio(r1_bio);
++		mempool_free(r1_bio, &conf->r1bio_pool);
+ 		allow_barrier(conf, bio->bi_iter.bi_sector);
+ 
+ 		if (bio->bi_opf & REQ_NOWAIT) {
+-- 
+2.44.0.325.g11c821f2f2
+
