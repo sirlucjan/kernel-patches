@@ -1,0 +1,258 @@
+From 8e97fe6fac3cbaca5c499d23fc604f658df28949 Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Wed, 24 Jan 2024 02:45:51 +0800
+Subject: [PATCH 3/4] mm, lru_gen: batch update counters on aging
+
+When lru_gen is aging, it will update mm counters page by page,
+which causes a higher overhead if age happens frequently or there
+are a lot of pages in one generation getting moved.
+Optimize this by doing the counter update in batch.
+
+Although most __mod_*_state has its own caches the overhead
+is still observable.
+
+Test 1: Ramdisk fio test in a 4G memcg on a EPYC 7K62 with:
+  fio -name=mglru --numjobs=16 --directory=/mnt --size=960m \
+    --buffered=1 --ioengine=io_uring --iodepth=128 \
+    --iodepth_batch_submit=32 --iodepth_batch_complete=32 \
+    --rw=randread --random_distribution=zipf:0.5 --norandommap \
+    --time_based --ramp_time=1m --runtime=6m --group_reporting
+
+Before this patch:
+bw (  MiB/s): min= 8360, max= 9771, per=100.00%, avg=9381.31, stdev=15.67, samples=11488
+iops        : min=2140296, max=2501385, avg=2401613.91, stdev=4010.41, samples=11488
+
+After this patch (+0.0%):
+bw (  MiB/s): min= 8299, max= 9847, per=100.00%, avg=9388.23, stdev=16.25, samples=11488
+iops        : min=2124544, max=2521056, avg=2403385.82, stdev=4159.07, samples=11488
+
+Test 2: Ramdisk fio hybrid test for 30m in a 4G memcg on a EPYC 7K62 (3 times):
+  fio --buffered=1 --numjobs=8 --size=960m --directory=/mnt \
+    --time_based --ramp_time=1m --runtime=30m \
+    --ioengine=io_uring --iodepth=128 --iodepth_batch_submit=32 \
+    --iodepth_batch_complete=32 --norandommap \
+    --name=mglru-ro --rw=randread --random_distribution=zipf:0.7 \
+    --name=mglru-rw --rw=randrw --random_distribution=zipf:0.7
+
+Before this patch:
+ READ: 6926.6 MiB/s, Stdev: 37.950260
+WRITE: 1297.3 MiB/s, Stdev: 7.408704
+
+After this patch (+0.7%, +0.4%):
+ READ: 6973.3 MiB/s, Stdev: 19.601587
+WRITE: 1302.3 MiB/s, Stdev: 4.988877
+
+Test 3: 30m of MySQL test in 6G memcg (12 times):
+  echo 'set GLOBAL innodb_buffer_pool_size=16106127360;' | \
+    mysql -u USER -h localhost --password=PASS
+
+  sysbench /usr/share/sysbench/oltp_read_only.lua \
+    --mysql-user=USER --mysql-password=PASS --mysql-db=DB \
+    --tables=48 --table-size=2000000 --threads=16 --time=1800 run
+
+Before this patch
+Avg: 135005.779091 qps. Stdev: 295.299027
+
+After this patch (+0.2%):
+Avg: 135310.868182 qps. Stdev: 379.200942
+
+Test 4: Build linux kernel in 2G memcg with make -j48 with SSD swap
+        (for memory stress, 18 times):
+
+Before this patch:
+Average: 1455.659254 s. Stdev: 15.274481
+
+After this patch (-0.8%):
+Average: 1467.813023 s. Stdev: 24.232886
+
+Test 5: Memtier test in a 4G cgroup using brd as swap (20 times):
+  memcached -u nobody -m 16384 -s /tmp/memcached.socket \
+    -a 0766 -t 16 -B binary &
+  memtier_benchmark -S /tmp/memcached.socket \
+    -P memcache_binary -n allkeys \
+    --key-minimum=1 --key-maximum=16000000 -d 1024 \
+    --ratio=1:0 --key-pattern=P:P -c 1 -t 16 --pipeline 8 -x 3
+
+Before this patch:
+Avg: 47691.343500 Ops/sec. Stdev: 3925.772473
+
+After this patch (+1.7%):
+Avg: 48389.282500 Ops/sec. Stdev: 3534.470933
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/vmscan.c | 68 +++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 55 insertions(+), 13 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 7f287b2d7..92e24efc8 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3120,12 +3120,45 @@ static int folio_update_gen(struct folio *folio, int gen)
+ 	return ((old_flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
+ }
+ 
+-/* protect pages accessed multiple times through file descriptors */
+-static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
++/*
++ * When oldest gen ie being reclaimed, protected/unreclaimable pages can be
++ * moved in batch. They usually all land on same gen (old_gen + 1) by
++ * folio_inc_gen so the batch struct is limited to one / type / zone
++ * level LRU.
++ * Batch is applied after finished or aborted scanning one LRU list.
++ */
++struct lru_gen_inc_batch {
++	int delta;
++};
++
++static void lru_gen_inc_batch_done(struct lruvec *lruvec, int gen, int type, int zone,
++				   struct lru_gen_inc_batch *batch)
+ {
+-	int type = folio_is_file_lru(folio);
++	int delta = batch->delta;
++	int new_gen = (gen + 1) % MAX_NR_GENS;
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+-	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
++	enum lru_list lru = type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON;
++
++	if (!delta)
++		return;
++
++	WRITE_ONCE(lrugen->nr_pages[gen][type][zone],
++		   lrugen->nr_pages[gen][type][zone] - delta);
++	WRITE_ONCE(lrugen->nr_pages[new_gen][type][zone],
++		   lrugen->nr_pages[new_gen][type][zone] + delta);
++
++	if (!lru_gen_is_active(lruvec, gen) && lru_gen_is_active(lruvec, new_gen)) {
++		__update_lru_size(lruvec, lru, zone, -delta);
++		__update_lru_size(lruvec, lru + LRU_ACTIVE, zone, delta);
++	}
++}
++
++/* protect pages accessed multiple times through file descriptors */
++static int folio_inc_gen(struct folio *folio, int old_gen, bool reclaiming,
++			 struct lru_gen_inc_batch *batch)
++{
++	int new_gen;
++	int delta = folio_nr_pages(folio);
+ 	unsigned long new_flags, old_flags = READ_ONCE(folio->flags);
+ 
+ 	VM_WARN_ON_ONCE_FOLIO(!(old_flags & LRU_GEN_MASK), folio);
+@@ -3145,7 +3178,8 @@ static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclai
+ 			new_flags |= BIT(PG_reclaim);
+ 	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
+ 
+-	lru_gen_update_size(lruvec, folio, old_gen, new_gen);
++	/* new_gen is ensured to be old_gen + 1 here, do a batch update */
++	batch->delta += delta;
+ 
+ 	return new_gen;
+ }
+@@ -3683,6 +3717,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+ {
+ 	int zone;
+ 	int remaining = MAX_LRU_BATCH;
++	struct lru_gen_inc_batch batch = { };
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+ 	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
+ 
+@@ -3712,12 +3747,15 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+ 				prefetchw(&prev->flags);
+ 			}
+ 
+-			new_gen = folio_inc_gen(lruvec, folio, false);
++			new_gen = folio_inc_gen(folio, old_gen, false, &batch);
+ 			list_move_tail(&folio->lru, &lrugen->folios[new_gen][type][zone]);
+ 
+-			if (!--remaining)
++			if (!--remaining) {
++				lru_gen_inc_batch_done(lruvec, old_gen, type, zone, &batch);
+ 				return false;
++			}
+ 		}
++		lru_gen_inc_batch_done(lruvec, old_gen, type, zone, &batch);
+ 	}
+ done:
+ 	reset_ctrl_pos(lruvec, type, true);
+@@ -4237,7 +4275,7 @@ void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
+  ******************************************************************************/
+ 
+ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_control *sc,
+-		       int tier_idx)
++		       int tier_idx, struct lru_gen_inc_batch *batch)
+ {
+ 	bool success;
+ 	int gen = folio_lru_gen(folio);
+@@ -4247,6 +4285,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 	int refs = folio_lru_refs(folio);
+ 	int tier = lru_tier_from_refs(refs);
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
++	int old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
+ 
+ 	VM_WARN_ON_ONCE_FOLIO(gen >= MAX_NR_GENS, folio);
+ 
+@@ -4270,7 +4309,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 	}
+ 
+ 	/* promoted */
+-	if (gen != lru_gen_from_seq(lrugen->min_seq[type])) {
++	if (gen != old_gen) {
+ 		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
+ 		return true;
+ 	}
+@@ -4279,7 +4318,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 	if (tier > tier_idx || refs == BIT(LRU_REFS_WIDTH)) {
+ 		int hist = lru_hist_from_seq(lrugen->min_seq[type]);
+ 
+-		gen = folio_inc_gen(lruvec, folio, false);
++		gen = folio_inc_gen(folio, old_gen, false, batch);
+ 		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
+ 
+ 		WRITE_ONCE(lrugen->protected[hist][type][tier - 1],
+@@ -4289,7 +4328,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 
+ 	/* ineligible */
+ 	if (zone > sc->reclaim_idx || skip_cma(folio, sc)) {
+-		gen = folio_inc_gen(lruvec, folio, false);
++		gen = folio_inc_gen(folio, old_gen, false, batch);
+ 		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
+ 		return true;
+ 	}
+@@ -4297,7 +4336,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 	/* waiting for writeback */
+ 	if (folio_test_locked(folio) || folio_test_writeback(folio) ||
+ 	    (type == LRU_GEN_FILE && folio_test_dirty(folio))) {
+-		gen = folio_inc_gen(lruvec, folio, true);
++		gen = folio_inc_gen(folio, old_gen, true, batch);
+ 		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
+ 		return true;
+ 	}
+@@ -4364,6 +4403,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+ 		LIST_HEAD(moved);
+ 		int skipped_zone = 0;
+ 		struct folio *prev = NULL;
++		struct lru_gen_inc_batch batch = { };
+ 		int zone = (sc->reclaim_idx + i) % MAX_NR_ZONES;
+ 		struct list_head *head = &lrugen->folios[gen][type][zone];
+ 
+@@ -4388,7 +4428,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+ 				prefetchw(&prev->flags);
+ 			}
+ 
+-			if (sort_folio(lruvec, folio, sc, tier))
++			if (sort_folio(lruvec, folio, sc, tier, &batch))
+ 				sorted += delta;
+ 			else if (isolate_folio(lruvec, folio, sc)) {
+ 				list_add(&folio->lru, list);
+@@ -4402,6 +4442,8 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+ 				break;
+ 		}
+ 
++		lru_gen_inc_batch_done(lruvec, gen, type, zone, &batch);
++
+ 		if (skipped_zone) {
+ 			list_splice(&moved, head);
+ 			__count_zid_vm_events(PGSCAN_SKIP, zone, skipped_zone);
+-- 
+2.44.0.325.g11c821f2f2
+
