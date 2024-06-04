@@ -1,0 +1,181 @@
+From 0eac723c6be2130ce3f63dcd61eb7cd460e76749 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 23 May 2024 12:25:32 +0200
+Subject: [PATCH 18/26] sched/fair: Implement delayed dequeue
+
+Extend / fix 86bfbb7ce4f6 ("sched/fair: Add lag based placement") by
+noting that lag is fundamentally a temporal measure. It should not be
+carried around indefinitely.
+
+OTOH it should also not be instantly discarded, doing so will allow a
+task to game the system by purposefully (micro) sleeping at the end of
+its time quantum.
+
+Since lag is intimately tied to the virtual time base, a wall-time
+based decay is also insufficient, notably competition is required for
+any of this to make sense.
+
+Instead, delay the dequeue and keep the 'tasks' on the runqueue,
+competing until they are eligible.
+
+Strictly speaking, we only care about keeping them until the 0-lag
+point, but that is a difficult proposition, instead carry them around
+until they get picked again, and dequeue them at that point.
+
+XXX test the cfs-throttle stuff
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ kernel/sched/fair.c     | 61 +++++++++++++++++++++++++++++++++++------
+ kernel/sched/features.h |  9 ++++++
+ 2 files changed, 62 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index b66db9113..5a1df8ca4 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5368,18 +5368,33 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 
+ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
+ 
+-static void
++static bool
+ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ {
+-	int action = UPDATE_TG;
+-
+-	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
+-		action |= DO_DETACH;
+-
+ 	/*
+ 	 * Update run-time statistics of the 'current'.
+ 	 */
+-	update_curr(cfs_rq);
++	if (flags & DEQUEUE_DELAYED) {
++		SCHED_WARN_ON(!se->sched_delayed);
++		se->sched_delayed = 0;
++	} else {
++		bool sleep = flags & DEQUEUE_SLEEP;
++
++		SCHED_WARN_ON(sleep && se->sched_delayed);
++		update_curr(cfs_rq);
++
++		if (sched_feat(DELAY_DEQUEUE) && sleep &&
++		    !entity_eligible(cfs_rq, se)) {
++			if (cfs_rq->next == se)
++				cfs_rq->next = NULL;
++			se->sched_delayed = 1;
++			return false;
++		}
++	}
++
++	int action = UPDATE_TG;
++	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
++		action |= DO_DETACH;
+ 
+ 	/*
+ 	 * When dequeuing a sched_entity, we must:
+@@ -5419,6 +5434,8 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 
+ 	if (cfs_rq->nr_running == 0)
+ 		update_idle_cfs_rq_clock_pelt(cfs_rq);
++
++	return true;
+ }
+ 
+ static void
+@@ -5820,6 +5837,10 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ 		if (!se->on_rq)
+ 			goto done;
+ 
++		/*
++		 * XXX should be fine vs sched_delay; if won't run after this.
++		 * Either pick dequeues it, or unthrottle. Double check!!
++		 */
+ 		dequeue_entity(qcfs_rq, se, DEQUEUE_SLEEP);
+ 
+ 		if (cfs_rq_is_idle(group_cfs_rq(se)))
+@@ -6894,6 +6915,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
+ {
+ 	bool was_sched_idle = sched_idle_rq(rq);
+ 	bool task_sleep = flags & DEQUEUE_SLEEP;
++	bool task_delayed = flags & DEQUEUE_DELAYED;
+ 	struct task_struct *p = NULL;
+ 	struct cfs_rq *cfs_rq;
+ 	int idle_h_nr_running;
+@@ -6907,7 +6929,13 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
+ 
+ 	for_each_sched_entity(se) {
+ 		cfs_rq = cfs_rq_of(se);
+-		dequeue_entity(cfs_rq, se, flags);
++
++		if (!dequeue_entity(cfs_rq, se, flags)) {
++			if (p && &p->se == se)
++				return -1;
++
++			break;
++		}
+ 
+ 		/* h_nr_running is the hierachical count of tasks */
+ 		if (p) {
+@@ -6935,6 +6963,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
+ 			break;
+ 		}
+ 		flags |= DEQUEUE_SLEEP;
++		flags &= ~DEQUEUE_DELAYED;
+ 	}
+ 
+ 	for_each_sched_entity(se) {
+@@ -6964,6 +6993,18 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
+ 		/* balance early to pull high priority tasks */
+ 		if (unlikely(!was_sched_idle && sched_idle_rq(rq)))
+ 			rq->next_balance = jiffies;
++
++		if (task_delayed) {
++			SCHED_WARN_ON(!task_sleep);
++			SCHED_WARN_ON(p->on_rq != 1);
++
++			/* Fix-up what dequeue_task_fair() skipped */
++			util_est_update(&rq->cfs, p, task_sleep);
++			hrtick_update(rq);
++
++			/* Fix-up what block_task() skipped. */
++			__block_task(rq, p);
++		}
+ 	}
+ 
+ 	return 1;
+@@ -6981,6 +7022,10 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	if (dequeue_entities(rq, &p->se, flags) < 0)
+ 		return false;
+ 
++	/*
++	 * It doesn't make sense to update util_est for the delayed dequeue
++	 * case where ttwu will make it appear the sleep never happened.
++	 */
+ 	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);
+ 	hrtick_update(rq);
+ 	return true;
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 61cab7b8c..51f6c123b 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -28,6 +28,15 @@ SCHED_FEAT(NEXT_BUDDY, false)
+  */
+ SCHED_FEAT(CACHE_HOT_BUDDY, true)
+ 
++/*
++ * Delay dequeueing tasks until they get selected or woken.
++ *
++ * By delaying the dequeue for non-eligible tasks, they remain in the
++ * competition and can burn off their negative lag. When they get selected
++ * they'll have positive lag by definition.
++ */
++SCHED_FEAT(DELAY_DEQUEUE, true)
++
+ /*
+  * Allow wakeup-time preemption of the current task:
+  */
+-- 
+2.45.1.145.g83f1add914
+
