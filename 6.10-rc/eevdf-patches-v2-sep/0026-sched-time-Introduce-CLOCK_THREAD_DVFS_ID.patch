@@ -1,0 +1,247 @@
+From 7271c36c12ec3123fd6873a091cd962e469158b8 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 3 Jun 2024 17:50:51 +0200
+Subject: [PATCH 26/26] sched/time: Introduce CLOCK_THREAD_DVFS_ID
+
+In order to measure thread time in a DVFS world, introduce
+CLOCK_THREAD_DVFS_ID -- a copy of CLOCK_THREAD_CPUTIME_ID that slows
+down with both DVFS scaling and CPU capacity.
+
+The clock does *NOT* support setting timers.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ include/linux/posix-timers_types.h |  5 ++--
+ include/linux/sched.h              |  1 +
+ include/linux/sched/cputime.h      |  3 +++
+ include/uapi/linux/time.h          |  1 +
+ kernel/sched/core.c                | 40 ++++++++++++++++++++++++++++++
+ kernel/sched/fair.c                |  8 ++++--
+ kernel/time/posix-cpu-timers.c     | 16 +++++++++++-
+ kernel/time/posix-timers.c         |  1 +
+ kernel/time/posix-timers.h         |  1 +
+ 9 files changed, 71 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/posix-timers_types.h b/include/linux/posix-timers_types.h
+index a4712c100..2f382344d 100644
+--- a/include/linux/posix-timers_types.h
++++ b/include/linux/posix-timers_types.h
+@@ -13,9 +13,9 @@
+  *
+  * Bit 2 indicates whether a cpu clock refers to a thread or a process.
+  *
+- * Bits 1 and 0 give the type: PROF=0, VIRT=1, SCHED=2, or FD=3.
++ * Bits 1 and 0 give the type: PROF=0, VIRT=1, SCHED=2, or DVSF=3
+  *
+- * A clockid is invalid if bits 2, 1, and 0 are all set.
++ * (DVFS is PERTHREAD only)
+  */
+ #define CPUCLOCK_PID(clock)		((pid_t) ~((clock) >> 3))
+ #define CPUCLOCK_PERTHREAD(clock) \
+@@ -27,6 +27,7 @@
+ #define CPUCLOCK_PROF		0
+ #define CPUCLOCK_VIRT		1
+ #define CPUCLOCK_SCHED		2
++#define CPUCLOCK_DVFS		3
+ #define CPUCLOCK_MAX		3
+ #define CLOCKFD			CPUCLOCK_MAX
+ #define CLOCKFD_MASK		(CPUCLOCK_PERTHREAD_MASK|CPUCLOCK_CLOCK_MASK)
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 5e3d07fcc..7635045b2 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -550,6 +550,7 @@ struct sched_entity {
+ 	u64				exec_start;
+ 	u64				sum_exec_runtime;
+ 	u64				prev_sum_exec_runtime;
++	u64				sum_dvfs_runtime;
+ 	u64				vruntime;
+ 	s64				vlag;
+ 	u64				slice;
+diff --git a/include/linux/sched/cputime.h b/include/linux/sched/cputime.h
+index 5f8fd5b24..1674d7a0a 100644
+--- a/include/linux/sched/cputime.h
++++ b/include/linux/sched/cputime.h
+@@ -180,4 +180,7 @@ static inline void prev_cputime_init(struct prev_cputime *prev)
+ extern unsigned long long
+ task_sched_runtime(struct task_struct *task);
+ 
++extern unsigned long long
++task_sched_dvfs_runtime(struct task_struct *task);
++
+ #endif /* _LINUX_SCHED_CPUTIME_H */
+diff --git a/include/uapi/linux/time.h b/include/uapi/linux/time.h
+index 4f4b6e48e..87f31ff5d 100644
+--- a/include/uapi/linux/time.h
++++ b/include/uapi/linux/time.h
+@@ -62,6 +62,7 @@ struct timezone {
+  */
+ #define CLOCK_SGI_CYCLE			10
+ #define CLOCK_TAI			11
++#define CLOCK_THREAD_DVFS_ID		12
+ 
+ #define MAX_CLOCKS			16
+ #define CLOCKS_MASK			(CLOCK_REALTIME | CLOCK_MONOTONIC)
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index a8a1310a7..aa6980834 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4344,6 +4344,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->se.exec_start		= 0;
+ 	p->se.sum_exec_runtime		= 0;
+ 	p->se.prev_sum_exec_runtime	= 0;
++	p->se.sum_dvfs_runtime		= 0;
+ 	p->se.nr_migrations		= 0;
+ 	p->se.vruntime			= 0;
+ 	p->se.vlag			= 0;
+@@ -5417,6 +5418,45 @@ unsigned long long task_sched_runtime(struct task_struct *p)
+ 	return ns;
+ }
+ 
++unsigned long long task_sched_dvfs_runtime(struct task_struct *p)
++{
++	struct rq_flags rf;
++	struct rq *rq;
++	u64 ns;
++
++#if defined(CONFIG_64BIT) && defined(CONFIG_SMP)
++	/*
++	 * 64-bit doesn't need locks to atomically read a 64-bit value.
++	 * So we have a optimization chance when the task's delta_exec is 0.
++	 * Reading ->on_cpu is racy, but this is ok.
++	 *
++	 * If we race with it leaving CPU, we'll take a lock. So we're correct.
++	 * If we race with it entering CPU, unaccounted time is 0. This is
++	 * indistinguishable from the read occurring a few cycles earlier.
++	 * If we see ->on_cpu without ->on_rq, the task is leaving, and has
++	 * been accounted, so we're correct here as well.
++	 */
++	if (!p->on_cpu || !task_on_rq_queued(p))
++		return p->se.sum_dvfs_runtime;
++#endif
++
++	rq = task_rq_lock(p, &rf);
++	/*
++	 * Must be ->curr _and_ ->on_rq.  If dequeued, we would
++	 * project cycles that may never be accounted to this
++	 * thread, breaking clock_gettime().
++	 */
++	if (task_current(rq, p) && task_on_rq_queued(p)) {
++		prefetch_curr_exec_start(p);
++		update_rq_clock(rq);
++		p->sched_class->update_curr(rq);
++	}
++	ns = p->se.sum_dvfs_runtime;
++	task_rq_unlock(rq, p, &rf);
++
++	return ns;
++}
++
+ #ifdef CONFIG_SCHED_DEBUG
+ static u64 cpu_resched_latency(struct rq *rq)
+ {
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index f165e1269..87a720fcd 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1118,15 +1118,19 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
+ static s64 update_curr_se(struct rq *rq, struct sched_entity *curr)
+ {
+ 	u64 now = rq_clock_task(rq);
+-	s64 delta_exec;
++	s64 delta_exec, delta_dvfs;
+ 
+-	delta_exec = now - curr->exec_start;
++	delta_dvfs = delta_exec = now - curr->exec_start;
+ 	if (unlikely(delta_exec <= 0))
+ 		return delta_exec;
+ 
+ 	curr->exec_start = now;
+ 	curr->sum_exec_runtime += delta_exec;
+ 
++	delta_dvfs = cap_scale(delta_dvfs, arch_scale_freq_capacity(cpu_of(rq)));
++	delta_dvfs = cap_scale(delta_dvfs, arch_scale_cpu_capacity(cpu_of(rq)));
++	curr->sum_dvfs_runtime += delta_dvfs;
++
+ 	if (schedstat_enabled()) {
+ 		struct sched_statistics *stats;
+ 
+diff --git a/kernel/time/posix-cpu-timers.c b/kernel/time/posix-cpu-timers.c
+index e9c6f9d0e..fbc789197 100644
+--- a/kernel/time/posix-cpu-timers.c
++++ b/kernel/time/posix-cpu-timers.c
+@@ -164,7 +164,7 @@ posix_cpu_clock_getres(const clockid_t which_clock, struct timespec64 *tp)
+ 	if (!error) {
+ 		tp->tv_sec = 0;
+ 		tp->tv_nsec = ((NSEC_PER_SEC + HZ - 1) / HZ);
+-		if (CPUCLOCK_WHICH(which_clock) == CPUCLOCK_SCHED) {
++		if (CPUCLOCK_WHICH(which_clock) >= CPUCLOCK_SCHED) {
+ 			/*
+ 			 * If sched_clock is using a cycle counter, we
+ 			 * don't have any idea of its true resolution
+@@ -198,6 +198,9 @@ static u64 cpu_clock_sample(const clockid_t clkid, struct task_struct *p)
+ 	if (clkid == CPUCLOCK_SCHED)
+ 		return task_sched_runtime(p);
+ 
++	if (clkid == CPUCLOCK_DVFS)
++		return task_sched_dvfs_runtime(p);
++
+ 	task_cputime(p, &utime, &stime);
+ 
+ 	switch (clkid) {
+@@ -1628,6 +1631,7 @@ static long posix_cpu_nsleep_restart(struct restart_block *restart_block)
+ 
+ #define PROCESS_CLOCK	make_process_cpuclock(0, CPUCLOCK_SCHED)
+ #define THREAD_CLOCK	make_thread_cpuclock(0, CPUCLOCK_SCHED)
++#define THREAD_DVFS_CLOCK make_thread_cpuclock(0, CPUCLOCK_DVFS)
+ 
+ static int process_cpu_clock_getres(const clockid_t which_clock,
+ 				    struct timespec64 *tp)
+@@ -1664,6 +1668,11 @@ static int thread_cpu_timer_create(struct k_itimer *timer)
+ 	timer->it_clock = THREAD_CLOCK;
+ 	return posix_cpu_timer_create(timer);
+ }
++static int thread_dvfs_cpu_clock_get(const clockid_t which_clock,
++				struct timespec64 *tp)
++{
++	return posix_cpu_clock_get(THREAD_DVFS_CLOCK, tp);
++}
+ 
+ const struct k_clock clock_posix_cpu = {
+ 	.clock_getres		= posix_cpu_clock_getres,
+@@ -1690,3 +1699,8 @@ const struct k_clock clock_thread = {
+ 	.clock_get_timespec	= thread_cpu_clock_get,
+ 	.timer_create		= thread_cpu_timer_create,
+ };
++
++const struct k_clock clock_thread_dvfs = {
++	.clock_getres		= thread_cpu_clock_getres,
++	.clock_get_timespec	= thread_dvfs_cpu_clock_get,
++};
+diff --git a/kernel/time/posix-timers.c b/kernel/time/posix-timers.c
+index b924f0f09..a7ae0beb7 100644
+--- a/kernel/time/posix-timers.c
++++ b/kernel/time/posix-timers.c
+@@ -1516,6 +1516,7 @@ static const struct k_clock * const posix_clocks[] = {
+ 	[CLOCK_MONOTONIC]		= &clock_monotonic,
+ 	[CLOCK_PROCESS_CPUTIME_ID]	= &clock_process,
+ 	[CLOCK_THREAD_CPUTIME_ID]	= &clock_thread,
++	[CLOCK_THREAD_DVFS_ID]		= &clock_thread_dvfs,
+ 	[CLOCK_MONOTONIC_RAW]		= &clock_monotonic_raw,
+ 	[CLOCK_REALTIME_COARSE]		= &clock_realtime_coarse,
+ 	[CLOCK_MONOTONIC_COARSE]	= &clock_monotonic_coarse,
+diff --git a/kernel/time/posix-timers.h b/kernel/time/posix-timers.h
+index f32a2ebba..f08ab208a 100644
+--- a/kernel/time/posix-timers.h
++++ b/kernel/time/posix-timers.h
+@@ -34,6 +34,7 @@ extern const struct k_clock clock_posix_cpu;
+ extern const struct k_clock clock_posix_dynamic;
+ extern const struct k_clock clock_process;
+ extern const struct k_clock clock_thread;
++extern const struct k_clock clock_thread_dvfs;
+ extern const struct k_clock alarm_clock;
+ 
+ int posix_timer_event(struct k_itimer *timr, int si_private);
+-- 
+2.45.1.145.g83f1add914
+
