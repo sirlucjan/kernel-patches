@@ -1,0 +1,778 @@
+From e46ac6124814460dddf45b67c8e763327d288131 Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:53 -0400
+Subject: [PATCH 01/13] btrfs: New helper to clear EXTENT_BUFFER_READING
+
+We are clearing the bit and waking up any waiters in two different
+places.  Factor that code out into a static helper function.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 87f487b11..9c66e7898 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4267,6 +4267,13 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
+ 	}
+ }
+ 
++static void clear_extent_buffer_reading(struct extent_buffer *eb)
++{
++	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
++	smp_mb__after_atomic();
++	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++}
++
+ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ {
+ 	struct extent_buffer *eb = bbio->private;
+@@ -4301,9 +4308,7 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 		bio_offset += len;
+ 	}
+ 
+-	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-	smp_mb__after_atomic();
+-	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++	clear_extent_buffer_reading(eb);
+ 	free_extent_buffer(eb);
+ 
+ 	bio_put(&bbio->bio);
+@@ -4337,9 +4342,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
+ 	 * will now be set, and we shouldn't read it in again.
+ 	 */
+ 	if (unlikely(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))) {
+-		clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-		smp_mb__after_atomic();
+-		wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++		clear_extent_buffer_reading(eb);
+ 		return 0;
+ 	}
+ 
+-- 
+2.45.1.145.g83f1add914
+
+
+From 33140f778bb4068ebaaf41fc04df68f32a79dfeb Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:54 -0400
+Subject: [PATCH 02/13] btrfs: WARN if EXTENT_BUFFER_UPTODATE is set while
+ reading
+
+We recently tracked down a race condition that triggered a read for an
+extent buffer with EXTENT_BUFFER_UPTODATE already set.  While this read
+was in progress, other concurrent readers would see the UPTODATE bit and
+return early as if the read was already complete, making accesses to the
+extent buffer conflict with the read operation that was overwriting it.
+
+Add a WARN_ON() to end_bbio_meta_read() for this situation to make
+similar races easier to spot in the future.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 9c66e7898..4f8677ce0 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4282,6 +4282,13 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 	struct folio_iter fi;
+ 	u32 bio_offset = 0;
+ 
++	/*
++	 * If the extent buffer is marked UPTODATE before the read operation
++	 * completes, other calls to read_extent_buffer_pages() will return
++	 * early without waiting for the read to finish, causing data races.
++	 */
++	WARN_ON(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags));
++
+ 	eb->read_mirror = bbio->mirror_num;
+ 
+ 	if (uptodate &&
+-- 
+2.45.1.145.g83f1add914
+
+
+From 1dc1023e49607f5f97c60d6ac7e8b35e49aac996 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai1@huaweicloud.com>
+Date: Fri, 15 Mar 2024 09:17:56 +0800
+Subject: [PATCH 03/13] md/raid5: fix deadlock between md0_reclaim and
+ md0_raid5
+
+Commit 5e2cf333b7bd ("md/raid5: Wait for MD_SB_CHANGE_PENDING in
+raid5d") introduced a regression, it got reverted through commit
+bed9e27baf52 ("Revert "md/raid5: Wait for MD_SB_CHANGE_PENDING in
+raid5d"). To fix the original issue commit 5e2cf333b7bd was fixing,
+commit d6e035aad6c0 ("md: bypass block throttle for superblock update")
+was created, it avoids md superblock write getting throttled by block
+layer which is good, but md superblock write could be stuck in block
+layer due to block flush as well, and that is what was happening in this
+regression report.
+
+Process "md0_reclaim" got stuck while waiting IO for md superblock write
+done, that IO was marked with REQ_PREFLUSH | REQ_FUA flags, these 3
+steps ( PREFLUSH, DATA and POSTFLUSH ) will be executed before done, the
+hung of this process is because the last step "POSTFLUSH" never done.
+And that was because of  process "md0_raid5" submitted another IO with
+REQ_FUA flag marked just before that step started. To handle that IO,
+blk_insert_flush() will be invoked and hit "REQ_FSEQ_DATA |
+REQ_FSEQ_POSTFLUSH" case where "fq->flush_data_in_flight" will be
+increased. When the IO for md superblock write was to issue "POSTFLUSH"
+step through blk_kick_flush(), it found that "fq->flush_data_in_flight"
+was not zero, so it will skip that step, that is expected, because flush
+will be triggered when "fq->flush_data_in_flight" dropped to zero.
+
+Unfortunately here that inflight data IO from "md0_raid5" will never
+done, because it was added into the blk_plug list of that process, but
+"md0_raid5" run into infinite loop due to "MD_SB_CHANGE_PENDING" which
+made it never had a chance to finish the blk plug until
+"MD_SB_CHANGE_PENDING" was cleared. Process "md0_reclaim" was supposed
+to clear that flag but it was stuck by "md0_raid5", so this is a deadlock.
+
+Once "md0_raid5" starts looping due to "MD_SB_CHANGE_PENDING", it should
+release all its staging IO requests to avoid blocking others.
+
+Reported-by: Dan Moulding <dan@danm.net>
+Fixes: d6e035aad6c0 ("md: bypass block throttle for superblock update")
+Link: https://lore.kernel.org/lkml/d3cdebfe-17c0-4f61-9ad9-71d9de2339b2@oracle.com/
+Link: https://lore.kernel.org/lkml/db4f5f1b-5eba-2cdb-fad0-7aa725cea508@huaweicloud.com/
+---
+ drivers/md/raid5.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index d874abfc1..27bdbe146 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6734,6 +6734,9 @@ static void raid5d(struct md_thread *thread)
+ 		int batch_size, released;
+ 		unsigned int offset;
+ 
++		if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
++			goto skip;
++
+ 		released = release_stripe_list(conf, conf->temp_inactive_list);
+ 		if (released)
+ 			clear_bit(R5_DID_ALLOC, &conf->cache_state);
+@@ -6783,6 +6786,7 @@ static void raid5d(struct md_thread *thread)
+ 			!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags),
+ 			conf->device_lock);
+ 	}
++skip:
+ 	pr_debug("%d stripes handled\n", handled);
+ 
+ 	spin_unlock_irq(&conf->device_lock);
+-- 
+2.45.1.145.g83f1add914
+
+
+From 7e0f74078cdc46126e5ac63e8465cd6712bd9a06 Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@linaro.org>
+Date: Sat, 4 May 2024 14:38:41 +0300
+Subject: [PATCH 04/13] btrfs: qgroup: fix initialization of auto inherit array
+
+The "i++" was accidentally left out so it just sets qgids[0] over and
+over.
+
+This can lead to unexpected problems, as the groups[1:] would be all 0,
+leading to later find_qgroup_rb() unable to find a qgroup and cause
+snapshot creation failure.
+
+Fixes: 5343cd9364ea ("btrfs: qgroup: simple quota auto hierarchy for nested subvolumes")
+CC: stable@vger.kernel.org # 6.7+
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: Dan Carpenter <dan.carpenter@linaro.org>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/qgroup.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+index 40e5f7f2f..f7e289fde 100644
+--- a/fs/btrfs/qgroup.c
++++ b/fs/btrfs/qgroup.c
+@@ -3129,7 +3129,7 @@ static int qgroup_auto_inherit(struct btrfs_fs_info *fs_info,
+ 	qgids = res->qgroups;
+ 
+ 	list_for_each_entry(qg_list, &inode_qg->groups, next_group)
+-		qgids[i] = qg_list->group->qgroupid;
++		qgids[i++] = qg_list->group->qgroupid;
+ 
+ 	*inherit = res;
+ 	return 0;
+-- 
+2.45.1.145.g83f1add914
+
+
+From 917d876a4944b15d925340e8d541eb422932c3bd Mon Sep 17 00:00:00 2001
+From: David Sterba <dsterba@suse.com>
+Date: Thu, 2 May 2024 22:45:58 +0200
+Subject: [PATCH 05/13] btrfs: qgroup: update rescan message levels and error
+ codes
+
+On filesystems without enabled quotas there's still a warning message in
+the logs when rescan is called. In that case it's not a problem that
+should be reported, rescan can be called unconditionally.  Change the
+error code to ENOTCONN which is used for 'quotas not enabled' elsewhere.
+
+Remove message (also a warning) when rescan is called during an ongoing
+rescan, this brings no useful information and the error code is
+sufficient.
+
+Change message levels to debug for now, they can be removed eventually.
+
+CC: stable@vger.kernel.org # 6.6+
+Reviewed-by: Boris Burkov <boris@bur.io>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/qgroup.c | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+index f7e289fde..55ab72e93 100644
+--- a/fs/btrfs/qgroup.c
++++ b/fs/btrfs/qgroup.c
+@@ -3826,14 +3826,14 @@ qgroup_rescan_init(struct btrfs_fs_info *fs_info, u64 progress_objectid,
+ 		/* we're resuming qgroup rescan at mount time */
+ 		if (!(fs_info->qgroup_flags &
+ 		      BTRFS_QGROUP_STATUS_FLAG_RESCAN)) {
+-			btrfs_warn(fs_info,
++			btrfs_debug(fs_info,
+ 			"qgroup rescan init failed, qgroup rescan is not queued");
+ 			ret = -EINVAL;
+ 		} else if (!(fs_info->qgroup_flags &
+ 			     BTRFS_QGROUP_STATUS_FLAG_ON)) {
+-			btrfs_warn(fs_info,
++			btrfs_debug(fs_info,
+ 			"qgroup rescan init failed, qgroup is not enabled");
+-			ret = -EINVAL;
++			ret = -ENOTCONN;
+ 		}
+ 
+ 		if (ret)
+@@ -3844,14 +3844,12 @@ qgroup_rescan_init(struct btrfs_fs_info *fs_info, u64 progress_objectid,
+ 
+ 	if (init_flags) {
+ 		if (fs_info->qgroup_flags & BTRFS_QGROUP_STATUS_FLAG_RESCAN) {
+-			btrfs_warn(fs_info,
+-				   "qgroup rescan is already in progress");
+ 			ret = -EINPROGRESS;
+ 		} else if (!(fs_info->qgroup_flags &
+ 			     BTRFS_QGROUP_STATUS_FLAG_ON)) {
+-			btrfs_warn(fs_info,
++			btrfs_debug(fs_info,
+ 			"qgroup rescan init failed, qgroup is not enabled");
+-			ret = -EINVAL;
++			ret = -ENOTCONN;
+ 		} else if (btrfs_qgroup_mode(fs_info) == BTRFS_QGROUP_MODE_DISABLED) {
+ 			/* Quota disable is in progress */
+ 			ret = -EBUSY;
+-- 
+2.45.1.145.g83f1add914
+
+
+From 2112c3ee4bfcb62ddb13914fc5fd93dd911a435b Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Thu, 9 May 2024 15:34:40 -0700
+Subject: [PATCH 06/13] btrfs: qgroup: fix qgroup id collision across mounts
+
+If we delete subvolumes whose ID is the largest in the filesystem, then
+unmount and mount again, then btrfs_init_root_free_objectid on the
+tree_root will select a subvolid smaller than that one and thus allow
+reusing it.
+
+If we are also using qgroups (and particularly squotas) it is possible
+to delete the subvol without deleting the qgroup. In that case, we will
+be able to create a new subvol whose id already has a level 0 qgroup.
+This will result in re-using that qgroup which would then lead to
+incorrect accounting.
+
+Fixes: 6ed05643ddb1 ("btrfs: create qgroup earlier in snapshot creation")
+CC: stable@vger.kernel.org # 6.7+
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: Boris Burkov <boris@bur.io>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/qgroup.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+index 55ab72e93..1167899a1 100644
+--- a/fs/btrfs/qgroup.c
++++ b/fs/btrfs/qgroup.c
+@@ -468,6 +468,7 @@ int btrfs_read_qgroup_config(struct btrfs_fs_info *fs_info)
+ 		}
+ 		if (!qgroup) {
+ 			struct btrfs_qgroup *prealloc;
++			struct btrfs_root *tree_root = fs_info->tree_root;
+ 
+ 			prealloc = kzalloc(sizeof(*prealloc), GFP_KERNEL);
+ 			if (!prealloc) {
+@@ -475,6 +476,25 @@ int btrfs_read_qgroup_config(struct btrfs_fs_info *fs_info)
+ 				goto out;
+ 			}
+ 			qgroup = add_qgroup_rb(fs_info, prealloc, found_key.offset);
++			/*
++			 * If a qgroup exists for a subvolume ID, it is possible
++			 * that subvolume has been deleted, in which case
++			 * re-using that ID would lead to incorrect accounting.
++			 *
++			 * Ensure that we skip any such subvol ids.
++			 *
++			 * We don't need to lock because this is only called
++			 * during mount before we start doing things like creating
++			 * subvolumes.
++			 */
++			if (is_fstree(qgroup->qgroupid) &&
++			    qgroup->qgroupid > tree_root->free_objectid)
++				/*
++				 * Don't need to check against BTRFS_LAST_FREE_OBJECTID,
++				 * as it will get checked on the next call to
++				 * btrfs_get_free_objectid.
++				 */
++				tree_root->free_objectid = qgroup->qgroupid + 1;
+ 		}
+ 		ret = btrfs_sysfs_add_one_qgroup(fs_info, qgroup);
+ 		if (ret < 0)
+-- 
+2.45.1.145.g83f1add914
+
+
+From d2e8d84f29707166231c86ff94efeddb4f561818 Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Tue, 21 May 2024 19:27:31 +0930
+Subject: [PATCH 07/13] btrfs: re-introduce 'norecovery' mount option
+
+Although 'norecovery' mount option was marked as deprecated for a long
+time and a warning message was printed during the deprecation window,
+it's still actively utilized by several projects that need a safer way
+to mount a btrfs without any writes.
+
+Furthermore this 'norecovery' mount option is supported by other major
+filesystems, which makes it less clear what's our motivation to remove
+it.
+
+Re-introduce the 'norecovery' mount option, and output a message to recommend
+'rescue=nologreplay' option.
+
+Link: https://lore.kernel.org/linux-btrfs/ZkxZT0J-z0GYvfy8@gardel-login/#t
+Link: https://github.com/systemd/systemd/pull/32892
+Link: https://bugzilla.suse.com/show_bug.cgi?id=1222429
+Reported-by: Lennart Poettering <lennart@poettering.net>
+Reported-by: Jiri Slaby <jslaby@suse.com>
+Fixes: a1912f712188 ("btrfs: remove code for inode_cache and recovery mount options")
+CC: stable@vger.kernel.org # 6.8+
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/super.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index 7e44ccaf3..fa6964de3 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -119,6 +119,7 @@ enum {
+ 	Opt_thread_pool,
+ 	Opt_treelog,
+ 	Opt_user_subvol_rm_allowed,
++	Opt_norecovery,
+ 
+ 	/* Rescue options */
+ 	Opt_rescue,
+@@ -245,6 +246,8 @@ static const struct fs_parameter_spec btrfs_fs_parameters[] = {
+ 	__fsparam(NULL, "nologreplay", Opt_nologreplay, fs_param_deprecated, NULL),
+ 	/* Deprecated, with alias rescue=usebackuproot */
+ 	__fsparam(NULL, "usebackuproot", Opt_usebackuproot, fs_param_deprecated, NULL),
++	/* For compatibility only, alias for "rescue=nologreplay". */
++	fsparam_flag("norecovery", Opt_norecovery),
+ 
+ 	/* Debugging options. */
+ 	fsparam_flag_no("enospc_debug", Opt_enospc_debug),
+@@ -438,6 +441,11 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 		"'nologreplay' is deprecated, use 'rescue=nologreplay' instead");
+ 		btrfs_set_opt(ctx->mount_opt, NOLOGREPLAY);
+ 		break;
++	case Opt_norecovery:
++		btrfs_info(NULL,
++"'norecovery' is for compatibility only, recommended to use 'rescue=nologreplay'");
++		btrfs_set_opt(ctx->mount_opt, NOLOGREPLAY);
++		break;
+ 	case Opt_flushoncommit:
+ 		if (result.negated)
+ 			btrfs_clear_opt(ctx->mount_opt, FLUSHONCOMMIT);
+-- 
+2.45.1.145.g83f1add914
+
+
+From 1cb9e30e8963a4a2498416d5fd425e087a65d7a7 Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Sat, 25 May 2024 19:28:46 +0200
+Subject: [PATCH 08/13] Revert "md/raid5: fix deadlock between md0_reclaim and
+ md0_raid5"
+
+This reverts commit 27d2352a81fd66d5a420784d3336f32833d3f686.
+---
+ drivers/md/raid5.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 27bdbe146..d874abfc1 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6734,9 +6734,6 @@ static void raid5d(struct md_thread *thread)
+ 		int batch_size, released;
+ 		unsigned int offset;
+ 
+-		if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
+-			goto skip;
+-
+ 		released = release_stripe_list(conf, conf->temp_inactive_list);
+ 		if (released)
+ 			clear_bit(R5_DID_ALLOC, &conf->cache_state);
+@@ -6786,7 +6783,6 @@ static void raid5d(struct md_thread *thread)
+ 			!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags),
+ 			conf->device_lock);
+ 	}
+-skip:
+ 	pr_debug("%d stripes handled\n", handled);
+ 
+ 	spin_unlock_irq(&conf->device_lock);
+-- 
+2.45.1.145.g83f1add914
+
+
+From c1c4bfd0e5539365eae329f9f02c4d7f58ada1bc Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 22 Mar 2024 16:10:05 +0800
+Subject: [PATCH 09/13] md/raid5: fix deadlock that raid5d() wait for itself to
+ clear MD_SB_CHANGE_PENDING
+
+Xiao reported that lvm2 test lvconvert-raid-takeover.sh can hang with
+small possibility, the root cause is exactly the same as commit
+bed9e27baf52 ("Revert "md/raid5: Wait for MD_SB_CHANGE_PENDING in raid5d"")
+
+However, Dan reported another hang after that, and junxiao investigated
+the problem and found out that this is caused by plugged bio can't issue
+from raid5d().
+
+Current implementation in raid5d() has a weird dependence:
+
+1) md_check_recovery() from raid5d() must hold 'reconfig_mutex' to clear
+   MD_SB_CHANGE_PENDING;
+2) raid5d() handles IO in a deadloop, until all IO are issued;
+3) IO from raid5d() must wait for MD_SB_CHANGE_PENDING to be cleared;
+
+This behaviour is introduce before v2.6, and for consequence, if other
+context hold 'reconfig_mutex', and md_check_recovery() can't update
+super_block, then raid5d() will waste one cpu 100% by the deadloop, until
+'reconfig_mutex' is released.
+
+Refer to the implementation from raid1 and raid10, fix this problem by
+skipping issue IO if MD_SB_CHANGE_PENDING is still set after
+md_check_recovery(), daemon thread will be woken up when 'reconfig_mutex'
+is released. Meanwhile, the hang problem will be fixed as well.
+
+Fixes: 5e2cf333b7bd ("md/raid5: Wait for MD_SB_CHANGE_PENDING in raid5d")
+Cc: stable@vger.kernel.org # v5.19+
+Reported-and-tested-by: Dan Moulding <dan@danm.net>
+Closes: https://lore.kernel.org/all/20240123005700.9302-1-dan@danm.net/
+Investigated-by: Junxiao Bi <junxiao.bi@oracle.com>
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Link: https://lore.kernel.org/r/20240322081005.1112401-1-yukuai1@huaweicloud.com
+Signed-off-by: Song Liu <song@kernel.org>
+---
+ drivers/md/raid5.c | 15 +++------------
+ 1 file changed, 3 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index d874abfc1..2bd1ce9b3 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -36,7 +36,6 @@
+  */
+ 
+ #include <linux/blkdev.h>
+-#include <linux/delay.h>
+ #include <linux/kthread.h>
+ #include <linux/raid/pq.h>
+ #include <linux/async_tx.h>
+@@ -6734,6 +6733,9 @@ static void raid5d(struct md_thread *thread)
+ 		int batch_size, released;
+ 		unsigned int offset;
+ 
++		if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
++			break;
++
+ 		released = release_stripe_list(conf, conf->temp_inactive_list);
+ 		if (released)
+ 			clear_bit(R5_DID_ALLOC, &conf->cache_state);
+@@ -6770,18 +6772,7 @@ static void raid5d(struct md_thread *thread)
+ 			spin_unlock_irq(&conf->device_lock);
+ 			md_check_recovery(mddev);
+ 			spin_lock_irq(&conf->device_lock);
+-
+-			/*
+-			 * Waiting on MD_SB_CHANGE_PENDING below may deadlock
+-			 * seeing md_check_recovery() is needed to clear
+-			 * the flag when using mdmon.
+-			 */
+-			continue;
+ 		}
+-
+-		wait_event_lock_irq(mddev->sb_wait,
+-			!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags),
+-			conf->device_lock);
+ 	}
+ 	pr_debug("%d stripes handled\n", handled);
+ 
+-- 
+2.45.1.145.g83f1add914
+
+
+From f111fe1e0a3af890e50c2bb74d055b7749b14497 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Tue, 28 May 2024 22:21:31 +0200
+Subject: [PATCH 10/13] x86/topology/amd: Evaluate SMT in CPUID leaf 0x8000001e
+ only on family 0x17 and greater
+
+The new AMD/HYGON topology parser evaluates the SMT information in CPUID leaf
+0x8000001e unconditionally while the original code restricted it to CPUs with
+family 0x17 and greater.
+
+This breaks family 0x15 CPUs which advertise that leaf and have a non-zero
+value in the SMT section. The machine boots, but the scheduler complains loudly
+about the mismatch of the core IDs:
+
+  WARNING: CPU: 1 PID: 0 at kernel/sched/core.c:6482 sched_cpu_starting+0x183/0x250
+  WARNING: CPU: 0 PID: 1 at kernel/sched/topology.c:2408 build_sched_domains+0x76b/0x12b0
+
+Add the condition back to cure it.
+
+  [ bp: Make it actually build because grandpa is not concerned with
+    trivial stuff. :-P ]
+
+Fixes: f7fb3b2dd92c ("x86/cpu: Provide an AMD/HYGON specific topology parser")
+Closes: https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/issues/56
+Reported-by: Tim Teichmann <teichmanntim@outlook.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Tested-by: Tim Teichmann <teichmanntim@outlook.de>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/7skhx6mwe4hxiul64v6azhlxnokheorksqsdbp7qw6g2jduf6c@7b5pvomauugk
+---
+ arch/x86/kernel/cpu/topology_amd.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/topology_amd.c b/arch/x86/kernel/cpu/topology_amd.c
+index ce2d507c3..5ee6373d4 100644
+--- a/arch/x86/kernel/cpu/topology_amd.c
++++ b/arch/x86/kernel/cpu/topology_amd.c
+@@ -84,9 +84,9 @@ static bool parse_8000_001e(struct topo_scan *tscan, bool has_0xb)
+ 
+ 	/*
+ 	 * If leaf 0xb is available, then the domain shifts are set
+-	 * already and nothing to do here.
++	 * already and nothing to do here. Only valid for family >= 0x17.
+ 	 */
+-	if (!has_0xb) {
++	if (!has_0xb && tscan->c->x86 >= 0x17) {
+ 		/*
+ 		 * Leaf 0x80000008 set the CORE domain shift already.
+ 		 * Update the SMT domain, but do not propagate it.
+-- 
+2.45.1.145.g83f1add914
+
+
+From 8e93377838d4ddd55fcb8263d00d686804d060b3 Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Fri, 17 May 2024 13:05:34 -0700
+Subject: [PATCH 11/13] x86/cpu: Provide default cache line size if not
+ enumerated
+
+tl;dr: CPUs with CPUID.80000008H but without CPUID.01H:EDX[CLFSH]
+will end up reporting cache_line_size()==0 and bad things happen.
+Fill in a default on those to avoid the problem.
+
+Long Story:
+
+The kernel dies a horrible death if c->x86_cache_alignment (aka.
+cache_line_size() is 0.  Normally, this value is populated from
+c->x86_clflush_size.
+
+Right now the code is set up to get c->x86_clflush_size from two
+places.  First, modern CPUs get it from CPUID.  Old CPUs that don't
+have leaf 0x80000008 (or CPUID at all) just get some sane defaults
+from the kernel in get_cpu_address_sizes().
+
+The vast majority of CPUs that have leaf 0x80000008 also get
+->x86_clflush_size from CPUID.  But there are oddballs.
+
+Intel Quark CPUs[1] and others[2] have leaf 0x80000008 but don't set
+CPUID.01H:EDX[CLFSH], so they skip over filling in ->x86_clflush_size:
+
+	cpuid(0x00000001, &tfms, &misc, &junk, &cap0);
+	if (cap0 & (1<<19))
+		c->x86_clflush_size = ((misc >> 8) & 0xff) * 8;
+
+So they: land in get_cpu_address_sizes(), set vp_bits_from_cpuid=0 and
+never fill in c->x86_clflush_size, assign c->x86_cache_alignment, and
+hilarity ensues in code like:
+
+        buffer = kzalloc(ALIGN(sizeof(*buffer), cache_line_size()),
+                         GFP_KERNEL);
+
+To fix this, always provide a sane value for ->x86_clflush_size.
+
+Big thanks to Andy Shevchenko for finding and reporting this and also
+providing a first pass at a fix. But his fix was only partial and only
+worked on the Quark CPUs.  It would not, for instance, have worked on
+the QEMU config.
+
+1. https://raw.githubusercontent.com/InstLatx64/InstLatx64/master/GenuineIntel/GenuineIntel0000590_Clanton_03_CPUID.txt
+2. You can also get this behavior if you use "-cpu 486,+clzero"
+   in QEMU.
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reported-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Fixes: fbf6449f84bf ("x86/sev-es: Set x86_virt_bits to the correct value straight away, instead of a two-phase approach")
+Link: https://lore.kernel.org/all/20240516173928.3960193-1-andriy.shevchenko@linux.intel.com/
+Cc: stable@vger.kernel.org
+---
+ arch/x86/kernel/cpu/common.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index ae987a26f..fc76b5197 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1064,6 +1064,10 @@ void get_cpu_address_sizes(struct cpuinfo_x86 *c)
+ 
+ 		c->x86_virt_bits = (eax >> 8) & 0xff;
+ 		c->x86_phys_bits = eax & 0xff;
++
++		/* Provide a sane default if not enumerated: */
++		if (!c->x86_clflush_size)
++			c->x86_clflush_size = 32;
+ 	} else {
+ 		if (IS_ENABLED(CONFIG_X86_64)) {
+ 			c->x86_clflush_size = 64;
+-- 
+2.45.1.145.g83f1add914
+
+
+From fb346870067ef525b3b15e17939c500eb877581f Mon Sep 17 00:00:00 2001
+From: "Martin K. Petersen" <martin.petersen@oracle.com>
+Date: Mon, 20 May 2024 22:30:40 -0400
+Subject: [PATCH 12/13] scsi: core: Handle devices which return an unusually
+ large VPD page count
+
+Peter Schneider reported that a system would no longer boot after
+updating to 6.8.4.  Peter bisected the issue and identified commit
+b5fc07a5fb56 ("scsi: core: Consult supported VPD page list prior to
+fetching page") as being the culprit.
+
+Turns out the enclosure device in Peter's system reports a byteswapped
+page length for VPD page 0. It reports "02 00" as page length instead
+of "00 02". This causes us to attempt to access 516 bytes (page length
++ header) of information despite only 2 pages being present.
+
+Limit the page search scope to the size of our VPD buffer to guard
+against devices returning a larger page count than requested.
+
+Cc: stable@vger.kernel.org
+Reported-by: Peter Schneider <pschneider1968@googlemail.com>
+Tested-by: Peter Schneider <pschneider1968@googlemail.com>
+Fixes: b5fc07a5fb56 ("scsi: core: Consult supported VPD page list prior to fetching page")
+Link: https://lore.kernel.org/all/eec6ebbf-061b-4a7b-96dc-ea748aa4d035@googlemail.com/
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+---
+ drivers/scsi/scsi.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index 3e0c03812..f0464db3f 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -350,6 +350,13 @@ static int scsi_get_vpd_size(struct scsi_device *sdev, u8 page)
+ 		if (result < SCSI_VPD_HEADER_SIZE)
+ 			return 0;
+ 
++		if (result > sizeof(vpd)) {
++			dev_warn_once(&sdev->sdev_gendev,
++				      "%s: long VPD page 0 length: %d bytes\n",
++				      __func__, result);
++			result = sizeof(vpd);
++		}
++
+ 		result -= SCSI_VPD_HEADER_SIZE;
+ 		if (!memchr(&vpd[SCSI_VPD_HEADER_SIZE], page, result))
+ 			return 0;
+-- 
+2.45.1.145.g83f1add914
+
+
+From 3bbcc8d661056c1ffac2bde3cf13e2150727861b Mon Sep 17 00:00:00 2001
+From: Shantanu Goel <sgoel01@yahoo.com>
+Date: Wed, 5 Jun 2024 21:52:00 +0000
+Subject: [PATCH 13/13] uas: set host status byte on data completion error
+
+Given a disk enclosure which is prone to data completion errors during
+initialization and because the UAS driver only sets the resid on a data
+completion error and not the host status byte, the SD driver ends up using
+invalid zero'ed data:
+
+sd 0:0:0:1: [sdf] tag#9 data cmplt err -75 uas-tag 1 inflight:
+sd 0:0:0:1: [sdf] tag#9 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 0:0:0:1: [sdf] Sector size 0 reported, assuming 512.
+sd 2:0:0:1: [sdn] Preferred minimum I/O size 4096 bytes
+sd 2:0:0:1: [sdn] Optimal transfer size 33553920 bytes not a multiple of preferred minimum block size (4096 bytes)
+sd 1:0:0:0: [sdd] tag#29 data cmplt err -75 uas-tag 1 inflight:
+sd 1:0:0:0: [sdd] tag#29 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 1:0:0:0: [sdd] Sector size 0 reported, assuming 512.
+sd 7:0:0:0: [sde] Attached SCSI disk
+sd 3:0:0:1: [sdk] tag#16 data cmplt err -75 uas-tag 1 inflight:
+sd 3:0:0:1: [sdk] tag#16 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 3:0:0:1: [sdk] Sector size 0 reported, assuming 512.
+sd 5:0:0:0: [sdo] tag#10 data cmplt err -75 uas-tag 1 inflight:
+sd 5:0:0:0: [sdo] tag#10 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 5:0:0:0: [sdo] Sector size 0 reported, assuming 512.
+sd 4:0:0:1: [sdj] tag#10 data cmplt err -75 uas-tag 2 inflight:
+sd 4:0:0:1: [sdj] tag#10 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 4:0:0:1: [sdj] Sector size 0 reported, assuming 512.
+
+The patch fixes this by setting the host status byte to DID_ERROR
+so the SD driver will notice the error and retry the command. The zero
+sector sizes above are not seen any more, and all sizes are detected
+correctly despite the presence of completion errors.
+
+Link: https://lore.kernel.org/all/675774215.2024605.1717624320352@mail.yahoo.com/
+Signed-off-by: Shantanu Goel <sgoel01@yahoo.com>
+---
+ drivers/usb/storage/uas.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 08953f0d4..345596890 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -422,6 +422,7 @@ static void uas_data_cmplt(struct urb *urb)
+ 			uas_log_cmd_state(cmnd, "data cmplt err", status);
+ 		/* error: no data transfered */
+ 		scsi_set_resid(cmnd, sdb->length);
++		set_host_byte(cmnd, DID_ERROR);
+ 	} else {
+ 		scsi_set_resid(cmnd, sdb->length - urb->actual_length);
+ 	}
+-- 
+2.45.1.145.g83f1add914
+
