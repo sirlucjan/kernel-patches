@@ -1,0 +1,394 @@
+From ec61d03b651826216aceb89559fcbad4eb450cfe Mon Sep 17 00:00:00 2001
+From: Dhananjay Ugwekar <Dhananjay.Ugwekar@amd.com>
+Date: Mon, 10 Jun 2024 10:07:51 +0000
+Subject: [PATCH 6/6] perf/x86/rapl: Add per-core energy counter support for
+ AMD CPUs
+
+Add a new "power_per_core" PMU and "energy-per-core" event for
+monitoring energy consumption by each core. The existing energy-cores
+event aggregates the energy consumption at the package level.
+This new event aligns with the AMD's per_core energy counters.
+
+Tested the package level and core level PMU counters with workloads
+pinned to different CPUs.
+
+Results with workload pinned to CPU 1 in core 1 on a AMD Zen4 Genoa
+machine:
+
+$ perf stat -a --per-core -e power_per_core/energy-per-core/ sleep 1
+
+ Performance counter stats for 'system wide':
+
+S0-D0-C0         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C1         1          5.72 Joules power_per_core/energy-per-core/
+S0-D0-C2         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C3         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C4         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C5         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C6         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C7         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C8         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C9         1          0.02 Joules power_per_core/energy-per-core/
+S0-D0-C10        1          0.02 Joules power_per_core/energy-per-core/
+
+Signed-off-by: Dhananjay Ugwekar <Dhananjay.Ugwekar@amd.com>
+---
+ arch/x86/events/rapl.c | 155 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 138 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/events/rapl.c b/arch/x86/events/rapl.c
+index af4c91cfd..030b6f75a 100644
+--- a/arch/x86/events/rapl.c
++++ b/arch/x86/events/rapl.c
+@@ -39,6 +39,10 @@
+  *	  event: rapl_energy_psys
+  *    perf code: 0x5
+  *
++ *  per_core counter: consumption of a single physical core
++ *	  event: rapl_energy_per_core
++ *    perf code: 0x6
++ *
+  * We manage those counters as free running (read-only). They may be
+  * use simultaneously by other tools, such as turbostat.
+  *
+@@ -76,6 +80,7 @@ enum perf_rapl_events {
+ 	PERF_RAPL_RAM,			/* DRAM */
+ 	PERF_RAPL_PP1,			/* gpu */
+ 	PERF_RAPL_PSYS,			/* psys */
++	PERF_RAPL_PERCORE,		/* per-core */
+ 
+ 	PERF_RAPL_MAX,
+ 	NR_RAPL_DOMAINS = PERF_RAPL_MAX,
+@@ -87,6 +92,7 @@ static const char *const rapl_domain_names[NR_RAPL_DOMAINS] __initconst = {
+ 	"dram",
+ 	"pp1-gpu",
+ 	"psys",
++	"per-core",
+ };
+ 
+ /*
+@@ -135,11 +141,13 @@ struct rapl_model {
+ 	unsigned long	events;
+ 	unsigned int	msr_power_unit;
+ 	enum rapl_unit_quirk	unit_quirk;
++	bool per_core;
+ };
+ 
+  /* 1/2^hw_unit Joule */
+ static int rapl_hw_unit[NR_RAPL_DOMAINS] __read_mostly;
+ static struct rapl_pmus *rapl_pmus;
++static struct rapl_pmus *rapl_pmus_per_core;
+ static unsigned int rapl_cntr_mask;
+ static u64 rapl_timer_ms;
+ static struct perf_msr *rapl_msrs;
+@@ -345,9 +353,14 @@ static int rapl_pmu_event_init(struct perf_event *event)
+ 	u64 cfg = event->attr.config & RAPL_EVENT_MASK;
+ 	int bit, ret = 0;
+ 	struct rapl_pmu *rapl_pmu;
++	struct rapl_pmus *curr_rapl_pmus;
+ 
+ 	/* only look at RAPL events */
+-	if (event->attr.type != rapl_pmus->pmu.type)
++	if (event->attr.type == rapl_pmus->pmu.type)
++		curr_rapl_pmus = rapl_pmus;
++	else if (rapl_pmus_per_core && event->attr.type == rapl_pmus_per_core->pmu.type)
++		curr_rapl_pmus = rapl_pmus_per_core;
++	else
+ 		return -ENOENT;
+ 
+ 	/* check only supported bits are set */
+@@ -374,9 +387,14 @@ static int rapl_pmu_event_init(struct perf_event *event)
+ 		return -EINVAL;
+ 
+ 	/* must be done before validate_group */
+-	rapl_pmu = cpu_to_rapl_pmu(event->cpu);
++	if (curr_rapl_pmus == rapl_pmus_per_core)
++		rapl_pmu = curr_rapl_pmus->rapl_pmu[topology_core_id(event->cpu)];
++	else
++		rapl_pmu = curr_rapl_pmus->rapl_pmu[get_rapl_pmu_idx(event->cpu)];
++
+ 	if (!rapl_pmu)
+ 		return -EINVAL;
++
+ 	event->cpu = rapl_pmu->cpu;
+ 	event->pmu_private = rapl_pmu;
+ 	event->hw.event_base = rapl_msrs[bit].msr;
+@@ -408,17 +426,38 @@ static struct attribute_group rapl_pmu_attr_group = {
+ 	.attrs = rapl_pmu_attrs,
+ };
+ 
++static ssize_t rapl_get_attr_per_core_cpumask(struct device *dev,
++					     struct device_attribute *attr, char *buf)
++{
++	return cpumap_print_to_pagebuf(true, buf, &rapl_pmus_per_core->cpumask);
++}
++
++static struct device_attribute dev_attr_per_core_cpumask = __ATTR(cpumask, 0444,
++								 rapl_get_attr_per_core_cpumask,
++								 NULL);
++
++static struct attribute *rapl_pmu_per_core_attrs[] = {
++	&dev_attr_per_core_cpumask.attr,
++	NULL,
++};
++
++static struct attribute_group rapl_pmu_per_core_attr_group = {
++	.attrs = rapl_pmu_per_core_attrs,
++};
++
+ RAPL_EVENT_ATTR_STR(energy-cores, rapl_cores, "event=0x01");
+ RAPL_EVENT_ATTR_STR(energy-pkg  ,   rapl_pkg, "event=0x02");
+ RAPL_EVENT_ATTR_STR(energy-ram  ,   rapl_ram, "event=0x03");
+ RAPL_EVENT_ATTR_STR(energy-gpu  ,   rapl_gpu, "event=0x04");
+ RAPL_EVENT_ATTR_STR(energy-psys,   rapl_psys, "event=0x05");
++RAPL_EVENT_ATTR_STR(energy-per-core,   rapl_per_core, "event=0x06");
+ 
+ RAPL_EVENT_ATTR_STR(energy-cores.unit, rapl_cores_unit, "Joules");
+ RAPL_EVENT_ATTR_STR(energy-pkg.unit  ,   rapl_pkg_unit, "Joules");
+ RAPL_EVENT_ATTR_STR(energy-ram.unit  ,   rapl_ram_unit, "Joules");
+ RAPL_EVENT_ATTR_STR(energy-gpu.unit  ,   rapl_gpu_unit, "Joules");
+ RAPL_EVENT_ATTR_STR(energy-psys.unit,   rapl_psys_unit, "Joules");
++RAPL_EVENT_ATTR_STR(energy-per-core.unit,   rapl_per_core_unit, "Joules");
+ 
+ /*
+  * we compute in 0.23 nJ increments regardless of MSR
+@@ -428,6 +467,7 @@ RAPL_EVENT_ATTR_STR(energy-pkg.scale,     rapl_pkg_scale, "2.3283064365386962890
+ RAPL_EVENT_ATTR_STR(energy-ram.scale,     rapl_ram_scale, "2.3283064365386962890625e-10");
+ RAPL_EVENT_ATTR_STR(energy-gpu.scale,     rapl_gpu_scale, "2.3283064365386962890625e-10");
+ RAPL_EVENT_ATTR_STR(energy-psys.scale,   rapl_psys_scale, "2.3283064365386962890625e-10");
++RAPL_EVENT_ATTR_STR(energy-per-core.scale,   rapl_per_core_scale, "2.3283064365386962890625e-10");
+ 
+ /*
+  * There are no default events, but we need to create
+@@ -461,6 +501,13 @@ static const struct attribute_group *rapl_attr_groups[] = {
+ 	NULL,
+ };
+ 
++static const struct attribute_group *rapl_per_core_attr_groups[] = {
++	&rapl_pmu_per_core_attr_group,
++	&rapl_pmu_format_group,
++	&rapl_pmu_events_group,
++	NULL,
++};
++
+ static struct attribute *rapl_events_cores[] = {
+ 	EVENT_PTR(rapl_cores),
+ 	EVENT_PTR(rapl_cores_unit),
+@@ -521,6 +568,18 @@ static struct attribute_group rapl_events_psys_group = {
+ 	.attrs = rapl_events_psys,
+ };
+ 
++static struct attribute *rapl_events_per_core[] = {
++	EVENT_PTR(rapl_per_core),
++	EVENT_PTR(rapl_per_core_unit),
++	EVENT_PTR(rapl_per_core_scale),
++	NULL,
++};
++
++static struct attribute_group rapl_events_per_core_group = {
++	.name  = "events",
++	.attrs = rapl_events_per_core,
++};
++
+ static bool test_msr(int idx, void *data)
+ {
+ 	return test_bit(idx, (unsigned long *) data);
+@@ -535,6 +594,7 @@ static struct perf_msr intel_rapl_msrs[] = {
+ 	[PERF_RAPL_RAM]  = { MSR_DRAM_ENERGY_STATUS,     &rapl_events_ram_group,   test_msr, false, RAPL_MSR_MASK },
+ 	[PERF_RAPL_PP1]  = { MSR_PP1_ENERGY_STATUS,      &rapl_events_gpu_group,   test_msr, false, RAPL_MSR_MASK },
+ 	[PERF_RAPL_PSYS] = { MSR_PLATFORM_ENERGY_STATUS, &rapl_events_psys_group,  test_msr, false, RAPL_MSR_MASK },
++	[PERF_RAPL_PERCORE] = { 0,			 &rapl_events_per_core_group,   NULL, false, 0 },
+ };
+ 
+ static struct perf_msr intel_rapl_spr_msrs[] = {
+@@ -543,6 +603,7 @@ static struct perf_msr intel_rapl_spr_msrs[] = {
+ 	[PERF_RAPL_RAM]  = { MSR_DRAM_ENERGY_STATUS,     &rapl_events_ram_group,   test_msr, false, RAPL_MSR_MASK },
+ 	[PERF_RAPL_PP1]  = { MSR_PP1_ENERGY_STATUS,      &rapl_events_gpu_group,   test_msr, false, RAPL_MSR_MASK },
+ 	[PERF_RAPL_PSYS] = { MSR_PLATFORM_ENERGY_STATUS, &rapl_events_psys_group,  test_msr, true, RAPL_MSR_MASK },
++	[PERF_RAPL_PERCORE] = { 0,			 &rapl_events_per_core_group,   NULL, false, 0 },
+ };
+ 
+ /*
+@@ -556,6 +617,7 @@ static struct perf_msr amd_rapl_msrs[] = {
+ 	[PERF_RAPL_RAM]  = { 0, &rapl_events_ram_group,   NULL, false, 0 },
+ 	[PERF_RAPL_PP1]  = { 0, &rapl_events_gpu_group,   NULL, false, 0 },
+ 	[PERF_RAPL_PSYS] = { 0, &rapl_events_psys_group,  NULL, false, 0 },
++	[PERF_RAPL_PERCORE] = { MSR_AMD_CORE_ENERGY_STATUS, &rapl_events_per_core_group, test_msr, false, RAPL_MSR_MASK },
+ };
+ 
+ static int __rapl_cpu_offline(struct rapl_pmus *rapl_pmus, unsigned int rapl_pmu_idx,
+@@ -583,8 +645,16 @@ static int __rapl_cpu_offline(struct rapl_pmus *rapl_pmus, unsigned int rapl_pmu
+ 
+ static int rapl_cpu_offline(unsigned int cpu)
+ {
+-	return __rapl_cpu_offline(rapl_pmus, get_rapl_pmu_idx(cpu),
+-				  get_rapl_pmu_cpumask(cpu), cpu);
++	int ret;
++
++	ret = __rapl_cpu_offline(rapl_pmus, get_rapl_pmu_idx(cpu),
++			   get_rapl_pmu_cpumask(cpu), cpu);
++
++	if (ret == 0 && rapl_model->per_core)
++		ret = __rapl_cpu_offline(rapl_pmus_per_core, topology_core_id(cpu),
++				   topology_sibling_cpumask(cpu), cpu);
++
++	return ret;
+ }
+ 
+ static int __rapl_cpu_online(struct rapl_pmus *rapl_pmus, unsigned int rapl_pmu_idx,
+@@ -622,10 +692,17 @@ static int __rapl_cpu_online(struct rapl_pmus *rapl_pmus, unsigned int rapl_pmu_
+ 
+ static int rapl_cpu_online(unsigned int cpu)
+ {
+-	return __rapl_cpu_online(rapl_pmus, get_rapl_pmu_idx(cpu),
+-				 get_rapl_pmu_cpumask(cpu), cpu);
+-}
++	int ret;
++
++	ret = __rapl_cpu_online(rapl_pmus, get_rapl_pmu_idx(cpu),
++			   get_rapl_pmu_cpumask(cpu), cpu);
+ 
++	if (ret == 0 && rapl_model->per_core)
++		ret = __rapl_cpu_online(rapl_pmus_per_core, topology_core_id(cpu),
++				   topology_sibling_cpumask(cpu), cpu);
++
++	return ret;
++}
+ 
+ static int rapl_check_hw_unit(void)
+ {
+@@ -687,7 +764,7 @@ static void __init rapl_advertise(void)
+ 	}
+ }
+ 
+-static void cleanup_rapl_pmus(void)
++static void cleanup_rapl_pmus(struct rapl_pmus *rapl_pmus)
+ {
+ 	int i;
+ 
+@@ -705,12 +782,15 @@ static const struct attribute_group *rapl_attr_update[] = {
+ 	NULL,
+ };
+ 
+-static int __init init_rapl_pmus(void)
+-{
+-	int nr_rapl_pmu = topology_max_packages() * topology_max_dies_per_package();
++static const struct attribute_group *rapl_per_core_attr_update[] = {
++	&rapl_events_per_core_group,
++};
+ 
+-	if (rapl_pmu_is_pkg_scope())
+-		nr_rapl_pmu = topology_max_packages();
++static int __init init_rapl_pmus(struct rapl_pmus **rapl_pmus_ptr, int nr_rapl_pmu,
++				 const struct attribute_group **rapl_attr_groups,
++				 const struct attribute_group **rapl_attr_update)
++{
++	struct rapl_pmus *rapl_pmus;
+ 
+ 	rapl_pmus = kzalloc(struct_size(rapl_pmus, rapl_pmu, nr_rapl_pmu), GFP_KERNEL);
+ 	if (!rapl_pmus)
+@@ -728,6 +808,9 @@ static int __init init_rapl_pmus(void)
+ 	rapl_pmus->pmu.read		= rapl_pmu_event_read;
+ 	rapl_pmus->pmu.module		= THIS_MODULE;
+ 	rapl_pmus->pmu.capabilities	= PERF_PMU_CAP_NO_EXCLUDE;
++
++	*rapl_pmus_ptr = rapl_pmus;
++
+ 	return 0;
+ }
+ 
+@@ -794,9 +877,11 @@ static struct rapl_model model_spr = {
+ };
+ 
+ static struct rapl_model model_amd_hygon = {
+-	.events		= BIT(PERF_RAPL_PKG),
++	.events		= BIT(PERF_RAPL_PKG) |
++			  BIT(PERF_RAPL_PERCORE),
+ 	.msr_power_unit = MSR_AMD_RAPL_POWER_UNIT,
+ 	.rapl_msrs      = amd_rapl_msrs,
++	.per_core = true,
+ };
+ 
+ static const struct x86_cpu_id rapl_model_match[] __initconst = {
+@@ -853,6 +938,11 @@ static int __init rapl_pmu_init(void)
+ {
+ 	const struct x86_cpu_id *id;
+ 	int ret;
++	int nr_rapl_pmu = topology_max_packages() * topology_max_dies_per_package();
++	int nr_cores = topology_max_packages() * topology_num_cores_per_package();
++
++	if (rapl_pmu_is_pkg_scope())
++		nr_rapl_pmu = topology_max_packages();
+ 
+ 	id = x86_match_cpu(rapl_model_match);
+ 	if (!id)
+@@ -869,10 +959,23 @@ static int __init rapl_pmu_init(void)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = init_rapl_pmus();
++	ret = init_rapl_pmus(&rapl_pmus, nr_rapl_pmu, rapl_attr_groups, rapl_attr_update);
+ 	if (ret)
+ 		return ret;
+ 
++	if (rapl_model->per_core) {
++		ret = init_rapl_pmus(&rapl_pmus_per_core, nr_cores,
++				     rapl_per_core_attr_groups, rapl_per_core_attr_update);
++		if (ret) {
++			/*
++			 * If initialization of per_core PMU fails, reset per_core
++			 * flag, and continue with power PMU initialization.
++			 */
++			pr_warn("Per-core PMU initialization failed (%d)\n", ret);
++			rapl_model->per_core = false;
++		}
++	}
++
+ 	/*
+ 	 * Install callbacks. Core will call them for each online cpu.
+ 	 */
+@@ -886,14 +989,28 @@ static int __init rapl_pmu_init(void)
+ 	if (ret)
+ 		goto out1;
+ 
++	if (rapl_model->per_core) {
++		ret = perf_pmu_register(&rapl_pmus_per_core->pmu, "power_per_core", -1);
++		if (ret) {
++			/*
++			 * If registration of per_core PMU fails, cleanup per_core PMU
++			 * variables, reset the per_core flag and keep the
++			 * power PMU untouched.
++			 */
++			pr_warn("Per-core PMU registration failed (%d)\n", ret);
++			cleanup_rapl_pmus(rapl_pmus_per_core);
++			rapl_model->per_core = false;
++		}
++	}
+ 	rapl_advertise();
++
+ 	return 0;
+ 
+ out1:
+ 	cpuhp_remove_state(CPUHP_AP_PERF_X86_RAPL_ONLINE);
+ out:
+ 	pr_warn("Initialization failed (%d), disabled\n", ret);
+-	cleanup_rapl_pmus();
++	cleanup_rapl_pmus(rapl_pmus);
+ 	return ret;
+ }
+ module_init(rapl_pmu_init);
+@@ -902,6 +1019,10 @@ static void __exit intel_rapl_exit(void)
+ {
+ 	cpuhp_remove_state_nocalls(CPUHP_AP_PERF_X86_RAPL_ONLINE);
+ 	perf_pmu_unregister(&rapl_pmus->pmu);
+-	cleanup_rapl_pmus();
++	cleanup_rapl_pmus(rapl_pmus);
++	if (rapl_model->per_core) {
++		perf_pmu_unregister(&rapl_pmus_per_core->pmu);
++		cleanup_rapl_pmus(rapl_pmus_per_core);
++	}
+ }
+ module_exit(intel_rapl_exit);
+-- 
+2.45.1.145.g83f1add914
+
