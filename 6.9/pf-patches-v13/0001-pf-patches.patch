@@ -1,0 +1,233 @@
+From d7eab6c64d4323627dc21a4e9e2f34ec785034ee Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:53 -0400
+Subject: [PATCH 1/4] btrfs: New helper to clear EXTENT_BUFFER_READING
+
+We are clearing the bit and waking up any waiters in two different
+places.  Factor that code out into a static helper function.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 41173701f..03ad6c579 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4269,6 +4269,13 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
+ 	}
+ }
+ 
++static void clear_extent_buffer_reading(struct extent_buffer *eb)
++{
++	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
++	smp_mb__after_atomic();
++	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++}
++
+ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ {
+ 	struct extent_buffer *eb = bbio->private;
+@@ -4303,9 +4310,7 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 		bio_offset += len;
+ 	}
+ 
+-	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-	smp_mb__after_atomic();
+-	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++	clear_extent_buffer_reading(eb);
+ 	free_extent_buffer(eb);
+ 
+ 	bio_put(&bbio->bio);
+@@ -4339,9 +4344,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
+ 	 * will now be set, and we shouldn't read it in again.
+ 	 */
+ 	if (unlikely(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))) {
+-		clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-		smp_mb__after_atomic();
+-		wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++		clear_extent_buffer_reading(eb);
+ 		return 0;
+ 	}
+ 
+-- 
+2.45.1.145.g83f1add914
+
+
+From 96f6e752fdfcdbda37b75a27d8c9eb7ab0fd6bd9 Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:54 -0400
+Subject: [PATCH 2/4] btrfs: WARN if EXTENT_BUFFER_UPTODATE is set while
+ reading
+
+We recently tracked down a race condition that triggered a read for an
+extent buffer with EXTENT_BUFFER_UPTODATE already set.  While this read
+was in progress, other concurrent readers would see the UPTODATE bit and
+return early as if the read was already complete, making accesses to the
+extent buffer conflict with the read operation that was overwriting it.
+
+Add a WARN_ON() to end_bbio_meta_read() for this situation to make
+similar races easier to spot in the future.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 03ad6c579..c0deff372 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4284,6 +4284,13 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 	struct folio_iter fi;
+ 	u32 bio_offset = 0;
+ 
++	/*
++	 * If the extent buffer is marked UPTODATE before the read operation
++	 * completes, other calls to read_extent_buffer_pages() will return
++	 * early without waiting for the read to finish, causing data races.
++	 */
++	WARN_ON(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags));
++
+ 	eb->read_mirror = bbio->mirror_num;
+ 
+ 	if (uptodate &&
+-- 
+2.45.1.145.g83f1add914
+
+
+From 0265dd850c645f9ac07a47e5d4b7bc6b0494cadd Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Fri, 17 May 2024 13:05:34 -0700
+Subject: [PATCH 3/4] x86/cpu: Provide default cache line size if not
+ enumerated
+
+tl;dr: CPUs with CPUID.80000008H but without CPUID.01H:EDX[CLFSH]
+will end up reporting cache_line_size()==0 and bad things happen.
+Fill in a default on those to avoid the problem.
+
+Long Story:
+
+The kernel dies a horrible death if c->x86_cache_alignment (aka.
+cache_line_size() is 0.  Normally, this value is populated from
+c->x86_clflush_size.
+
+Right now the code is set up to get c->x86_clflush_size from two
+places.  First, modern CPUs get it from CPUID.  Old CPUs that don't
+have leaf 0x80000008 (or CPUID at all) just get some sane defaults
+from the kernel in get_cpu_address_sizes().
+
+The vast majority of CPUs that have leaf 0x80000008 also get
+->x86_clflush_size from CPUID.  But there are oddballs.
+
+Intel Quark CPUs[1] and others[2] have leaf 0x80000008 but don't set
+CPUID.01H:EDX[CLFSH], so they skip over filling in ->x86_clflush_size:
+
+	cpuid(0x00000001, &tfms, &misc, &junk, &cap0);
+	if (cap0 & (1<<19))
+		c->x86_clflush_size = ((misc >> 8) & 0xff) * 8;
+
+So they: land in get_cpu_address_sizes(), set vp_bits_from_cpuid=0 and
+never fill in c->x86_clflush_size, assign c->x86_cache_alignment, and
+hilarity ensues in code like:
+
+        buffer = kzalloc(ALIGN(sizeof(*buffer), cache_line_size()),
+                         GFP_KERNEL);
+
+To fix this, always provide a sane value for ->x86_clflush_size.
+
+Big thanks to Andy Shevchenko for finding and reporting this and also
+providing a first pass at a fix. But his fix was only partial and only
+worked on the Quark CPUs.  It would not, for instance, have worked on
+the QEMU config.
+
+1. https://raw.githubusercontent.com/InstLatx64/InstLatx64/master/GenuineIntel/GenuineIntel0000590_Clanton_03_CPUID.txt
+2. You can also get this behavior if you use "-cpu 486,+clzero"
+   in QEMU.
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reported-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Fixes: fbf6449f84bf ("x86/sev-es: Set x86_virt_bits to the correct value straight away, instead of a two-phase approach")
+Link: https://lore.kernel.org/all/20240516173928.3960193-1-andriy.shevchenko@linux.intel.com/
+Cc: stable@vger.kernel.org
+---
+ arch/x86/kernel/cpu/common.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index ae987a26f..fc76b5197 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1064,6 +1064,10 @@ void get_cpu_address_sizes(struct cpuinfo_x86 *c)
+ 
+ 		c->x86_virt_bits = (eax >> 8) & 0xff;
+ 		c->x86_phys_bits = eax & 0xff;
++
++		/* Provide a sane default if not enumerated: */
++		if (!c->x86_clflush_size)
++			c->x86_clflush_size = 32;
+ 	} else {
+ 		if (IS_ENABLED(CONFIG_X86_64)) {
+ 			c->x86_clflush_size = 64;
+-- 
+2.45.1.145.g83f1add914
+
+
+From 42bd09f2ba6efae22c2d0936e53f4e210b912b4b Mon Sep 17 00:00:00 2001
+From: Shantanu Goel <sgoel01@yahoo.com>
+Date: Wed, 5 Jun 2024 21:52:00 +0000
+Subject: [PATCH 4/4] uas: set host status byte on data completion error
+
+Given a disk enclosure which is prone to data completion errors during
+initialization and because the UAS driver only sets the resid on a data
+completion error and not the host status byte, the SD driver ends up using
+invalid zero'ed data:
+
+sd 0:0:0:1: [sdf] tag#9 data cmplt err -75 uas-tag 1 inflight:
+sd 0:0:0:1: [sdf] tag#9 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 0:0:0:1: [sdf] Sector size 0 reported, assuming 512.
+sd 2:0:0:1: [sdn] Preferred minimum I/O size 4096 bytes
+sd 2:0:0:1: [sdn] Optimal transfer size 33553920 bytes not a multiple of preferred minimum block size (4096 bytes)
+sd 1:0:0:0: [sdd] tag#29 data cmplt err -75 uas-tag 1 inflight:
+sd 1:0:0:0: [sdd] tag#29 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 1:0:0:0: [sdd] Sector size 0 reported, assuming 512.
+sd 7:0:0:0: [sde] Attached SCSI disk
+sd 3:0:0:1: [sdk] tag#16 data cmplt err -75 uas-tag 1 inflight:
+sd 3:0:0:1: [sdk] tag#16 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 3:0:0:1: [sdk] Sector size 0 reported, assuming 512.
+sd 5:0:0:0: [sdo] tag#10 data cmplt err -75 uas-tag 1 inflight:
+sd 5:0:0:0: [sdo] tag#10 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 5:0:0:0: [sdo] Sector size 0 reported, assuming 512.
+sd 4:0:0:1: [sdj] tag#10 data cmplt err -75 uas-tag 2 inflight:
+sd 4:0:0:1: [sdj] tag#10 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 4:0:0:1: [sdj] Sector size 0 reported, assuming 512.
+
+The patch fixes this by setting the host status byte to DID_ERROR
+so the SD driver will notice the error and retry the command. The zero
+sector sizes above are not seen any more, and all sizes are detected
+correctly despite the presence of completion errors.
+
+Link: https://lore.kernel.org/all/675774215.2024605.1717624320352@mail.yahoo.com/
+Signed-off-by: Shantanu Goel <sgoel01@yahoo.com>
+---
+ drivers/usb/storage/uas.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 08953f0d4..345596890 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -422,6 +422,7 @@ static void uas_data_cmplt(struct urb *urb)
+ 			uas_log_cmd_state(cmnd, "data cmplt err", status);
+ 		/* error: no data transfered */
+ 		scsi_set_resid(cmnd, sdb->length);
++		set_host_byte(cmnd, DID_ERROR);
+ 	} else {
+ 		scsi_set_resid(cmnd, sdb->length - urb->actual_length);
+ 	}
+-- 
+2.45.1.145.g83f1add914
+
