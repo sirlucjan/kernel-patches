@@ -1,0 +1,2055 @@
+From d863bc3002b76cd7cb10d08cecf77e2fa0148363 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:02 +0000
+Subject: [PATCH 01/19] media: uvcvideo: Support timestamp lists of any size
+
+The tail of the list lives at the position before the head. This is
+mathematically noted as:
+```
+(head-1) mod size.
+```
+Unfortunately C, does not have a modulus operator, but a remainder
+operator (%).
+The reminder operation has a different result than the modulus if
+(head -1) is a negative number and size is not a power of two.
+
+Adding size to (head-1) allows the code to run with any value of size.
+
+This does not change the current behaviour of the driver, as the size is
+always a power of two, but avoid tedious debugging if we ever change its
+size.
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 7cbf4692b..659c9e988 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -732,7 +732,7 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 		goto done;
+ 
+ 	first = &clock->samples[clock->head];
+-	last = &clock->samples[(clock->head - 1) % clock->size];
++	last = &clock->samples[(clock->head - 1 + clock->size) % clock->size];
+ 
+ 	/* First step, PTS to SOF conversion. */
+ 	delta_stc = buf->pts - (1UL << 31);
+-- 
+2.45.1.145.g83f1add914
+
+
+From b451efab6052e9a655068f64560301ee27a8f712 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:03 +0000
+Subject: [PATCH 02/19] media: uvcvideo: Ignore empty TS packets
+
+Some SunplusIT cameras took a borderline interpretation of the UVC 1.5
+standard, and fill the PTS and SCR fields with invalid data if the
+package does not contain data.
+
+"STC must be captured when the first video data of a video frame is put
+on the USB bus."
+
+Some SunplusIT devices send, e.g.,
+
+buffer: 0xa7755c00 len 000012 header:0x8c stc 00000000 sof 0000 pts 00000000
+buffer: 0xa7755c00 len 000012 header:0x8c stc 00000000 sof 0000 pts 00000000
+buffer: 0xa7755c00 len 000668 header:0x8c stc 73779dba sof 070c pts 7376d37a
+
+While the UVC specification meant that the first two packets shouldn't
+have had the SCR bit set in the header.
+
+This borderline/buggy interpretation has been implemented in a variety
+of devices, from directly SunplusIT and from other OEMs that rebrand
+SunplusIT products. So quirking based on VID:PID will be problematic.
+
+All the affected modules have the following extension unit:
+VideoControl Interface Descriptor:
+  guidExtensionCode         {82066163-7050-ab49-b8cc-b3855e8d221d}
+
+But the vendor plans to use that GUID in the future and fix the bug,
+this means that we should use heuristic to figure out the broken
+packets.
+
+This patch takes care of this.
+
+lsusb of one of the affected cameras:
+
+Bus 001 Device 003: ID 1bcf:2a01 Sunplus Innovation Technology Inc.
+Device Descriptor:
+  bLength                18
+  bDescriptorType         1
+  bcdUSB               2.01
+  bDeviceClass          239 Miscellaneous Device
+  bDeviceSubClass         2 ?
+  bDeviceProtocol         1 Interface Association
+  bMaxPacketSize0        64
+  idVendor           0x1bcf Sunplus Innovation Technology Inc.
+  idProduct          0x2a01
+  bcdDevice            0.02
+  iManufacturer           1 SunplusIT Inc
+  iProduct                2 HanChen Wise Camera
+  iSerial                 3 01.00.00
+  bNumConfigurations      1
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 659c9e988..b2e70fcf4 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -478,6 +478,7 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	ktime_t time;
+ 	u16 host_sof;
+ 	u16 dev_sof;
++	u32 dev_stc;
+ 
+ 	switch (data[1] & (UVC_STREAM_PTS | UVC_STREAM_SCR)) {
+ 	case UVC_STREAM_PTS | UVC_STREAM_SCR:
+@@ -526,6 +527,34 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	if (dev_sof == stream->clock.last_sof)
+ 		return;
+ 
++	dev_stc = get_unaligned_le32(&data[header_size - 6]);
++
++	/*
++	 * STC (Source Time Clock) is the clock used by the camera. The UVC 1.5
++	 * standard states that it "must be captured when the first video data
++	 * of a video frame is put on the USB bus". This is generally understood
++	 * as requiring devices to clear the payload header's SCR bit before
++	 * the first packet containing video data.
++	 *
++	 * Most vendors follow that interpretation, but some (namely SunplusIT
++	 * on some devices) always set the `UVC_STREAM_SCR` bit, fill the SCR
++	 * field with 0's,and expect that the driver only processes the SCR if
++	 * there is data in the packet.
++	 *
++	 * Ignore all the hardware timestamp information if we haven't received
++	 * any data for this frame yet, the packet contains no data, and both
++	 * STC and SOF are zero. This heuristics should be safe on compliant
++	 * devices. This should be safe with compliant devices, as in the very
++	 * unlikely case where a UVC 1.1 device would send timing information
++	 * only before the first packet containing data, and both STC and SOF
++	 * happen to be zero for a particular frame, we would only miss one
++	 * clock sample from many and the clock recovery algorithm wouldn't
++	 * suffer from this condition.
++	 */
++	if (buf && buf->bytesused == 0 && len == header_size &&
++	    dev_stc == 0 && dev_sof == 0)
++		return;
++
+ 	stream->clock.last_sof = dev_sof;
+ 
+ 	host_sof = usb_get_current_frame_number(stream->dev->udev);
+@@ -564,7 +593,7 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	spin_lock_irqsave(&stream->clock.lock, flags);
+ 
+ 	sample = &stream->clock.samples[stream->clock.head];
+-	sample->dev_stc = get_unaligned_le32(&data[header_size - 6]);
++	sample->dev_stc = dev_stc;
+ 	sample->dev_sof = dev_sof;
+ 	sample->host_sof = host_sof;
+ 	sample->host_time = time;
+-- 
+2.45.1.145.g83f1add914
+
+
+From 94b67245cebc044689afa92e6f93a4d350070d54 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:04 +0000
+Subject: [PATCH 03/19] media: uvcvideo: Quirk for invalid dev_sof in Logitech
+ C922
+
+Logitech C922 internal SOF does not increases at a stable rate of 1kHz.
+This causes that the device_sof and the host_sof run at different rates,
+breaking the clock domain conversion algorithm. Eg:
+
+30 (6) [-] none 30 614400 B 21.245557 21.395214 34.133 fps ts mono/SoE
+31 (7) [-] none 31 614400 B 21.275327 21.427246 33.591 fps ts mono/SoE
+32 (0) [-] none 32 614400 B 21.304739 21.459256 34.000 fps ts mono/SoE
+33 (1) [-] none 33 614400 B 21.334324 21.495274 33.801 fps ts mono/SoE
+* 34 (2) [-] none 34 614400 B 21.529237 21.527297 5.130 fps ts mono/SoE
+* 35 (3) [-] none 35 614400 B 21.649416 21.559306 8.321 fps ts mono/SoE
+36 (4) [-] none 36 614400 B 21.678789 21.595320 34.045 fps ts mono/SoE
+...
+99 (3) [-] none 99 614400 B 23.542226 23.696352 33.541 fps ts mono/SoE
+100 (4) [-] none 100 614400 B 23.571578 23.728404 34.069 fps ts mono/SoE
+101 (5) [-] none 101 614400 B 23.601425 23.760420 33.504 fps ts mono/SoE
+* 102 (6) [-] none 102 614400 B 23.798324 23.796428 5.079 fps ts mono/SoE
+* 103 (7) [-] none 103 614400 B 23.916271 23.828450 8.478 fps ts mono/SoE
+104 (0) [-] none 104 614400 B 23.945720 23.860479 33.957 fps ts mono/SoE
+
+Instead of disabling completely the hardware timestamping for such
+hardware we take the assumption that the packet handling jitter is
+under 2ms and use the host_sof as dev_sof.
+
+We can think of the UVC hardware clock as a system with a coarse clock
+(the SOF) and a fine clock (the PTS). The coarse clock can be replaced
+with a clock on the same frequency, if the jitter of such clock is
+smaller than its sampling rate. That way we can save some of the
+precision of the fine clock.
+
+To probe this point we have run three experiments on the Logitech C922.
+On that experiment we run the camera at 33fps and we analyse the
+difference in msec between a frame and its predecessor. If we display
+the histogram of that value, a thinner histogram will mean a better
+meassurement. The results for:
+- original hw timestamp: https://ibb.co/D1HJJ4x
+- pure software timestamp: https://ibb.co/QC9MgVK
+- modified hw timestamp: https://ibb.co/8s9dBdk
+
+This bug in the camera firmware has been confirmed by the vendor.
+
+lsusb -v
+
+Bus 001 Device 044: ID 046d:085c Logitech, Inc. C922 Pro Stream Webcam
+Device Descriptor:
+  bLength                18
+  bDescriptorType         1
+  bcdUSB               2.00
+  bDeviceClass          239 Miscellaneous Device
+  bDeviceSubClass         2
+  bDeviceProtocol         1 Interface Association
+  bMaxPacketSize0        64
+  idVendor           0x046d Logitech, Inc.
+  idProduct          0x085c C922 Pro Stream Webcam
+  bcdDevice            0.16
+  iManufacturer           0
+  iProduct                2 C922 Pro Stream Webcam
+  iSerial                 1 80B912DF
+  bNumConfigurations      1
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Reviewed-by: Ricardo Ribalda <ribalda@chromium.org>
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ drivers/media/usb/uvc/uvc_driver.c |  9 +++++++++
+ drivers/media/usb/uvc/uvc_video.c  | 11 +++++++++++
+ drivers/media/usb/uvc/uvcvideo.h   |  1 +
+ 3 files changed, 21 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index 8fe24c980..6e55f91ac 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2581,6 +2581,15 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+ 	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTORE_CTRLS_ON_INIT) },
++	/* Logitech HD Pro Webcam C922 */
++	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
++				| USB_DEVICE_ID_MATCH_INT_INFO,
++	  .idVendor		= 0x046d,
++	  .idProduct		= 0x085c,
++	  .bInterfaceClass	= USB_CLASS_VIDEO,
++	  .bInterfaceSubClass	= 1,
++	  .bInterfaceProtocol	= 0,
++	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_INVALID_DEVICE_SOF) },
+ 	/* Logitech Rally Bar Huddle */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index b2e70fcf4..d6ca383f6 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -558,6 +558,17 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	stream->clock.last_sof = dev_sof;
+ 
+ 	host_sof = usb_get_current_frame_number(stream->dev->udev);
++
++	/*
++	 * On some devices, like the Logitech C922, the device SOF does not run
++	 * at a stable rate of 1kHz. For those devices use the host SOF instead.
++	 * In the tests performed so far, this improves the timestamp precision.
++	 * This is probably explained by a small packet handling jitter from the
++	 * host, but the exact reason hasn't been fully determined.
++	 */
++	if (stream->dev->quirks & UVC_QUIRK_INVALID_DEVICE_SOF)
++		dev_sof = host_sof;
++
+ 	time = uvc_video_get_time();
+ 
+ 	/*
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 3653b2c8a..e5b127170 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -75,6 +75,7 @@
+ #define UVC_QUIRK_WAKE_AUTOSUSPEND	0x00002000
+ #define UVC_QUIRK_NO_RESET_RESUME	0x00004000
+ #define UVC_QUIRK_DISABLE_AUTOSUSPEND	0x00008000
++#define UVC_QUIRK_INVALID_DEVICE_SOF	0x00010000
+ 
+ /* Format flags */
+ #define UVC_FMT_FLAG_COMPRESSED		0x00000001
+-- 
+2.45.1.145.g83f1add914
+
+
+From 83c4366092737dcbd815365d1da13ac665875500 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:05 +0000
+Subject: [PATCH 04/19] media: uvcvideo: Allow hw clock updates with buffers
+ not full
+
+With UVC 1.5 we get as little as one clock sample per frame. Which means
+that it takes 32 frames to move from the software timestamp to the
+hardware timestamp method.
+
+This results in abrupt changes in the timestamping after 32 frames (~1
+second), resulting in noticeable artifacts when used for encoding.
+
+With this patch we modify the update algorithm to work with whatever
+amount of values are available.
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index d6ca383f6..af25b9f1b 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -768,10 +768,10 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 
+ 	spin_lock_irqsave(&clock->lock, flags);
+ 
+-	if (clock->count < clock->size)
++	if (clock->count < 2)
+ 		goto done;
+ 
+-	first = &clock->samples[clock->head];
++	first = &clock->samples[(clock->head - clock->count + clock->size) % clock->size];
+ 	last = &clock->samples[(clock->head - 1 + clock->size) % clock->size];
+ 
+ 	/* First step, PTS to SOF conversion. */
+@@ -786,6 +786,18 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 	if (y2 < y1)
+ 		y2 += 2048 << 16;
+ 
++	/*
++	 * Have at least 1/4 of a second of timestamps before we
++	 * try to do any calculation. Otherwise we do not have enough
++	 * precision. This value was determined by running Android CTS
++	 * on different devices.
++	 *
++	 * dev_sof runs at 1KHz, and we have a fixed point precision of
++	 * 16 bits.
++	 */
++	if ((y2 - y1) < ((1000 / 4) << 16))
++		goto done;
++
+ 	y = (u64)(y2 - y1) * (1ULL << 31) + (u64)y1 * (u64)x2
+ 	  - (u64)y2 * (u64)x1;
+ 	y = div_u64(y, x2 - x1);
+-- 
+2.45.1.145.g83f1add914
+
+
+From 72a7f38f19149b9c1a8612b9e5a5c5c428ffdc94 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Sat, 23 Mar 2024 10:48:06 +0000
+Subject: [PATCH 05/19] media: uvcvideo: Refactor clock circular buffer
+
+Isolate all the changes related to the clock circular buffer to its own
+function, that way we can make changes easier to the buffer logic.
+
+Also simplify the lock, by removing the circular buffer clock handling
+from uvc_video_clock_decode().
+
+And now that we are at it, unify the API of the clock functions.
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 83 ++++++++++++++-----------------
+ 1 file changed, 36 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index af25b9f1b..5df8f61d3 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -466,19 +466,28 @@ static inline ktime_t uvc_video_get_time(void)
+ 		return ktime_get_real();
+ }
+ 
++static void uvc_video_clock_add_sample(struct uvc_clock *clock,
++				       const struct uvc_clock_sample *sample)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&clock->lock, flags);
++
++	clock->samples[clock->head] = *sample;
++	clock->head = (clock->head + 1) % clock->size;
++	clock->count = min(clock->count + 1, clock->size);
++
++	spin_unlock_irqrestore(&clock->lock, flags);
++}
++
+ static void
+ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 		       const u8 *data, int len)
+ {
+-	struct uvc_clock_sample *sample;
++	struct uvc_clock_sample sample;
+ 	unsigned int header_size;
+ 	bool has_pts = false;
+ 	bool has_scr = false;
+-	unsigned long flags;
+-	ktime_t time;
+-	u16 host_sof;
+-	u16 dev_sof;
+-	u32 dev_stc;
+ 
+ 	switch (data[1] & (UVC_STREAM_PTS | UVC_STREAM_SCR)) {
+ 	case UVC_STREAM_PTS | UVC_STREAM_SCR:
+@@ -523,11 +532,11 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * all the data packets of the same frame contains the same SOF. In that
+ 	 * case only the first one will match the host_sof.
+ 	 */
+-	dev_sof = get_unaligned_le16(&data[header_size - 2]);
+-	if (dev_sof == stream->clock.last_sof)
++	sample.dev_sof = get_unaligned_le16(&data[header_size - 2]);
++	if (sample.dev_sof == stream->clock.last_sof)
+ 		return;
+ 
+-	dev_stc = get_unaligned_le32(&data[header_size - 6]);
++	sample.dev_stc = get_unaligned_le32(&data[header_size - 6]);
+ 
+ 	/*
+ 	 * STC (Source Time Clock) is the clock used by the camera. The UVC 1.5
+@@ -552,12 +561,10 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * suffer from this condition.
+ 	 */
+ 	if (buf && buf->bytesused == 0 && len == header_size &&
+-	    dev_stc == 0 && dev_sof == 0)
++	    sample.dev_stc == 0 && sample.dev_sof == 0)
+ 		return;
+ 
+-	stream->clock.last_sof = dev_sof;
+-
+-	host_sof = usb_get_current_frame_number(stream->dev->udev);
++	sample.host_sof = usb_get_current_frame_number(stream->dev->udev);
+ 
+ 	/*
+ 	 * On some devices, like the Logitech C922, the device SOF does not run
+@@ -567,9 +574,9 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * host, but the exact reason hasn't been fully determined.
+ 	 */
+ 	if (stream->dev->quirks & UVC_QUIRK_INVALID_DEVICE_SOF)
+-		dev_sof = host_sof;
++		sample.dev_sof = sample.host_sof;
+ 
+-	time = uvc_video_get_time();
++	sample.host_time = uvc_video_get_time();
+ 
+ 	/*
+ 	 * The UVC specification allows device implementations that can't obtain
+@@ -592,46 +599,28 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
+ 	 * the 8 LSBs of the delta are kept.
+ 	 */
+ 	if (stream->clock.sof_offset == (u16)-1) {
+-		u16 delta_sof = (host_sof - dev_sof) & 255;
++		u16 delta_sof = (sample.host_sof - sample.dev_sof) & 255;
+ 		if (delta_sof >= 10)
+ 			stream->clock.sof_offset = delta_sof;
+ 		else
+ 			stream->clock.sof_offset = 0;
+ 	}
+ 
+-	dev_sof = (dev_sof + stream->clock.sof_offset) & 2047;
+-
+-	spin_lock_irqsave(&stream->clock.lock, flags);
+-
+-	sample = &stream->clock.samples[stream->clock.head];
+-	sample->dev_stc = dev_stc;
+-	sample->dev_sof = dev_sof;
+-	sample->host_sof = host_sof;
+-	sample->host_time = time;
+-
+-	/* Update the sliding window head and count. */
+-	stream->clock.head = (stream->clock.head + 1) % stream->clock.size;
+-
+-	if (stream->clock.count < stream->clock.size)
+-		stream->clock.count++;
+-
+-	spin_unlock_irqrestore(&stream->clock.lock, flags);
++	sample.dev_sof = (sample.dev_sof + stream->clock.sof_offset) & 2047;
++	uvc_video_clock_add_sample(&stream->clock, &sample);
++	stream->clock.last_sof = sample.dev_sof;
+ }
+ 
+-static void uvc_video_clock_reset(struct uvc_streaming *stream)
++static void uvc_video_clock_reset(struct uvc_clock *clock)
+ {
+-	struct uvc_clock *clock = &stream->clock;
+-
+ 	clock->head = 0;
+ 	clock->count = 0;
+ 	clock->last_sof = -1;
+ 	clock->sof_offset = -1;
+ }
+ 
+-static int uvc_video_clock_init(struct uvc_streaming *stream)
++static int uvc_video_clock_init(struct uvc_clock *clock)
+ {
+-	struct uvc_clock *clock = &stream->clock;
+-
+ 	spin_lock_init(&clock->lock);
+ 	clock->size = 32;
+ 
+@@ -640,15 +629,15 @@ static int uvc_video_clock_init(struct uvc_streaming *stream)
+ 	if (clock->samples == NULL)
+ 		return -ENOMEM;
+ 
+-	uvc_video_clock_reset(stream);
++	uvc_video_clock_reset(clock);
+ 
+ 	return 0;
+ }
+ 
+-static void uvc_video_clock_cleanup(struct uvc_streaming *stream)
++static void uvc_video_clock_cleanup(struct uvc_clock *clock)
+ {
+-	kfree(stream->clock.samples);
+-	stream->clock.samples = NULL;
++	kfree(clock->samples);
++	clock->samples = NULL;
+ }
+ 
+ /*
+@@ -2123,7 +2112,7 @@ int uvc_video_resume(struct uvc_streaming *stream, int reset)
+ 
+ 	stream->frozen = 0;
+ 
+-	uvc_video_clock_reset(stream);
++	uvc_video_clock_reset(&stream->clock);
+ 
+ 	if (!uvc_queue_streaming(&stream->queue))
+ 		return 0;
+@@ -2272,7 +2261,7 @@ int uvc_video_start_streaming(struct uvc_streaming *stream)
+ {
+ 	int ret;
+ 
+-	ret = uvc_video_clock_init(stream);
++	ret = uvc_video_clock_init(&stream->clock);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2290,7 +2279,7 @@ int uvc_video_start_streaming(struct uvc_streaming *stream)
+ error_video:
+ 	usb_set_interface(stream->dev->udev, stream->intfnum, 0);
+ error_commit:
+-	uvc_video_clock_cleanup(stream);
++	uvc_video_clock_cleanup(&stream->clock);
+ 
+ 	return ret;
+ }
+@@ -2318,5 +2307,5 @@ void uvc_video_stop_streaming(struct uvc_streaming *stream)
+ 		usb_clear_halt(stream->dev->udev, pipe);
+ 	}
+ 
+-	uvc_video_clock_cleanup(stream);
++	uvc_video_clock_cleanup(&stream->clock);
+ }
+-- 
+2.45.1.145.g83f1add914
+
+
+From 017b69f2cf3c11f456bd81b0dd0d573bf0ff5889 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 19:17:48 +0000
+Subject: [PATCH 06/19] media: uvcvideo: Fix hw timestamp handling for slow FPS
+
+In UVC 1.5 we get a single clock value per frame. With the current
+buffer size of 32, FPS slowers than 32 might roll-over twice.
+
+The current code cannot handle two roll-over and provide invalid
+timestamps.
+
+Revome all the samples from the circular buffer that are more than two
+rollovers old, so the algorithm always provides good timestamps.
+
+Note that we are removing values that are more than one second old,
+which means that there is enough distance between the two points that
+we use for the interpolation to provide good values.
+
+Tested-by: HungNien Chen <hn.chen@sunplusit.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Tomasz Figa <tfiga@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 23 +++++++++++++++++++++++
+ drivers/media/usb/uvc/uvcvideo.h  |  1 +
+ 2 files changed, 24 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 5df8f61d3..451d6c1a2 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -471,8 +471,30 @@ static void uvc_video_clock_add_sample(struct uvc_clock *clock,
+ {
+ 	unsigned long flags;
+ 
++	/*
++	 * If we write new data on the position where we had the last
++	 * overflow, remove the overflow pointer. There is no SOF overflow
++	 * in the whole circular buffer.
++	 */
++	if (clock->head == clock->last_sof_overflow)
++		clock->last_sof_overflow = -1;
++
+ 	spin_lock_irqsave(&clock->lock, flags);
+ 
++	/* Handle SOF overflows. */
++	if (clock->count > 0 && clock->last_sof > sample->dev_sof) {
++		/*
++		 * Remove data from the circular buffer that is older than the
++		 * last SOF overflow. We only support one SOF overflow per
++		 * circular buffer.
++		 */
++		if (clock->last_sof_overflow != -1)
++			clock->count = (clock->head - clock->last_sof_overflow
++					+ clock->size) % clock->size;
++		clock->last_sof_overflow = clock->head;
++	}
++
++	/* Add sample. */
+ 	clock->samples[clock->head] = *sample;
+ 	clock->head = (clock->head + 1) % clock->size;
+ 	clock->count = min(clock->count + 1, clock->size);
+@@ -616,6 +638,7 @@ static void uvc_video_clock_reset(struct uvc_clock *clock)
+ 	clock->head = 0;
+ 	clock->count = 0;
+ 	clock->last_sof = -1;
++	clock->last_sof_overflow = -1;
+ 	clock->sof_offset = -1;
+ }
+ 
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index e5b127170..f21207deb 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -501,6 +501,7 @@ struct uvc_streaming {
+ 		unsigned int head;
+ 		unsigned int count;
+ 		unsigned int size;
++		unsigned int last_sof_overflow;
+ 
+ 		u16 last_sof;
+ 		u16 sof_offset;
+-- 
+2.45.1.145.g83f1add914
+
+
+From 7dbe697277bc34adb14da983698559d453cb0013 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 19:17:49 +0000
+Subject: [PATCH 07/19] media: uvcvideo: Fix integer overflow calculating
+ timestamp
+
+The function uvc_video_clock_update() supports a single SOF overflow. Or
+in other words, the maximum difference between the first ant the last
+timestamp can be 4096 ticks or 4.096 seconds.
+
+This results in a maximum value for y2 of: 0x12FBECA00, that overflows
+32bits.
+y2 = (u32)ktime_to_ns(ktime_sub(last->host_time, first->host_time)) + y1;
+
+Extend the size of y2 to u64 to support all its values.
+
+Without this patch:
+ # yavta -s 1920x1080 -f YUYV -t 1/5 -c /dev/video0
+Device /dev/v4l/by-id/usb-Shine-Optics_Integrated_Camera_0001-video-index0 opened.
+Device `Integrated Camera: Integrated C' on `usb-0000:00:14.0-6' (driver 'uvcvideo') supports video, capture, without mplanes.
+Video format set: YUYV (56595559) 1920x1080 (stride 3840) field none buffer size 4147200
+Video format: YUYV (56595559) 1920x1080 (stride 3840) field none buffer size 4147200
+Current frame rate: 1/5
+Setting frame rate to: 1/5
+Frame rate set: 1/5
+8 buffers requested.
+length: 4147200 offset: 0 timestamp type/source: mono/SoE
+Buffer 0/0 mapped at address 0x7947ea94c000.
+length: 4147200 offset: 4149248 timestamp type/source: mono/SoE
+Buffer 1/0 mapped at address 0x7947ea557000.
+length: 4147200 offset: 8298496 timestamp type/source: mono/SoE
+Buffer 2/0 mapped at address 0x7947ea162000.
+length: 4147200 offset: 12447744 timestamp type/source: mono/SoE
+Buffer 3/0 mapped at address 0x7947e9d6d000.
+length: 4147200 offset: 16596992 timestamp type/source: mono/SoE
+Buffer 4/0 mapped at address 0x7947e9978000.
+length: 4147200 offset: 20746240 timestamp type/source: mono/SoE
+Buffer 5/0 mapped at address 0x7947e9583000.
+length: 4147200 offset: 24895488 timestamp type/source: mono/SoE
+Buffer 6/0 mapped at address 0x7947e918e000.
+length: 4147200 offset: 29044736 timestamp type/source: mono/SoE
+Buffer 7/0 mapped at address 0x7947e8d99000.
+0 (0) [-] none 0 4147200 B 507.554210 508.874282 242.836 fps ts mono/SoE
+1 (1) [-] none 2 4147200 B 508.886298 509.074289 0.751 fps ts mono/SoE
+2 (2) [-] none 3 4147200 B 509.076362 509.274307 5.261 fps ts mono/SoE
+3 (3) [-] none 4 4147200 B 509.276371 509.474336 5.000 fps ts mono/SoE
+4 (4) [-] none 5 4147200 B 509.476394 509.674394 4.999 fps ts mono/SoE
+5 (5) [-] none 6 4147200 B 509.676506 509.874345 4.997 fps ts mono/SoE
+6 (6) [-] none 7 4147200 B 509.876430 510.074370 5.002 fps ts mono/SoE
+7 (7) [-] none 8 4147200 B 510.076434 510.274365 5.000 fps ts mono/SoE
+8 (0) [-] none 9 4147200 B 510.276421 510.474333 5.000 fps ts mono/SoE
+9 (1) [-] none 10 4147200 B 510.476391 510.674429 5.001 fps ts mono/SoE
+10 (2) [-] none 11 4147200 B 510.676434 510.874283 4.999 fps ts mono/SoE
+11 (3) [-] none 12 4147200 B 510.886264 511.074349 4.766 fps ts mono/SoE
+12 (4) [-] none 13 4147200 B 511.070577 511.274304 5.426 fps ts mono/SoE
+13 (5) [-] none 14 4147200 B 511.286249 511.474301 4.637 fps ts mono/SoE
+14 (6) [-] none 15 4147200 B 511.470542 511.674251 5.426 fps ts mono/SoE
+15 (7) [-] none 16 4147200 B 511.672651 511.874337 4.948 fps ts mono/SoE
+16 (0) [-] none 17 4147200 B 511.873988 512.074462 4.967 fps ts mono/SoE
+17 (1) [-] none 18 4147200 B 512.075982 512.278296 4.951 fps ts mono/SoE
+18 (2) [-] none 19 4147200 B 512.282631 512.482423 4.839 fps ts mono/SoE
+19 (3) [-] none 20 4147200 B 518.986637 512.686333 0.149 fps ts mono/SoE
+20 (4) [-] none 21 4147200 B 518.342709 512.886386 -1.553 fps ts mono/SoE
+21 (5) [-] none 22 4147200 B 517.909812 513.090360 -2.310 fps ts mono/SoE
+22 (6) [-] none 23 4147200 B 517.590775 513.294454 -3.134 fps ts mono/SoE
+23 (7) [-] none 24 4147200 B 513.298465 513.494335 -0.233 fps ts mono/SoE
+24 (0) [-] none 25 4147200 B 513.510273 513.698375 4.721 fps ts mono/SoE
+25 (1) [-] none 26 4147200 B 513.698904 513.902327 5.301 fps ts mono/SoE
+26 (2) [-] none 27 4147200 B 513.895971 514.102348 5.074 fps ts mono/SoE
+27 (3) [-] none 28 4147200 B 514.099091 514.306337 4.923 fps ts mono/SoE
+28 (4) [-] none 29 4147200 B 514.310348 514.510567 4.734 fps ts mono/SoE
+29 (5) [-] none 30 4147200 B 514.509295 514.710367 5.026 fps ts mono/SoE
+30 (6) [-] none 31 4147200 B 521.532513 514.914398 0.142 fps ts mono/SoE
+31 (7) [-] none 32 4147200 B 520.885277 515.118385 -1.545 fps ts mono/SoE
+32 (0) [-] none 33 4147200 B 520.411140 515.318336 -2.109 fps ts mono/SoE
+33 (1) [-] none 34 4147200 B 515.325425 515.522278 -0.197 fps ts mono/SoE
+34 (2) [-] none 35 4147200 B 515.538276 515.726423 4.698 fps ts mono/SoE
+35 (3) [-] none 36 4147200 B 515.720767 515.930373 5.480 fps ts mono/SoE
+
+Cc: stable@vger.kernel.org
+Fixes: 66847ef013cc ("[media] uvcvideo: Add UVC timestamps support")
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_video.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 451d6c1a2..b5545bc5c 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -761,11 +761,11 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 	unsigned long flags;
+ 	u64 timestamp;
+ 	u32 delta_stc;
+-	u32 y1, y2;
++	u32 y1;
+ 	u32 x1, x2;
+ 	u32 mean;
+ 	u32 sof;
+-	u64 y;
++	u64 y, y2;
+ 
+ 	if (!uvc_hw_timestamps_param)
+ 		return;
+@@ -817,7 +817,7 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 	sof = y;
+ 
+ 	uvc_dbg(stream->dev, CLOCK,
+-		"%s: PTS %u y %llu.%06llu SOF %u.%06llu (x1 %u x2 %u y1 %u y2 %u SOF offset %u)\n",
++		"%s: PTS %u y %llu.%06llu SOF %u.%06llu (x1 %u x2 %u y1 %u y2 %llu SOF offset %u)\n",
+ 		stream->dev->name, buf->pts,
+ 		y >> 16, div_u64((y & 0xffff) * 1000000, 65536),
+ 		sof >> 16, div_u64(((u64)sof & 0xffff) * 1000000LLU, 65536),
+@@ -832,7 +832,7 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 		goto done;
+ 
+ 	y1 = NSEC_PER_SEC;
+-	y2 = (u32)ktime_to_ns(ktime_sub(last->host_time, first->host_time)) + y1;
++	y2 = ktime_to_ns(ktime_sub(last->host_time, first->host_time)) + y1;
+ 
+ 	/*
+ 	 * Interpolated and host SOF timestamps can wrap around at slightly
+@@ -853,7 +853,7 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 	timestamp = ktime_to_ns(first->host_time) + y - y1;
+ 
+ 	uvc_dbg(stream->dev, CLOCK,
+-		"%s: SOF %u.%06llu y %llu ts %llu buf ts %llu (x1 %u/%u/%u x2 %u/%u/%u y1 %u y2 %u)\n",
++		"%s: SOF %u.%06llu y %llu ts %llu buf ts %llu (x1 %u/%u/%u x2 %u/%u/%u y1 %u y2 %llu)\n",
+ 		stream->dev->name,
+ 		sof >> 16, div_u64(((u64)sof & 0xffff) * 1000000LLU, 65536),
+ 		y, timestamp, vbuf->vb2_buf.timestamp,
+-- 
+2.45.1.145.g83f1add914
+
+
+From 54558af39ff7d6d5806e04e84a63b7d8293e89a6 Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Mon, 25 Mar 2024 15:26:11 +0100
+Subject: [PATCH 08/19] media/uvcvideo: add quirk for invalid dev_sof in
+ Logitech C920
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Similarly to Logitech C922, C920 seems to also suffer from a firmware
+bug that breaks hardware timestamping.
+
+Add a quirk for this camera model too.
+
+Before applying the quirk:
+
+```
+100 (4) [-] none 100 200717 B 212.919114 213.079004 33.727 fps ts mono/SoE
+101 (5) [-] none 101 200889 B 213.003703 213.114996 11.822 fps ts mono/SoE
+102 (6) [-] none 102 200926 B 213.035571 213.146999 31.379 fps ts mono/SoE
+103 (7) [-] none 103 200839 B 213.067424 213.179003 31.394 fps ts mono/SoE
+104 (0) [-] none 104 200692 B 213.293180 213.214991 4.430 fps ts mono/SoE
+105 (1) [-] none 105 200937 B 213.322374 213.247001 34.254 fps ts mono/SoE
+106 (2) [-] none 106 201013 B 213.352228 213.279005 33.496 fps ts mono/SoE
+…
+```
+
+After applying the quirk:
+
+```
+154 (2) [-] none 154 192417 B 42.199823 42.207788 27.779 fps ts mono/SoE
+155 (3) [-] none 155 192040 B 42.231834 42.239791 31.239 fps ts mono/SoE
+156 (4) [-] none 156 192213 B 42.263823 42.271822 31.261 fps ts mono/SoE
+157 (5) [-] none 157 191981 B 42.299824 42.303827 27.777 fps ts mono/SoE
+158 (6) [-] none 158 191953 B 42.331835 42.339811 31.239 fps ts mono/SoE
+159 (7) [-] none 159 191904 B 42.363824 42.371813 31.261 fps ts mono/SoE
+160 (0) [-] none 160 192210 B 42.399834 42.407801 27.770 fps ts mono/SoE
+```
+
+Link: https://lore.kernel.org/lkml/5764213.DvuYhMxLoT@natalenko.name/
+Reviewed-by: Ricardo Ribalda <ribalda@chromium.org>
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ drivers/media/usb/uvc/uvc_driver.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index 6e55f91ac..d435b6a6c 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2580,7 +2580,8 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceClass	= USB_CLASS_VIDEO,
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTORE_CTRLS_ON_INIT) },
++	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTORE_CTRLS_ON_INIT
++					       | UVC_QUIRK_INVALID_DEVICE_SOF) },
+ 	/* Logitech HD Pro Webcam C922 */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+-- 
+2.45.1.145.g83f1add914
+
+
+From 6f47f409092ced2fba3e77ec468106d7643d1821 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Tue, 11 Jun 2024 08:12:06 +0000
+Subject: [PATCH 09/19] media: uvcvideo: stop stream during unregister
+
+uvc_unregister_video() can be called asynchronously from
+uvc_disconnect(). If the device is still streaming when that happens, a
+plethora of race conditions can happen.
+
+Make sure that the device has stopped streaming before exiting this
+function.
+
+If the user still holds handles to the driver's file descriptors, any
+ioctl will return -ENODEV from the v4l2 core.
+
+This change make uvc more consistent with the rest of the v4l2 drivers
+using the vb2_fop_* and vb2_ioctl_* helpers.
+
+Suggested-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Reviewed-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+---
+ drivers/media/usb/uvc/uvc_driver.c | 32 +++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index d435b6a6c..da45274fb 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -1909,11 +1909,41 @@ static void uvc_unregister_video(struct uvc_device *dev)
+ 	struct uvc_streaming *stream;
+ 
+ 	list_for_each_entry(stream, &dev->streams, list) {
++		/* Nothing to do here, continue. */
+ 		if (!video_is_registered(&stream->vdev))
+ 			continue;
+ 
++		/*
++		 * For stream->vdev we follow the same logic as:
++		 * vb2_video_unregister_device().
++		 */
++
++		/* 1. Take a reference to vdev */
++		get_device(&stream->vdev.dev);
++
++		/* 2. Ensure that no new ioctls can be called. */
+ 		video_unregister_device(&stream->vdev);
+-		video_unregister_device(&stream->meta.vdev);
++
++		/* 3. Wait for old ioctls to finish. */
++		mutex_lock(&stream->mutex);
++
++		/* 4. Stop streamming. */
++		uvc_queue_streamoff(&stream->queue, stream->type);
++
++		mutex_unlock(&stream->mutex);
++
++		put_device(&stream->vdev.dev);
++
++		/*
++		 * For stream->meta.vdev we can directly call:
++		 * vb2_video_unregister_device().
++		 */
++		vb2_video_unregister_device(&stream->meta.vdev);
++
++		/*
++		 * Now both vdevs are not streaming and all the ioctls will
++		 * return -ENODEV.
++		 */
+ 
+ 		uvc_debugfs_cleanup_stream(stream);
+ 	}
+-- 
+2.45.1.145.g83f1add914
+
+
+From 9d347b31e5bd9e8eed80b7ee63391a2bf3813df6 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Tue, 11 Jun 2024 08:12:07 +0000
+Subject: [PATCH 10/19] media: uvcvideo: Refactor the status irq API
+
+There are two different use-cases of uvc_status():
+	- adding/removing a user when the camera is open/closed
+	- stopping/starting when the camera is suspended/resumed
+
+Make the API reflect these two use-cases and move all the refcounting
+and locking logic to the uvc_status.c file.
+
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_driver.c | 13 ++-----
+ drivers/media/usb/uvc/uvc_status.c | 55 ++++++++++++++++++++++++++++--
+ drivers/media/usb/uvc/uvc_v4l2.c   | 22 ++++--------
+ drivers/media/usb/uvc/uvcvideo.h   | 10 +++---
+ 4 files changed, 67 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index da45274fb..214ca27a2 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2136,7 +2136,6 @@ static int uvc_probe(struct usb_interface *intf,
+ 	INIT_LIST_HEAD(&dev->streams);
+ 	kref_init(&dev->ref);
+ 	atomic_set(&dev->nmappings, 0);
+-	mutex_init(&dev->lock);
+ 
+ 	dev->udev = usb_get_dev(udev);
+ 	dev->intf = usb_get_intf(intf);
+@@ -2308,10 +2307,7 @@ static int uvc_suspend(struct usb_interface *intf, pm_message_t message)
+ 	/* Controls are cached on the fly so they don't need to be saved. */
+ 	if (intf->cur_altsetting->desc.bInterfaceSubClass ==
+ 	    UVC_SC_VIDEOCONTROL) {
+-		mutex_lock(&dev->lock);
+-		if (dev->users)
+-			uvc_status_stop(dev);
+-		mutex_unlock(&dev->lock);
++		uvc_status_suspend(dev);
+ 		return 0;
+ 	}
+ 
+@@ -2342,12 +2338,7 @@ static int __uvc_resume(struct usb_interface *intf, int reset)
+ 				return ret;
+ 		}
+ 
+-		mutex_lock(&dev->lock);
+-		if (dev->users)
+-			ret = uvc_status_start(dev, GFP_NOIO);
+-		mutex_unlock(&dev->lock);
+-
+-		return ret;
++		return uvc_status_resume(dev);
+ 	}
+ 
+ 	list_for_each_entry(stream, &dev->streams, list) {
+diff --git a/drivers/media/usb/uvc/uvc_status.c b/drivers/media/usb/uvc/uvc_status.c
+index a78a88c71..375a95dd3 100644
+--- a/drivers/media/usb/uvc/uvc_status.c
++++ b/drivers/media/usb/uvc/uvc_status.c
+@@ -257,6 +257,8 @@ int uvc_status_init(struct uvc_device *dev)
+ 	unsigned int pipe;
+ 	int interval;
+ 
++	mutex_init(&dev->status_lock);
++
+ 	if (ep == NULL)
+ 		return 0;
+ 
+@@ -302,18 +304,22 @@ void uvc_status_cleanup(struct uvc_device *dev)
+ 	kfree(dev->status);
+ }
+ 
+-int uvc_status_start(struct uvc_device *dev, gfp_t flags)
++static int __uvc_status_start(struct uvc_device *dev, gfp_t flags)
+ {
++	lockdep_assert_held(&dev->status_lock);
++
+ 	if (dev->int_urb == NULL)
+ 		return 0;
+ 
+ 	return usb_submit_urb(dev->int_urb, flags);
+ }
+ 
+-void uvc_status_stop(struct uvc_device *dev)
++static void __uvc_status_stop(struct uvc_device *dev)
+ {
+ 	struct uvc_ctrl_work *w = &dev->async_ctrl;
+ 
++	lockdep_assert_held(&dev->status_lock);
++
+ 	/*
+ 	 * Prevent the asynchronous control handler from requeing the URB. The
+ 	 * barrier is needed so the flush_status change is visible to other
+@@ -350,3 +356,48 @@ void uvc_status_stop(struct uvc_device *dev)
+ 	 */
+ 	smp_store_release(&dev->flush_status, false);
+ }
++
++int uvc_status_resume(struct uvc_device *dev)
++{
++	int ret = 0;
++
++	mutex_lock(&dev->status_lock);
++	if (dev->status_users)
++		ret = __uvc_status_start(dev, GFP_NOIO);
++	mutex_unlock(&dev->status_lock);
++
++	return ret;
++}
++
++void uvc_status_suspend(struct uvc_device *dev)
++{
++	mutex_lock(&dev->status_lock);
++	if (dev->status_users)
++		__uvc_status_stop(dev);
++	mutex_unlock(&dev->status_lock);
++}
++
++int uvc_status_get(struct uvc_device *dev)
++{
++	int ret = 0;
++
++	mutex_lock(&dev->status_lock);
++	if (!dev->status_users)
++		ret = __uvc_status_start(dev, GFP_KERNEL);
++	if (!ret)
++		dev->status_users++;
++	mutex_unlock(&dev->status_lock);
++
++	return ret;
++}
++
++void uvc_status_put(struct uvc_device *dev)
++{
++	mutex_lock(&dev->status_lock);
++	if (dev->status_users == 1)
++		__uvc_status_stop(dev);
++	WARN_ON(!dev->status_users);
++	if (dev->status_users)
++		dev->status_users--;
++	mutex_unlock(&dev->status_lock);
++}
+diff --git a/drivers/media/usb/uvc/uvc_v4l2.c b/drivers/media/usb/uvc/uvc_v4l2.c
+index f4988f036..97c5407f6 100644
+--- a/drivers/media/usb/uvc/uvc_v4l2.c
++++ b/drivers/media/usb/uvc/uvc_v4l2.c
+@@ -628,20 +628,13 @@ static int uvc_v4l2_open(struct file *file)
+ 		return -ENOMEM;
+ 	}
+ 
+-	mutex_lock(&stream->dev->lock);
+-	if (stream->dev->users == 0) {
+-		ret = uvc_status_start(stream->dev, GFP_KERNEL);
+-		if (ret < 0) {
+-			mutex_unlock(&stream->dev->lock);
+-			usb_autopm_put_interface(stream->dev->intf);
+-			kfree(handle);
+-			return ret;
+-		}
++	ret = uvc_status_get(stream->dev);
++	if (ret) {
++		usb_autopm_put_interface(stream->dev->intf);
++		kfree(handle);
++		return ret;
+ 	}
+ 
+-	stream->dev->users++;
+-	mutex_unlock(&stream->dev->lock);
+-
+ 	v4l2_fh_init(&handle->vfh, &stream->vdev);
+ 	v4l2_fh_add(&handle->vfh);
+ 	handle->chain = stream->chain;
+@@ -670,10 +663,7 @@ static int uvc_v4l2_release(struct file *file)
+ 	kfree(handle);
+ 	file->private_data = NULL;
+ 
+-	mutex_lock(&stream->dev->lock);
+-	if (--stream->dev->users == 0)
+-		uvc_status_stop(stream->dev);
+-	mutex_unlock(&stream->dev->lock);
++	uvc_status_put(stream->dev);
+ 
+ 	usb_autopm_put_interface(stream->dev->intf);
+ 	return 0;
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index f21207deb..621d157e7 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -559,8 +559,6 @@ struct uvc_device {
+ 
+ 	const struct uvc_device_info *info;
+ 
+-	struct mutex lock;		/* Protects users */
+-	unsigned int users;
+ 	atomic_t nmappings;
+ 
+ 	/* Video control interface */
+@@ -582,6 +580,8 @@ struct uvc_device {
+ 	struct usb_host_endpoint *int_ep;
+ 	struct urb *int_urb;
+ 	struct uvc_status *status;
++	struct mutex status_lock; /* Protects status_users */
++	unsigned int status_users;
+ 	bool flush_status;
+ 
+ 	struct input_dev *input;
+@@ -748,8 +748,10 @@ int uvc_register_video_device(struct uvc_device *dev,
+ int uvc_status_init(struct uvc_device *dev);
+ void uvc_status_unregister(struct uvc_device *dev);
+ void uvc_status_cleanup(struct uvc_device *dev);
+-int uvc_status_start(struct uvc_device *dev, gfp_t flags);
+-void uvc_status_stop(struct uvc_device *dev);
++int uvc_status_resume(struct uvc_device *dev);
++void uvc_status_suspend(struct uvc_device *dev);
++int uvc_status_get(struct uvc_device *dev);
++void uvc_status_put(struct uvc_device *dev);
+ 
+ /* Controls */
+ extern const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited;
+-- 
+2.45.1.145.g83f1add914
+
+
+From 32cd850bf20e666c9c37babfb672e84df58835b9 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Tue, 11 Jun 2024 08:12:08 +0000
+Subject: [PATCH 11/19] media: uvcvideo: Avoid race condition during unregister
+
+The control events are handled asynchronously by the driver. Once the
+control event are handled, the urb is re-submitted.
+
+If we simply kill the urb, there is a chance that a control event is
+waiting to be processed, which will re-submit the urb after the device is
+disconnected.
+
+uvc_status_suspend() flushes the async controls and stops the urb in a
+correct manner.
+
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_status.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_status.c b/drivers/media/usb/uvc/uvc_status.c
+index 375a95dd3..8fd825011 100644
+--- a/drivers/media/usb/uvc/uvc_status.c
++++ b/drivers/media/usb/uvc/uvc_status.c
+@@ -294,7 +294,7 @@ int uvc_status_init(struct uvc_device *dev)
+ 
+ void uvc_status_unregister(struct uvc_device *dev)
+ {
+-	usb_kill_urb(dev->int_urb);
++	uvc_status_suspend(dev);
+ 	uvc_input_unregister(dev);
+ }
+ 
+-- 
+2.45.1.145.g83f1add914
+
+
+From 4952927e221d5e875db197ab3d828cb974b3d6e8 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Tue, 11 Jun 2024 08:12:09 +0000
+Subject: [PATCH 12/19] media: uvcvideo: Exit early if there is not int_urb
+
+If there is no int_urb there is no need to do a clean stop.
+
+Also we avoid calling usb_kill_urb(NULL). It is properly handled by the
+usb framework, but it is not polite.
+
+Now that we are at it, fix the code style in uvc_status_start() for
+consistency.
+
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_status.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_status.c b/drivers/media/usb/uvc/uvc_status.c
+index 8fd825011..9108522be 100644
+--- a/drivers/media/usb/uvc/uvc_status.c
++++ b/drivers/media/usb/uvc/uvc_status.c
+@@ -308,7 +308,7 @@ static int __uvc_status_start(struct uvc_device *dev, gfp_t flags)
+ {
+ 	lockdep_assert_held(&dev->status_lock);
+ 
+-	if (dev->int_urb == NULL)
++	if (!dev->int_urb)
+ 		return 0;
+ 
+ 	return usb_submit_urb(dev->int_urb, flags);
+@@ -320,6 +320,9 @@ static void __uvc_status_stop(struct uvc_device *dev)
+ 
+ 	lockdep_assert_held(&dev->status_lock);
+ 
++	if (!dev->int_urb)
++		return;
++
+ 	/*
+ 	 * Prevent the asynchronous control handler from requeing the URB. The
+ 	 * barrier is needed so the flush_status change is visible to other
+-- 
+2.45.1.145.g83f1add914
+
+
+From 9648129c37b846bd9a9cb19ad640e7fc311c1262 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 23:09:52 +0000
+Subject: [PATCH 13/19] media: uvcvideo: Allow custom control mapping
+
+Some advanced controls might not be completely implemented by vendors.
+
+If the controls are a enumeration, UVC does not gives a way to probe
+what is implemented and what is not.
+
+Let's create a new callback function where heuristics can be implemented
+to detect what is implemented and what not.
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 10 +++++++++-
+ drivers/media/usb/uvc/uvcvideo.h |  5 +++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 4b685f883..b6a3e2645 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -2362,7 +2362,7 @@ static int uvc_ctrl_add_info(struct uvc_device *dev, struct uvc_control *ctrl,
+ /*
+  * Add a control mapping to a given control.
+  */
+-static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
++static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
+ 	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
+ {
+ 	struct uvc_control_mapping *map;
+@@ -2436,6 +2436,14 @@ static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
+ 	return -ENOMEM;
+ }
+ 
++static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
++	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
++{
++	if (mapping && mapping->add_mapping)
++		return mapping->add_mapping(chain, ctrl, mapping);
++	return __uvc_ctrl_add_mapping_to_list(chain, ctrl, mapping);
++}
++
+ int uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
+ 	const struct uvc_control_mapping *mapping)
+ {
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 621d157e7..c3eeb21f4 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -87,7 +87,9 @@
+ 
+ struct gpio_desc;
+ struct sg_table;
++struct uvc_control;
+ struct uvc_device;
++struct uvc_video_chain;
+ 
+ /*
+  * TODO: Put the most frequently accessed fields at the beginning of
+@@ -126,6 +128,9 @@ struct uvc_control_mapping {
+ 	s32 master_manual;
+ 	u32 slave_ids[2];
+ 
++	int (*add_mapping)(struct uvc_video_chain *chain,
++			   struct uvc_control *ctrl,
++			   const struct uvc_control_mapping *mapping);
+ 	s32 (*get)(struct uvc_control_mapping *mapping, u8 query,
+ 		   const u8 *data);
+ 	void (*set)(struct uvc_control_mapping *mapping, s32 value,
+-- 
+2.45.1.145.g83f1add914
+
+
+From 7a924c9aa1306e34bcb1e9bb03d8195d70d12a78 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 23:09:53 +0000
+Subject: [PATCH 14/19] media: uvcvideo: Refactor Power Line Frequency limit
+ selection
+
+Move the PLF mapping logic to its own function. This patch does not
+introduce any new functionality to the logic, it is just a preparation
+patch.
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 93 +++++++++++++++++++-------------
+ 1 file changed, 55 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index b6a3e2645..8a053f7a0 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -459,6 +459,56 @@ static void uvc_ctrl_set_rel_speed(struct uvc_control_mapping *mapping,
+ 	data[first+1] = min_t(int, abs(value), 0xff);
+ }
+ 
++const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited = {
++	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
++	.entity		= UVC_GUID_UVC_PROCESSING,
++	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
++	.size		= 2,
++	.offset		= 0,
++	.v4l2_type	= V4L2_CTRL_TYPE_MENU,
++	.data_type	= UVC_CTRL_DATA_TYPE_ENUM,
++	.menu_mask	= GENMASK(V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
++				  V4L2_CID_POWER_LINE_FREQUENCY_50HZ),
++};
++
++const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc11 = {
++	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
++	.entity		= UVC_GUID_UVC_PROCESSING,
++	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
++	.size		= 2,
++	.offset		= 0,
++	.v4l2_type	= V4L2_CTRL_TYPE_MENU,
++	.data_type	= UVC_CTRL_DATA_TYPE_ENUM,
++	.menu_mask	= GENMASK(V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
++				  V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
++};
++
++static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc15 = {
++	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
++	.entity		= UVC_GUID_UVC_PROCESSING,
++	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
++	.size		= 2,
++	.offset		= 0,
++	.v4l2_type	= V4L2_CTRL_TYPE_MENU,
++	.data_type	= UVC_CTRL_DATA_TYPE_ENUM,
++	.menu_mask	= GENMASK(V4L2_CID_POWER_LINE_FREQUENCY_AUTO,
++				  V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
++};
++
++static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
++	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping);
++
++static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
++	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
++{
++	if (chain->dev->uvc_version < 0x150)
++		return __uvc_ctrl_add_mapping(chain, ctrl,
++					      &uvc_ctrl_power_line_mapping_uvc11);
++
++	return __uvc_ctrl_add_mapping(chain, ctrl,
++				      &uvc_ctrl_power_line_mapping_uvc15);
++}
++
+ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 	{
+ 		.id		= V4L2_CID_BRIGHTNESS,
+@@ -748,51 +798,18 @@ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 		.v4l2_type	= V4L2_CTRL_TYPE_BOOLEAN,
+ 		.data_type	= UVC_CTRL_DATA_TYPE_BOOLEAN,
+ 	},
+-};
+-
+-const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited = {
+-	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
+-	.entity		= UVC_GUID_UVC_PROCESSING,
+-	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+-	.size		= 2,
+-	.offset		= 0,
+-	.v4l2_type	= V4L2_CTRL_TYPE_MENU,
+-	.data_type	= UVC_CTRL_DATA_TYPE_ENUM,
+-	.menu_mask	= GENMASK(V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
+-				  V4L2_CID_POWER_LINE_FREQUENCY_50HZ),
+-};
+-
+-const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc11 = {
+-	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
+-	.entity		= UVC_GUID_UVC_PROCESSING,
+-	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+-	.size		= 2,
+-	.offset		= 0,
+-	.v4l2_type	= V4L2_CTRL_TYPE_MENU,
+-	.data_type	= UVC_CTRL_DATA_TYPE_ENUM,
+-	.menu_mask	= GENMASK(V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
+-				  V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
++	{
++		.entity		= UVC_GUID_UVC_PROCESSING,
++		.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
++		.add_mapping	= uvc_ctrl_add_plf_mapping,
++	},
+ };
+ 
+ static const struct uvc_control_mapping *uvc_ctrl_mappings_uvc11[] = {
+-	&uvc_ctrl_power_line_mapping_uvc11,
+ 	NULL, /* Sentinel */
+ };
+ 
+-static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc15 = {
+-	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
+-	.entity		= UVC_GUID_UVC_PROCESSING,
+-	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+-	.size		= 2,
+-	.offset		= 0,
+-	.v4l2_type	= V4L2_CTRL_TYPE_MENU,
+-	.data_type	= UVC_CTRL_DATA_TYPE_ENUM,
+-	.menu_mask	= GENMASK(V4L2_CID_POWER_LINE_FREQUENCY_AUTO,
+-				  V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
+-};
+-
+ static const struct uvc_control_mapping *uvc_ctrl_mappings_uvc15[] = {
+-	&uvc_ctrl_power_line_mapping_uvc15,
+ 	NULL, /* Sentinel */
+ };
+ 
+-- 
+2.45.1.145.g83f1add914
+
+
+From 6c4e475f1061afea1d09bdc11137efd43b30a2e7 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 23:09:54 +0000
+Subject: [PATCH 15/19] media: uvcvideo: Probe the PLF characteristics
+
+The UVC 1.5 standard defines 4 values for the PLF control: Off, 50Hz,
+60Hz and Auto. But it does not clearly define if all the values must be
+implemented or not.
+
+Instead of just using the UVC version to determine what the PLF control
+can do, probe it.
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 52 +++++++++++++++++++++++++++++---
+ 1 file changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 8a053f7a0..ba7b9476e 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -495,18 +495,60 @@ static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc15 = {
+ 				  V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
+ };
+ 
+-static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
++static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
+ 	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping);
+ 
+ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
+ 	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
+ {
++	const struct uvc_control_mapping *out_mapping =
++					&uvc_ctrl_power_line_mapping_uvc11;
++	u8 *buf __free(kfree) = NULL;
++	u8 init_val;
++	int ret;
++
++	buf = kmalloc(sizeof(*buf), GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	/* Save the default PLF value, so we can restore it. */
++	ret = uvc_query_ctrl(chain->dev, UVC_GET_CUR, ctrl->entity->id,
++			     chain->dev->intfnum, ctrl->info.selector,
++			     buf, sizeof(*buf));
++	/* If we cannot read the control skip it. */
++	if (ret)
++		return ret;
++	init_val = *buf;
++
++	/* If PLF value cannot be set to off, it is limited. */
++	*buf = V4L2_CID_POWER_LINE_FREQUENCY_DISABLED;
++	ret = uvc_query_ctrl(chain->dev, UVC_SET_CUR, ctrl->entity->id,
++			     chain->dev->intfnum, ctrl->info.selector,
++			     buf, sizeof(*buf));
++	if (ret)
++		return __uvc_ctrl_add_mapping_to_list(chain, ctrl,
++					&uvc_ctrl_power_line_mapping_limited);
++
++	/* UVC 1.1 does not define auto, we can exit. */
+ 	if (chain->dev->uvc_version < 0x150)
+-		return __uvc_ctrl_add_mapping(chain, ctrl,
+-					      &uvc_ctrl_power_line_mapping_uvc11);
++		goto end;
++
++	/* Check if the device supports auto. */
++	*buf = V4L2_CID_POWER_LINE_FREQUENCY_AUTO;
++	ret = uvc_query_ctrl(chain->dev, UVC_SET_CUR, ctrl->entity->id,
++			     chain->dev->intfnum, ctrl->info.selector,
++			     buf, sizeof(*buf));
++	if (!ret)
++		out_mapping = &uvc_ctrl_power_line_mapping_uvc15;
++
++end:
++	/* Restore initial value and add mapping. */
++	*buf = init_val;
++	uvc_query_ctrl(chain->dev, UVC_SET_CUR, ctrl->entity->id,
++		       chain->dev->intfnum, ctrl->info.selector,
++		       buf, sizeof(*buf));
+ 
+-	return __uvc_ctrl_add_mapping(chain, ctrl,
+-				      &uvc_ctrl_power_line_mapping_uvc15);
++	return __uvc_ctrl_add_mapping_to_list(chain, ctrl, out_mapping);
+ }
+ 
+ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+-- 
+2.45.1.145.g83f1add914
+
+
+From b8ac53a13652d48705de74117d38c7ef8cf11fd9 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 23:09:55 +0000
+Subject: [PATCH 16/19] media: uvcvideo: Cleanup version-specific mapping
+
+We do not have more version specific mappings. Let's remove this code
+for now. It can be easily reverted later if needed.
+
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 21 ---------------------
+ 1 file changed, 21 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index ba7b9476e..7e2a78b79 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -847,14 +847,6 @@ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 	},
+ };
+ 
+-static const struct uvc_control_mapping *uvc_ctrl_mappings_uvc11[] = {
+-	NULL, /* Sentinel */
+-};
+-
+-static const struct uvc_control_mapping *uvc_ctrl_mappings_uvc15[] = {
+-	NULL, /* Sentinel */
+-};
+-
+ /* ------------------------------------------------------------------------
+  * Utility functions
+  */
+@@ -2658,7 +2650,6 @@ static void uvc_ctrl_prune_entity(struct uvc_device *dev,
+ static void uvc_ctrl_init_ctrl(struct uvc_video_chain *chain,
+ 			       struct uvc_control *ctrl)
+ {
+-	const struct uvc_control_mapping **mappings;
+ 	unsigned int i;
+ 
+ 	/*
+@@ -2723,18 +2714,6 @@ static void uvc_ctrl_init_ctrl(struct uvc_video_chain *chain,
+ 		    ctrl->info.selector == mapping->selector)
+ 			__uvc_ctrl_add_mapping(chain, ctrl, mapping);
+ 	}
+-
+-	/* Finally process version-specific mappings. */
+-	mappings = chain->dev->uvc_version < 0x0150
+-		 ? uvc_ctrl_mappings_uvc11 : uvc_ctrl_mappings_uvc15;
+-
+-	for (i = 0; mappings[i]; ++i) {
+-		const struct uvc_control_mapping *mapping = mappings[i];
+-
+-		if (uvc_entity_match_guid(ctrl->entity, mapping->entity) &&
+-		    ctrl->info.selector == mapping->selector)
+-			__uvc_ctrl_add_mapping(chain, ctrl, mapping);
+-	}
+ }
+ 
+ /*
+-- 
+2.45.1.145.g83f1add914
+
+
+From 7856028c761a97a3f731743789a2fbb3fc5a706a Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 23:09:56 +0000
+Subject: [PATCH 17/19] media: uvcvideo: Remove PLF device quirking
+
+We can use heuristics to figure out the proper range of the control
+instead of quirking every single device.
+
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c   |   4 +-
+ drivers/media/usb/uvc/uvc_driver.c | 131 -----------------------------
+ drivers/media/usb/uvc/uvcvideo.h   |   2 -
+ 3 files changed, 2 insertions(+), 135 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 7e2a78b79..156177548 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -459,7 +459,7 @@ static void uvc_ctrl_set_rel_speed(struct uvc_control_mapping *mapping,
+ 	data[first+1] = min_t(int, abs(value), 0xff);
+ }
+ 
+-const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited = {
++static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited = {
+ 	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
+ 	.entity		= UVC_GUID_UVC_PROCESSING,
+ 	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+@@ -471,7 +471,7 @@ const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited = {
+ 				  V4L2_CID_POWER_LINE_FREQUENCY_50HZ),
+ };
+ 
+-const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc11 = {
++static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc11 = {
+ 	.id		= V4L2_CID_POWER_LINE_FREQUENCY,
+ 	.entity		= UVC_GUID_UVC_PROCESSING,
+ 	.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index 214ca27a2..e51e3b73b 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2411,20 +2411,6 @@ MODULE_PARM_DESC(timeout, "Streaming control requests timeout");
+  * Driver initialization and cleanup
+  */
+ 
+-static const struct uvc_device_info uvc_ctrl_power_line_limited = {
+-	.mappings = (const struct uvc_control_mapping *[]) {
+-		&uvc_ctrl_power_line_mapping_limited,
+-		NULL, /* Sentinel */
+-	},
+-};
+-
+-static const struct uvc_device_info uvc_ctrl_power_line_uvc11 = {
+-	.mappings = (const struct uvc_control_mapping *[]) {
+-		&uvc_ctrl_power_line_mapping_uvc11,
+-		NULL, /* Sentinel */
+-	},
+-};
+-
+ static const struct uvc_device_info uvc_quirk_probe_minmax = {
+ 	.quirks = UVC_QUIRK_PROBE_MINMAX,
+ };
+@@ -2455,33 +2441,6 @@ static const struct uvc_device_info uvc_quirk_force_y8 = {
+  * though they are compliant.
+  */
+ static const struct usb_device_id uvc_ids[] = {
+-	/* Quanta USB2.0 HD UVC Webcam */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x0408,
+-	  .idProduct		= 0x3090,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+-	/* Quanta USB2.0 HD UVC Webcam */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x0408,
+-	  .idProduct		= 0x4030,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+-	/* Quanta USB2.0 HD UVC Webcam */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x0408,
+-	  .idProduct		= 0x4034,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= UVC_PC_PROTOCOL_15,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+ 	/* LogiLink Wireless Webcam */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+@@ -2648,42 +2607,6 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+ 	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTRICT_FRAME_RATE) },
+-	/* Chicony EasyCamera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x04f2,
+-	  .idProduct		= 0xb5eb,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+-	/* Chicony Electronics Co., Ltd Integrated Camera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x04f2,
+-	  .idProduct		= 0xb67c,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= UVC_PC_PROTOCOL_15,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_uvc11 },
+-	/* Chicony EasyCamera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x04f2,
+-	  .idProduct		= 0xb6ba,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+-	/* Chicony EasyCamera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x04f2,
+-	  .idProduct		= 0xb746,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+ 	/* Alcor Micro AU3820 (Future Boy PC USB Webcam) */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+@@ -3068,15 +2991,6 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+ 	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_FORCE_BPP) },
+-	/* SunplusIT Inc HD Camera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x2b7e,
+-	  .idProduct		= 0xb752,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= UVC_PC_PROTOCOL_15,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_uvc11 },
+ 	/* Insta360 Link */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+@@ -3086,51 +3000,6 @@ static const struct usb_device_id uvc_ids[] = {
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0,
+ 	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_DISABLE_AUTOSUSPEND) },
+-	/* Lenovo Integrated Camera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x30c9,
+-	  .idProduct		= 0x0093,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= UVC_PC_PROTOCOL_15,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_uvc11 },
+-	/* Sonix Technology USB 2.0 Camera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x3277,
+-	  .idProduct		= 0x0072,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+-	/* Shine-Optics Integrated Camera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x3277,
+-	  .idProduct		= 0x009e,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= UVC_PC_PROTOCOL_15,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_uvc11 },
+-	/* Acer EasyCamera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x5986,
+-	  .idProduct		= 0x1172,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+-	/* Acer EasyCamera */
+-	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+-				| USB_DEVICE_ID_MATCH_INT_INFO,
+-	  .idVendor		= 0x5986,
+-	  .idProduct		= 0x1180,
+-	  .bInterfaceClass	= USB_CLASS_VIDEO,
+-	  .bInterfaceSubClass	= 1,
+-	  .bInterfaceProtocol	= 0,
+-	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+ 	/* Intel D410/ASR depth camera */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index c3eeb21f4..b67e8220e 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -759,8 +759,6 @@ int uvc_status_get(struct uvc_device *dev);
+ void uvc_status_put(struct uvc_device *dev);
+ 
+ /* Controls */
+-extern const struct uvc_control_mapping uvc_ctrl_power_line_mapping_limited;
+-extern const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc11;
+ extern const struct v4l2_subscribed_event_ops uvc_ctrl_sub_ev_ops;
+ 
+ int uvc_query_v4l2_ctrl(struct uvc_video_chain *chain,
+-- 
+2.45.1.145.g83f1add914
+
+
+From 86cf53191d46c7c7c97127284ad0466f250ccded Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 23:09:57 +0000
+Subject: [PATCH 18/19] media: uvcvideo: Remove mappings form uvc_device_info
+
+We do not have any quirk device making us of this. Remove from now. It
+can be easily reverted later if needed.
+
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 27 +--------------------------
+ drivers/media/usb/uvc/uvcvideo.h |  1 -
+ 2 files changed, 1 insertion(+), 27 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 156177548..12b9db7d6 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -2681,32 +2681,7 @@ static void uvc_ctrl_init_ctrl(struct uvc_video_chain *chain,
+ 	if (!ctrl->initialized)
+ 		return;
+ 
+-	/*
+-	 * First check if the device provides a custom mapping for this control,
+-	 * used to override standard mappings for non-conformant devices. Don't
+-	 * process standard mappings if a custom mapping is found. This
+-	 * mechanism doesn't support combining standard and custom mappings for
+-	 * a single control.
+-	 */
+-	if (chain->dev->info->mappings) {
+-		bool custom = false;
+-
+-		for (i = 0; chain->dev->info->mappings[i]; ++i) {
+-			const struct uvc_control_mapping *mapping =
+-				chain->dev->info->mappings[i];
+-
+-			if (uvc_entity_match_guid(ctrl->entity, mapping->entity) &&
+-			    ctrl->info.selector == mapping->selector) {
+-				__uvc_ctrl_add_mapping(chain, ctrl, mapping);
+-				custom = true;
+-			}
+-		}
+-
+-		if (custom)
+-			return;
+-	}
+-
+-	/* Process common mappings next. */
++	/* Process common mappings. */
+ 	for (i = 0; i < ARRAY_SIZE(uvc_ctrl_mappings); ++i) {
+ 		const struct uvc_control_mapping *mapping = &uvc_ctrl_mappings[i];
+ 
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index b67e8220e..32fc94e01 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -531,7 +531,6 @@ struct uvc_device_info {
+ 	u32	quirks;
+ 	u32	meta_format;
+ 	u16	uvc_version;
+-	const struct uvc_control_mapping **mappings;
+ };
+ 
+ struct uvc_status_streaming {
+-- 
+2.45.1.145.g83f1add914
+
+
+From 662b099692d64ea54e02a7de53f8e8209090c3a5 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 10 Jun 2024 23:09:58 +0000
+Subject: [PATCH 19/19] media: uvcvideo: Replace get_mapping with
+ filter_mapping
+
+If the callback returns a mapping instead of adding it, the codeflow is
+more clean and we do not need a forward declaration of
+__uvc_ctrl_add_mapping_to_list().
+
+Suggested-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 40 ++++++++++++++------------------
+ drivers/media/usb/uvc/uvcvideo.h |  6 ++---
+ 2 files changed, 21 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 12b9db7d6..37af2e817 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -495,11 +495,8 @@ static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc15 = {
+ 				  V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
+ };
+ 
+-static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
+-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping);
+-
+-static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
+-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
++static const struct uvc_control_mapping *uvc_ctrl_filter_plf_mapping
++		(struct uvc_video_chain *chain, struct uvc_control *ctrl)
+ {
+ 	const struct uvc_control_mapping *out_mapping =
+ 					&uvc_ctrl_power_line_mapping_uvc11;
+@@ -509,7 +506,7 @@ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
+ 
+ 	buf = kmalloc(sizeof(*buf), GFP_KERNEL);
+ 	if (!buf)
+-		return -ENOMEM;
++		return NULL;
+ 
+ 	/* Save the default PLF value, so we can restore it. */
+ 	ret = uvc_query_ctrl(chain->dev, UVC_GET_CUR, ctrl->entity->id,
+@@ -517,7 +514,7 @@ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
+ 			     buf, sizeof(*buf));
+ 	/* If we cannot read the control skip it. */
+ 	if (ret)
+-		return ret;
++		return NULL;
+ 	init_val = *buf;
+ 
+ 	/* If PLF value cannot be set to off, it is limited. */
+@@ -526,8 +523,7 @@ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
+ 			     chain->dev->intfnum, ctrl->info.selector,
+ 			     buf, sizeof(*buf));
+ 	if (ret)
+-		return __uvc_ctrl_add_mapping_to_list(chain, ctrl,
+-					&uvc_ctrl_power_line_mapping_limited);
++		return &uvc_ctrl_power_line_mapping_limited;
+ 
+ 	/* UVC 1.1 does not define auto, we can exit. */
+ 	if (chain->dev->uvc_version < 0x150)
+@@ -548,7 +544,7 @@ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
+ 		       chain->dev->intfnum, ctrl->info.selector,
+ 		       buf, sizeof(*buf));
+ 
+-	return __uvc_ctrl_add_mapping_to_list(chain, ctrl, out_mapping);
++	return out_mapping;
+ }
+ 
+ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+@@ -843,7 +839,7 @@ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 	{
+ 		.entity		= UVC_GUID_UVC_PROCESSING,
+ 		.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+-		.add_mapping	= uvc_ctrl_add_plf_mapping,
++		.filter_mapping	= uvc_ctrl_filter_plf_mapping,
+ 	},
+ };
+ 
+@@ -2413,8 +2409,9 @@ static int uvc_ctrl_add_info(struct uvc_device *dev, struct uvc_control *ctrl,
+ /*
+  * Add a control mapping to a given control.
+  */
+-static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
+-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
++static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
++				  struct uvc_control *ctrl,
++				  const struct uvc_control_mapping *mapping)
+ {
+ 	struct uvc_control_mapping *map;
+ 	unsigned int size;
+@@ -2487,14 +2484,6 @@ static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
+ 	return -ENOMEM;
+ }
+ 
+-static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
+-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
+-{
+-	if (mapping && mapping->add_mapping)
+-		return mapping->add_mapping(chain, ctrl, mapping);
+-	return __uvc_ctrl_add_mapping_to_list(chain, ctrl, mapping);
+-}
+-
+ int uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
+ 	const struct uvc_control_mapping *mapping)
+ {
+@@ -2683,7 +2672,14 @@ static void uvc_ctrl_init_ctrl(struct uvc_video_chain *chain,
+ 
+ 	/* Process common mappings. */
+ 	for (i = 0; i < ARRAY_SIZE(uvc_ctrl_mappings); ++i) {
+-		const struct uvc_control_mapping *mapping = &uvc_ctrl_mappings[i];
++		const struct uvc_control_mapping *mapping = NULL;
++
++		/* Try to get a custom mapping from the device. */
++		if (uvc_ctrl_mappings[i].filter_mapping)
++			mapping = uvc_ctrl_mappings[i].filter_mapping(chain,
++								      ctrl);
++		if (!mapping)
++			mapping = &uvc_ctrl_mappings[i];
+ 
+ 		if (uvc_entity_match_guid(ctrl->entity, mapping->entity) &&
+ 		    ctrl->info.selector == mapping->selector)
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 32fc94e01..07f9921d8 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -128,9 +128,9 @@ struct uvc_control_mapping {
+ 	s32 master_manual;
+ 	u32 slave_ids[2];
+ 
+-	int (*add_mapping)(struct uvc_video_chain *chain,
+-			   struct uvc_control *ctrl,
+-			   const struct uvc_control_mapping *mapping);
++	const struct uvc_control_mapping *(*filter_mapping)
++				(struct uvc_video_chain *chain,
++				struct uvc_control *ctrl);
+ 	s32 (*get)(struct uvc_control_mapping *mapping, u8 query,
+ 		   const u8 *data);
+ 	void (*set)(struct uvc_control_mapping *mapping, s32 value,
+-- 
+2.45.1.145.g83f1add914
+
