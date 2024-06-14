@@ -1,0 +1,197 @@
+From 50e45eb39d70318d9c1349b274d7e69751ad6e8b Mon Sep 17 00:00:00 2001
+From: Perry Yuan <perry.yuan@amd.com>
+Date: Mon, 13 May 2024 10:07:27 +0800
+Subject: [PATCH 27/35] cpufreq: amd-pstate: implement heterogeneous core
+ topology for highest performance initialization
+
+Introduces an optimization to the AMD-Pstate driver by implementing
+a heterogeneous core topology for the initialization of the highest
+performance value while driver loading.
+There are two type cores designed including performance core and
+Efficiency Core.
+Each core type has different highest performance and frequency values
+configured by the platform.  The `amd_pstate` driver needs to identify
+the type of core to correctly set an appropriate highest perf value.
+
+X86_FEATURE_HETERO_CORE_TOPOLOGY is used to identify whether the
+processor support heterogeneous core type by reading CPUID leaf
+Fn_0x80000026_EAX and bit 30. if the bit is set as one, then amd_pstate
+driver will check EBX 30:28 bits to get the core type.
+
+PDF p274
+
+Link: https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24593.pdf
+Signed-off-by: Perry Yuan <perry.yuan@amd.com>
+---
+ arch/x86/include/asm/processor.h |  2 +
+ arch/x86/kernel/cpu/amd.c        | 19 +++++++++
+ drivers/cpufreq/amd-pstate.c     | 66 ++++++++++++++++++++------------
+ include/linux/amd-pstate.h       |  8 ++++
+ 4 files changed, 71 insertions(+), 24 deletions(-)
+
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 78e51b0d6..04d30dd35 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -682,10 +682,12 @@ static inline u32 per_cpu_l2c_id(unsigned int cpu)
+ extern u32 amd_get_highest_perf(void);
+ extern void amd_clear_divider(void);
+ extern void amd_check_microcode(void);
++extern int amd_get_this_core_type(void);
+ #else
+ static inline u32 amd_get_highest_perf(void)		{ return 0; }
+ static inline void amd_clear_divider(void)		{ }
+ static inline void amd_check_microcode(void)		{ }
++static inline int amd_get_this_core_type(void)		{ return -1; }
+ #endif
+ 
+ extern unsigned long arch_align_stack(unsigned long sp);
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 307302af0..67966bdcd 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -1219,3 +1219,22 @@ void noinstr amd_clear_divider(void)
+ 		     :: "a" (0), "d" (0), "r" (1));
+ }
+ EXPORT_SYMBOL_GPL(amd_clear_divider);
++
++#define X86_CPU_TYPE_ID_SHIFT	28
++
++/**
++ * amd_get_this_core_type - Get the type of this heterogeneous CPU
++ *
++ * Returns the CPU type [31:28] (i.e., performance or efficient) of
++ * a CPU in the processor.
++ * If the processor has no core type support, returns -1.
++ */
++
++int amd_get_this_core_type(void)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_HETERO_CORE_TOPOLOGY))
++		return -1;
++
++	return cpuid_ebx(0x80000026) >> X86_CPU_TYPE_ID_SHIFT;
++}
++EXPORT_SYMBOL_GPL(amd_get_this_core_type);
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index ca879b75d..d2a93c6fd 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -50,8 +50,9 @@
+ 
+ #define AMD_PSTATE_TRANSITION_LATENCY	20000
+ #define AMD_PSTATE_TRANSITION_DELAY	1000
+-#define CPPC_HIGHEST_PERF_PERFORMANCE	196
+-#define CPPC_HIGHEST_PERF_DEFAULT	166
++#define CPPC_HIGHEST_PERF_EFFICIENT		132
++#define CPPC_HIGHEST_PERF_PERFORMANCE		196
++#define CPPC_HIGHEST_PERF_DEFAULT		166
+ 
+ /*
+  * TODO: We need more time to fine tune processors with shared memory solution
+@@ -329,19 +330,47 @@ static inline int amd_pstate_enable(bool enable)
+ 	return static_call(amd_pstate_enable)(enable);
+ }
+ 
++static void get_this_core_type(void *data)
++{
++	int *cpu_type = data;
++
++	*cpu_type = amd_get_this_core_type();
++}
++
++static int amd_pstate_get_cpu_type(int cpu)
++{
++	int cpu_type = 0;
++
++	smp_call_function_single(cpu, get_this_core_type, &cpu_type, 1);
++
++	return cpu_type;
++}
++
+ static u32 amd_pstate_highest_perf_set(struct amd_cpudata *cpudata)
+ {
+-	struct cpuinfo_x86 *c = &cpu_data(0);
++	u32 highest_perf;
++	int core_type;
+ 
+-	/*
+-	 * For AMD CPUs with Family ID 19H and Model ID range 0x70 to 0x7f,
+-	 * the highest performance level is set to 196.
+-	 * https://bugzilla.kernel.org/show_bug.cgi?id=218759
+-	 */
+-	if (c->x86 == 0x19 && (c->x86_model >= 0x70 && c->x86_model <= 0x7f))
+-		return CPPC_HIGHEST_PERF_PERFORMANCE;
++	core_type = amd_pstate_get_cpu_type(cpudata->cpu);
++	pr_debug("core_type %d found\n", core_type);
+ 
+-	return CPPC_HIGHEST_PERF_DEFAULT;
++	switch (core_type) {
++	case CPU_CORE_TYPE_NO_HETERO_SUP:
++		highest_perf = CPPC_HIGHEST_PERF_DEFAULT;
++		break;
++	case CPU_CORE_TYPE_PERFORMANCE:
++		highest_perf = CPPC_HIGHEST_PERF_PERFORMANCE;
++		break;
++	case CPU_CORE_TYPE_EFFICIENCY:
++		highest_perf = CPPC_HIGHEST_PERF_EFFICIENT;
++		break;
++	default:
++		highest_perf = CPPC_HIGHEST_PERF_DEFAULT;
++		WARN_ONCE(true, "WARNING: Undefined core type found");
++		break;
++	}
++
++    return highest_perf;
+ }
+ 
+ static int pstate_init_perf(struct amd_cpudata *cpudata)
+@@ -354,15 +383,7 @@ static int pstate_init_perf(struct amd_cpudata *cpudata)
+ 	if (ret)
+ 		return ret;
+ 
+-	/* For platforms that do not support the preferred core feature, the
+-	 * highest_pef may be configured with 166 or 255, to avoid max frequency
+-	 * calculated wrongly. we take the AMD_CPPC_HIGHEST_PERF(cap1) value as
+-	 * the default max perf.
+-	 */
+-	if (cpudata->hw_prefcore)
+-		highest_perf = amd_pstate_highest_perf_set(cpudata);
+-	else
+-		highest_perf = AMD_CPPC_HIGHEST_PERF(cap1);
++	highest_perf = amd_pstate_highest_perf_set(cpudata);
+ 
+ 	WRITE_ONCE(cpudata->highest_perf, highest_perf);
+ 	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
+@@ -383,10 +404,7 @@ static int cppc_init_perf(struct amd_cpudata *cpudata)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (cpudata->hw_prefcore)
+-		highest_perf = amd_pstate_highest_perf_set(cpudata);
+-	else
+-		highest_perf = cppc_perf.highest_perf;
++	highest_perf = amd_pstate_highest_perf_set(cpudata);
+ 
+ 	WRITE_ONCE(cpudata->highest_perf, highest_perf);
+ 	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
+diff --git a/include/linux/amd-pstate.h b/include/linux/amd-pstate.h
+index 56f616a5c..ebb7de0cd 100644
+--- a/include/linux/amd-pstate.h
++++ b/include/linux/amd-pstate.h
+@@ -148,4 +148,12 @@ struct amd_pstate_global_params {
+ 
+ extern struct amd_pstate_global_params amd_pstate_global_params;
+ 
++/* defined by CPUID_Fn80000026_EBX BIT [31:28] */
++enum amd_core_type {
++	CPU_CORE_TYPE_NO_HETERO_SUP = -1,
++	CPU_CORE_TYPE_PERFORMANCE = 0,
++	CPU_CORE_TYPE_EFFICIENCY = 1,
++	CPU_CORE_TYPE_UNDEFINED = 2,
++};
++
+ #endif /* _LINUX_AMD_PSTATE_H */
+-- 
+2.45.1.145.g83f1add914
+
