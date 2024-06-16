@@ -1,0 +1,302 @@
+From a4624d3375b951589c565667f74eacda35662a2d Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:53 -0400
+Subject: [PATCH 1/5] btrfs: New helper to clear EXTENT_BUFFER_READING
+
+We are clearing the bit and waking up any waiters in two different
+places.  Factor that code out into a static helper function.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 41173701f..03ad6c579 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4269,6 +4269,13 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
+ 	}
+ }
+ 
++static void clear_extent_buffer_reading(struct extent_buffer *eb)
++{
++	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
++	smp_mb__after_atomic();
++	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++}
++
+ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ {
+ 	struct extent_buffer *eb = bbio->private;
+@@ -4303,9 +4310,7 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 		bio_offset += len;
+ 	}
+ 
+-	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-	smp_mb__after_atomic();
+-	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++	clear_extent_buffer_reading(eb);
+ 	free_extent_buffer(eb);
+ 
+ 	bio_put(&bbio->bio);
+@@ -4339,9 +4344,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
+ 	 * will now be set, and we shouldn't read it in again.
+ 	 */
+ 	if (unlikely(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))) {
+-		clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+-		smp_mb__after_atomic();
+-		wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
++		clear_extent_buffer_reading(eb);
+ 		return 0;
+ 	}
+ 
+-- 
+2.45.1.145.g83f1add914
+
+
+From 1d56e5b951156b0dd295c255294830b54c53de94 Mon Sep 17 00:00:00 2001
+From: Tavian Barnes <tavianator@tavianator.com>
+Date: Mon, 18 Mar 2024 09:56:54 -0400
+Subject: [PATCH 2/5] btrfs: WARN if EXTENT_BUFFER_UPTODATE is set while
+ reading
+
+We recently tracked down a race condition that triggered a read for an
+extent buffer with EXTENT_BUFFER_UPTODATE already set.  While this read
+was in progress, other concurrent readers would see the UPTODATE bit and
+return early as if the read was already complete, making accesses to the
+extent buffer conflict with the read operation that was overwriting it.
+
+Add a WARN_ON() to end_bbio_meta_read() for this situation to make
+similar races easier to spot in the future.
+
+Signed-off-by: Tavian Barnes <tavianator@tavianator.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/extent_io.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 03ad6c579..c0deff372 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -4284,6 +4284,13 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
+ 	struct folio_iter fi;
+ 	u32 bio_offset = 0;
+ 
++	/*
++	 * If the extent buffer is marked UPTODATE before the read operation
++	 * completes, other calls to read_extent_buffer_pages() will return
++	 * early without waiting for the read to finish, causing data races.
++	 */
++	WARN_ON(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags));
++
+ 	eb->read_mirror = bbio->mirror_num;
+ 
+ 	if (uptodate &&
+-- 
+2.45.1.145.g83f1add914
+
+
+From c66834dbce10e5fa573fe33aed15590b054bd285 Mon Sep 17 00:00:00 2001
+From: Shantanu Goel <sgoel01@yahoo.com>
+Date: Wed, 5 Jun 2024 21:52:00 +0000
+Subject: [PATCH 3/5] uas: set host status byte on data completion error
+
+Given a disk enclosure which is prone to data completion errors during
+initialization and because the UAS driver only sets the resid on a data
+completion error and not the host status byte, the SD driver ends up using
+invalid zero'ed data:
+
+sd 0:0:0:1: [sdf] tag#9 data cmplt err -75 uas-tag 1 inflight:
+sd 0:0:0:1: [sdf] tag#9 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 0:0:0:1: [sdf] Sector size 0 reported, assuming 512.
+sd 2:0:0:1: [sdn] Preferred minimum I/O size 4096 bytes
+sd 2:0:0:1: [sdn] Optimal transfer size 33553920 bytes not a multiple of preferred minimum block size (4096 bytes)
+sd 1:0:0:0: [sdd] tag#29 data cmplt err -75 uas-tag 1 inflight:
+sd 1:0:0:0: [sdd] tag#29 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 1:0:0:0: [sdd] Sector size 0 reported, assuming 512.
+sd 7:0:0:0: [sde] Attached SCSI disk
+sd 3:0:0:1: [sdk] tag#16 data cmplt err -75 uas-tag 1 inflight:
+sd 3:0:0:1: [sdk] tag#16 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 3:0:0:1: [sdk] Sector size 0 reported, assuming 512.
+sd 5:0:0:0: [sdo] tag#10 data cmplt err -75 uas-tag 1 inflight:
+sd 5:0:0:0: [sdo] tag#10 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 5:0:0:0: [sdo] Sector size 0 reported, assuming 512.
+sd 4:0:0:1: [sdj] tag#10 data cmplt err -75 uas-tag 2 inflight:
+sd 4:0:0:1: [sdj] tag#10 CDB: Read capacity(16) 9e 10 00 00 00 00 00 00 00 00 00 00 00 20 00 00
+sd 4:0:0:1: [sdj] Sector size 0 reported, assuming 512.
+
+The patch fixes this by setting the host status byte to DID_ERROR
+so the SD driver will notice the error and retry the command. The zero
+sector sizes above are not seen any more, and all sizes are detected
+correctly despite the presence of completion errors.
+
+Link: https://lore.kernel.org/all/675774215.2024605.1717624320352@mail.yahoo.com/
+Signed-off-by: Shantanu Goel <sgoel01@yahoo.com>
+---
+ drivers/usb/storage/uas.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 08953f0d4..345596890 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -422,6 +422,7 @@ static void uas_data_cmplt(struct urb *urb)
+ 			uas_log_cmd_state(cmnd, "data cmplt err", status);
+ 		/* error: no data transfered */
+ 		scsi_set_resid(cmnd, sdb->length);
++		set_host_byte(cmnd, DID_ERROR);
+ 	} else {
+ 		scsi_set_resid(cmnd, sdb->length - urb->actual_length);
+ 	}
+-- 
+2.45.1.145.g83f1add914
+
+
+From 674fa31bb134ea46546cfd501b7d99c875e32577 Mon Sep 17 00:00:00 2001
+From: Bart Van Assche <bvanassche@acm.org>
+Date: Tue, 11 Jun 2024 16:08:44 -0700
+Subject: [PATCH 4/5] sd: usb-storage: skip IO hints on slave_alloc()
+
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ drivers/scsi/sd.c              | 4 ++++
+ drivers/usb/storage/scsiglue.c | 2 ++
+ include/scsi/scsi_devinfo.h    | 4 +++-
+ 3 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index caac482ff..3e6a4e43f 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -63,6 +63,7 @@
+ #include <scsi/scsi_cmnd.h>
+ #include <scsi/scsi_dbg.h>
+ #include <scsi/scsi_device.h>
++#include <scsi/scsi_devinfo.h>
+ #include <scsi/scsi_driver.h>
+ #include <scsi/scsi_eh.h>
+ #include <scsi/scsi_host.h>
+@@ -3125,6 +3126,9 @@ static void sd_read_io_hints(struct scsi_disk *sdkp, unsigned char *buffer)
+ 	struct scsi_mode_data data;
+ 	int res;
+ 
++	if (sdp->sdev_bflags & BLIST_SKIP_IO_HINTS)
++		return;
++
+ 	res = scsi_mode_sense(sdp, /*dbd=*/0x8, /*modepage=*/0x0a,
+ 			      /*subpage=*/0x05, buffer, SD_BUF_SIZE, SD_TIMEOUT,
+ 			      sdkp->max_retries, &data, &sshdr);
+diff --git a/drivers/usb/storage/scsiglue.c b/drivers/usb/storage/scsiglue.c
+index 12cf9940e..39ef39854 100644
+--- a/drivers/usb/storage/scsiglue.c
++++ b/drivers/usb/storage/scsiglue.c
+@@ -86,6 +86,8 @@ static int slave_alloc (struct scsi_device *sdev)
+ 	if (us->protocol == USB_PR_BULK && us->max_lun > 0)
+ 		sdev->sdev_bflags |= BLIST_FORCELUN;
+ 
++	sdev->sdev_bflags |= BLIST_SKIP_IO_HINTS;
++
+ 	return 0;
+ }
+ 
+diff --git a/include/scsi/scsi_devinfo.h b/include/scsi/scsi_devinfo.h
+index 6b548dc2c..fa8721e49 100644
+--- a/include/scsi/scsi_devinfo.h
++++ b/include/scsi/scsi_devinfo.h
+@@ -69,8 +69,10 @@
+ #define BLIST_RETRY_ITF		((__force blist_flags_t)(1ULL << 32))
+ /* Always retry ABORTED_COMMAND with ASC 0xc1 */
+ #define BLIST_RETRY_ASC_C1	((__force blist_flags_t)(1ULL << 33))
++/* Do not read the I/O hints mode page */
++#define BLIST_SKIP_IO_HINTS	((__force blist_flags_t)(1ULL << 34))
+ 
+-#define __BLIST_LAST_USED BLIST_RETRY_ASC_C1
++#define __BLIST_LAST_USED BLIST_SKIP_IO_HINTS
+ 
+ #define __BLIST_HIGH_UNUSED (~(__BLIST_LAST_USED | \
+ 			       (__force blist_flags_t) \
+-- 
+2.45.1.145.g83f1add914
+
+
+From 8493e7cc5cf051073e9897e446721a7dedabf103 Mon Sep 17 00:00:00 2001
+From: Mario Limonciello <mario.limonciello@amd.com>
+Date: Thu, 9 May 2024 13:45:02 -0500
+Subject: [PATCH 5/5] ACPI: x86: Force StorageD3Enable on more products
+
+A Rembrandt-based HP thin client is reported to have problems where
+the NVME disk isn't present after resume from s2idle.
+
+This is because the NVME disk wasn't put into D3 at suspend, and
+that happened because the StorageD3Enable _DSD was missing in the BIOS.
+
+As AMD's architecture requires that the NVME is in D3 for s2idle, adjust
+the criteria for force_storage_d3 to match *all* Zen SoCs when the FADT
+advertises low power idle support.
+
+This will ensure that any future products with this BIOS deficiency don't
+need to be added to the allow list of overrides.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+---
+ drivers/acpi/x86/utils.c | 24 ++++++++++--------------
+ 1 file changed, 10 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/acpi/x86/utils.c b/drivers/acpi/x86/utils.c
+index 90c3d2eab..7507a7706 100644
+--- a/drivers/acpi/x86/utils.c
++++ b/drivers/acpi/x86/utils.c
+@@ -197,16 +197,16 @@ bool acpi_device_override_status(struct acpi_device *adev, unsigned long long *s
+ }
+ 
+ /*
+- * AMD systems from Renoir and Lucienne *require* that the NVME controller
++ * AMD systems from Renoir onwards *require* that the NVME controller
+  * is put into D3 over a Modern Standby / suspend-to-idle cycle.
+  *
+  * This is "typically" accomplished using the `StorageD3Enable`
+  * property in the _DSD that is checked via the `acpi_storage_d3` function
+- * but this property was introduced after many of these systems launched
+- * and most OEM systems don't have it in their BIOS.
++ * but some OEM systems still don't have it in their BIOS.
+  *
+  * The Microsoft documentation for StorageD3Enable mentioned that Windows has
+- * a hardcoded allowlist for D3 support, which was used for these platforms.
++ * a hardcoded allowlist for D3 support as well as a registry key to override
++ * the BIOS, which has been used for these cases.
+  *
+  * This allows quirking on Linux in a similar fashion.
+  *
+@@ -219,19 +219,15 @@ bool acpi_device_override_status(struct acpi_device *adev, unsigned long long *s
+  *    https://bugzilla.kernel.org/show_bug.cgi?id=216773
+  *    https://bugzilla.kernel.org/show_bug.cgi?id=217003
+  * 2) On at least one HP system StorageD3Enable is missing on the second NVME
+-      disk in the system.
++ *    disk in the system.
++ * 3) On at least one HP Rembrandt system StorageD3Enable is missing on the only
++ *    NVME device.
+  */
+-static const struct x86_cpu_id storage_d3_cpu_ids[] = {
+-	X86_MATCH_VENDOR_FAM_MODEL(AMD, 23, 24, NULL),  /* Picasso */
+-	X86_MATCH_VENDOR_FAM_MODEL(AMD, 23, 96, NULL),	/* Renoir */
+-	X86_MATCH_VENDOR_FAM_MODEL(AMD, 23, 104, NULL),	/* Lucienne */
+-	X86_MATCH_VENDOR_FAM_MODEL(AMD, 25, 80, NULL),	/* Cezanne */
+-	{}
+-};
+-
+ bool force_storage_d3(void)
+ {
+-	return x86_match_cpu(storage_d3_cpu_ids);
++	if (!cpu_feature_enabled(X86_FEATURE_ZEN))
++		return false;
++	return acpi_gbl_FADT.flags & ACPI_FADT_LOW_POWER_S0;
+ }
+ 
+ /*
+-- 
+2.45.1.145.g83f1add914
+
