@@ -1,0 +1,1121 @@
+From f3eacb090c72853a1ee9ce507e8c79dcd3f4f34d Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Wed, 26 Jun 2024 08:32:44 +0200
+Subject: [PATCH] bcachefs-6.10: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ fs/bcachefs/alloc_background.c      | 263 +++++++++++++++-------------
+ fs/bcachefs/alloc_background.h      |   6 +-
+ fs/bcachefs/alloc_foreground.c      |   4 +-
+ fs/bcachefs/bcachefs.h              |  16 +-
+ fs/bcachefs/btree_iter.c            |  19 +-
+ fs/bcachefs/chardev.c               |   9 +-
+ fs/bcachefs/debug.c                 | 109 +++++++-----
+ fs/bcachefs/journal.c               |   5 +
+ fs/bcachefs/journal_io.c            |   7 +
+ fs/bcachefs/journal_seq_blacklist.c |   2 +-
+ fs/bcachefs/sb-errors.c             |  14 +-
+ fs/bcachefs/seqmutex.h              |  11 +-
+ fs/bcachefs/snapshot.c              |   3 +
+ fs/bcachefs/super.c                 |   6 +-
+ include/linux/closure.h             |  23 +++
+ lib/closure.c                       |  52 +++++-
+ 16 files changed, 342 insertions(+), 207 deletions(-)
+
+diff --git a/fs/bcachefs/alloc_background.c b/fs/bcachefs/alloc_background.c
+index 8dec2c6cb..1de9fac3b 100644
+--- a/fs/bcachefs/alloc_background.c
++++ b/fs/bcachefs/alloc_background.c
+@@ -29,7 +29,7 @@
+ #include <linux/sched/task.h>
+ #include <linux/sort.h>
+ 
+-static void bch2_discard_one_bucket_fast(struct bch_fs *c, struct bpos bucket);
++static void bch2_discard_one_bucket_fast(struct bch_dev *, u64);
+ 
+ /* Persistent alloc info: */
+ 
+@@ -893,12 +893,12 @@ int bch2_trigger_alloc(struct btree_trans *trans,
+ 		if (statechange(a->data_type == BCH_DATA_need_discard) &&
+ 		    !bch2_bucket_is_open_safe(c, new.k->p.inode, new.k->p.offset) &&
+ 		    bucket_flushed(new_a))
+-			bch2_discard_one_bucket_fast(c, new.k->p);
++			bch2_discard_one_bucket_fast(ca, new.k->p.offset);
+ 
+ 		if (statechange(a->data_type == BCH_DATA_cached) &&
+ 		    !bch2_bucket_is_open(c, new.k->p.inode, new.k->p.offset) &&
+ 		    should_invalidate_buckets(ca, bch2_dev_usage_read(ca)))
+-			bch2_do_invalidates(c);
++			bch2_dev_do_invalidates(ca);
+ 
+ 		if (statechange(a->data_type == BCH_DATA_need_gc_gens))
+ 			bch2_gc_gens_async(c);
+@@ -1636,34 +1636,38 @@ int bch2_check_alloc_to_lru_refs(struct bch_fs *c)
+ 	return ret;
+ }
+ 
+-static int discard_in_flight_add(struct bch_fs *c, struct bpos bucket)
++static int discard_in_flight_add(struct bch_dev *ca, u64 bucket, bool in_progress)
+ {
+ 	int ret;
+ 
+-	mutex_lock(&c->discard_buckets_in_flight_lock);
+-	darray_for_each(c->discard_buckets_in_flight, i)
+-		if (bkey_eq(*i, bucket)) {
++	mutex_lock(&ca->discard_buckets_in_flight_lock);
++	darray_for_each(ca->discard_buckets_in_flight, i)
++		if (i->bucket == bucket) {
+ 			ret = -BCH_ERR_EEXIST_discard_in_flight_add;
+ 			goto out;
+ 		}
+ 
+-	ret = darray_push(&c->discard_buckets_in_flight, bucket);
++	ret = darray_push(&ca->discard_buckets_in_flight, ((struct discard_in_flight) {
++			   .in_progress = in_progress,
++			   .bucket	= bucket,
++	}));
+ out:
+-	mutex_unlock(&c->discard_buckets_in_flight_lock);
++	mutex_unlock(&ca->discard_buckets_in_flight_lock);
+ 	return ret;
+ }
+ 
+-static void discard_in_flight_remove(struct bch_fs *c, struct bpos bucket)
++static void discard_in_flight_remove(struct bch_dev *ca, u64 bucket)
+ {
+-	mutex_lock(&c->discard_buckets_in_flight_lock);
+-	darray_for_each(c->discard_buckets_in_flight, i)
+-		if (bkey_eq(*i, bucket)) {
+-			darray_remove_item(&c->discard_buckets_in_flight, i);
++	mutex_lock(&ca->discard_buckets_in_flight_lock);
++	darray_for_each(ca->discard_buckets_in_flight, i)
++		if (i->bucket == bucket) {
++			BUG_ON(!i->in_progress);
++			darray_remove_item(&ca->discard_buckets_in_flight, i);
+ 			goto found;
+ 		}
+ 	BUG();
+ found:
+-	mutex_unlock(&c->discard_buckets_in_flight_lock);
++	mutex_unlock(&ca->discard_buckets_in_flight_lock);
+ }
+ 
+ struct discard_buckets_state {
+@@ -1671,26 +1675,11 @@ struct discard_buckets_state {
+ 	u64		open;
+ 	u64		need_journal_commit;
+ 	u64		discarded;
+-	struct bch_dev	*ca;
+ 	u64		need_journal_commit_this_dev;
+ };
+ 
+-static void discard_buckets_next_dev(struct bch_fs *c, struct discard_buckets_state *s, struct bch_dev *ca)
+-{
+-	if (s->ca == ca)
+-		return;
+-
+-	if (s->ca && s->need_journal_commit_this_dev >
+-	    bch2_dev_usage_read(s->ca).d[BCH_DATA_free].buckets)
+-		bch2_journal_flush_async(&c->journal, NULL);
+-
+-	if (s->ca)
+-		percpu_ref_put(&s->ca->io_ref);
+-	s->ca = ca;
+-	s->need_journal_commit_this_dev = 0;
+-}
+-
+ static int bch2_discard_one_bucket(struct btree_trans *trans,
++				   struct bch_dev *ca,
+ 				   struct btree_iter *need_discard_iter,
+ 				   struct bpos *discard_pos_done,
+ 				   struct discard_buckets_state *s)
+@@ -1704,16 +1693,6 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
+ 	bool discard_locked = false;
+ 	int ret = 0;
+ 
+-	struct bch_dev *ca = s->ca && s->ca->dev_idx == pos.inode
+-		? s->ca
+-		: bch2_dev_get_ioref(c, pos.inode, WRITE);
+-	if (!ca) {
+-		bch2_btree_iter_set_pos(need_discard_iter, POS(pos.inode + 1, 0));
+-		return 0;
+-	}
+-
+-	discard_buckets_next_dev(c, s, ca);
+-
+ 	if (bch2_bucket_is_open_safe(c, pos.inode, pos.offset)) {
+ 		s->open++;
+ 		goto out;
+@@ -1773,7 +1752,7 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
+ 		goto out;
+ 	}
+ 
+-	if (discard_in_flight_add(c, SPOS(iter.pos.inode, iter.pos.offset, true)))
++	if (discard_in_flight_add(ca, iter.pos.offset, true))
+ 		goto out;
+ 
+ 	discard_locked = true;
+@@ -1811,7 +1790,7 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
+ 	s->discarded++;
+ out:
+ 	if (discard_locked)
+-		discard_in_flight_remove(c, iter.pos);
++		discard_in_flight_remove(ca, iter.pos.offset);
+ 	s->seen++;
+ 	bch2_trans_iter_exit(trans, &iter);
+ 	printbuf_exit(&buf);
+@@ -1820,7 +1799,8 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
+ 
+ static void bch2_do_discards_work(struct work_struct *work)
+ {
+-	struct bch_fs *c = container_of(work, struct bch_fs, discard_work);
++	struct bch_dev *ca = container_of(work, struct bch_dev, discard_work);
++	struct bch_fs *c = ca->fs;
+ 	struct discard_buckets_state s = {};
+ 	struct bpos discard_pos_done = POS_MAX;
+ 	int ret;
+@@ -1831,23 +1811,41 @@ static void bch2_do_discards_work(struct work_struct *work)
+ 	 * successful commit:
+ 	 */
+ 	ret = bch2_trans_run(c,
+-		for_each_btree_key(trans, iter,
+-				   BTREE_ID_need_discard, POS_MIN, 0, k,
+-			bch2_discard_one_bucket(trans, &iter, &discard_pos_done, &s)));
+-
+-	discard_buckets_next_dev(c, &s, NULL);
++		for_each_btree_key_upto(trans, iter,
++				   BTREE_ID_need_discard,
++				   POS(ca->dev_idx, 0),
++				   POS(ca->dev_idx, U64_MAX), 0, k,
++			bch2_discard_one_bucket(trans, ca, &iter, &discard_pos_done, &s)));
+ 
+ 	trace_discard_buckets(c, s.seen, s.open, s.need_journal_commit, s.discarded,
+ 			      bch2_err_str(ret));
+ 
+ 	bch2_write_ref_put(c, BCH_WRITE_REF_discard);
++	percpu_ref_put(&ca->io_ref);
++}
++
++void bch2_dev_do_discards(struct bch_dev *ca)
++{
++	struct bch_fs *c = ca->fs;
++
++	if (!bch2_dev_get_ioref(c, ca->dev_idx, WRITE))
++		return;
++
++	if (!bch2_write_ref_tryget(c, BCH_WRITE_REF_discard))
++		goto put_ioref;
++
++	if (queue_work(c->write_ref_wq, &ca->discard_work))
++		return;
++
++	bch2_write_ref_put(c, BCH_WRITE_REF_discard);
++put_ioref:
++	percpu_ref_put(&ca->io_ref);
+ }
+ 
+ void bch2_do_discards(struct bch_fs *c)
+ {
+-	if (bch2_write_ref_tryget(c, BCH_WRITE_REF_discard) &&
+-	    !queue_work(c->write_ref_wq, &c->discard_work))
+-		bch2_write_ref_put(c, BCH_WRITE_REF_discard);
++	for_each_member_device(c, ca)
++		bch2_dev_do_discards(ca);
+ }
+ 
+ static int bch2_clear_bucket_needs_discard(struct btree_trans *trans, struct bpos bucket)
+@@ -1876,68 +1874,69 @@ static int bch2_clear_bucket_needs_discard(struct btree_trans *trans, struct bpo
+ 
+ static void bch2_do_discards_fast_work(struct work_struct *work)
+ {
+-	struct bch_fs *c = container_of(work, struct bch_fs, discard_fast_work);
++	struct bch_dev *ca = container_of(work, struct bch_dev, discard_fast_work);
++	struct bch_fs *c = ca->fs;
+ 
+ 	while (1) {
+ 		bool got_bucket = false;
+-		struct bpos bucket;
+-		struct bch_dev *ca;
++		u64 bucket;
+ 
+-		mutex_lock(&c->discard_buckets_in_flight_lock);
+-		darray_for_each(c->discard_buckets_in_flight, i) {
+-			if (i->snapshot)
++		mutex_lock(&ca->discard_buckets_in_flight_lock);
++		darray_for_each(ca->discard_buckets_in_flight, i) {
++			if (i->in_progress)
+ 				continue;
+ 
+-			ca = bch2_dev_get_ioref(c, i->inode, WRITE);
+-			if (!ca) {
+-				darray_remove_item(&c->discard_buckets_in_flight, i);
+-				continue;
+-			}
+-
+ 			got_bucket = true;
+-			bucket = *i;
+-			i->snapshot = true;
++			bucket = i->bucket;
++			i->in_progress = true;
+ 			break;
+ 		}
+-		mutex_unlock(&c->discard_buckets_in_flight_lock);
++		mutex_unlock(&ca->discard_buckets_in_flight_lock);
+ 
+ 		if (!got_bucket)
+ 			break;
+ 
+ 		if (ca->mi.discard && !c->opts.nochanges)
+ 			blkdev_issue_discard(ca->disk_sb.bdev,
+-					     bucket.offset * ca->mi.bucket_size,
++					     bucket_to_sector(ca, bucket),
+ 					     ca->mi.bucket_size,
+ 					     GFP_KERNEL);
+ 
+ 		int ret = bch2_trans_do(c, NULL, NULL,
+-					BCH_WATERMARK_btree|
+-					BCH_TRANS_COMMIT_no_enospc,
+-					bch2_clear_bucket_needs_discard(trans, bucket));
++			BCH_WATERMARK_btree|
++			BCH_TRANS_COMMIT_no_enospc,
++			bch2_clear_bucket_needs_discard(trans, POS(ca->dev_idx, bucket)));
+ 		bch_err_fn(c, ret);
+ 
+-		percpu_ref_put(&ca->io_ref);
+-		discard_in_flight_remove(c, bucket);
++		discard_in_flight_remove(ca, bucket);
+ 
+ 		if (ret)
+ 			break;
+ 	}
+ 
+ 	bch2_write_ref_put(c, BCH_WRITE_REF_discard_fast);
++	percpu_ref_put(&ca->io_ref);
+ }
+ 
+-static void bch2_discard_one_bucket_fast(struct bch_fs *c, struct bpos bucket)
++static void bch2_discard_one_bucket_fast(struct bch_dev *ca, u64 bucket)
+ {
+-	rcu_read_lock();
+-	struct bch_dev *ca = bch2_dev_rcu(c, bucket.inode);
+-	bool dead = !ca || percpu_ref_is_dying(&ca->io_ref);
+-	rcu_read_unlock();
++	struct bch_fs *c = ca->fs;
++
++	if (discard_in_flight_add(ca, bucket, false))
++		return;
++
++	if (!bch2_dev_get_ioref(c, ca->dev_idx, WRITE))
++		return;
++
++	if (!bch2_write_ref_tryget(c, BCH_WRITE_REF_discard_fast))
++		goto put_ioref;
++
++	if (queue_work(c->write_ref_wq, &ca->discard_fast_work))
++		return;
+ 
+-	if (!dead &&
+-	    !discard_in_flight_add(c, bucket) &&
+-	    bch2_write_ref_tryget(c, BCH_WRITE_REF_discard_fast) &&
+-	    !queue_work(c->write_ref_wq, &c->discard_fast_work))
+-		bch2_write_ref_put(c, BCH_WRITE_REF_discard_fast);
++	bch2_write_ref_put(c, BCH_WRITE_REF_discard_fast);
++put_ioref:
++	percpu_ref_put(&ca->io_ref);
+ }
+ 
+ static int invalidate_one_bucket(struct btree_trans *trans,
+@@ -2038,7 +2037,8 @@ static struct bkey_s_c next_lru_key(struct btree_trans *trans, struct btree_iter
+ 
+ static void bch2_do_invalidates_work(struct work_struct *work)
+ {
+-	struct bch_fs *c = container_of(work, struct bch_fs, invalidate_work);
++	struct bch_dev *ca = container_of(work, struct bch_dev, invalidate_work);
++	struct bch_fs *c = ca->fs;
+ 	struct btree_trans *trans = bch2_trans_get(c);
+ 	int ret = 0;
+ 
+@@ -2046,52 +2046,63 @@ static void bch2_do_invalidates_work(struct work_struct *work)
+ 	if (ret)
+ 		goto err;
+ 
+-	for_each_member_device(c, ca) {
+-		s64 nr_to_invalidate =
+-			should_invalidate_buckets(ca, bch2_dev_usage_read(ca));
+-		struct btree_iter iter;
+-		bool wrapped = false;
+-
+-		bch2_trans_iter_init(trans, &iter, BTREE_ID_lru,
+-				     lru_pos(ca->dev_idx, 0,
+-					     ((bch2_current_io_time(c, READ) + U32_MAX) &
+-					      LRU_TIME_MAX)), 0);
+-
+-		while (true) {
+-			bch2_trans_begin(trans);
+-
+-			struct bkey_s_c k = next_lru_key(trans, &iter, ca, &wrapped);
+-			ret = bkey_err(k);
+-			if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+-				continue;
+-			if (ret)
+-				break;
+-			if (!k.k)
+-				break;
++	s64 nr_to_invalidate =
++		should_invalidate_buckets(ca, bch2_dev_usage_read(ca));
++	struct btree_iter iter;
++	bool wrapped = false;
+ 
+-			ret = invalidate_one_bucket(trans, &iter, k, &nr_to_invalidate);
+-			if (ret)
+-				break;
++	bch2_trans_iter_init(trans, &iter, BTREE_ID_lru,
++			     lru_pos(ca->dev_idx, 0,
++				     ((bch2_current_io_time(c, READ) + U32_MAX) &
++				      LRU_TIME_MAX)), 0);
+ 
+-			bch2_btree_iter_advance(&iter);
+-		}
+-		bch2_trans_iter_exit(trans, &iter);
++	while (true) {
++		bch2_trans_begin(trans);
+ 
+-		if (ret < 0) {
+-			bch2_dev_put(ca);
++		struct bkey_s_c k = next_lru_key(trans, &iter, ca, &wrapped);
++		ret = bkey_err(k);
++		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
++			continue;
++		if (ret)
+ 			break;
+-		}
++		if (!k.k)
++			break;
++
++		ret = invalidate_one_bucket(trans, &iter, k, &nr_to_invalidate);
++		if (ret)
++			break;
++
++		bch2_btree_iter_advance(&iter);
+ 	}
++	bch2_trans_iter_exit(trans, &iter);
+ err:
+ 	bch2_trans_put(trans);
+ 	bch2_write_ref_put(c, BCH_WRITE_REF_invalidate);
++	percpu_ref_put(&ca->io_ref);
++}
++
++void bch2_dev_do_invalidates(struct bch_dev *ca)
++{
++	struct bch_fs *c = ca->fs;
++
++	if (!bch2_dev_get_ioref(c, ca->dev_idx, WRITE))
++		return;
++
++	if (!bch2_write_ref_tryget(c, BCH_WRITE_REF_invalidate))
++		goto put_ioref;
++
++	if (queue_work(c->write_ref_wq, &ca->invalidate_work))
++		return;
++
++	bch2_write_ref_put(c, BCH_WRITE_REF_invalidate);
++put_ioref:
++	percpu_ref_put(&ca->io_ref);
+ }
+ 
+ void bch2_do_invalidates(struct bch_fs *c)
+ {
+-	if (bch2_write_ref_tryget(c, BCH_WRITE_REF_invalidate) &&
+-	    !queue_work(c->write_ref_wq, &c->invalidate_work))
+-		bch2_write_ref_put(c, BCH_WRITE_REF_invalidate);
++	for_each_member_device(c, ca)
++		bch2_dev_do_invalidates(ca);
+ }
+ 
+ int bch2_dev_freespace_init(struct bch_fs *c, struct bch_dev *ca,
+@@ -2407,16 +2418,20 @@ void bch2_dev_allocator_add(struct bch_fs *c, struct bch_dev *ca)
+ 			set_bit(ca->dev_idx, c->rw_devs[i].d);
+ }
+ 
+-void bch2_fs_allocator_background_exit(struct bch_fs *c)
++void bch2_dev_allocator_background_exit(struct bch_dev *ca)
++{
++	darray_exit(&ca->discard_buckets_in_flight);
++}
++
++void bch2_dev_allocator_background_init(struct bch_dev *ca)
+ {
+-	darray_exit(&c->discard_buckets_in_flight);
++	mutex_init(&ca->discard_buckets_in_flight_lock);
++	INIT_WORK(&ca->discard_work, bch2_do_discards_work);
++	INIT_WORK(&ca->discard_fast_work, bch2_do_discards_fast_work);
++	INIT_WORK(&ca->invalidate_work, bch2_do_invalidates_work);
+ }
+ 
+ void bch2_fs_allocator_background_init(struct bch_fs *c)
+ {
+ 	spin_lock_init(&c->freelist_lock);
+-	mutex_init(&c->discard_buckets_in_flight_lock);
+-	INIT_WORK(&c->discard_work, bch2_do_discards_work);
+-	INIT_WORK(&c->discard_fast_work, bch2_do_discards_fast_work);
+-	INIT_WORK(&c->invalidate_work, bch2_do_invalidates_work);
+ }
+diff --git a/fs/bcachefs/alloc_background.h b/fs/bcachefs/alloc_background.h
+index c3cc3c5ba..ba2c5557a 100644
+--- a/fs/bcachefs/alloc_background.h
++++ b/fs/bcachefs/alloc_background.h
+@@ -275,6 +275,7 @@ int bch2_trigger_alloc(struct btree_trans *, enum btree_id, unsigned,
+ 		       enum btree_iter_update_trigger_flags);
+ int bch2_check_alloc_info(struct bch_fs *);
+ int bch2_check_alloc_to_lru_refs(struct bch_fs *);
++void bch2_dev_do_discards(struct bch_dev *);
+ void bch2_do_discards(struct bch_fs *);
+ 
+ static inline u64 should_invalidate_buckets(struct bch_dev *ca,
+@@ -289,6 +290,7 @@ static inline u64 should_invalidate_buckets(struct bch_dev *ca,
+ 	return clamp_t(s64, want_free - free, 0, u.d[BCH_DATA_cached].buckets);
+ }
+ 
++void bch2_dev_do_invalidates(struct bch_dev *);
+ void bch2_do_invalidates(struct bch_fs *);
+ 
+ static inline struct bch_backpointer *alloc_v4_backpointers(struct bch_alloc_v4 *a)
+@@ -312,7 +314,9 @@ u64 bch2_min_rw_member_capacity(struct bch_fs *);
+ void bch2_dev_allocator_remove(struct bch_fs *, struct bch_dev *);
+ void bch2_dev_allocator_add(struct bch_fs *, struct bch_dev *);
+ 
+-void bch2_fs_allocator_background_exit(struct bch_fs *);
++void bch2_dev_allocator_background_exit(struct bch_dev *);
++void bch2_dev_allocator_background_init(struct bch_dev *);
++
+ void bch2_fs_allocator_background_init(struct bch_fs *);
+ 
+ #endif /* _BCACHEFS_ALLOC_BACKGROUND_H */
+diff --git a/fs/bcachefs/alloc_foreground.c b/fs/bcachefs/alloc_foreground.c
+index 927a5f300..9d3d64746 100644
+--- a/fs/bcachefs/alloc_foreground.c
++++ b/fs/bcachefs/alloc_foreground.c
+@@ -621,13 +621,13 @@ static struct open_bucket *bch2_bucket_alloc_trans(struct btree_trans *trans,
+ 	avail = dev_buckets_free(ca, *usage, watermark);
+ 
+ 	if (usage->d[BCH_DATA_need_discard].buckets > avail)
+-		bch2_do_discards(c);
++		bch2_dev_do_discards(ca);
+ 
+ 	if (usage->d[BCH_DATA_need_gc_gens].buckets > avail)
+ 		bch2_gc_gens_async(c);
+ 
+ 	if (should_invalidate_buckets(ca, *usage))
+-		bch2_do_invalidates(c);
++		bch2_dev_do_invalidates(ca);
+ 
+ 	if (!avail) {
+ 		if (cl && !waiting) {
+diff --git a/fs/bcachefs/bcachefs.h b/fs/bcachefs/bcachefs.h
+index a6b83ecab..1106fec6e 100644
+--- a/fs/bcachefs/bcachefs.h
++++ b/fs/bcachefs/bcachefs.h
+@@ -493,6 +493,11 @@ struct io_count {
+ 	u64			sectors[2][BCH_DATA_NR];
+ };
+ 
++struct discard_in_flight {
++	bool			in_progress:1;
++	u64			bucket:63;
++};
++
+ struct bch_dev {
+ 	struct kobject		kobj;
+ #ifdef CONFIG_BCACHEFS_DEBUG
+@@ -554,6 +559,12 @@ struct bch_dev {
+ 	size_t			inc_gen_really_needs_gc;
+ 	size_t			buckets_waiting_on_journal;
+ 
++	struct work_struct	invalidate_work;
++	struct work_struct	discard_work;
++	struct mutex		discard_buckets_in_flight_lock;
++	DARRAY(struct discard_in_flight)	discard_buckets_in_flight;
++	struct work_struct	discard_fast_work;
++
+ 	atomic64_t		rebalance_work;
+ 
+ 	struct journal_device	journal;
+@@ -915,11 +926,6 @@ struct bch_fs {
+ 	unsigned		write_points_nr;
+ 
+ 	struct buckets_waiting_for_journal buckets_waiting_for_journal;
+-	struct work_struct	invalidate_work;
+-	struct work_struct	discard_work;
+-	struct mutex		discard_buckets_in_flight_lock;
+-	DARRAY(struct bpos)	discard_buckets_in_flight;
+-	struct work_struct	discard_fast_work;
+ 
+ 	/* GARBAGE COLLECTION */
+ 	struct work_struct	gc_gens_work;
+diff --git a/fs/bcachefs/btree_iter.c b/fs/bcachefs/btree_iter.c
+index 3a1419d17..0ed9e6574 100644
+--- a/fs/bcachefs/btree_iter.c
++++ b/fs/bcachefs/btree_iter.c
+@@ -3130,7 +3130,6 @@ struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
+ 
+ 	trans = mempool_alloc(&c->btree_trans_pool, GFP_NOFS);
+ 	memset(trans, 0, sizeof(*trans));
+-	closure_init_stack(&trans->ref);
+ 
+ 	seqmutex_lock(&c->btree_trans_lock);
+ 	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+@@ -3150,18 +3149,12 @@ struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
+ 			BUG_ON(pos_task &&
+ 			       pid == pos_task->pid &&
+ 			       pos->locked);
+-
+-			if (pos_task && pid < pos_task->pid) {
+-				list_add_tail(&trans->list, &pos->list);
+-				goto list_add_done;
+-			}
+ 		}
+ 	}
+-	list_add_tail(&trans->list, &c->btree_trans_list);
+-list_add_done:
++
++	list_add(&trans->list, &c->btree_trans_list);
+ 	seqmutex_unlock(&c->btree_trans_lock);
+ got_trans:
+-	trans->ref.closure_get_happened = false;
+ 	trans->c		= c;
+ 	trans->last_begin_time	= local_clock();
+ 	trans->fn_idx		= fn_idx;
+@@ -3200,6 +3193,8 @@ struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
+ 	trans->srcu_idx		= srcu_read_lock(&c->btree_trans_barrier);
+ 	trans->srcu_lock_time	= jiffies;
+ 	trans->srcu_held	= true;
++
++	closure_init_stack_release(&trans->ref);
+ 	return trans;
+ }
+ 
+@@ -3257,10 +3252,10 @@ void bch2_trans_put(struct btree_trans *trans)
+ 		bch2_journal_keys_put(c);
+ 
+ 	/*
+-	 * trans->ref protects trans->locking_wait.task, btree_paths arary; used
++	 * trans->ref protects trans->locking_wait.task, btree_paths array; used
+ 	 * by cycle detector
+ 	 */
+-	closure_sync(&trans->ref);
++	closure_return_sync(&trans->ref);
+ 	trans->locking_wait.task = NULL;
+ 
+ 	unsigned long *paths_allocated = trans->paths_allocated;
+@@ -3385,8 +3380,6 @@ void bch2_fs_btree_iter_exit(struct bch_fs *c)
+ 				per_cpu_ptr(c->btree_trans_bufs, cpu)->trans;
+ 
+ 			if (trans) {
+-				closure_sync(&trans->ref);
+-
+ 				seqmutex_lock(&c->btree_trans_lock);
+ 				list_del(&trans->list);
+ 				seqmutex_unlock(&c->btree_trans_lock);
+diff --git a/fs/bcachefs/chardev.c b/fs/bcachefs/chardev.c
+index 9e54323f0..6d82e1165 100644
+--- a/fs/bcachefs/chardev.c
++++ b/fs/bcachefs/chardev.c
+@@ -216,7 +216,8 @@ static long bch2_ioctl_fsck_offline(struct bch_ioctl_fsck_offline __user *user_a
+ 
+ 		ret =   PTR_ERR_OR_ZERO(optstr) ?:
+ 			bch2_parse_mount_opts(NULL, &thr->opts, optstr);
+-		kfree(optstr);
++		if (!IS_ERR(optstr))
++			kfree(optstr);
+ 
+ 		if (ret)
+ 			goto err;
+@@ -319,7 +320,8 @@ static long bch2_ioctl_disk_add(struct bch_fs *c, struct bch_ioctl_disk arg)
+ 		return ret;
+ 
+ 	ret = bch2_dev_add(c, path);
+-	kfree(path);
++	if (!IS_ERR(path))
++		kfree(path);
+ 
+ 	return ret;
+ }
+@@ -850,7 +852,8 @@ static long bch2_ioctl_fsck_online(struct bch_fs *c,
+ 
+ 		ret =   PTR_ERR_OR_ZERO(optstr) ?:
+ 			bch2_parse_mount_opts(c, &thr->opts, optstr);
+-		kfree(optstr);
++		if (!IS_ERR(optstr))
++			kfree(optstr);
+ 
+ 		if (ret)
+ 			goto err;
+diff --git a/fs/bcachefs/debug.c b/fs/bcachefs/debug.c
+index 51cbf3928..f0d4727c4 100644
+--- a/fs/bcachefs/debug.c
++++ b/fs/bcachefs/debug.c
+@@ -568,6 +568,32 @@ static const struct file_operations cached_btree_nodes_ops = {
+ 	.read		= bch2_cached_btree_nodes_read,
+ };
+ 
++typedef int (*list_cmp_fn)(const struct list_head *l, const struct list_head *r);
++
++static void list_sort(struct list_head *head, list_cmp_fn cmp)
++{
++	struct list_head *pos;
++
++	list_for_each(pos, head)
++		while (!list_is_last(pos, head) &&
++		       cmp(pos, pos->next) > 0) {
++			struct list_head *pos2, *next = pos->next;
++
++			list_del(next);
++			list_for_each(pos2, head)
++				if (cmp(next, pos2) < 0)
++					goto pos_found;
++			BUG();
++pos_found:
++			list_add_tail(next, pos2);
++		}
++}
++
++static int list_ptr_order_cmp(const struct list_head *l, const struct list_head *r)
++{
++	return cmp_int(l, r);
++}
++
+ static ssize_t bch2_btree_transactions_read(struct file *file, char __user *buf,
+ 					    size_t size, loff_t *ppos)
+ {
+@@ -575,41 +601,39 @@ static ssize_t bch2_btree_transactions_read(struct file *file, char __user *buf,
+ 	struct bch_fs *c = i->c;
+ 	struct btree_trans *trans;
+ 	ssize_t ret = 0;
+-	u32 seq;
+ 
+ 	i->ubuf = buf;
+ 	i->size	= size;
+ 	i->ret	= 0;
+ restart:
+ 	seqmutex_lock(&c->btree_trans_lock);
+-	list_for_each_entry(trans, &c->btree_trans_list, list) {
+-		struct task_struct *task = READ_ONCE(trans->locking_wait.task);
++	list_sort(&c->btree_trans_list, list_ptr_order_cmp);
+ 
+-		if (!task || task->pid <= i->iter)
++	list_for_each_entry(trans, &c->btree_trans_list, list) {
++		if ((ulong) trans < i->iter)
+ 			continue;
+ 
+-		closure_get(&trans->ref);
+-		seq = seqmutex_seq(&c->btree_trans_lock);
+-		seqmutex_unlock(&c->btree_trans_lock);
++		i->iter = (ulong) trans;
+ 
+-		ret = flush_buf(i);
+-		if (ret) {
+-			closure_put(&trans->ref);
+-			goto unlocked;
+-		}
++		if (!closure_get_not_zero(&trans->ref))
++			continue;
++
++		u32 seq = seqmutex_unlock(&c->btree_trans_lock);
+ 
+ 		bch2_btree_trans_to_text(&i->buf, trans);
+ 
+ 		prt_printf(&i->buf, "backtrace:\n");
+ 		printbuf_indent_add(&i->buf, 2);
+-		bch2_prt_task_backtrace(&i->buf, task, 0, GFP_KERNEL);
++		bch2_prt_task_backtrace(&i->buf, trans->locking_wait.task, 0, GFP_KERNEL);
+ 		printbuf_indent_sub(&i->buf, 2);
+ 		prt_newline(&i->buf);
+ 
+-		i->iter = task->pid;
+-
+ 		closure_put(&trans->ref);
+ 
++		ret = flush_buf(i);
++		if (ret)
++			goto unlocked;
++
+ 		if (!seqmutex_relock(&c->btree_trans_lock, seq))
+ 			goto restart;
+ 	}
+@@ -804,50 +828,55 @@ static const struct file_operations btree_transaction_stats_op = {
+ 	.read		= btree_transaction_stats_read,
+ };
+ 
+-static ssize_t bch2_btree_deadlock_read(struct file *file, char __user *buf,
+-					    size_t size, loff_t *ppos)
++/* walk btree transactions until we find a deadlock and print it */
++static void btree_deadlock_to_text(struct printbuf *out, struct bch_fs *c)
+ {
+-	struct dump_iter *i = file->private_data;
+-	struct bch_fs *c = i->c;
+ 	struct btree_trans *trans;
+-	ssize_t ret = 0;
+-	u32 seq;
+-
+-	i->ubuf = buf;
+-	i->size	= size;
+-	i->ret	= 0;
+-
+-	if (i->iter)
+-		goto out;
++	pid_t iter = 0;
+ restart:
+ 	seqmutex_lock(&c->btree_trans_lock);
+ 	list_for_each_entry(trans, &c->btree_trans_list, list) {
+ 		struct task_struct *task = READ_ONCE(trans->locking_wait.task);
+ 
+-		if (!task || task->pid <= i->iter)
++		if (!task || task->pid <= iter)
+ 			continue;
+ 
+-		closure_get(&trans->ref);
+-		seq = seqmutex_seq(&c->btree_trans_lock);
+-		seqmutex_unlock(&c->btree_trans_lock);
++		iter = task->pid;
+ 
+-		ret = flush_buf(i);
+-		if (ret) {
+-			closure_put(&trans->ref);
+-			goto out;
+-		}
++		if (!closure_get_not_zero(&trans->ref))
++			continue;
+ 
+-		bch2_check_for_deadlock(trans, &i->buf);
++		u32 seq = seqmutex_unlock(&c->btree_trans_lock);
+ 
+-		i->iter = task->pid;
++		bool found = bch2_check_for_deadlock(trans, out) != 0;
+ 
+ 		closure_put(&trans->ref);
+ 
++		if (found)
++			return;
++
+ 		if (!seqmutex_relock(&c->btree_trans_lock, seq))
+ 			goto restart;
+ 	}
+ 	seqmutex_unlock(&c->btree_trans_lock);
+-out:
++}
++
++static ssize_t bch2_btree_deadlock_read(struct file *file, char __user *buf,
++					    size_t size, loff_t *ppos)
++{
++	struct dump_iter *i = file->private_data;
++	struct bch_fs *c = i->c;
++	ssize_t ret = 0;
++
++	i->ubuf = buf;
++	i->size	= size;
++	i->ret	= 0;
++
++	if (!i->iter) {
++		btree_deadlock_to_text(&i->buf, c);
++		i->iter++;
++	}
++
+ 	if (i->buf.allocation_failure)
+ 		ret = -ENOMEM;
+ 
+diff --git a/fs/bcachefs/journal.c b/fs/bcachefs/journal.c
+index dac2f498a..13669dd0e 100644
+--- a/fs/bcachefs/journal.c
++++ b/fs/bcachefs/journal.c
+@@ -1521,6 +1521,11 @@ bool bch2_journal_seq_pins_to_text(struct printbuf *out, struct journal *j, u64
+ 	struct journal_entry_pin *pin;
+ 
+ 	spin_lock(&j->lock);
++	if (!test_bit(JOURNAL_running, &j->flags)) {
++		spin_unlock(&j->lock);
++		return true;
++	}
++
+ 	*seq = max(*seq, j->pin.front);
+ 
+ 	if (*seq >= j->pin.back) {
+diff --git a/fs/bcachefs/journal_io.c b/fs/bcachefs/journal_io.c
+index 492426c8d..db24ce21b 100644
+--- a/fs/bcachefs/journal_io.c
++++ b/fs/bcachefs/journal_io.c
+@@ -1677,6 +1677,13 @@ static CLOSURE_CALLBACK(journal_write_done)
+ 		mod_delayed_work(j->wq, &j->write_work, max(0L, delta));
+ 	}
+ 
++	/*
++	 * We don't typically trigger journal writes from her - the next journal
++	 * write will be triggered immediately after the previous one is
++	 * allocated, in bch2_journal_write() - but the journal write error path
++	 * is special:
++	 */
++	bch2_journal_do_writes(j);
+ 	spin_unlock(&j->lock);
+ }
+ 
+diff --git a/fs/bcachefs/journal_seq_blacklist.c b/fs/bcachefs/journal_seq_blacklist.c
+index ed4846709..1f25c111c 100644
+--- a/fs/bcachefs/journal_seq_blacklist.c
++++ b/fs/bcachefs/journal_seq_blacklist.c
+@@ -232,7 +232,7 @@ bool bch2_blacklist_entries_gc(struct bch_fs *c)
+ 	BUG_ON(nr != t->nr);
+ 
+ 	unsigned i;
+-	for (src = bl->start, i = eytzinger0_first(t->nr);
++	for (src = bl->start, i = t->nr == 0 ? 0 : eytzinger0_first(t->nr);
+ 	     src < bl->start + nr;
+ 	     src++, i = eytzinger0_next(i, nr)) {
+ 		BUG_ON(t->entries[i].start	!= le64_to_cpu(src->start));
+diff --git a/fs/bcachefs/sb-errors.c b/fs/bcachefs/sb-errors.c
+index bda33e59e..c1270d790 100644
+--- a/fs/bcachefs/sb-errors.c
++++ b/fs/bcachefs/sb-errors.c
+@@ -110,19 +110,25 @@ void bch2_sb_error_count(struct bch_fs *c, enum bch_sb_error_id err)
+ void bch2_sb_errors_from_cpu(struct bch_fs *c)
+ {
+ 	bch_sb_errors_cpu *src = &c->fsck_error_counts;
+-	struct bch_sb_field_errors *dst =
+-		bch2_sb_field_resize(&c->disk_sb, errors,
+-				     bch2_sb_field_errors_u64s(src->nr));
++	struct bch_sb_field_errors *dst;
+ 	unsigned i;
+ 
++	mutex_lock(&c->fsck_error_counts_lock);
++
++	dst = bch2_sb_field_resize(&c->disk_sb, errors,
++				   bch2_sb_field_errors_u64s(src->nr));
++
+ 	if (!dst)
+-		return;
++		goto err;
+ 
+ 	for (i = 0; i < src->nr; i++) {
+ 		SET_BCH_SB_ERROR_ENTRY_ID(&dst->entries[i], src->data[i].id);
+ 		SET_BCH_SB_ERROR_ENTRY_NR(&dst->entries[i], src->data[i].nr);
+ 		dst->entries[i].last_error_time = cpu_to_le64(src->data[i].last_error_time);
+ 	}
++
++err:
++	mutex_unlock(&c->fsck_error_counts_lock);
+ }
+ 
+ static int bch2_sb_errors_to_cpu(struct bch_fs *c)
+diff --git a/fs/bcachefs/seqmutex.h b/fs/bcachefs/seqmutex.h
+index c1860d816..c4b3d8d3f 100644
+--- a/fs/bcachefs/seqmutex.h
++++ b/fs/bcachefs/seqmutex.h
+@@ -19,17 +19,14 @@ static inline bool seqmutex_trylock(struct seqmutex *lock)
+ static inline void seqmutex_lock(struct seqmutex *lock)
+ {
+ 	mutex_lock(&lock->lock);
+-}
+-
+-static inline void seqmutex_unlock(struct seqmutex *lock)
+-{
+ 	lock->seq++;
+-	mutex_unlock(&lock->lock);
+ }
+ 
+-static inline u32 seqmutex_seq(struct seqmutex *lock)
++static inline u32 seqmutex_unlock(struct seqmutex *lock)
+ {
+-	return lock->seq;
++	u32 seq = lock->seq;
++	mutex_unlock(&lock->lock);
++	return seq;
+ }
+ 
+ static inline bool seqmutex_relock(struct seqmutex *lock, u32 seq)
+diff --git a/fs/bcachefs/snapshot.c b/fs/bcachefs/snapshot.c
+index 4ef98e696..24023d6a9 100644
+--- a/fs/bcachefs/snapshot.c
++++ b/fs/bcachefs/snapshot.c
+@@ -168,6 +168,9 @@ static noinline struct snapshot_t *__snapshot_t_mut(struct bch_fs *c, u32 id)
+ 	size_t new_bytes = kmalloc_size_roundup(struct_size(new, s, idx + 1));
+ 	size_t new_size = (new_bytes - sizeof(*new)) / sizeof(new->s[0]);
+ 
++	if (unlikely(new_bytes > INT_MAX))
++		return NULL;
++
+ 	new = kvzalloc(new_bytes, GFP_KERNEL);
+ 	if (!new)
+ 		return NULL;
+diff --git a/fs/bcachefs/super.c b/fs/bcachefs/super.c
+index 9083df820..fb9064672 100644
+--- a/fs/bcachefs/super.c
++++ b/fs/bcachefs/super.c
+@@ -536,7 +536,6 @@ static void __bch2_fs_free(struct bch_fs *c)
+ 
+ 	bch2_find_btree_nodes_exit(&c->found_btree_nodes);
+ 	bch2_free_pending_node_rewrites(c);
+-	bch2_fs_allocator_background_exit(c);
+ 	bch2_fs_sb_errors_exit(c);
+ 	bch2_fs_counters_exit(c);
+ 	bch2_fs_snapshots_exit(c);
+@@ -1195,6 +1194,7 @@ static void bch2_dev_free(struct bch_dev *ca)
+ 
+ 	kfree(ca->buckets_nouse);
+ 	bch2_free_super(&ca->disk_sb);
++	bch2_dev_allocator_background_exit(ca);
+ 	bch2_dev_journal_exit(ca);
+ 
+ 	free_percpu(ca->io_done);
+@@ -1317,6 +1317,8 @@ static struct bch_dev *__bch2_dev_alloc(struct bch_fs *c,
+ 	atomic_long_set(&ca->ref, 1);
+ #endif
+ 
++	bch2_dev_allocator_background_init(ca);
++
+ 	if (percpu_ref_init(&ca->io_ref, bch2_dev_io_ref_complete,
+ 			    PERCPU_REF_INIT_DEAD, GFP_KERNEL) ||
+ 	    !(ca->sb_read_scratch = (void *) __get_free_page(GFP_KERNEL)) ||
+@@ -1529,6 +1531,7 @@ static void __bch2_dev_read_only(struct bch_fs *c, struct bch_dev *ca)
+ 	 * The allocator thread itself allocates btree nodes, so stop it first:
+ 	 */
+ 	bch2_dev_allocator_remove(c, ca);
++	bch2_recalc_capacity(c);
+ 	bch2_dev_journal_stop(&c->journal, ca);
+ }
+ 
+@@ -1540,6 +1543,7 @@ static void __bch2_dev_read_write(struct bch_fs *c, struct bch_dev *ca)
+ 
+ 	bch2_dev_allocator_add(c, ca);
+ 	bch2_recalc_capacity(c);
++	bch2_dev_do_discards(ca);
+ }
+ 
+ int __bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
+diff --git a/include/linux/closure.h b/include/linux/closure.h
+index 99155df16..59b8c06b1 100644
+--- a/include/linux/closure.h
++++ b/include/linux/closure.h
+@@ -284,6 +284,21 @@ static inline void closure_get(struct closure *cl)
+ #endif
+ }
+ 
++/**
++ * closure_get_not_zero
++ */
++static inline bool closure_get_not_zero(struct closure *cl)
++{
++	unsigned old = atomic_read(&cl->remaining);
++	do {
++		if (!(old & CLOSURE_REMAINING_MASK))
++			return false;
++
++	} while (!atomic_try_cmpxchg_acquire(&cl->remaining, &old, old + 1));
++
++	return true;
++}
++
+ /**
+  * closure_init - Initialize a closure, setting the refcount to 1
+  * @cl:		closure to initialize
+@@ -310,6 +325,12 @@ static inline void closure_init_stack(struct closure *cl)
+ 	atomic_set(&cl->remaining, CLOSURE_REMAINING_INITIALIZER);
+ }
+ 
++static inline void closure_init_stack_release(struct closure *cl)
++{
++	memset(cl, 0, sizeof(struct closure));
++	atomic_set_release(&cl->remaining, CLOSURE_REMAINING_INITIALIZER);
++}
++
+ /**
+  * closure_wake_up - wake up all closures on a wait list,
+  *		     with memory barrier
+@@ -355,6 +376,8 @@ do {									\
+  */
+ #define closure_return(_cl)	continue_at((_cl), NULL, NULL)
+ 
++void closure_return_sync(struct closure *cl);
++
+ /**
+  * continue_at_nobarrier - jump to another function without barrier
+  *
+diff --git a/lib/closure.c b/lib/closure.c
+index 2e1ee9fde..c971216d9 100644
+--- a/lib/closure.c
++++ b/lib/closure.c
+@@ -13,7 +13,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/sched/debug.h>
+ 
+-static inline void closure_put_after_sub(struct closure *cl, int flags)
++static inline void closure_put_after_sub_checks(int flags)
+ {
+ 	int r = flags & CLOSURE_REMAINING_MASK;
+ 
+@@ -22,12 +22,17 @@ static inline void closure_put_after_sub(struct closure *cl, int flags)
+ 		 flags & CLOSURE_GUARD_MASK, (unsigned) __fls(r)))
+ 		r &= ~CLOSURE_GUARD_MASK;
+ 
+-	if (!r) {
+-		smp_acquire__after_ctrl_dep();
++	WARN(!r && (flags & ~CLOSURE_DESTRUCTOR),
++	     "closure ref hit 0 with incorrect flags set: %x (%u)",
++	     flags & ~CLOSURE_DESTRUCTOR, (unsigned) __fls(flags));
++}
++
++static inline void closure_put_after_sub(struct closure *cl, int flags)
++{
++	closure_put_after_sub_checks(flags);
+ 
+-		WARN(flags & ~CLOSURE_DESTRUCTOR,
+-		     "closure ref hit 0 with incorrect flags set: %x (%u)",
+-		     flags & ~CLOSURE_DESTRUCTOR, (unsigned) __fls(flags));
++	if (!(flags & CLOSURE_REMAINING_MASK)) {
++		smp_acquire__after_ctrl_dep();
+ 
+ 		cl->closure_get_happened = false;
+ 
+@@ -145,6 +150,41 @@ void __sched __closure_sync(struct closure *cl)
+ }
+ EXPORT_SYMBOL(__closure_sync);
+ 
++/*
++ * closure_return_sync - finish running a closure, synchronously (i.e. waiting
++ * for outstanding get()s to finish) and returning once closure refcount is 0.
++ *
++ * Unlike closure_sync() this doesn't reinit the ref to 1; subsequent
++ * closure_get_not_zero() calls waill fail.
++ */
++void __sched closure_return_sync(struct closure *cl)
++{
++	struct closure_syncer s = { .task = current };
++
++	cl->s = &s;
++	set_closure_fn(cl, closure_sync_fn, NULL);
++
++	unsigned flags = atomic_sub_return_release(1 + CLOSURE_RUNNING - CLOSURE_DESTRUCTOR,
++						   &cl->remaining);
++
++	closure_put_after_sub_checks(flags);
++
++	if (unlikely(flags & CLOSURE_REMAINING_MASK)) {
++		while (1) {
++			set_current_state(TASK_UNINTERRUPTIBLE);
++			if (s.done)
++				break;
++			schedule();
++		}
++
++		__set_current_state(TASK_RUNNING);
++	}
++
++	if (cl->parent)
++		closure_put(cl->parent);
++}
++EXPORT_SYMBOL(closure_return_sync);
++
+ int __sched __closure_sync_timeout(struct closure *cl, unsigned long timeout)
+ {
+ 	struct closure_syncer s = { .task = current };
+-- 
+2.45.2.606.g9005149a4a
+
