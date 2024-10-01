@@ -1,0 +1,345 @@
+From 5d76e1a01f906df5741f52f70706a46e107f79d3 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 14 Aug 2024 00:25:53 +0200
+Subject: [PATCH 48/60] sched: Rework pick_next_task()
+
+The current rule is that:
+
+  pick_next_task() := pick_task() + set_next_task(.first = true)
+
+And many classes implement it directly as such. Change things around
+to make pick_next_task() optional while also changing the definition to:
+
+  pick_next_task(prev) := pick_task() + put_prev_task() + set_next_task(.first = true)
+
+The reason is that sched_ext would like to have a 'final' call that
+knows the next task. By placing put_prev_task() right next to
+set_next_task() (as it already is for sched_core) this becomes
+trivial.
+
+As a bonus, this is a nice cleanup on its own.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20240813224016.051225657@infradead.org
+---
+ kernel/sched/core.c      | 21 +++++++++++++++------
+ kernel/sched/deadline.c  | 21 +--------------------
+ kernel/sched/fair.c      | 11 +++++------
+ kernel/sched/idle.c      | 16 ++--------------
+ kernel/sched/rt.c        | 13 +------------
+ kernel/sched/sched.h     | 16 ++++++++++++----
+ kernel/sched/stop_task.c | 13 +------------
+ 7 files changed, 37 insertions(+), 74 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 36f9bc509..b9429eb5d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -5893,8 +5893,9 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 
+ 		/* Assume the next prioritized class is idle_sched_class */
+ 		if (!p) {
++			p = pick_task_idle(rq);
+ 			put_prev_task(rq, prev);
+-			p = pick_next_task_idle(rq);
++			set_next_task_first(rq, p);
+ 		}
+ 
+ 		/*
+@@ -5916,12 +5917,20 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 
+ restart:
+ 	prev_balance(rq, prev, rf);
+-	put_prev_task(rq, prev);
+ 
+ 	for_each_class(class) {
+-		p = class->pick_next_task(rq);
+-		if (p)
+-			return p;
++		if (class->pick_next_task) {
++			p = class->pick_next_task(rq, prev);
++			if (p)
++				return p;
++		} else {
++			p = class->pick_task(rq);
++			if (p) {
++				put_prev_task(rq, prev);
++				set_next_task_first(rq, p);
++				return p;
++			}
++		}
+ 	}
+ 
+ 	BUG(); /* The idle class should always have a runnable task. */
+@@ -6017,7 +6026,6 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	}
+ 
+ 	prev_balance(rq, prev, rf);
+-	put_prev_task(rq, prev);
+ 
+ 	smt_mask = cpu_smt_mask(cpu);
+ 	need_sync = !!rq->core->core_cookie;
+@@ -6184,6 +6192,7 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	}
+ 
+ out_set_next:
++	put_prev_task(rq, prev);
+ 	set_next_task_first(rq, next);
+ out:
+ 	if (rq->core->core_forceidle_count && next == rq->idle)
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 2ea929ce9..a1547e1cd 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2431,28 +2431,10 @@ static struct task_struct *__pick_task_dl(struct rq *rq)
+ 	return p;
+ }
+ 
+-#ifdef CONFIG_SMP
+ static struct task_struct *pick_task_dl(struct rq *rq)
+ {
+ 	return __pick_task_dl(rq);
+ }
+-#endif
+-
+-static struct task_struct *pick_next_task_dl(struct rq *rq)
+-{
+-	struct task_struct *p;
+-
+-	p = __pick_task_dl(rq);
+-	if (!p)
+-		return p;
+-
+-	if (p->dl_server)
+-		p->sched_class->set_next_task(rq, p, true);
+-	else
+-		set_next_task_dl(rq, p, true);
+-
+-	return p;
+-}
+ 
+ static void put_prev_task_dl(struct rq *rq, struct task_struct *p)
+ {
+@@ -3146,13 +3128,12 @@ DEFINE_SCHED_CLASS(dl) = {
+ 
+ 	.wakeup_preempt		= wakeup_preempt_dl,
+ 
+-	.pick_next_task		= pick_next_task_dl,
++	.pick_task		= pick_task_dl,
+ 	.put_prev_task		= put_prev_task_dl,
+ 	.set_next_task		= set_next_task_dl,
+ 
+ #ifdef CONFIG_SMP
+ 	.balance		= balance_dl,
+-	.pick_task		= pick_task_dl,
+ 	.select_task_rq		= select_task_rq_dl,
+ 	.migrate_task_rq	= migrate_task_rq_dl,
+ 	.set_cpus_allowed       = set_cpus_allowed_dl,
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e703e0e1a..7e2fe00a3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8786,7 +8786,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 	se = &p->se;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-	if (!prev || prev->sched_class != &fair_sched_class)
++	if (prev->sched_class != &fair_sched_class)
+ 		goto simple;
+ 
+ 	/*
+@@ -8828,8 +8828,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 
+ simple:
+ #endif
+-	if (prev)
+-		put_prev_task(rq, prev);
++	put_prev_task(rq, prev);
+ 	set_next_task_fair(rq, p, true);
+ 	return p;
+ 
+@@ -8859,9 +8858,9 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 	return NULL;
+ }
+ 
+-static struct task_struct *__pick_next_task_fair(struct rq *rq)
++static struct task_struct *__pick_next_task_fair(struct rq *rq, struct task_struct *prev)
+ {
+-	return pick_next_task_fair(rq, NULL, NULL);
++	return pick_next_task_fair(rq, prev, NULL);
+ }
+ 
+ static bool fair_server_has_tasks(struct sched_dl_entity *dl_se)
+@@ -13500,13 +13499,13 @@ DEFINE_SCHED_CLASS(fair) = {
+ 
+ 	.wakeup_preempt		= check_preempt_wakeup_fair,
+ 
++	.pick_task		= pick_task_fair,
+ 	.pick_next_task		= __pick_next_task_fair,
+ 	.put_prev_task		= put_prev_task_fair,
+ 	.set_next_task          = set_next_task_fair,
+ 
+ #ifdef CONFIG_SMP
+ 	.balance		= balance_fair,
+-	.pick_task		= pick_task_fair,
+ 	.select_task_rq		= select_task_rq_fair,
+ 	.migrate_task_rq	= migrate_task_rq_fair,
+ 
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index 16074209c..a343e1c97 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -462,21 +462,10 @@ static void set_next_task_idle(struct rq *rq, struct task_struct *next, bool fir
+ 	next->se.exec_start = rq_clock_task(rq);
+ }
+ 
+-#ifdef CONFIG_SMP
+-static struct task_struct *pick_task_idle(struct rq *rq)
++struct task_struct *pick_task_idle(struct rq *rq)
+ {
+ 	return rq->idle;
+ }
+-#endif
+-
+-struct task_struct *pick_next_task_idle(struct rq *rq)
+-{
+-	struct task_struct *next = rq->idle;
+-
+-	set_next_task_idle(rq, next, true);
+-
+-	return next;
+-}
+ 
+ /*
+  * It is not legal to sleep in the idle task - print a warning
+@@ -531,13 +520,12 @@ DEFINE_SCHED_CLASS(idle) = {
+ 
+ 	.wakeup_preempt		= wakeup_preempt_idle,
+ 
+-	.pick_next_task		= pick_next_task_idle,
++	.pick_task		= pick_task_idle,
+ 	.put_prev_task		= put_prev_task_idle,
+ 	.set_next_task          = set_next_task_idle,
+ 
+ #ifdef CONFIG_SMP
+ 	.balance		= balance_idle,
+-	.pick_task		= pick_task_idle,
+ 	.select_task_rq		= select_task_rq_idle,
+ 	.set_cpus_allowed	= set_cpus_allowed_common,
+ #endif
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index fdc8e059c..8025f394b 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1748,16 +1748,6 @@ static struct task_struct *pick_task_rt(struct rq *rq)
+ 	return p;
+ }
+ 
+-static struct task_struct *pick_next_task_rt(struct rq *rq)
+-{
+-	struct task_struct *p = pick_task_rt(rq);
+-
+-	if (p)
+-		set_next_task_rt(rq, p, true);
+-
+-	return p;
+-}
+-
+ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
+ {
+ 	struct sched_rt_entity *rt_se = &p->rt;
+@@ -2645,13 +2635,12 @@ DEFINE_SCHED_CLASS(rt) = {
+ 
+ 	.wakeup_preempt		= wakeup_preempt_rt,
+ 
+-	.pick_next_task		= pick_next_task_rt,
++	.pick_task		= pick_task_rt,
+ 	.put_prev_task		= put_prev_task_rt,
+ 	.set_next_task          = set_next_task_rt,
+ 
+ #ifdef CONFIG_SMP
+ 	.balance		= balance_rt,
+-	.pick_task		= pick_task_rt,
+ 	.select_task_rq		= select_task_rq_rt,
+ 	.set_cpus_allowed       = set_cpus_allowed_common,
+ 	.rq_online              = rq_online_rt,
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 80605e2da..64a4ed758 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2300,7 +2300,17 @@ struct sched_class {
+ 
+ 	void (*wakeup_preempt)(struct rq *rq, struct task_struct *p, int flags);
+ 
+-	struct task_struct *(*pick_next_task)(struct rq *rq);
++	struct task_struct *(*pick_task)(struct rq *rq);
++	/*
++	 * Optional! When implemented pick_next_task() should be equivalent to:
++	 *
++	 *   next = pick_task();
++	 *   if (next) {
++	 *       put_prev_task(prev);
++	 *       set_next_task_first(next);
++	 *   }
++	 */
++	struct task_struct *(*pick_next_task)(struct rq *rq, struct task_struct *prev);
+ 
+ 	void (*put_prev_task)(struct rq *rq, struct task_struct *p);
+ 	void (*set_next_task)(struct rq *rq, struct task_struct *p, bool first);
+@@ -2309,8 +2319,6 @@ struct sched_class {
+ 	int (*balance)(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
+ 	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int flags);
+ 
+-	struct task_struct * (*pick_task)(struct rq *rq);
+-
+ 	void (*migrate_task_rq)(struct task_struct *p, int new_cpu);
+ 
+ 	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
+@@ -2421,7 +2429,7 @@ static inline bool sched_fair_runnable(struct rq *rq)
+ }
+ 
+ extern struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
+-extern struct task_struct *pick_next_task_idle(struct rq *rq);
++extern struct task_struct *pick_task_idle(struct rq *rq);
+ 
+ #define SCA_CHECK		0x01
+ #define SCA_MIGRATE_DISABLE	0x02
+diff --git a/kernel/sched/stop_task.c b/kernel/sched/stop_task.c
+index 4cf02074f..0fd5352ff 100644
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@ -41,16 +41,6 @@ static struct task_struct *pick_task_stop(struct rq *rq)
+ 	return rq->stop;
+ }
+ 
+-static struct task_struct *pick_next_task_stop(struct rq *rq)
+-{
+-	struct task_struct *p = pick_task_stop(rq);
+-
+-	if (p)
+-		set_next_task_stop(rq, p, true);
+-
+-	return p;
+-}
+-
+ static void
+ enqueue_task_stop(struct rq *rq, struct task_struct *p, int flags)
+ {
+@@ -112,13 +102,12 @@ DEFINE_SCHED_CLASS(stop) = {
+ 
+ 	.wakeup_preempt		= wakeup_preempt_stop,
+ 
+-	.pick_next_task		= pick_next_task_stop,
++	.pick_task		= pick_task_stop,
+ 	.put_prev_task		= put_prev_task_stop,
+ 	.set_next_task          = set_next_task_stop,
+ 
+ #ifdef CONFIG_SMP
+ 	.balance		= balance_stop,
+-	.pick_task		= pick_task_stop,
+ 	.select_task_rq		= select_task_rq_stop,
+ 	.set_cpus_allowed	= set_cpus_allowed_common,
+ #endif
+-- 
+2.46.0.469.g4590f2e941
+
