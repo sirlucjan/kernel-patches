@@ -1,0 +1,203 @@
+From 085e4224f95b7859918c3c08b8f40e29f4b302a5 Mon Sep 17 00:00:00 2001
+From: Antonio Quartulli <antonio@openvpn.net>
+Date: Wed, 2 Oct 2024 11:02:35 +0200
+Subject: [PATCH 21/24] ovpn: kill key and notify userspace in case of IV
+ exhaustion
+
+IV wrap-around is cryptographically dangerous for a number of ciphers,
+therefore kill the key and inform userspace (via netlink) should the
+IV space go exhausted.
+
+Userspace has two ways of deciding when the key has to be renewed before
+exhausting the IV space:
+1) time based approach:
+   after X seconds/minutes userspace generates a new key and sends it
+   to the kernel. This is based on guestimate and normally default
+   timer value works well.
+
+2) packet count based approach:
+   after X packets/bytes userspace generates a new key and sends it to
+   the kernel. Userspace keeps track of the amount of traffic by
+   periodically polling GET_PEER and fetching the VPN/LINK stats.
+
+Signed-off-by: Antonio Quartulli <antonio@openvpn.net>
+---
+ drivers/net/ovpn/crypto.c  | 19 +++++++++++++
+ drivers/net/ovpn/crypto.h  |  2 ++
+ drivers/net/ovpn/io.c      | 18 ++++++++++++-
+ drivers/net/ovpn/netlink.c | 55 ++++++++++++++++++++++++++++++++++++++
+ drivers/net/ovpn/netlink.h |  2 ++
+ 5 files changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ovpn/crypto.c b/drivers/net/ovpn/crypto.c
+index f1f7510e2..56ae2f5e5 100644
+--- a/drivers/net/ovpn/crypto.c
++++ b/drivers/net/ovpn/crypto.c
+@@ -55,6 +55,25 @@ void ovpn_crypto_state_release(struct ovpn_crypto_state *cs)
+ 	}
+ }
+ 
++/* removes the key matching the specified id from the crypto context */
++void ovpn_crypto_kill_key(struct ovpn_crypto_state *cs, u8 key_id)
++{
++	struct ovpn_crypto_key_slot *ks = NULL;
++
++	spin_lock_bh(&cs->lock);
++	if (rcu_access_pointer(cs->slots[0])->key_id == key_id) {
++		ks = rcu_replace_pointer(cs->slots[0], NULL,
++					 lockdep_is_held(&cs->lock));
++	} else if (rcu_access_pointer(cs->slots[1])->key_id == key_id) {
++		ks = rcu_replace_pointer(cs->slots[1], NULL,
++					 lockdep_is_held(&cs->lock));
++	}
++	spin_unlock_bh(&cs->lock);
++
++	if (ks)
++		ovpn_crypto_key_slot_put(ks);
++}
++
+ /* Reset the ovpn_crypto_state object in a way that is atomic
+  * to RCU readers.
+  */
+diff --git a/drivers/net/ovpn/crypto.h b/drivers/net/ovpn/crypto.h
+index 61de855d2..48ea6ae9f 100644
+--- a/drivers/net/ovpn/crypto.h
++++ b/drivers/net/ovpn/crypto.h
+@@ -133,4 +133,6 @@ void ovpn_crypto_state_release(struct ovpn_crypto_state *cs);
+ 
+ void ovpn_crypto_key_slots_swap(struct ovpn_crypto_state *cs);
+ 
++void ovpn_crypto_kill_key(struct ovpn_crypto_state *cs, u8 key_id);
++
+ #endif /* _NET_OVPN_OVPNCRYPTO_H_ */
+diff --git a/drivers/net/ovpn/io.c b/drivers/net/ovpn/io.c
+index 8f2b4a85d..3e82ff882 100644
+--- a/drivers/net/ovpn/io.c
++++ b/drivers/net/ovpn/io.c
+@@ -223,6 +223,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
+ 
+ void ovpn_encrypt_post(void *data, int ret)
+ {
++	struct ovpn_crypto_key_slot *ks = NULL;
+ 	struct ovpn_peer *peer = NULL;
+ 	struct sk_buff *skb = data;
+ 	unsigned int orig_len = 0;
+@@ -235,15 +236,28 @@ void ovpn_encrypt_post(void *data, int ret)
+ 
+ 	/* crypto is done, cleanup skb CB and its members */
+ 	if (likely(ovpn_skb_cb(skb)->ctx)) {
++		ks = ovpn_skb_cb(skb)->ctx->ks;
+ 		peer = ovpn_skb_cb(skb)->ctx->peer;
+ 		orig_len = ovpn_skb_cb(skb)->ctx->orig_len;
+ 
+-		ovpn_crypto_key_slot_put(ovpn_skb_cb(skb)->ctx->ks);
+ 		aead_request_free(ovpn_skb_cb(skb)->ctx->req);
+ 		kfree(ovpn_skb_cb(skb)->ctx);
+ 		ovpn_skb_cb(skb)->ctx = NULL;
+ 	}
+ 
++	if (unlikely(ret == -ERANGE)) {
++		/* we ran out of IVs and we must kill the key as it can't be
++		 * use anymore
++		 */
++		netdev_warn(peer->ovpn->dev,
++			    "killing key %u for peer %u\n", ks->key_id,
++			    peer->id);
++		ovpn_crypto_kill_key(&peer->crypto, ks->key_id);
++		/* let userspace know so that a new key must be negotiated */
++		ovpn_nl_key_swap_notify(peer, ks->key_id);
++		goto err;
++	}
++
+ 	if (unlikely(ret < 0))
+ 		goto err;
+ 
+@@ -273,6 +287,8 @@ void ovpn_encrypt_post(void *data, int ret)
+ 		dev_core_stats_tx_dropped_inc(peer->ovpn->dev);
+ 	if (likely(peer))
+ 		ovpn_peer_put(peer);
++	if (likely(ks))
++		ovpn_crypto_key_slot_put(ks);
+ 	kfree_skb(skb);
+ }
+ 
+diff --git a/drivers/net/ovpn/netlink.c b/drivers/net/ovpn/netlink.c
+index c9cede902..e9cf847e9 100644
+--- a/drivers/net/ovpn/netlink.c
++++ b/drivers/net/ovpn/netlink.c
+@@ -963,6 +963,61 @@ int ovpn_nl_key_del_doit(struct sk_buff *skb, struct genl_info *info)
+ 	return 0;
+ }
+ 
++/**
++ * ovpn_nl_key_swap_notify - notify userspace peer's key must be renewed
++ * @peer: the peer whose key needs to be renewed
++ * @key_id: the ID of the key that needs to be renewed
++ *
++ * Return: 0 on success or a negative error code otherwise
++ */
++int ovpn_nl_key_swap_notify(struct ovpn_peer *peer, u8 key_id)
++{
++	struct nlattr *k_attr;
++	struct sk_buff *msg;
++	int ret = -EMSGSIZE;
++	void *hdr;
++
++	netdev_info(peer->ovpn->dev, "peer with id %u must rekey - primary key unusable.\n",
++		    peer->id);
++
++	msg = nlmsg_new(100, GFP_ATOMIC);
++	if (!msg)
++		return -ENOMEM;
++
++	hdr = genlmsg_put(msg, 0, 0, &ovpn_nl_family, 0, OVPN_CMD_KEY_SWAP_NTF);
++	if (!hdr) {
++		ret = -ENOBUFS;
++		goto err_free_msg;
++	}
++
++	if (nla_put_u32(msg, OVPN_A_IFINDEX, peer->ovpn->dev->ifindex))
++		goto err_cancel_msg;
++
++	k_attr = nla_nest_start(msg, OVPN_A_KEYCONF);
++	if (!k_attr)
++		goto err_cancel_msg;
++
++	if (nla_put_u32(msg, OVPN_A_KEYCONF_PEER_ID, peer->id))
++		goto err_cancel_msg;
++
++	if (nla_put_u16(msg, OVPN_A_KEYCONF_KEY_ID, key_id))
++		goto err_cancel_msg;
++
++	nla_nest_end(msg, k_attr);
++	genlmsg_end(msg, hdr);
++
++	genlmsg_multicast_netns(&ovpn_nl_family, dev_net(peer->ovpn->dev), msg,
++				0, OVPN_NLGRP_PEERS, GFP_ATOMIC);
++
++	return 0;
++
++err_cancel_msg:
++	genlmsg_cancel(msg, hdr);
++err_free_msg:
++	nlmsg_free(msg);
++	return ret;
++}
++
+ /**
+  * ovpn_nl_register - perform any needed registration in the NL subsustem
+  *
+diff --git a/drivers/net/ovpn/netlink.h b/drivers/net/ovpn/netlink.h
+index 9e87cf11d..33390b13c 100644
+--- a/drivers/net/ovpn/netlink.h
++++ b/drivers/net/ovpn/netlink.h
+@@ -12,4 +12,6 @@
+ int ovpn_nl_register(void);
+ void ovpn_nl_unregister(void);
+ 
++int ovpn_nl_key_swap_notify(struct ovpn_peer *peer, u8 key_id);
++
+ #endif /* _NET_OVPN_NETLINK_H_ */
+-- 
+2.46.0.469.g4590f2e941
+
