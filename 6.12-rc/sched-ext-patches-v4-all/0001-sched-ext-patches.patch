@@ -1,0 +1,431 @@
+From 3f12966f9712dac5ee4748a2e683f536c8148657 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 24 Sep 2024 14:08:52 -1000
+Subject: [PATCH 1/6] sched_ext: Factor out move_task_between_dsqs() from
+ scx_dispatch_from_dsq()
+
+Pure reorganization. No functional changes.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 116 +++++++++++++++++++++++++++++----------------
+ 1 file changed, 75 insertions(+), 41 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 3cd7c50a5..74d0ebc5e 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -2369,6 +2369,73 @@ static inline bool task_can_run_on_remote_rq(struct task_struct *p, struct rq *r
+ static inline bool consume_remote_task(struct rq *this_rq, struct task_struct *p, struct scx_dispatch_q *dsq, struct rq *task_rq) { return false; }
+ #endif	/* CONFIG_SMP */
+ 
++/**
++ * move_task_between_dsqs() - Move a task from one DSQ to another
++ * @p: target task
++ * @enq_flags: %SCX_ENQ_*
++ * @src_dsq: DSQ @p is currently on, must not be a local DSQ
++ * @dst_dsq: DSQ @p is being moved to, can be any DSQ
++ *
++ * Must be called with @p's task_rq and @src_dsq locked. If @dst_dsq is a local
++ * DSQ and @p is on a different CPU, @p will be migrated and thus its task_rq
++ * will change. As @p's task_rq is locked, this function doesn't need to use the
++ * holding_cpu mechanism.
++ *
++ * On return, @src_dsq is unlocked and only @p's new task_rq, which is the
++ * return value, is locked.
++ */
++static struct rq *move_task_between_dsqs(struct task_struct *p, u64 enq_flags,
++					 struct scx_dispatch_q *src_dsq,
++					 struct scx_dispatch_q *dst_dsq)
++{
++	struct rq *src_rq = task_rq(p), *dst_rq;
++
++	BUG_ON(src_dsq->id == SCX_DSQ_LOCAL);
++	lockdep_assert_held(&src_dsq->lock);
++	lockdep_assert_rq_held(src_rq);
++
++	if (dst_dsq->id == SCX_DSQ_LOCAL) {
++		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
++		if (!task_can_run_on_remote_rq(p, dst_rq, true)) {
++			dst_dsq = find_global_dsq(p);
++			dst_rq = src_rq;
++		}
++	} else {
++		/* no need to migrate if destination is a non-local DSQ */
++		dst_rq = src_rq;
++	}
++
++	/*
++	 * Move @p into $dst_dsq. If $dst_dsq is the local DSQ of a different
++	 * CPU, @p will be migrated.
++	 */
++	if (dst_dsq->id == SCX_DSQ_LOCAL) {
++		/* @p is going from a non-local DSQ to a local DSQ */
++		if (src_rq == dst_rq) {
++			task_unlink_from_dsq(p, src_dsq);
++			move_local_task_to_local_dsq(p, enq_flags,
++						     src_dsq, dst_rq);
++			raw_spin_unlock(&src_dsq->lock);
++		} else {
++			raw_spin_unlock(&src_dsq->lock);
++			move_remote_task_to_local_dsq(p, enq_flags,
++						      src_rq, dst_rq);
++		}
++	} else {
++		/*
++		 * @p is going from a non-local DSQ to a non-local DSQ. As
++		 * $src_dsq is already locked, do an abbreviated dequeue.
++		 */
++		task_unlink_from_dsq(p, src_dsq);
++		p->scx.dsq = NULL;
++		raw_spin_unlock(&src_dsq->lock);
++
++		dispatch_enqueue(dst_dsq, p, enq_flags);
++	}
++
++	return dst_rq;
++}
++
+ static bool consume_dispatch_q(struct rq *rq, struct scx_dispatch_q *dsq)
+ {
+ 	struct task_struct *p;
+@@ -6033,7 +6100,7 @@ static bool scx_dispatch_from_dsq(struct bpf_iter_scx_dsq_kern *kit,
+ 				  u64 enq_flags)
+ {
+ 	struct scx_dispatch_q *src_dsq = kit->dsq, *dst_dsq;
+-	struct rq *this_rq, *src_rq, *dst_rq, *locked_rq;
++	struct rq *this_rq, *src_rq, *locked_rq;
+ 	bool dispatched = false;
+ 	bool in_balance;
+ 	unsigned long flags;
+@@ -6079,51 +6146,18 @@ static bool scx_dispatch_from_dsq(struct bpf_iter_scx_dsq_kern *kit,
+ 	/* @p is still on $src_dsq and stable, determine the destination */
+ 	dst_dsq = find_dsq_for_dispatch(this_rq, dsq_id, p);
+ 
+-	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+-		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
+-		if (!task_can_run_on_remote_rq(p, dst_rq, true)) {
+-			dst_dsq = find_global_dsq(p);
+-			dst_rq = src_rq;
+-		}
+-	} else {
+-		/* no need to migrate if destination is a non-local DSQ */
+-		dst_rq = src_rq;
+-	}
+-
+ 	/*
+-	 * Move @p into $dst_dsq. If $dst_dsq is the local DSQ of a different
+-	 * CPU, @p will be migrated.
++	 * Apply vtime and slice updates before moving so that the new time is
++	 * visible before inserting into $dst_dsq. @p is still on $src_dsq but
++	 * this is safe as we're locking it.
+ 	 */
+-	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+-		/* @p is going from a non-local DSQ to a local DSQ */
+-		if (src_rq == dst_rq) {
+-			task_unlink_from_dsq(p, src_dsq);
+-			move_local_task_to_local_dsq(p, enq_flags,
+-						     src_dsq, dst_rq);
+-			raw_spin_unlock(&src_dsq->lock);
+-		} else {
+-			raw_spin_unlock(&src_dsq->lock);
+-			move_remote_task_to_local_dsq(p, enq_flags,
+-						      src_rq, dst_rq);
+-			locked_rq = dst_rq;
+-		}
+-	} else {
+-		/*
+-		 * @p is going from a non-local DSQ to a non-local DSQ. As
+-		 * $src_dsq is already locked, do an abbreviated dequeue.
+-		 */
+-		task_unlink_from_dsq(p, src_dsq);
+-		p->scx.dsq = NULL;
+-		raw_spin_unlock(&src_dsq->lock);
+-
+-		if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_VTIME)
+-			p->scx.dsq_vtime = kit->vtime;
+-		dispatch_enqueue(dst_dsq, p, enq_flags);
+-	}
+-
++	if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_VTIME)
++		p->scx.dsq_vtime = kit->vtime;
+ 	if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_SLICE)
+ 		p->scx.slice = kit->slice;
+ 
++	/* execute move */
++	locked_rq = move_task_between_dsqs(p, enq_flags, src_dsq, dst_dsq);
+ 	dispatched = true;
+ out:
+ 	if (in_balance) {
+-- 
+2.46.0.469.g4590f2e941
+
+
+From 856aedc78c65f303de535afca443993529709b01 Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Thu, 26 Sep 2024 10:15:04 +0800
+Subject: [PATCH 2/6] sched/ext: Fix unmatch trailing comment of
+ CONFIG_EXT_GROUP_SCHED
+
+The #endif trailing comment of CONFIG_EXT_GROUP_SCHED is unmatched, so fix
+it.
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 74d0ebc5e..0e8eac19d 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -589,7 +589,7 @@ struct sched_ext_ops {
+ 	 * Update @tg's weight to @weight.
+ 	 */
+ 	void (*cgroup_set_weight)(struct cgroup *cgrp, u32 weight);
+-#endif	/* CONFIG_CGROUPS */
++#endif	/* CONFIG_EXT_GROUP_SCHED */
+ 
+ 	/*
+ 	 * All online ops must come before ops.cpu_online().
+-- 
+2.46.0.469.g4590f2e941
+
+
+From 4d2a0cb34a90d70fcd10e8fdf15da5bc3903bfe8 Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Thu, 26 Sep 2024 10:15:05 +0800
+Subject: [PATCH 3/6] sched/ext: Use tg_cgroup() to elieminate duplicate code
+
+Use tg_cgroup() to eliminate duplicate code patterns
+in scx_bpf_task_cgroup().
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 0e8eac19d..fe8acae35 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -7130,15 +7130,8 @@ __bpf_kfunc struct cgroup *scx_bpf_task_cgroup(struct task_struct *p)
+ 	if (!scx_kf_allowed_on_arg_tasks(__SCX_KF_RQ_LOCKED, p))
+ 		goto out;
+ 
+-	/*
+-	 * A task_group may either be a cgroup or an autogroup. In the latter
+-	 * case, @tg->css.cgroup is %NULL. A task_group can't become the other
+-	 * kind once created.
+-	 */
+-	if (tg && tg->css.cgroup)
+-		cgrp = tg->css.cgroup;
+-	else
+-		cgrp = &cgrp_dfl_root.cgrp;
++	cgrp = tg_cgrp(tg);
++
+ out:
+ 	cgroup_get(cgrp);
+ 	return cgrp;
+-- 
+2.46.0.469.g4590f2e941
+
+
+From 0a3c678eed13f7c93f7eaaa49073338700c65f98 Mon Sep 17 00:00:00 2001
+From: Vishal Chourasia <vishalc@linux.ibm.com>
+Date: Wed, 2 Oct 2024 12:38:06 +0530
+Subject: [PATCH 4/6] sched_ext: Add __weak markers to BPF helper function
+ decalarations
+
+Fix build errors by adding __weak markers to BPF helper function
+declarations in header files. This resolves static assertion failures
+in scx_qmap.bpf.c and scx_flatcg.bpf.c where functions like
+scx_bpf_dispatch_from_dsq_set_slice, scx_bpf_dispatch_from_dsq_set_vtime,
+and scx_bpf_task_cgroup were missing the __weak attribute.
+
+[1] https://lore.kernel.org/all/ZvvfUqRNM4-jYQzH@linux.ibm.com
+
+Signed-off-by: Vishal Chourasia <vishalc@linux.ibm.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ tools/sched_ext/include/scx/common.bpf.h | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/tools/sched_ext/include/scx/common.bpf.h b/tools/sched_ext/include/scx/common.bpf.h
+index 225f61f9b..27749c51c 100644
+--- a/tools/sched_ext/include/scx/common.bpf.h
++++ b/tools/sched_ext/include/scx/common.bpf.h
+@@ -41,8 +41,8 @@ void scx_bpf_dispatch_vtime(struct task_struct *p, u64 dsq_id, u64 slice, u64 vt
+ u32 scx_bpf_dispatch_nr_slots(void) __ksym;
+ void scx_bpf_dispatch_cancel(void) __ksym;
+ bool scx_bpf_consume(u64 dsq_id) __ksym;
+-void scx_bpf_dispatch_from_dsq_set_slice(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym;
+-void scx_bpf_dispatch_from_dsq_set_vtime(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym;
++void scx_bpf_dispatch_from_dsq_set_slice(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym __weak;
++void scx_bpf_dispatch_from_dsq_set_vtime(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym __weak;
+ bool scx_bpf_dispatch_from_dsq(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
+ bool scx_bpf_dispatch_vtime_from_dsq(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
+ u32 scx_bpf_reenqueue_local(void) __ksym;
+@@ -71,7 +71,7 @@ s32 scx_bpf_pick_any_cpu(const cpumask_t *cpus_allowed, u64 flags) __ksym;
+ bool scx_bpf_task_running(const struct task_struct *p) __ksym;
+ s32 scx_bpf_task_cpu(const struct task_struct *p) __ksym;
+ struct rq *scx_bpf_cpu_rq(s32 cpu) __ksym;
+-struct cgroup *scx_bpf_task_cgroup(struct task_struct *p) __ksym;
++struct cgroup *scx_bpf_task_cgroup(struct task_struct *p) __ksym __weak;
+ 
+ /*
+  * Use the following as @it__iter when calling
+-- 
+2.46.0.469.g4590f2e941
+
+
+From 03f8ca0bbef4226536e36f91bbef44088f359e92 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 2 Oct 2024 10:33:37 -1000
+Subject: [PATCH 5/6] sched_ext: Improve error reporting during loading
+
+When the BPF scheduler fails, ops.exit() allows rich error reporting through
+scx_exit_info. Use scx.exit() path consistently for all failures which can
+be caused by the BPF scheduler:
+
+- scx_ops_error() is called after ops.init() and ops.cgroup_init() failure
+  to record error information.
+
+- ops.init_task() failure now uses scx_ops_error() instead of pr_err().
+
+- The err_disable path updated to automatically trigger scx_ops_error() to
+  cover cases that the error message hasn't already been generated and
+  always return 0 indicating init success so that the error is reported
+  through ops.exit().
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: David Vernet <void@manifault.com>
+Cc: Daniel Hodges <hodges.daniel.scott@gmail.com>
+Cc: Changwoo Min <multics69@gmail.com>
+Cc: Andrea Righi <andrea.righi@linux.dev>
+Cc: Dan Schatzberg <schatzberg.dan@gmail.com>
+---
+ kernel/sched/ext.c | 30 +++++++++++++++++++-----------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index fe8acae35..abde86b03 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -625,6 +625,10 @@ struct sched_ext_ops {
+ 	/**
+ 	 * exit - Clean up after the BPF scheduler
+ 	 * @info: Exit info
++	 *
++	 * ops.exit() is also called on ops.init() failure, which is a bit
++	 * unusual. This is to allow rich reporting through @info on how
++	 * ops.init() failed.
+ 	 */
+ 	void (*exit)(struct scx_exit_info *info);
+ 
+@@ -4184,6 +4188,7 @@ static int scx_cgroup_init(void)
+ 				      css->cgroup, &args);
+ 		if (ret) {
+ 			css_put(css);
++			scx_ops_error("ops.cgroup_init() failed (%d)", ret);
+ 			return ret;
+ 		}
+ 		tg->scx_flags |= SCX_TG_INITED;
+@@ -5108,6 +5113,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 		if (ret) {
+ 			ret = ops_sanitize_err("init", ret);
+ 			cpus_read_unlock();
++			scx_ops_error("ops.init() failed (%d)", ret);
+ 			goto err_disable;
+ 		}
+ 	}
+@@ -5217,8 +5223,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 			spin_lock_irq(&scx_tasks_lock);
+ 			scx_task_iter_exit(&sti);
+ 			spin_unlock_irq(&scx_tasks_lock);
+-			pr_err("sched_ext: ops.init_task() failed (%d) for %s[%d] while loading\n",
+-			       ret, p->comm, p->pid);
++			scx_ops_error("ops.init_task() failed (%d) for %s[%d]",
++				      ret, p->comm, p->pid);
+ 			goto err_disable_unlock_all;
+ 		}
+ 
+@@ -5266,14 +5272,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ 	scx_ops_bypass(false);
+ 
+-	/*
+-	 * Returning an error code here would lose the recorded error
+-	 * information. Exit indicating success so that the error is notified
+-	 * through ops.exit() with all the details.
+-	 */
+ 	if (!scx_ops_tryset_enable_state(SCX_OPS_ENABLED, SCX_OPS_ENABLING)) {
+ 		WARN_ON_ONCE(atomic_read(&scx_exit_kind) == SCX_EXIT_NONE);
+-		ret = 0;
+ 		goto err_disable;
+ 	}
+ 
+@@ -5308,10 +5308,18 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 	scx_ops_bypass(false);
+ err_disable:
+ 	mutex_unlock(&scx_ops_enable_mutex);
+-	/* must be fully disabled before returning */
+-	scx_ops_disable(SCX_EXIT_ERROR);
++	/*
++	 * Returning an error code here would not pass all the error information
++	 * to userspace. Record errno using scx_ops_error() for cases
++	 * scx_ops_error() wasn't already invoked and exit indicating success so
++	 * that the error is notified through ops.exit() with all the details.
++	 *
++	 * Flush scx_ops_disable_work to ensure that error is reported before
++	 * init completion.
++	 */
++	scx_ops_error("scx_ops_enable() failed (%d)", ret);
+ 	kthread_flush_work(&scx_ops_disable_work);
+-	return ret;
++	return 0;
+ }
+ 
+ 
+-- 
+2.46.0.469.g4590f2e941
+
+
+From b5058f3473138b1acc27cd157e5db03b0ba440c3 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 2 Oct 2024 10:34:38 -1000
+Subject: [PATCH 6/6] sched_ext: scx_cgroup_exit() may be called without
+ successful scx_cgroup_init()
+
+568894edbe48 ("sched_ext: Add scx_cgroup_enabled to gate cgroup operations
+and fix scx_tg_online()") assumed that scx_cgroup_exit() is only called
+after scx_cgroup_init() finished successfully. This isn't true.
+scx_cgroup_exit() can be called without scx_cgroup_init() being called at
+all or after scx_cgroup_init() failed in the middle.
+
+As init state is tracked per cgroup, scx_cgroup_exit() can be used safely to
+clean up in all cases. Remove the incorrect WARN_ON_ONCE().
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Fixes: 568894edbe48 ("sched_ext: Add scx_cgroup_enabled to gate cgroup operations and fix scx_tg_online()")
+---
+ kernel/sched/ext.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index abde86b03..525abc918 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -4119,7 +4119,6 @@ static void scx_cgroup_exit(void)
+ 
+ 	percpu_rwsem_assert_held(&scx_cgroup_rwsem);
+ 
+-	WARN_ON_ONCE(!scx_cgroup_enabled);
+ 	scx_cgroup_enabled = false;
+ 
+ 	/*
+-- 
+2.46.0.469.g4590f2e941
+
