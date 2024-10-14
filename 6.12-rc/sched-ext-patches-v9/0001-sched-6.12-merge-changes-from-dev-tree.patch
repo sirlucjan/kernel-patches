@@ -1,0 +1,614 @@
+From b943f3b15e057e82c53580100eab0215106fce0b Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Mon, 14 Oct 2024 07:53:10 +0200
+Subject: [PATCH] sched-6.12: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ kernel/sched/ext.c                         | 187 +++++++++++----------
+ tools/testing/selftests/Makefile           |   9 +-
+ tools/testing/selftests/sched_ext/Makefile |  71 ++++----
+ 3 files changed, 139 insertions(+), 128 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 410a4df8a..cb1ab668e 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -9,7 +9,6 @@
+ #define SCX_OP_IDX(op)		(offsetof(struct sched_ext_ops, op) / sizeof(void (*)(void)))
+ 
+ enum scx_consts {
+-	SCX_SLICE_BYPASS		= SCX_SLICE_DFL / 4,
+ 	SCX_DSP_DFL_MAX_BATCH		= 32,
+ 	SCX_DSP_MAX_LOOPS		= 32,
+ 	SCX_WATCHDOG_MAX_TIMEOUT	= 30 * HZ,
+@@ -19,6 +18,12 @@ enum scx_consts {
+ 	SCX_EXIT_DUMP_DFL_LEN		= 32768,
+ 
+ 	SCX_CPUPERF_ONE			= SCHED_CAPACITY_SCALE,
++
++	/*
++	 * Iterating all tasks may take a while. Periodically drop
++	 * scx_tasks_lock to avoid causing e.g. CSD and RCU stalls.
++	 */
++	SCX_OPS_TASK_ITER_BATCH		= 32,
+ };
+ 
+ enum scx_exit_kind {
+@@ -1274,86 +1279,105 @@ struct scx_task_iter {
+ 	struct task_struct		*locked;
+ 	struct rq			*rq;
+ 	struct rq_flags			rf;
++	u32				cnt;
+ };
+ 
+ /**
+- * scx_task_iter_init - Initialize a task iterator
++ * scx_task_iter_start - Lock scx_tasks_lock and start a task iteration
+  * @iter: iterator to init
+  *
+- * Initialize @iter. Must be called with scx_tasks_lock held. Once initialized,
+- * @iter must eventually be exited with scx_task_iter_exit().
++ * Initialize @iter and return with scx_tasks_lock held. Once initialized, @iter
++ * must eventually be stopped with scx_task_iter_stop().
+  *
+- * scx_tasks_lock may be released between this and the first next() call or
+- * between any two next() calls. If scx_tasks_lock is released between two
+- * next() calls, the caller is responsible for ensuring that the task being
+- * iterated remains accessible either through RCU read lock or obtaining a
+- * reference count.
++ * scx_tasks_lock and the rq lock may be released using scx_task_iter_unlock()
++ * between this and the first next() call or between any two next() calls. If
++ * the locks are released between two next() calls, the caller is responsible
++ * for ensuring that the task being iterated remains accessible either through
++ * RCU read lock or obtaining a reference count.
+  *
+  * All tasks which existed when the iteration started are guaranteed to be
+  * visited as long as they still exist.
+  */
+-static void scx_task_iter_init(struct scx_task_iter *iter)
++static void scx_task_iter_start(struct scx_task_iter *iter)
+ {
+-	lockdep_assert_held(&scx_tasks_lock);
+-
+ 	BUILD_BUG_ON(__SCX_DSQ_ITER_ALL_FLAGS &
+ 		     ((1U << __SCX_DSQ_LNODE_PRIV_SHIFT) - 1));
+ 
++	spin_lock_irq(&scx_tasks_lock);
++
+ 	iter->cursor = (struct sched_ext_entity){ .flags = SCX_TASK_CURSOR };
+ 	list_add(&iter->cursor.tasks_node, &scx_tasks);
+ 	iter->locked = NULL;
++	iter->cnt = 0;
++}
++
++static void __scx_task_iter_rq_unlock(struct scx_task_iter *iter)
++{
++	if (iter->locked) {
++		task_rq_unlock(iter->rq, iter->locked, &iter->rf);
++		iter->locked = NULL;
++	}
+ }
+ 
+ /**
+- * scx_task_iter_rq_unlock - Unlock rq locked by a task iterator
+- * @iter: iterator to unlock rq for
++ * scx_task_iter_unlock - Unlock rq and scx_tasks_lock held by a task iterator
++ * @iter: iterator to unlock
+  *
+  * If @iter is in the middle of a locked iteration, it may be locking the rq of
+- * the task currently being visited. Unlock the rq if so. This function can be
+- * safely called anytime during an iteration.
++ * the task currently being visited in addition to scx_tasks_lock. Unlock both.
++ * This function can be safely called anytime during an iteration.
++ */
++static void scx_task_iter_unlock(struct scx_task_iter *iter)
++{
++	__scx_task_iter_rq_unlock(iter);
++	spin_unlock_irq(&scx_tasks_lock);
++}
++
++/**
++ * scx_task_iter_relock - Lock scx_tasks_lock released by scx_task_iter_unlock()
++ * @iter: iterator to re-lock
+  *
+- * Returns %true if the rq @iter was locking is unlocked. %false if @iter was
+- * not locking an rq.
++ * Re-lock scx_tasks_lock unlocked by scx_task_iter_unlock(). Note that it
++ * doesn't re-lock the rq lock. Must be called before other iterator operations.
+  */
+-static bool scx_task_iter_rq_unlock(struct scx_task_iter *iter)
++static void scx_task_iter_relock(struct scx_task_iter *iter)
+ {
+-	if (iter->locked) {
+-		task_rq_unlock(iter->rq, iter->locked, &iter->rf);
+-		iter->locked = NULL;
+-		return true;
+-	} else {
+-		return false;
+-	}
++	spin_lock_irq(&scx_tasks_lock);
+ }
+ 
+ /**
+- * scx_task_iter_exit - Exit a task iterator
++ * scx_task_iter_stop - Stop a task iteration and unlock scx_tasks_lock
+  * @iter: iterator to exit
+  *
+- * Exit a previously initialized @iter. Must be called with scx_tasks_lock held.
+- * If the iterator holds a task's rq lock, that rq lock is released. See
+- * scx_task_iter_init() for details.
++ * Exit a previously initialized @iter. Must be called with scx_tasks_lock held
++ * which is released on return. If the iterator holds a task's rq lock, that rq
++ * lock is also released. See scx_task_iter_start() for details.
+  */
+-static void scx_task_iter_exit(struct scx_task_iter *iter)
++static void scx_task_iter_stop(struct scx_task_iter *iter)
+ {
+-	lockdep_assert_held(&scx_tasks_lock);
+-
+-	scx_task_iter_rq_unlock(iter);
+ 	list_del_init(&iter->cursor.tasks_node);
++	scx_task_iter_unlock(iter);
+ }
+ 
+ /**
+  * scx_task_iter_next - Next task
+  * @iter: iterator to walk
+  *
+- * Visit the next task. See scx_task_iter_init() for details.
++ * Visit the next task. See scx_task_iter_start() for details. Locks are dropped
++ * and re-acquired every %SCX_OPS_TASK_ITER_BATCH iterations to avoid causing
++ * stalls by holding scx_tasks_lock for too long.
+  */
+ static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
+ {
+ 	struct list_head *cursor = &iter->cursor.tasks_node;
+ 	struct sched_ext_entity *pos;
+ 
+-	lockdep_assert_held(&scx_tasks_lock);
++	if (!(++iter->cnt % SCX_OPS_TASK_ITER_BATCH)) {
++		scx_task_iter_unlock(iter);
++		cpu_relax();
++		cond_resched();
++		scx_task_iter_relock(iter);
++	}
+ 
+ 	list_for_each_entry(pos, cursor, tasks_node) {
+ 		if (&pos->tasks_node == &scx_tasks)
+@@ -1374,14 +1398,14 @@ static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
+  * @include_dead: Whether we should include dead tasks in the iteration
+  *
+  * Visit the non-idle task with its rq lock held. Allows callers to specify
+- * whether they would like to filter out dead tasks. See scx_task_iter_init()
++ * whether they would like to filter out dead tasks. See scx_task_iter_start()
+  * for details.
+  */
+ static struct task_struct *scx_task_iter_next_locked(struct scx_task_iter *iter)
+ {
+ 	struct task_struct *p;
+ 
+-	scx_task_iter_rq_unlock(iter);
++	__scx_task_iter_rq_unlock(iter);
+ 
+ 	while ((p = scx_task_iter_next(iter))) {
+ 		/*
+@@ -1949,7 +1973,6 @@ static bool scx_rq_online(struct rq *rq)
+ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 			    int sticky_cpu)
+ {
+-	bool bypassing = scx_rq_bypassing(rq);
+ 	struct task_struct **ddsp_taskp;
+ 	unsigned long qseq;
+ 
+@@ -1967,7 +1990,7 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 	if (!scx_rq_online(rq))
+ 		goto local;
+ 
+-	if (bypassing)
++	if (scx_rq_bypassing(rq))
+ 		goto global;
+ 
+ 	if (p->scx.ddsp_dsq_id != SCX_DSQ_INVALID)
+@@ -2022,7 +2045,7 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 
+ global:
+ 	touch_core_sched(rq, p);	/* see the comment in local: */
+-	p->scx.slice = bypassing ? SCX_SLICE_BYPASS : SCX_SLICE_DFL;
++	p->scx.slice = SCX_SLICE_DFL;
+ 	dispatch_enqueue(find_global_dsq(p), p, enq_flags);
+ }
+ 
+@@ -2958,8 +2981,8 @@ static struct task_struct *pick_task_scx(struct rq *rq)
+ 
+ 		if (unlikely(!p->scx.slice)) {
+ 			if (!scx_rq_bypassing(rq) && !scx_warned_zero_slice) {
+-				printk_deferred(KERN_WARNING "sched_ext: %s[%d] has zero slice in pick_next_task_scx()\n",
+-						p->comm, p->pid);
++				printk_deferred(KERN_WARNING "sched_ext: %s[%d] has zero slice in %s()\n",
++						p->comm, p->pid, __func__);
+ 				scx_warned_zero_slice = true;
+ 			}
+ 			p->scx.slice = SCX_SLICE_DFL;
+@@ -3064,11 +3087,6 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
+ 
+ 	*found = false;
+ 
+-	if (!static_branch_likely(&scx_builtin_idle_enabled)) {
+-		scx_ops_error("built-in idle tracking is disabled");
+-		return prev_cpu;
+-	}
+-
+ 	/*
+ 	 * If WAKE_SYNC, the waker's local DSQ is empty, and the system is
+ 	 * under utilized, wake up @p to the local DSQ of the waker. Checking
+@@ -3133,7 +3151,7 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
+ 	if (unlikely(wake_flags & WF_EXEC))
+ 		return prev_cpu;
+ 
+-	if (SCX_HAS_OP(select_cpu)) {
++	if (SCX_HAS_OP(select_cpu) && !scx_rq_bypassing(task_rq(p))) {
+ 		s32 cpu;
+ 		struct task_struct **ddsp_taskp;
+ 
+@@ -3198,7 +3216,7 @@ void __scx_update_idle(struct rq *rq, bool idle)
+ {
+ 	int cpu = cpu_of(rq);
+ 
+-	if (SCX_HAS_OP(update_idle)) {
++	if (SCX_HAS_OP(update_idle) && !scx_rq_bypassing(rq)) {
+ 		SCX_CALL_OP(SCX_KF_REST, update_idle, cpu_of(rq), idle);
+ 		if (!static_branch_unlikely(&scx_builtin_idle_enabled))
+ 			return;
+@@ -4261,21 +4279,23 @@ bool task_should_scx(struct task_struct *p)
+  * the DISABLING state and then cycling the queued tasks through dequeue/enqueue
+  * to force global FIFO scheduling.
+  *
+- * a. ops.enqueue() is ignored and tasks are queued in simple global FIFO order.
+- *    %SCX_OPS_ENQ_LAST is also ignored.
++ * - ops.select_cpu() is ignored and the default select_cpu() is used.
+  *
+- * b. ops.dispatch() is ignored.
++ * - ops.enqueue() is ignored and tasks are queued in simple global FIFO order.
++ *   %SCX_OPS_ENQ_LAST is also ignored.
+  *
+- * c. balance_scx() does not set %SCX_RQ_BAL_KEEP on non-zero slice as slice
+- *    can't be trusted. Whenever a tick triggers, the running task is rotated to
+- *    the tail of the queue with core_sched_at touched.
++ * - ops.dispatch() is ignored.
+  *
+- * d. pick_next_task() suppresses zero slice warning.
++ * - balance_scx() does not set %SCX_RQ_BAL_KEEP on non-zero slice as slice
++ *   can't be trusted. Whenever a tick triggers, the running task is rotated to
++ *   the tail of the queue with core_sched_at touched.
+  *
+- * e. scx_bpf_kick_cpu() is disabled to avoid irq_work malfunction during PM
+- *    operations.
++ * - pick_next_task() suppresses zero slice warning.
+  *
+- * f. scx_prio_less() reverts to the default core_sched_at order.
++ * - scx_bpf_kick_cpu() is disabled to avoid irq_work malfunction during PM
++ *   operations.
++ *
++ * - scx_prio_less() reverts to the default core_sched_at order.
+  */
+ static void scx_ops_bypass(bool bypass)
+ {
+@@ -4345,7 +4365,7 @@ static void scx_ops_bypass(bool bypass)
+ 
+ 		rq_unlock_irqrestore(rq, &rf);
+ 
+-		/* kick to restore ticks */
++		/* resched to restore ticks and idle state */
+ 		resched_cpu(cpu);
+ 	}
+ }
+@@ -4467,15 +4487,13 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
+ 
+ 	scx_ops_init_task_enabled = false;
+ 
+-	spin_lock_irq(&scx_tasks_lock);
+-	scx_task_iter_init(&sti);
++	scx_task_iter_start(&sti);
+ 	while ((p = scx_task_iter_next_locked(&sti))) {
+ 		const struct sched_class *old_class = p->sched_class;
+ 		struct sched_enq_and_set_ctx ctx;
+ 
+ 		sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE, &ctx);
+ 
+-		p->scx.slice = min_t(u64, p->scx.slice, SCX_SLICE_DFL);
+ 		__setscheduler_prio(p, p->prio);
+ 		check_class_changing(task_rq(p), p, old_class);
+ 
+@@ -4484,8 +4502,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
+ 		check_class_changed(task_rq(p), p, old_class, p->prio);
+ 		scx_ops_exit_task(p);
+ 	}
+-	scx_task_iter_exit(&sti);
+-	spin_unlock_irq(&scx_tasks_lock);
++	scx_task_iter_stop(&sti);
+ 	percpu_up_write(&scx_fork_rwsem);
+ 
+ 	/* no task is on scx, turn off all the switches and flush in-progress calls */
+@@ -5136,8 +5153,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 	if (ret)
+ 		goto err_disable_unlock_all;
+ 
+-	spin_lock_irq(&scx_tasks_lock);
+-	scx_task_iter_init(&sti);
++	scx_task_iter_start(&sti);
+ 	while ((p = scx_task_iter_next_locked(&sti))) {
+ 		/*
+ 		 * @p may already be dead, have lost all its usages counts and
+@@ -5147,15 +5163,13 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 		if (!tryget_task_struct(p))
+ 			continue;
+ 
+-		scx_task_iter_rq_unlock(&sti);
+-		spin_unlock_irq(&scx_tasks_lock);
++		scx_task_iter_unlock(&sti);
+ 
+ 		ret = scx_ops_init_task(p, task_group(p), false);
+ 		if (ret) {
+ 			put_task_struct(p);
+-			spin_lock_irq(&scx_tasks_lock);
+-			scx_task_iter_exit(&sti);
+-			spin_unlock_irq(&scx_tasks_lock);
++			scx_task_iter_relock(&sti);
++			scx_task_iter_stop(&sti);
+ 			scx_ops_error("ops.init_task() failed (%d) for %s[%d]",
+ 				      ret, p->comm, p->pid);
+ 			goto err_disable_unlock_all;
+@@ -5164,10 +5178,9 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 		scx_set_task_state(p, SCX_TASK_READY);
+ 
+ 		put_task_struct(p);
+-		spin_lock_irq(&scx_tasks_lock);
++		scx_task_iter_relock(&sti);
+ 	}
+-	scx_task_iter_exit(&sti);
+-	spin_unlock_irq(&scx_tasks_lock);
++	scx_task_iter_stop(&sti);
+ 	scx_cgroup_unlock();
+ 	percpu_up_write(&scx_fork_rwsem);
+ 
+@@ -5184,14 +5197,14 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 	 * scx_tasks_lock.
+ 	 */
+ 	percpu_down_write(&scx_fork_rwsem);
+-	spin_lock_irq(&scx_tasks_lock);
+-	scx_task_iter_init(&sti);
++	scx_task_iter_start(&sti);
+ 	while ((p = scx_task_iter_next_locked(&sti))) {
+ 		const struct sched_class *old_class = p->sched_class;
+ 		struct sched_enq_and_set_ctx ctx;
+ 
+ 		sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE, &ctx);
+ 
++		p->scx.slice = SCX_SLICE_DFL;
+ 		__setscheduler_prio(p, p->prio);
+ 		check_class_changing(task_rq(p), p, old_class);
+ 
+@@ -5199,8 +5212,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ 		check_class_changed(task_rq(p), p, old_class, p->prio);
+ 	}
+-	scx_task_iter_exit(&sti);
+-	spin_unlock_irq(&scx_tasks_lock);
++	scx_task_iter_stop(&sti);
+ 	percpu_up_write(&scx_fork_rwsem);
+ 
+ 	scx_ops_bypass(false);
+@@ -5872,16 +5884,21 @@ __bpf_kfunc_start_defs();
+ __bpf_kfunc s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
+ 				       u64 wake_flags, bool *is_idle)
+ {
+-	if (!scx_kf_allowed(SCX_KF_SELECT_CPU)) {
+-		*is_idle = false;
+-		return prev_cpu;
++	if (!static_branch_likely(&scx_builtin_idle_enabled)) {
++		scx_ops_error("built-in idle tracking is disabled");
++		goto prev_cpu;
+ 	}
++
++	if (!scx_kf_allowed(SCX_KF_SELECT_CPU))
++		goto prev_cpu;
++
+ #ifdef CONFIG_SMP
+ 	return scx_select_cpu_dfl(p, prev_cpu, wake_flags, is_idle);
+-#else
++#endif
++
++prev_cpu:
+ 	*is_idle = false;
+ 	return prev_cpu;
+-#endif
+ }
+ 
+ __bpf_kfunc_end_defs();
+diff --git a/tools/testing/selftests/Makefile b/tools/testing/selftests/Makefile
+index b38199965..363d031a1 100644
+--- a/tools/testing/selftests/Makefile
++++ b/tools/testing/selftests/Makefile
+@@ -88,6 +88,7 @@ TARGETS += rlimits
+ TARGETS += rseq
+ TARGETS += rtc
+ TARGETS += rust
++TARGETS += sched_ext
+ TARGETS += seccomp
+ TARGETS += sgx
+ TARGETS += sigaltstack
+@@ -129,10 +130,10 @@ ifeq ($(filter net/lib,$(TARGETS)),)
+ endif
+ endif
+ 
+-# User can optionally provide a TARGETS skiplist.  By default we skip
+-# BPF since it has cutting edge build time dependencies which require
+-# more effort to install.
+-SKIP_TARGETS ?= bpf
++# User can optionally provide a TARGETS skiplist. By default we skip
++# targets using BPF since it has cutting edge build time dependencies
++# which require more effort to install.
++SKIP_TARGETS ?= bpf sched_ext
+ ifneq ($(SKIP_TARGETS),)
+ 	TMP := $(filter-out $(SKIP_TARGETS), $(TARGETS))
+ 	override TARGETS := $(TMP)
+diff --git a/tools/testing/selftests/sched_ext/Makefile b/tools/testing/selftests/sched_ext/Makefile
+index 0754a2c11..06ae9c107 100644
+--- a/tools/testing/selftests/sched_ext/Makefile
++++ b/tools/testing/selftests/sched_ext/Makefile
+@@ -3,23 +3,12 @@
+ include ../../../build/Build.include
+ include ../../../scripts/Makefile.arch
+ include ../../../scripts/Makefile.include
+-include ../lib.mk
+ 
+-ifneq ($(LLVM),)
+-ifneq ($(filter %/,$(LLVM)),)
+-LLVM_PREFIX := $(LLVM)
+-else ifneq ($(filter -%,$(LLVM)),)
+-LLVM_SUFFIX := $(LLVM)
+-endif
+-
+-CC := $(LLVM_PREFIX)clang$(LLVM_SUFFIX) $(CLANG_FLAGS) -fintegrated-as
+-else
+-CC := gcc
+-endif # LLVM
++TEST_GEN_PROGS := runner
+ 
+-ifneq ($(CROSS_COMPILE),)
+-$(error CROSS_COMPILE not supported for scx selftests)
+-endif # CROSS_COMPILE
++# override lib.mk's default rules
++OVERRIDE_TARGETS := 1
++include ../lib.mk
+ 
+ CURDIR := $(abspath .)
+ REPOROOT := $(abspath ../../../..)
+@@ -34,18 +23,23 @@ GENHDR := $(GENDIR)/autoconf.h
+ SCXTOOLSDIR := $(TOOLSDIR)/sched_ext
+ SCXTOOLSINCDIR := $(TOOLSDIR)/sched_ext/include
+ 
+-OUTPUT_DIR := $(CURDIR)/build
++OUTPUT_DIR := $(OUTPUT)/build
+ OBJ_DIR := $(OUTPUT_DIR)/obj
+ INCLUDE_DIR := $(OUTPUT_DIR)/include
+ BPFOBJ_DIR := $(OBJ_DIR)/libbpf
+ SCXOBJ_DIR := $(OBJ_DIR)/sched_ext
+ BPFOBJ := $(BPFOBJ_DIR)/libbpf.a
+ LIBBPF_OUTPUT := $(OBJ_DIR)/libbpf/libbpf.a
+-DEFAULT_BPFTOOL := $(OUTPUT_DIR)/sbin/bpftool
+-HOST_BUILD_DIR := $(OBJ_DIR)
+-HOST_OUTPUT_DIR := $(OUTPUT_DIR)
+ 
+-VMLINUX_BTF_PATHS ?= ../../../../vmlinux					\
++DEFAULT_BPFTOOL := $(OUTPUT_DIR)/host/sbin/bpftool
++HOST_OBJ_DIR := $(OBJ_DIR)/host/bpftool
++HOST_LIBBPF_OUTPUT := $(OBJ_DIR)/host/libbpf/
++HOST_LIBBPF_DESTDIR := $(OUTPUT_DIR)/host/
++HOST_DESTDIR := $(OUTPUT_DIR)/host/
++
++VMLINUX_BTF_PATHS ?= $(if $(O),$(O)/vmlinux)					\
++		     $(if $(KBUILD_OUTPUT),$(KBUILD_OUTPUT)/vmlinux)		\
++		     ../../../../vmlinux					\
+ 		     /sys/kernel/btf/vmlinux					\
+ 		     /boot/vmlinux-$(shell uname -r)
+ VMLINUX_BTF ?= $(abspath $(firstword $(wildcard $(VMLINUX_BTF_PATHS))))
+@@ -80,17 +74,23 @@ IS_LITTLE_ENDIAN = $(shell $(CC) -dM -E - </dev/null |				\
+ # Use '-idirafter': Don't interfere with include mechanics except where the
+ # build would have failed anyways.
+ define get_sys_includes
+-$(shell $(1) -v -E - </dev/null 2>&1 \
++$(shell $(1) $(2) -v -E - </dev/null 2>&1 \
+ 	| sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }') \
+-$(shell $(1) -dM -E - </dev/null | grep '__riscv_xlen ' | awk '{printf("-D__riscv_xlen=%d -D__BITS_PER_LONG=%d", $$3, $$3)}')
++$(shell $(1) $(2) -dM -E - </dev/null | grep '__riscv_xlen ' | awk '{printf("-D__riscv_xlen=%d -D__BITS_PER_LONG=%d", $$3, $$3)}')
+ endef
+ 
++ifneq ($(CROSS_COMPILE),)
++CLANG_TARGET_ARCH = --target=$(notdir $(CROSS_COMPILE:%-=%))
++endif
++
++CLANG_SYS_INCLUDES = $(call get_sys_includes,$(CLANG),$(CLANG_TARGET_ARCH))
++
+ BPF_CFLAGS = -g -D__TARGET_ARCH_$(SRCARCH)					\
+ 	     $(if $(IS_LITTLE_ENDIAN),-mlittle-endian,-mbig-endian)		\
+ 	     -I$(CURDIR)/include -I$(CURDIR)/include/bpf-compat			\
+ 	     -I$(INCLUDE_DIR) -I$(APIDIR) -I$(SCXTOOLSINCDIR)			\
+ 	     -I$(REPOROOT)/include						\
+-	     $(call get_sys_includes,$(CLANG))					\
++	     $(CLANG_SYS_INCLUDES) 						\
+ 	     -Wall -Wno-compare-distinct-pointer-types				\
+ 	     -Wno-incompatible-function-pointer-types				\
+ 	     -O2 -mcpu=v3
+@@ -98,7 +98,7 @@ BPF_CFLAGS = -g -D__TARGET_ARCH_$(SRCARCH)					\
+ # sort removes libbpf duplicates when not cross-building
+ MAKE_DIRS := $(sort $(OBJ_DIR)/libbpf $(OBJ_DIR)/libbpf				\
+ 	       $(OBJ_DIR)/bpftool $(OBJ_DIR)/resolve_btfids			\
+-	       $(INCLUDE_DIR) $(SCXOBJ_DIR))
++	       $(HOST_OBJ_DIR) $(INCLUDE_DIR) $(SCXOBJ_DIR))
+ 
+ $(MAKE_DIRS):
+ 	$(call msg,MKDIR,,$@)
+@@ -108,18 +108,19 @@ $(BPFOBJ): $(wildcard $(BPFDIR)/*.[ch] $(BPFDIR)/Makefile)			\
+ 	   $(APIDIR)/linux/bpf.h						\
+ 	   | $(OBJ_DIR)/libbpf
+ 	$(Q)$(MAKE) $(submake_extras) -C $(BPFDIR) OUTPUT=$(OBJ_DIR)/libbpf/	\
++		    ARCH=$(ARCH) CC="$(CC)" CROSS_COMPILE=$(CROSS_COMPILE)	\
+ 		    EXTRA_CFLAGS='-g -O0 -fPIC'					\
+ 		    DESTDIR=$(OUTPUT_DIR) prefix= all install_headers
+ 
+ $(DEFAULT_BPFTOOL): $(wildcard $(BPFTOOLDIR)/*.[ch] $(BPFTOOLDIR)/Makefile)	\
+-		    $(LIBBPF_OUTPUT) | $(OBJ_DIR)/bpftool
++		    $(LIBBPF_OUTPUT) | $(HOST_OBJ_DIR)
+ 	$(Q)$(MAKE) $(submake_extras)  -C $(BPFTOOLDIR)				\
+ 		    ARCH= CROSS_COMPILE= CC=$(HOSTCC) LD=$(HOSTLD)		\
+ 		    EXTRA_CFLAGS='-g -O0'					\
+-		    OUTPUT=$(OBJ_DIR)/bpftool/					\
+-		    LIBBPF_OUTPUT=$(OBJ_DIR)/libbpf/				\
+-		    LIBBPF_DESTDIR=$(OUTPUT_DIR)/				\
+-		    prefix= DESTDIR=$(OUTPUT_DIR)/ install-bin
++		    OUTPUT=$(HOST_OBJ_DIR)/					\
++		    LIBBPF_OUTPUT=$(HOST_LIBBPF_OUTPUT)				\
++		    LIBBPF_DESTDIR=$(HOST_LIBBPF_DESTDIR)			\
++		    prefix= DESTDIR=$(HOST_DESTDIR) install-bin
+ 
+ $(INCLUDE_DIR)/vmlinux.h: $(VMLINUX_BTF) $(BPFTOOL) | $(INCLUDE_DIR)
+ ifeq ($(VMLINUX_H),)
+@@ -150,9 +151,7 @@ $(INCLUDE_DIR)/%.bpf.skel.h: $(SCXOBJ_DIR)/%.bpf.o $(INCLUDE_DIR)/vmlinux.h $(BP
+ 
+ override define CLEAN
+ 	rm -rf $(OUTPUT_DIR)
+-	rm -f *.o *.bpf.o *.bpf.skel.h *.bpf.subskel.h
+ 	rm -f $(TEST_GEN_PROGS)
+-	rm -f runner
+ endef
+ 
+ # Every testcase takes all of the BPF progs are dependencies by default. This
+@@ -196,21 +195,15 @@ $(SCXOBJ_DIR)/runner.o: runner.c | $(SCXOBJ_DIR)
+ # function doesn't support using implicit rules otherwise.
+ $(testcase-targets): $(SCXOBJ_DIR)/%.o: %.c $(SCXOBJ_DIR)/runner.o $(all_test_bpfprogs) | $(SCXOBJ_DIR)
+ 	$(eval test=$(patsubst %.o,%.c,$(notdir $@)))
+-	$(CC) $(CFLAGS) -c $< -o $@ $(SCXOBJ_DIR)/runner.o
++	$(CC) $(CFLAGS) -c $< -o $@
+ 
+ $(SCXOBJ_DIR)/util.o: util.c | $(SCXOBJ_DIR)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
+-runner: $(SCXOBJ_DIR)/runner.o $(SCXOBJ_DIR)/util.o $(BPFOBJ) $(testcase-targets)
++$(OUTPUT)/runner: $(SCXOBJ_DIR)/runner.o $(SCXOBJ_DIR)/util.o $(BPFOBJ) $(testcase-targets)
+ 	@echo "$(testcase-targets)"
+ 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+ 
+-TEST_GEN_PROGS := runner
+-
+-all: runner
+-
+-.PHONY: all clean help
+-
+ .DEFAULT_GOAL := all
+ 
+ .DELETE_ON_ERROR:
+-- 
+2.47.0
+
