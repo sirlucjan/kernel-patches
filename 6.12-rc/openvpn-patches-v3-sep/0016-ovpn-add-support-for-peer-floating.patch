@@ -1,0 +1,217 @@
+From b7bed3ce02c7f651abb8d2fd8941866cd945f3e2 Mon Sep 17 00:00:00 2001
+From: Antonio Quartulli <antonio@openvpn.net>
+Date: Wed, 16 Oct 2024 03:03:17 +0200
+Subject: [PATCH 16/23] ovpn: add support for peer floating
+
+A peer connected via UDP may change its IP address without reconnecting
+(float).
+
+Add support for detecting and updating the new peer IP/port in case of
+floating.
+
+Signed-off-by: Antonio Quartulli <antonio@openvpn.net>
+---
+ drivers/net/ovpn/bind.c |  10 +---
+ drivers/net/ovpn/io.c   |   9 +++
+ drivers/net/ovpn/peer.c | 126 ++++++++++++++++++++++++++++++++++++++--
+ drivers/net/ovpn/peer.h |   2 +
+ 4 files changed, 136 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/ovpn/bind.c b/drivers/net/ovpn/bind.c
+index b4d2ccec2..d17d078c5 100644
+--- a/drivers/net/ovpn/bind.c
++++ b/drivers/net/ovpn/bind.c
+@@ -47,12 +47,8 @@ struct ovpn_bind *ovpn_bind_from_sockaddr(const struct sockaddr_storage *ss)
+  * @new: the new bind to assign
+  */
+ void ovpn_bind_reset(struct ovpn_peer *peer, struct ovpn_bind *new)
++	__must_hold(&peer->lock)
+ {
+-	struct ovpn_bind *old;
+-
+-	spin_lock_bh(&peer->lock);
+-	old = rcu_replace_pointer(peer->bind, new, true);
+-	spin_unlock_bh(&peer->lock);
+-
+-	kfree_rcu(old, rcu);
++	kfree_rcu(rcu_replace_pointer(peer->bind, new,
++				      lockdep_is_held(&peer->lock)), rcu);
+ }
+diff --git a/drivers/net/ovpn/io.c b/drivers/net/ovpn/io.c
+index 1c4cdbb16..c857ac901 100644
+--- a/drivers/net/ovpn/io.c
++++ b/drivers/net/ovpn/io.c
+@@ -135,6 +135,15 @@ void ovpn_decrypt_post(void *data, int ret)
+ 	/* keep track of last received authenticated packet for keepalive */
+ 	peer->last_recv = ktime_get_real_seconds();
+ 
++	if (peer->sock->sock->sk->sk_protocol == IPPROTO_UDP) {
++		/* check if this peer changed it's IP address and update
++		 * state
++		 */
++		ovpn_peer_float(peer, skb);
++		/* update source endpoint for this peer */
++		ovpn_peer_update_local_endpoint(peer, skb);
++	}
++
+ 	/* point to encapsulated IP packet */
+ 	__skb_pull(skb, payload_offset);
+ 
+diff --git a/drivers/net/ovpn/peer.c b/drivers/net/ovpn/peer.c
+index f3b20a561..0718051bb 100644
+--- a/drivers/net/ovpn/peer.c
++++ b/drivers/net/ovpn/peer.c
+@@ -94,6 +94,128 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_struct *ovpn, u32 id)
+ 	return peer;
+ }
+ 
++/**
++ * ovpn_peer_reset_sockaddr - recreate binding for peer
++ * @peer: peer to recreate the binding for
++ * @ss: sockaddr to use as remote endpoint for the binding
++ * @local_ip: local IP for the binding
++ *
++ * Return: 0 on success or a negative error code otherwise
++ */
++static int ovpn_peer_reset_sockaddr(struct ovpn_peer *peer,
++				    const struct sockaddr_storage *ss,
++				    const u8 *local_ip)
++	__must_hold(&peer->lock)
++{
++	struct ovpn_bind *bind;
++	size_t ip_len;
++
++	/* create new ovpn_bind object */
++	bind = ovpn_bind_from_sockaddr(ss);
++	if (IS_ERR(bind))
++		return PTR_ERR(bind);
++
++	if (local_ip) {
++		if (ss->ss_family == AF_INET) {
++			ip_len = sizeof(struct in_addr);
++		} else if (ss->ss_family == AF_INET6) {
++			ip_len = sizeof(struct in6_addr);
++		} else {
++			netdev_dbg(peer->ovpn->dev, "%s: invalid family for remote endpoint\n",
++				   __func__);
++			kfree(bind);
++			return -EINVAL;
++		}
++
++		memcpy(&bind->local, local_ip, ip_len);
++	}
++
++	/* set binding */
++	ovpn_bind_reset(peer, bind);
++
++	return 0;
++}
++
++#define ovpn_get_hash_head(_tbl, _key, _key_len) ({		\
++	typeof(_tbl) *__tbl = &(_tbl);				\
++	(&(*__tbl)[jhash(_key, _key_len, 0) % HASH_SIZE(*__tbl)]); }) \
++
++/**
++ * ovpn_peer_float - update remote endpoint for peer
++ * @peer: peer to update the remote endpoint for
++ * @skb: incoming packet to retrieve the source address (remote) from
++ */
++void ovpn_peer_float(struct ovpn_peer *peer, struct sk_buff *skb)
++{
++	struct hlist_nulls_head *nhead;
++	struct sockaddr_storage ss;
++	const u8 *local_ip = NULL;
++	struct sockaddr_in6 *sa6;
++	struct sockaddr_in *sa;
++	struct ovpn_bind *bind;
++	sa_family_t family;
++	size_t salen;
++
++	rcu_read_lock();
++	bind = rcu_dereference(peer->bind);
++	if (unlikely(!bind)) {
++		rcu_read_unlock();
++		return;
++	}
++
++	spin_lock_bh(&peer->lock);
++	if (likely(ovpn_bind_skb_src_match(bind, skb)))
++		goto unlock;
++
++	family = skb_protocol_to_family(skb);
++
++	if (bind->remote.in4.sin_family == family)
++		local_ip = (u8 *)&bind->local;
++
++	switch (family) {
++	case AF_INET:
++		sa = (struct sockaddr_in *)&ss;
++		sa->sin_family = AF_INET;
++		sa->sin_addr.s_addr = ip_hdr(skb)->saddr;
++		sa->sin_port = udp_hdr(skb)->source;
++		salen = sizeof(*sa);
++		break;
++	case AF_INET6:
++		sa6 = (struct sockaddr_in6 *)&ss;
++		sa6->sin6_family = AF_INET6;
++		sa6->sin6_addr = ipv6_hdr(skb)->saddr;
++		sa6->sin6_port = udp_hdr(skb)->source;
++		sa6->sin6_scope_id = ipv6_iface_scope_id(&ipv6_hdr(skb)->saddr,
++							 skb->skb_iif);
++		salen = sizeof(*sa6);
++		break;
++	default:
++		goto unlock;
++	}
++
++	netdev_dbg(peer->ovpn->dev, "%s: peer %d floated to %pIScp", __func__,
++		   peer->id, &ss);
++	ovpn_peer_reset_sockaddr(peer, (struct sockaddr_storage *)&ss,
++				 local_ip);
++
++	/* rehashing is required only in MP mode as P2P has one peer
++	 * only and thus there is no hashtable
++	 */
++	if (peer->ovpn->mode == OVPN_MODE_MP) {
++		spin_lock_bh(&peer->ovpn->peers->lock);
++		/* remove old hashing */
++		hlist_nulls_del_init_rcu(&peer->hash_entry_transp_addr);
++		/* re-add with new transport address */
++		nhead = ovpn_get_hash_head(peer->ovpn->peers->by_transp_addr,
++					   &ss, salen);
++		hlist_nulls_add_head_rcu(&peer->hash_entry_transp_addr, nhead);
++		spin_unlock_bh(&peer->ovpn->peers->lock);
++	}
++unlock:
++	spin_unlock_bh(&peer->lock);
++	rcu_read_unlock();
++}
++
+ static void ovpn_peer_release(struct ovpn_peer *peer)
+ {
+ 	if (peer->sock)
+@@ -186,10 +308,6 @@ static struct in6_addr ovpn_nexthop_from_skb6(struct sk_buff *skb)
+ 	return rt->rt6i_gateway;
+ }
+ 
+-#define ovpn_get_hash_head(_tbl, _key, _key_len) ({		\
+-	typeof(_tbl) *__tbl = &(_tbl);				\
+-	(&(*__tbl)[jhash(_key, _key_len, 0) % HASH_SIZE(*__tbl)]); }) \
+-
+ /**
+  * ovpn_peer_get_by_vpn_addr4 - retrieve peer by its VPN IPv4 address
+  * @ovpn: the openvpn instance to search
+diff --git a/drivers/net/ovpn/peer.h b/drivers/net/ovpn/peer.h
+index 1a8638d26..940cea537 100644
+--- a/drivers/net/ovpn/peer.h
++++ b/drivers/net/ovpn/peer.h
+@@ -155,4 +155,6 @@ void ovpn_peer_keepalive_work(struct work_struct *work);
+ void ovpn_peer_update_local_endpoint(struct ovpn_peer *peer,
+ 				     struct sk_buff *skb);
+ 
++void ovpn_peer_float(struct ovpn_peer *peer, struct sk_buff *skb);
++
+ #endif /* _NET_OVPN_OVPNPEER_H_ */
+-- 
+2.47.0
+
