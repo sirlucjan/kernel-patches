@@ -1,0 +1,487 @@
+From 32d7ceb02c8194445fc802c855f21f105661930e Mon Sep 17 00:00:00 2001
+From: Rong Xu <xur@google.com>
+Date: Mon, 14 Oct 2024 14:33:40 -0700
+Subject: [PATCH 6/6] Add Propeller configuration for kernel build.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the build support for using Clang's Propeller optimizer. Like
+AutoFDO, Propeller uses hardware sampling to gather information
+about the frequency of execution of different code paths within a
+binary. This information is then used to guide the compiler's
+optimization decisions, resulting in a more efficient binary.
+
+The support requires a Clang compiler LLVM 19 or later, and the
+create_llvm_prof tool
+(https://github.com/google/autofdo/releases/tag/v0.30.1). This
+submission is limited to x86 platforms that support PMU features
+like LBR on Intel machines and AMD Zen3 BRS.
+
+For Arm, we plan to send patches for SPE-based Propeller when
+AutoFDO for Arm is ready.
+
+Here is an example workflow for building an AutoFDO+Propeller
+optimized kernel:
+
+1) Build the kernel on the HOST machine, with AutoFDO and Propeller
+   build config
+      CONFIG_AUTOFDO_CLANG=y
+      CONFIG_PROPELLER_CLANG=y
+   then
+      $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<autofdo_profile>
+
+“<autofdo_profile>” is the profile collected when doing a non-Propeller
+AutoFDO build. This step builds a kernel that has the same optimization
+level as AutoFDO, plus a metadata section that records basic block
+information. This kernel image runs as fast as an AutoFDO optimized
+kernel.
+
+2) Install the kernel on test/production machines.
+
+3) Run the load tests. The '-c' option in perf specifies the sample
+   event period. We suggest using a suitable prime number,
+   like 500009, for this purpose.
+   For Intel platforms:
+      $ perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -a -N -b -c <count> \
+        -o <perf_file> -- <loadtest>
+   For AMD platforms:
+      The supported system are: Zen3 with BRS, or Zen4 with amd_lbr_v2
+      # To see if Zen3 support LBR:
+      $ cat proc/cpuinfo | grep " brs"
+      # To see if Zen4 support LBR:
+      $ cat proc/cpuinfo | grep amd_lbr_v2
+      # If the result is yes, then collect the profile using:
+      $ perf record --pfm-events RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -a \
+        -N -b -c <count> -o <perf_file> -- <loadtest>
+
+4) (Optional) Download the raw perf file to the HOST machine.
+
+5) Generate Propeller profile:
+   $ create_llvm_prof --binary=<vmlinux> --profile=<perf_file> \
+     --format=propeller --propeller_output_module_name \
+     --out=<propeller_profile_prefix>_cc_profile.txt \
+     --propeller_symorder=<propeller_profile_prefix>_ld_profile.txt
+
+   “create_llvm_prof” is the profile conversion tool, and a prebuilt
+   binary for linux can be found on
+   https://github.com/google/autofdo/releases/tag/v0.30.1 (can also build
+   from source).
+
+   "<propeller_profile_prefix>" can be something like
+   "/home/user/dir/any_string".
+
+   This command generates a pair of Propeller profiles:
+   "<propeller_profile_prefix>_cc_profile.txt" and
+   "<propeller_profile_prefix>_ld_profile.txt".
+
+6) Rebuild the kernel using the AutoFDO and Propeller profile files.
+      CONFIG_AUTOFDO_CLANG=y
+      CONFIG_PROPELLER_CLANG=y
+   and
+      $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<autofdo_profile> \
+        CLANG_PROPELLER_PROFILE_PREFIX=<propeller_profile_prefix>
+
+Co-developed-by: Han Shen <shenhan@google.com>
+Signed-off-by: Han Shen <shenhan@google.com>
+Signed-off-by: Rong Xu <xur@google.com>
+Suggested-by: Sriraman Tallam <tmsriram@google.com>
+Suggested-by: Krzysztof Pszeniczny <kpszeniczny@google.com>
+Suggested-by: Nick Desaulniers <ndesaulniers@google.com>
+Suggested-by: Stephane Eranian <eranian@google.com>
+Tested-by: Yonghong Song <yonghong.song@linux.dev>
+---
+ Documentation/dev-tools/index.rst     |   1 +
+ Documentation/dev-tools/propeller.rst | 161 ++++++++++++++++++++++++++
+ MAINTAINERS                           |   7 ++
+ Makefile                              |   1 +
+ arch/Kconfig                          |  22 ++++
+ arch/x86/Kconfig                      |   1 +
+ arch/x86/kernel/vmlinux.lds.S         |   4 +
+ include/asm-generic/vmlinux.lds.h     |  10 +-
+ scripts/Makefile.lib                  |  10 ++
+ scripts/Makefile.propeller            |  28 +++++
+ tools/objtool/check.c                 |   1 +
+ 11 files changed, 241 insertions(+), 5 deletions(-)
+ create mode 100644 Documentation/dev-tools/propeller.rst
+ create mode 100644 scripts/Makefile.propeller
+
+diff --git a/Documentation/dev-tools/index.rst b/Documentation/dev-tools/index.rst
+index 6945644f7..3c0ac08b2 100644
+--- a/Documentation/dev-tools/index.rst
++++ b/Documentation/dev-tools/index.rst
+@@ -35,6 +35,7 @@ Documentation/dev-tools/testing-overview.rst
+    checkuapi
+    gpio-sloppy-logic-analyzer
+    autofdo
++   propeller
+ 
+ 
+ .. only::  subproject and html
+diff --git a/Documentation/dev-tools/propeller.rst b/Documentation/dev-tools/propeller.rst
+new file mode 100644
+index 000000000..a217354e0
+--- /dev/null
++++ b/Documentation/dev-tools/propeller.rst
+@@ -0,0 +1,161 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=====================================
++Using Propeller with the Linux kernel
++=====================================
++
++This enables Propeller build support for the kernel when using Clang
++compiler. Propeller is a profile-guided optimization (PGO) method used
++to optimize binary executables. Like AutoFDO, it utilizes hardware
++sampling to gather information about the frequency of execution of
++different code paths within a binary. Unlike AutoFDO, this information
++is then used right before linking phase to optimize (among others)
++block layout within and across functions.
++
++A few important notes about adopting Propeller optimization:
++
++#. Although it can be used as a standalone optimization step, it is
++   strongly recommended to apply Propeller on top of AutoFDO,
++   AutoFDO+ThinLTO or Instrument FDO. The rest of this document
++   assumes this paradigm.
++
++#. Propeller uses another round of profiling on top of
++   AutoFDO/AutoFDO+ThinLTO/iFDO. The whole build process involves
++   "build-afdo - train-afdo - build-propeller - train-propeller -
++   build-optimized".
++
++#. Propeller requires LLVM 19 release or later for Clang/Clang++
++   and the linker(ld.lld).
++
++#. In addition to LLVM toolchain, Propeller requires a profiling
++   conversion tool: https://github.com/google/autofdo with a release
++   after v0.30.1: https://github.com/google/autofdo/releases/tag/v0.30.1.
++
++The Propeller optimization process involves the following steps:
++
++#. Initial building: Build the AutoFDO or AutoFDO+ThinLTO binary as
++   you would normally do, but with a set of compile-time / link-time
++   flags, so that a special metadata section is created within the
++   kernel binary. The special section is only intend to be used by the
++   profiling tool, it is not part of the runtime image, nor does it
++   change kernel run time text sections.
++
++#. Profiling: The above kernel is then run with a representative
++   workload to gather execution frequency data. This data is collected
++   using hardware sampling, via perf. Propeller is most effective on
++   platforms supporting advanced PMU features like LBR on Intel
++   machines. This step is the same as profiling the kernel for AutoFDO
++   (the exact perf parameters can be different).
++
++#. Propeller profile generation: Perf output file is converted to a
++   pair of Propeller profiles via an offline tool.
++
++#. Optimized build: Build the AutoFDO or AutoFDO+ThinLTO optimized
++   binary as you would normally do, but with a compile-time /
++   link-time flag to pick up the Propeller compile time and link time
++   profiles. This build step uses 3 profiles - the AutoFDO profile,
++   the Propeller compile-time profile and the Propeller link-time
++   profile.
++
++#. Deployment: The optimized kernel binary is deployed and used
++   in production environments, providing improved performance
++   and reduced latency.
++
++Preparation
++===========
++
++Configure the kernel with::
++
++   CONFIG_AUTOFDO_CLANG=y
++   CONFIG_PROPELLER_CLANG=y
++
++Customization
++=============
++
++You can enable or disable Propeller build for individual file and
++directories by adding a line similar to the following to the
++respective kernel Makefile:
++
++- For enabling a single file (e.g. foo.o)::
++
++   PROPELLER_PROFILE_foo.o := y
++
++- For enabling all files in one directory::
++
++   PROPELLER_PROFILE := y
++
++- For disabling one file::
++
++   PROPELLER_PROFILE_foo.o := n
++
++- For disabling all files in one directory::
++
++   PROPELLER__PROFILE := n
++
++
++Workflow
++========
++
++Here is an example workflow for building an AutoFDO+Propeller kernel:
++
++1) Assuming an AutoFDO profile is already collected following
++   instructions in the AutoFDO document, build the kernel on the HOST
++   machine, with AutoFDO and Propeller build configs ::
++
++      CONFIG_AUTOFDO_CLANG=y
++      CONFIG_PROPELLER_CLANG=y
++
++   and ::
++
++      $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<autofdo-profile-name>
++
++2) Install the kernel on the TEST machine.
++
++3) Run the load tests. The '-c' option in perf specifies the sample
++   event period. We suggest using a suitable prime number, like 500009,
++   for this purpose.
++
++   - For Intel platforms::
++
++      $ perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -a -N -b -c <count> -o <perf_file> -- <loadtest>
++
++   - For AMD platforms::
++
++      $ perf record --pfm-event RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -a -N -b -c <count> -o <perf_file> -- <loadtest>
++
++   Note you can repeat the above steps to collect multiple <perf_file>s.
++
++4) (Optional) Download the raw perf file(s) to the HOST machine.
++
++5) Use the create_llvm_prof tool (https://github.com/google/autofdo) to
++   generate Propeller profile. ::
++
++      $ create_llvm_prof --binary=<vmlinux> --profile=<perf_file>
++                         --format=propeller --propeller_output_module_name
++                         --out=<propeller_profile_prefix>_cc_profile.txt
++                         --propeller_symorder=<propeller_profile_prefix>_ld_profile.txt
++
++   "<propeller_profile_prefix>" can be something like "/home/user/dir/any_string".
++
++   This command generates a pair of Propeller profiles:
++   "<propeller_profile_prefix>_cc_profile.txt" and
++   "<propeller_profile_prefix>_ld_profile.txt".
++
++   If there are more than 1 perf_file collected in the previous step,
++   you can create a temp list file "<perf_file_list>" with each line
++   containing one perf file name and run::
++
++      $ create_llvm_prof --binary=<vmlinux> --profile=@<perf_file_list>
++                         --format=propeller --propeller_output_module_name
++                         --out=<propeller_profile_prefix>_cc_profile.txt
++                         --propeller_symorder=<propeller_profile_prefix>_ld_profile.txt
++
++6) Rebuild the kernel using the AutoFDO and Propeller
++   profiles. ::
++
++      CONFIG_AUTOFDO_CLANG=y
++      CONFIG_PROPELLER_CLANG=y
++
++   and ::
++
++      $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<profile_file> CLANG_PROPELLER_PROFILE_PREFIX=<propeller_profile_prefix>
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 86dec4cd3..5dd99f031 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -18443,6 +18443,13 @@ S:	Maintained
+ F:	include/linux/psi*
+ F:	kernel/sched/psi.c
+ 
++PROPELLER BUILD
++M:	Rong Xu <xur@google.com>
++M:	Han Shen <shenhan@google.com>
++S:	Supported
++F:	Documentation/dev-tools/propeller.rst
++F:	scripts/Makefile.propeller
++
+ PRINTK
+ M:	Petr Mladek <pmladek@suse.com>
+ R:	Steven Rostedt <rostedt@goodmis.org>
+diff --git a/Makefile b/Makefile
+index f7dee6cee..facf889fe 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1019,6 +1019,7 @@ include-$(CONFIG_UBSAN)		+= scripts/Makefile.ubsan
+ include-$(CONFIG_KCOV)		+= scripts/Makefile.kcov
+ include-$(CONFIG_RANDSTRUCT)	+= scripts/Makefile.randstruct
+ include-$(CONFIG_AUTOFDO_CLANG)	+= scripts/Makefile.autofdo
++include-$(CONFIG_PROPELLER_CLANG)	+= scripts/Makefile.propeller
+ include-$(CONFIG_GCC_PLUGINS)	+= scripts/Makefile.gcc-plugins
+ 
+ include $(addprefix $(srctree)/, $(include-y))
+diff --git a/arch/Kconfig b/arch/Kconfig
+index 39b5a705a..1198bc34f 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -831,6 +831,28 @@ config AUTOFDO_CLANG
+ 
+ 	  If unsure, say N.
+ 
++config ARCH_SUPPORTS_PROPELLER_CLANG
++	bool
++
++config PROPELLER_CLANG
++	bool "Enable Clang's Propeller build"
++	depends on ARCH_SUPPORTS_PROPELLER_CLANG
++	depends on AUTOFDO_CLANG
++	depends on CC_IS_CLANG && CLANG_VERSION >= 190000
++	help
++	  This option enables Clang’s Propeller build which
++	  is on top of AutoFDO build. When the Propeller profiles
++	  is specified in variable CLANG_PROPELLER_PROFILE_PREFIX
++	  during the build process, Clang uses the profiles to
++	  optimize the kernel.
++
++	  If no profile is specified, Proepller options are
++	  still passed to Clang to facilitate the collection
++	  of perf data for creating the Propeller profiles in
++	  subsequent builds.
++
++	  If unsure, say N.
++
+ config ARCH_SUPPORTS_CFI_CLANG
+ 	bool
+ 	help
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 503a02681..da47164bf 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -127,6 +127,7 @@ config X86
+ 	select ARCH_SUPPORTS_LTO_CLANG_THIN
+ 	select ARCH_SUPPORTS_RT
+ 	select ARCH_SUPPORTS_AUTOFDO_CLANG
++	select ARCH_SUPPORTS_PROPELLER_CLANG    if X86_64
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF		if X86_CMPXCHG64
+ 	select ARCH_USE_MEMTEST
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index 6726be89b..7ecc21c56 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -442,6 +442,10 @@ SECTIONS
+ 
+ 	STABS_DEBUG
+ 	DWARF_DEBUG
++#ifdef CONFIG_PROPELLER_CLANG
++	.llvm_bb_addr_map : { *(.llvm_bb_addr_map) }
++#endif
++
+ 	ELF_DETAILS
+ 
+ 	DISCARDS
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 20e46c091..5986dd4cf 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -95,14 +95,14 @@
+  * With LTO_CLANG, the linker also splits sections by default, so we need
+  * these macros to combine the sections during the final link.
+  *
+- * With LTO_CLANG, the linker also splits sections by default, so we need
+- * these macros to combine the sections during the final link.
++ * CONFIG_AUTOFD_CLANG and CONFIG_PROPELLER_CLANG will also split text sections
++ * and cluster them in the linking time.
+  *
+  * RODATA_MAIN is not used because existing code already defines .rodata.x
+  * sections to be brought in with rodata.
+  */
+ #if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG) || \
+-defined(CONFIG_AUTOFDO_CLANG)
++defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
+ #define TEXT_MAIN .text .text.[0-9a-zA-Z_]*
+ #else
+ #define TEXT_MAIN .text
+@@ -556,7 +556,7 @@ defined(CONFIG_AUTOFDO_CLANG)
+ 		__cpuidle_text_end = .;					\
+ 		__noinstr_text_end = .;
+ 
+-#ifdef CONFIG_AUTOFDO_CLANG
++#if defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
+ #define TEXT_HOT							\
+ 		__hot_text_start = .;					\
+ 		*(.text.hot .text.hot.*)				\
+@@ -584,7 +584,7 @@ defined(CONFIG_AUTOFDO_CLANG)
+  * first when in these builds.
+  */
+ #if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG) || \
+-defined(CONFIG_AUTOFDO_CLANG)
++defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
+ #define TEXT_TEXT							\
+ 		ALIGN_FUNCTION();					\
+ 		*(.text.asan.* .text.tsan.*)				\
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index e85d6ac31..60354c476 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -201,6 +201,16 @@ _c_flags += $(if $(patsubst n%,, \
+ 	$(CFLAGS_AUTOFDO_CLANG))
+ endif
+ 
++#
++# Enable Clang's Propeller build flags for a file or directory depending on
++# variables AUTOFDO_PROPELLER_obj.o and PROPELLER_PROFILE.
++#
++ifeq ($(CONFIG_PROPELLER_CLANG),y)
++_c_flags += $(if $(patsubst n%,, \
++	$(AUTOFDO_PROFILE_$(target-stem).o)$(AUTOFDO_PROFILE)$(PROPELLER_PROFILE))$(is-kernel-object), \
++	$(CFLAGS_PROPELLER_CLANG))
++endif
++
+ # $(src) for including checkin headers from generated source files
+ # $(obj) for including generated headers from checkin source files
+ ifeq ($(KBUILD_EXTMOD),)
+diff --git a/scripts/Makefile.propeller b/scripts/Makefile.propeller
+new file mode 100644
+index 000000000..344190717
+--- /dev/null
++++ b/scripts/Makefile.propeller
+@@ -0,0 +1,28 @@
++# SPDX-License-Identifier: GPL-2.0
++
++# Enable available and selected Clang Propeller features.
++ifdef CLANG_PROPELLER_PROFILE_PREFIX
++  CFLAGS_PROPELLER_CLANG := -fbasic-block-sections=list=$(CLANG_PROPELLER_PROFILE_PREFIX)_cc_profile.txt -ffunction-sections
++  KBUILD_LDFLAGS += --symbol-ordering-file=$(CLANG_PROPELLER_PROFILE_PREFIX)_ld_profile.txt --no-warn-symbol-ordering
++else
++  CFLAGS_PROPELLER_CLANG := -fbasic-block-sections=labels
++endif
++
++# Propeller requires debug information to embed module names in the profiles.
++# If CONFIG_DEBUG_INFO is not enabled, set -gmlt option. Skip this for AutoFDO,
++# as the option should already be set.
++ifndef CONFIG_DEBUG_INFO
++  ifndef CONFIG_AUTOFDO_CLANG
++    CFLAGS_PROPELLER_CLANG += -gmlt
++  endif
++endif
++
++ifdef CONFIG_LTO_CLANG_THIN
++  ifdef CLANG_PROPELLER_PROFILE_PREFIX
++    KBUILD_LDFLAGS += --lto-basic-block-sections=$(CLANG_PROPELLER_PROFILE_PREFIX)_cc_profile.txt
++  else
++    KBUILD_LDFLAGS += --lto-basic-block-sections=labels
++  endif
++endif
++
++export CFLAGS_PROPELLER_CLANG
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 4c5229991..05a0fb4a3 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -4558,6 +4558,7 @@ static int validate_ibt(struct objtool_file *file)
+ 		    !strcmp(sec->name, "__mcount_loc")			||
+ 		    !strcmp(sec->name, ".kcfi_traps")			||
+ 		    !strcmp(sec->name, ".llvm.call-graph-profile")	||
++		    !strcmp(sec->name, ".llvm_bb_addr_map")		||
+ 		    strstr(sec->name, "__patchable_function_entries"))
+ 			continue;
+ 
+-- 
+2.47.0
+
