@@ -1,0 +1,529 @@
+From 4a29c84c2e8f4843bebeccd5f17f984605d62ff1 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 24 Sep 2024 14:08:52 -1000
+Subject: [PATCH 1/8] sched_ext: Factor out move_task_between_dsqs() from
+ scx_dispatch_from_dsq()
+
+Pure reorganization. No functional changes.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 116 +++++++++++++++++++++++++++++----------------
+ 1 file changed, 75 insertions(+), 41 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 5900b06fd..15e788392 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -2396,6 +2396,73 @@ static inline bool task_can_run_on_remote_rq(struct task_struct *p, struct rq *r
+ static inline bool consume_remote_task(struct rq *this_rq, struct task_struct *p, struct scx_dispatch_q *dsq, struct rq *task_rq) { return false; }
+ #endif	/* CONFIG_SMP */
+ 
++/**
++ * move_task_between_dsqs() - Move a task from one DSQ to another
++ * @p: target task
++ * @enq_flags: %SCX_ENQ_*
++ * @src_dsq: DSQ @p is currently on, must not be a local DSQ
++ * @dst_dsq: DSQ @p is being moved to, can be any DSQ
++ *
++ * Must be called with @p's task_rq and @src_dsq locked. If @dst_dsq is a local
++ * DSQ and @p is on a different CPU, @p will be migrated and thus its task_rq
++ * will change. As @p's task_rq is locked, this function doesn't need to use the
++ * holding_cpu mechanism.
++ *
++ * On return, @src_dsq is unlocked and only @p's new task_rq, which is the
++ * return value, is locked.
++ */
++static struct rq *move_task_between_dsqs(struct task_struct *p, u64 enq_flags,
++					 struct scx_dispatch_q *src_dsq,
++					 struct scx_dispatch_q *dst_dsq)
++{
++	struct rq *src_rq = task_rq(p), *dst_rq;
++
++	BUG_ON(src_dsq->id == SCX_DSQ_LOCAL);
++	lockdep_assert_held(&src_dsq->lock);
++	lockdep_assert_rq_held(src_rq);
++
++	if (dst_dsq->id == SCX_DSQ_LOCAL) {
++		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
++		if (!task_can_run_on_remote_rq(p, dst_rq, true)) {
++			dst_dsq = find_global_dsq(p);
++			dst_rq = src_rq;
++		}
++	} else {
++		/* no need to migrate if destination is a non-local DSQ */
++		dst_rq = src_rq;
++	}
++
++	/*
++	 * Move @p into $dst_dsq. If $dst_dsq is the local DSQ of a different
++	 * CPU, @p will be migrated.
++	 */
++	if (dst_dsq->id == SCX_DSQ_LOCAL) {
++		/* @p is going from a non-local DSQ to a local DSQ */
++		if (src_rq == dst_rq) {
++			task_unlink_from_dsq(p, src_dsq);
++			move_local_task_to_local_dsq(p, enq_flags,
++						     src_dsq, dst_rq);
++			raw_spin_unlock(&src_dsq->lock);
++		} else {
++			raw_spin_unlock(&src_dsq->lock);
++			move_remote_task_to_local_dsq(p, enq_flags,
++						      src_rq, dst_rq);
++		}
++	} else {
++		/*
++		 * @p is going from a non-local DSQ to a non-local DSQ. As
++		 * $src_dsq is already locked, do an abbreviated dequeue.
++		 */
++		task_unlink_from_dsq(p, src_dsq);
++		p->scx.dsq = NULL;
++		raw_spin_unlock(&src_dsq->lock);
++
++		dispatch_enqueue(dst_dsq, p, enq_flags);
++	}
++
++	return dst_rq;
++}
++
+ static bool consume_dispatch_q(struct rq *rq, struct scx_dispatch_q *dsq)
+ {
+ 	struct task_struct *p;
+@@ -6057,7 +6124,7 @@ static bool scx_dispatch_from_dsq(struct bpf_iter_scx_dsq_kern *kit,
+ 				  u64 enq_flags)
+ {
+ 	struct scx_dispatch_q *src_dsq = kit->dsq, *dst_dsq;
+-	struct rq *this_rq, *src_rq, *dst_rq, *locked_rq;
++	struct rq *this_rq, *src_rq, *locked_rq;
+ 	bool dispatched = false;
+ 	bool in_balance;
+ 	unsigned long flags;
+@@ -6103,51 +6170,18 @@ static bool scx_dispatch_from_dsq(struct bpf_iter_scx_dsq_kern *kit,
+ 	/* @p is still on $src_dsq and stable, determine the destination */
+ 	dst_dsq = find_dsq_for_dispatch(this_rq, dsq_id, p);
+ 
+-	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+-		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
+-		if (!task_can_run_on_remote_rq(p, dst_rq, true)) {
+-			dst_dsq = find_global_dsq(p);
+-			dst_rq = src_rq;
+-		}
+-	} else {
+-		/* no need to migrate if destination is a non-local DSQ */
+-		dst_rq = src_rq;
+-	}
+-
+ 	/*
+-	 * Move @p into $dst_dsq. If $dst_dsq is the local DSQ of a different
+-	 * CPU, @p will be migrated.
++	 * Apply vtime and slice updates before moving so that the new time is
++	 * visible before inserting into $dst_dsq. @p is still on $src_dsq but
++	 * this is safe as we're locking it.
+ 	 */
+-	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+-		/* @p is going from a non-local DSQ to a local DSQ */
+-		if (src_rq == dst_rq) {
+-			task_unlink_from_dsq(p, src_dsq);
+-			move_local_task_to_local_dsq(p, enq_flags,
+-						     src_dsq, dst_rq);
+-			raw_spin_unlock(&src_dsq->lock);
+-		} else {
+-			raw_spin_unlock(&src_dsq->lock);
+-			move_remote_task_to_local_dsq(p, enq_flags,
+-						      src_rq, dst_rq);
+-			locked_rq = dst_rq;
+-		}
+-	} else {
+-		/*
+-		 * @p is going from a non-local DSQ to a non-local DSQ. As
+-		 * $src_dsq is already locked, do an abbreviated dequeue.
+-		 */
+-		task_unlink_from_dsq(p, src_dsq);
+-		p->scx.dsq = NULL;
+-		raw_spin_unlock(&src_dsq->lock);
+-
+-		if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_VTIME)
+-			p->scx.dsq_vtime = kit->vtime;
+-		dispatch_enqueue(dst_dsq, p, enq_flags);
+-	}
+-
++	if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_VTIME)
++		p->scx.dsq_vtime = kit->vtime;
+ 	if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_SLICE)
+ 		p->scx.slice = kit->slice;
+ 
++	/* execute move */
++	locked_rq = move_task_between_dsqs(p, enq_flags, src_dsq, dst_dsq);
+ 	dispatched = true;
+ out:
+ 	if (in_balance) {
+-- 
+2.47.0
+
+
+From 53612440a89a153ca94d26ea6fbf4161e50eb54f Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Thu, 26 Sep 2024 10:15:04 +0800
+Subject: [PATCH 2/8] sched/ext: Fix unmatch trailing comment of
+ CONFIG_EXT_GROUP_SCHED
+
+The #endif trailing comment of CONFIG_EXT_GROUP_SCHED is unmatched, so fix
+it.
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 15e788392..520e1cd0d 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -594,7 +594,7 @@ struct sched_ext_ops {
+ 	 * Update @tg's weight to @weight.
+ 	 */
+ 	void (*cgroup_set_weight)(struct cgroup *cgrp, u32 weight);
+-#endif	/* CONFIG_CGROUPS */
++#endif	/* CONFIG_EXT_GROUP_SCHED */
+ 
+ 	/*
+ 	 * All online ops must come before ops.cpu_online().
+-- 
+2.47.0
+
+
+From 871fbee46171cbd46485d7d4cd02a6e018dd2dbc Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Thu, 26 Sep 2024 10:15:05 +0800
+Subject: [PATCH 3/8] sched/ext: Use tg_cgroup() to elieminate duplicate code
+
+Use tg_cgroup() to eliminate duplicate code patterns
+in scx_bpf_task_cgroup().
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 520e1cd0d..609b9fb00 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -7154,15 +7154,8 @@ __bpf_kfunc struct cgroup *scx_bpf_task_cgroup(struct task_struct *p)
+ 	if (!scx_kf_allowed_on_arg_tasks(__SCX_KF_RQ_LOCKED, p))
+ 		goto out;
+ 
+-	/*
+-	 * A task_group may either be a cgroup or an autogroup. In the latter
+-	 * case, @tg->css.cgroup is %NULL. A task_group can't become the other
+-	 * kind once created.
+-	 */
+-	if (tg && tg->css.cgroup)
+-		cgrp = tg->css.cgroup;
+-	else
+-		cgrp = &cgrp_dfl_root.cgrp;
++	cgrp = tg_cgrp(tg);
++
+ out:
+ 	cgroup_get(cgrp);
+ 	return cgrp;
+-- 
+2.47.0
+
+
+From 57308169945532c00e6b7e511494384e94bab846 Mon Sep 17 00:00:00 2001
+From: Tianchen Ding <dtcccc@linux.alibaba.com>
+Date: Thu, 17 Oct 2024 10:44:12 +0800
+Subject: [PATCH 4/8] sched_ext: Use btf_ids to resolve task_struct
+
+Save the searching time during bpf_scx_init.
+
+Signed-off-by: Tianchen Ding <dtcccc@linux.alibaba.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 609b9fb00..09fe4e155 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -5343,7 +5343,6 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ extern struct btf *btf_vmlinux;
+ static const struct btf_type *task_struct_type;
+-static u32 task_struct_type_id;
+ 
+ static bool set_arg_maybe_null(const char *op, int arg_n, int off, int size,
+ 			       enum bpf_access_type type,
+@@ -5395,7 +5394,7 @@ static bool set_arg_maybe_null(const char *op, int arg_n, int off, int size,
+ 		 */
+ 		info->reg_type = PTR_MAYBE_NULL | PTR_TO_BTF_ID | PTR_TRUSTED;
+ 		info->btf = btf_vmlinux;
+-		info->btf_id = task_struct_type_id;
++		info->btf_id = btf_tracing_ids[BTF_TRACING_TYPE_TASK];
+ 
+ 		return true;
+ 	}
+@@ -5547,13 +5546,7 @@ static void bpf_scx_unreg(void *kdata, struct bpf_link *link)
+ 
+ static int bpf_scx_init(struct btf *btf)
+ {
+-	s32 type_id;
+-
+-	type_id = btf_find_by_name_kind(btf, "task_struct", BTF_KIND_STRUCT);
+-	if (type_id < 0)
+-		return -EINVAL;
+-	task_struct_type = btf_type_by_id(btf, type_id);
+-	task_struct_type_id = type_id;
++	task_struct_type = btf_type_by_id(btf, btf_tracing_ids[BTF_TRACING_TYPE_TASK]);
+ 
+ 	return 0;
+ }
+-- 
+2.47.0
+
+
+From 99b58722d9ac1458f65196f434ef9d66dde900b0 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <andrea.righi@linux.dev>
+Date: Fri, 18 Oct 2024 20:09:51 +0200
+Subject: [PATCH 5/8] sched_ext: improve WAKE_SYNC behavior for default idle
+ CPU selection
+
+In the sched_ext built-in idle CPU selection logic, when handling a
+WF_SYNC wakeup, we always attempt to migrate the task to the waker's
+CPU, as the waker is expected to yield the CPU after waking the task.
+
+However, it may be preferable to keep the task on its previous CPU if
+the waker's CPU is cache-affine.
+
+The same approach is also used by the fair class and in other scx
+schedulers, like scx_rusty and scx_bpfland.
+
+Therefore, apply the same logic to the built-in idle CPU selection
+policy as well.
+
+Signed-off-by: Andrea Righi <andrea.righi@linux.dev>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 46 +++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 33 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 09fe4e155..2110d38eb 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -3154,20 +3154,40 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
+ 	*found = false;
+ 
+ 	/*
+-	 * If WAKE_SYNC, the waker's local DSQ is empty, and the system is
+-	 * under utilized, wake up @p to the local DSQ of the waker. Checking
+-	 * only for an empty local DSQ is insufficient as it could give the
+-	 * wakee an unfair advantage when the system is oversaturated.
+-	 * Checking only for the presence of idle CPUs is also insufficient as
+-	 * the local DSQ of the waker could have tasks piled up on it even if
+-	 * there is an idle core elsewhere on the system.
+-	 */
+-	cpu = smp_processor_id();
+-	if ((wake_flags & SCX_WAKE_SYNC) &&
+-	    !cpumask_empty(idle_masks.cpu) && !(current->flags & PF_EXITING) &&
+-	    cpu_rq(cpu)->scx.local_dsq.nr == 0) {
+-		if (cpumask_test_cpu(cpu, p->cpus_ptr))
++	 * If WAKE_SYNC, try to migrate the wakee to the waker's CPU.
++	 */
++	if (wake_flags & SCX_WAKE_SYNC) {
++		cpu = smp_processor_id();
++
++		/*
++		 * If the waker's CPU is cache affine and prev_cpu is idle,
++		 * then avoid a migration.
++		 */
++		if (cpus_share_cache(cpu, prev_cpu) &&
++		    test_and_clear_cpu_idle(prev_cpu)) {
++			cpu = prev_cpu;
+ 			goto cpu_found;
++		}
++
++		/*
++		 * If the waker's local DSQ is empty, and the system is under
++		 * utilized, try to wake up @p to the local DSQ of the waker.
++		 *
++		 * Checking only for an empty local DSQ is insufficient as it
++		 * could give the wakee an unfair advantage when the system is
++		 * oversaturated.
++		 *
++		 * Checking only for the presence of idle CPUs is also
++		 * insufficient as the local DSQ of the waker could have tasks
++		 * piled up on it even if there is an idle core elsewhere on
++		 * the system.
++		 */
++		if (!cpumask_empty(idle_masks.cpu) &&
++		    !(current->flags & PF_EXITING) &&
++		    cpu_rq(cpu)->scx.local_dsq.nr == 0) {
++			if (cpumask_test_cpu(cpu, p->cpus_ptr))
++				goto cpu_found;
++		}
+ 	}
+ 
+ 	/*
+-- 
+2.47.0
+
+
+From 109e1ff10cff935387c942260af4244d83162da9 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Mon, 21 Oct 2024 13:11:43 -0700
+Subject: [PATCH 6/8] sched-ext: Use correct annotation for strings in kfuncs
+
+The sched-ext kfuncs with bstr suffix need to take a string, but that
+requires annotating the parameters with __str suffix, as right now the
+verifier will treat this parameter as a one-byte memory region.
+
+Fixes: f0e1a0643a59 ("sched_ext: Implement BPF extensible scheduler class")
+Fixes: 07814a9439a3 ("sched_ext: Print debug dump after an error exit")
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 2110d38eb..a8a3a6514 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -6779,7 +6779,7 @@ __bpf_kfunc_start_defs();
+  * Indicate that the BPF scheduler wants to exit gracefully, and initiate ops
+  * disabling.
+  */
+-__bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt,
++__bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt__str,
+ 				   unsigned long long *data, u32 data__sz)
+ {
+ 	unsigned long flags;
+@@ -6800,7 +6800,7 @@ __bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt,
+  * Indicate that the BPF scheduler encountered a fatal error and initiate ops
+  * disabling.
+  */
+-__bpf_kfunc void scx_bpf_error_bstr(char *fmt, unsigned long long *data,
++__bpf_kfunc void scx_bpf_error_bstr(char *fmt__str, unsigned long long *data,
+ 				    u32 data__sz)
+ {
+ 	unsigned long flags;
+@@ -6824,7 +6824,7 @@ __bpf_kfunc void scx_bpf_error_bstr(char *fmt, unsigned long long *data,
+  * The extra dump may be multiple lines. A single line may be split over
+  * multiple calls. The last line is automatically terminated.
+  */
+-__bpf_kfunc void scx_bpf_dump_bstr(char *fmt, unsigned long long *data,
++__bpf_kfunc void scx_bpf_dump_bstr(char *fmt__str, unsigned long long *data,
+ 				   u32 data__sz)
+ {
+ 	struct scx_dump_data *dd = &scx_dump_data;
+-- 
+2.47.0
+
+
+From 355931112bee499d705c5b65f29d278cc174f2f7 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <andrea.righi@linux.dev>
+Date: Tue, 22 Oct 2024 09:40:35 +0200
+Subject: [PATCH 7/8] sched_ext: fix fmt__str variables in kfuncs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit 3e99aee7ce48 ("sched-ext: Use correct annotation for strings in
+kfuncs") renamed some parameters without updating the body of the
+functions, triggering build errors like this:
+
+kernel/sched/ext.c:6881:45: error: ‘fmt’ undeclared (first use in this function)
+6881 |       if (bstr_format(&scx_exit_bstr_buf, fmt, data, data__sz) >= 0)
+     |                                             ^~~
+
+Fix by renaming also the varibles in the affected kfuncs.
+
+Fixes: 3e99aee7ce48 ("sched-ext: Use correct annotation for strings in kfuncs")
+Signed-off-by: Andrea Righi <andrea.righi@linux.dev>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index a8a3a6514..c6e105571 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -6785,7 +6785,7 @@ __bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt__str,
+ 	unsigned long flags;
+ 
+ 	raw_spin_lock_irqsave(&scx_exit_bstr_buf_lock, flags);
+-	if (bstr_format(&scx_exit_bstr_buf, fmt, data, data__sz) >= 0)
++	if (bstr_format(&scx_exit_bstr_buf, fmt__str, data, data__sz) >= 0)
+ 		scx_ops_exit_kind(SCX_EXIT_UNREG_BPF, exit_code, "%s",
+ 				  scx_exit_bstr_buf.line);
+ 	raw_spin_unlock_irqrestore(&scx_exit_bstr_buf_lock, flags);
+@@ -6806,7 +6806,7 @@ __bpf_kfunc void scx_bpf_error_bstr(char *fmt__str, unsigned long long *data,
+ 	unsigned long flags;
+ 
+ 	raw_spin_lock_irqsave(&scx_exit_bstr_buf_lock, flags);
+-	if (bstr_format(&scx_exit_bstr_buf, fmt, data, data__sz) >= 0)
++	if (bstr_format(&scx_exit_bstr_buf, fmt__str, data, data__sz) >= 0)
+ 		scx_ops_exit_kind(SCX_EXIT_ERROR_BPF, 0, "%s",
+ 				  scx_exit_bstr_buf.line);
+ 	raw_spin_unlock_irqrestore(&scx_exit_bstr_buf_lock, flags);
+@@ -6838,10 +6838,10 @@ __bpf_kfunc void scx_bpf_dump_bstr(char *fmt__str, unsigned long long *data,
+ 
+ 	/* append the formatted string to the line buf */
+ 	ret = __bstr_format(buf->data, buf->line + dd->cursor,
+-			    sizeof(buf->line) - dd->cursor, fmt, data, data__sz);
++			    sizeof(buf->line) - dd->cursor, fmt__str, data, data__sz);
+ 	if (ret < 0) {
+ 		dump_line(dd->s, "%s[!] (\"%s\", %p, %u) failed to format (%d)",
+-			  dd->prefix, fmt, data, data__sz, ret);
++			  dd->prefix, fmt__str, data, data__sz, ret);
+ 		return;
+ 	}
+ 
+-- 
+2.47.0
+
+
+From aedb66612dbd94adb2466d1d7e0267a66bb69220 Mon Sep 17 00:00:00 2001
+From: Ihor Solodrai <ihor.solodrai@pm.me>
+Date: Mon, 21 Oct 2024 23:16:52 +0000
+Subject: [PATCH 8/8] selftests/sched_ext: add order-only dependency of
+ runner.o on BPFOBJ
+
+The runner.o may start building before libbpf headers are installed,
+and as a result build fails. This happened a couple of times on
+libbpf/ci test jobs:
+  * https://github.com/libbpf/ci/actions/runs/11447667257/job/31849533100
+  * https://github.com/theihor/libbpf-ci/actions/runs/11445162764/job/31841649552
+
+Headers are installed in a recipe for $(BPFOBJ) target, and adding an
+order-only dependency should ensure this doesn't happen.
+
+Signed-off-by: Ihor Solodrai <ihor.solodrai@pm.me>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ tools/testing/selftests/sched_ext/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/testing/selftests/sched_ext/Makefile b/tools/testing/selftests/sched_ext/Makefile
+index 06ae9c107..011762224 100644
+--- a/tools/testing/selftests/sched_ext/Makefile
++++ b/tools/testing/selftests/sched_ext/Makefile
+@@ -184,7 +184,7 @@ auto-test-targets :=			\
+ 
+ testcase-targets := $(addsuffix .o,$(addprefix $(SCXOBJ_DIR)/,$(auto-test-targets)))
+ 
+-$(SCXOBJ_DIR)/runner.o: runner.c | $(SCXOBJ_DIR)
++$(SCXOBJ_DIR)/runner.o: runner.c | $(SCXOBJ_DIR) $(BPFOBJ)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
+ # Create all of the test targets object files, whose testcase objects will be
+-- 
+2.47.0
+
