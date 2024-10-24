@@ -1,0 +1,244 @@
+From 60c45df17705ebfd4d725ff6ba6292ab318e7947 Mon Sep 17 00:00:00 2001
+From: Usama Arif <usamaarif642@gmail.com>
+Date: Fri, 30 Aug 2024 11:03:38 +0100
+Subject: [PATCH 3/6] mm: Introduce a pageflag for partially mapped folios
+
+Currently folio->_deferred_list is used to keep track of
+partially_mapped folios that are going to be split under memory
+pressure. In the next patch, all THPs that are faulted in and collapsed
+by khugepaged are also going to be tracked using _deferred_list.
+
+This patch introduces a pageflag to be able to distinguish between
+partially mapped folios and others in the deferred_list at split time in
+deferred_split_scan. Its needed as __folio_remove_rmap decrements
+_mapcount, _large_mapcount and _entire_mapcount, hence it won't be
+possible to distinguish between partially mapped folios and others in
+deferred_split_scan.
+
+Eventhough it introduces an extra flag to track if the folio is
+partially mapped, there is no functional change intended with this
+patch and the flag is not useful in this patch itself, it will
+become useful in the next patch when _deferred_list has non partially
+mapped folios.
+
+Signed-off-by: Usama Arif <usamaarif642@gmail.com>
+Signed-off-by: Eric Naim <dnaim@cachyos.org>
+---
+ include/linux/huge_mm.h    |  4 ++--
+ include/linux/page-flags.h | 13 ++++++++++++-
+ mm/huge_memory.c           | 30 +++++++++++++++++++++++-------
+ mm/memcontrol.c            |  3 ++-
+ mm/migrate.c               |  3 ++-
+ mm/page_alloc.c            |  5 +++--
+ mm/rmap.c                  |  5 +++--
+ mm/vmscan.c                |  3 ++-
+ 8 files changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index e25d9ebfd..00af84aa8 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -321,7 +321,7 @@ static inline int split_huge_page(struct page *page)
+ {
+ 	return split_huge_page_to_list_to_order(page, NULL, 0);
+ }
+-void deferred_split_folio(struct folio *folio);
++void deferred_split_folio(struct folio *folio, bool partially_mapped);
+ 
+ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long address, bool freeze, struct folio *folio);
+@@ -484,7 +484,7 @@ static inline int split_huge_page(struct page *page)
+ {
+ 	return 0;
+ }
+-static inline void deferred_split_folio(struct folio *folio) {}
++static inline void deferred_split_folio(struct folio *folio, bool partially_mapped) {}
+ #define split_huge_pmd(__vma, __pmd, __address)	\
+ 	do { } while (0)
+ 
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index 5769fe6e4..5e7bc8522 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -185,6 +185,7 @@ enum pageflags {
+ 	/* At least one page in this folio has the hwpoison flag set */
+ 	PG_has_hwpoisoned = PG_error,
+ 	PG_large_rmappable = PG_workingset, /* anon or file-backed */
++	PG_partially_mapped = PG_reclaim, /* was identified to be partially mapped */
+ };
+ 
+ #define PAGEFLAGS_MASK		((1UL << NR_PAGEFLAGS) - 1)
+@@ -865,8 +866,18 @@ static inline void ClearPageCompound(struct page *page)
+ 	ClearPageHead(page);
+ }
+ FOLIO_FLAG(large_rmappable, FOLIO_SECOND_PAGE)
++FOLIO_TEST_FLAG(partially_mapped, FOLIO_SECOND_PAGE)
++/*
++ * PG_partially_mapped is protected by deferred_split split_queue_lock,
++ * so its safe to use non-atomic set/clear.
++ */
++__FOLIO_SET_FLAG(partially_mapped, FOLIO_SECOND_PAGE)
++__FOLIO_CLEAR_FLAG(partially_mapped, FOLIO_SECOND_PAGE)
+ #else
+ FOLIO_FLAG_FALSE(large_rmappable)
++FOLIO_TEST_FLAG_FALSE(partially_mapped)
++__FOLIO_SET_FLAG_NOOP(partially_mapped)
++__FOLIO_CLEAR_FLAG_NOOP(partially_mapped)
+ #endif
+ 
+ #define PG_head_mask ((1UL << PG_head))
+@@ -1175,7 +1186,7 @@ static __always_inline void __ClearPageAnonExclusive(struct page *page)
+  */
+ #define PAGE_FLAGS_SECOND						\
+ 	(0xffUL /* order */		| 1UL << PG_has_hwpoisoned |	\
+-	 1UL << PG_large_rmappable)
++	 1UL << PG_large_rmappable	| 1UL << PG_partially_mapped)
+ 
+ #define PAGE_FLAGS_PRIVATE				\
+ 	(1UL << PG_private | 1UL << PG_private_2)
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index ced74ce06..91ecf61d5 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3231,6 +3231,9 @@ int split_huge_page_to_list_to_order(struct page *page, struct list_head *list,
+ 		if (folio_order(folio) > 1 &&
+ 		    !list_empty(&folio->_deferred_list)) {
+ 			ds_queue->split_queue_len--;
++			if (folio_test_partially_mapped(folio)) {
++				__folio_clear_partially_mapped(folio);
++			}
+ 			/*
+ 			 * Reinitialize page_deferred_list after removing the
+ 			 * page from the split_queue, otherwise a subsequent
+@@ -3293,12 +3296,16 @@ void __folio_undo_large_rmappable(struct folio *folio)
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+ 	if (!list_empty(&folio->_deferred_list)) {
+ 		ds_queue->split_queue_len--;
++		if (folio_test_partially_mapped(folio)) {
++			__folio_clear_partially_mapped(folio);
++		}
+ 		list_del_init(&folio->_deferred_list);
+ 	}
+ 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
+ }
+ 
+-void deferred_split_folio(struct folio *folio)
++/* partially_mapped=false won't clear PG_partially_mapped folio flag */
++void deferred_split_folio(struct folio *folio, bool partially_mapped)
+ {
+ 	struct deferred_split *ds_queue = get_deferred_split_queue(folio);
+ #ifdef CONFIG_MEMCG
+@@ -3326,14 +3333,20 @@ void deferred_split_folio(struct folio *folio)
+ 	if (folio_test_swapcache(folio))
+ 		return;
+ 
+-	if (!list_empty(&folio->_deferred_list))
+-		return;
+-
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
++	if (partially_mapped) {
++		if (!folio_test_partially_mapped(folio)) {
++			__folio_set_partially_mapped(folio);
++			if (folio_test_pmd_mappable(folio))
++				count_vm_event(THP_DEFERRED_SPLIT_PAGE);
++			count_mthp_stat(folio_order(folio), MTHP_STAT_SPLIT_DEFERRED);
++
++		}
++	} else {
++		/* partially mapped folios cannot become non-partially mapped */
++		VM_WARN_ON_FOLIO(folio_test_partially_mapped(folio), folio);
++	}
+ 	if (list_empty(&folio->_deferred_list)) {
+-		if (folio_test_pmd_mappable(folio))
+-			count_vm_event(THP_DEFERRED_SPLIT_PAGE);
+-		count_mthp_stat(folio_order(folio), MTHP_STAT_SPLIT_DEFERRED);
+ 		list_add_tail(&folio->_deferred_list, &ds_queue->split_queue);
+ 		ds_queue->split_queue_len++;
+ #ifdef CONFIG_MEMCG
+@@ -3381,6 +3394,9 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
+ 			list_move(&folio->_deferred_list, &list);
+ 		} else {
+ 			/* We lost race with folio_put() */
++			if (folio_test_partially_mapped(folio)) {
++				__folio_clear_partially_mapped(folio);
++			}
+ 			list_del_init(&folio->_deferred_list);
+ 			ds_queue->split_queue_len--;
+ 		}
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index d563fb515..c5078e86a 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -4606,7 +4606,8 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
+ 	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+ 	VM_BUG_ON_FOLIO(folio_order(folio) > 1 &&
+ 			!folio_test_hugetlb(folio) &&
+-			!list_empty(&folio->_deferred_list), folio);
++			!list_empty(&folio->_deferred_list) &&
++			folio_test_partially_mapped(folio), folio);
+ 
+ 	/*
+ 	 * Nobody should be changing or seriously looking at
+diff --git a/mm/migrate.c b/mm/migrate.c
+index d947359cd..d3a66f1a6 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1736,7 +1736,8 @@ static int migrate_pages_batch(struct list_head *from,
+ 			 * use _deferred_list.
+ 			 */
+ 			if (nr_pages > 2 &&
+-			   !list_empty(&folio->_deferred_list)) {
++			   !list_empty(&folio->_deferred_list) &&
++			   folio_test_partially_mapped(folio)) {
+ 				if (!try_split_folio(folio, split_folios, mode)) {
+ 					nr_failed++;
+ 					stats->nr_thp_failed += is_thp;
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 91ace8ca9..71d82619a 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -958,8 +958,9 @@ static int free_tail_page_prepare(struct page *head_page, struct page *page)
+ 		break;
+ 	case 2:
+ 		/* the second tail page: deferred_list overlaps ->mapping */
+-		if (unlikely(!list_empty(&folio->_deferred_list))) {
+-			bad_page(page, "on deferred list");
++		if (unlikely(!list_empty(&folio->_deferred_list) &&
++		    folio_test_partially_mapped(folio))) {
++			bad_page(page, "partially mapped folio on deferred list");
+ 			goto out;
+ 		}
+ 		break;
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 2490e727e..77b518505 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1566,8 +1566,9 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 		 * Check partially_mapped first to ensure it is a large folio.
+ 		 */
+ 		if (folio_test_anon(folio) && partially_mapped &&
+-		    list_empty(&folio->_deferred_list))
+-			deferred_split_folio(folio);
++	    !folio_test_partially_mapped(folio))
++		deferred_split_folio(folio, true);
++
+ 	}
+ 	__folio_mod_stat(folio, -nr, -nr_pmdmapped);
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 128f307da..08297d3cc 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1228,7 +1228,8 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+ 					 * Split partially mapped folios right away.
+ 					 * We can free the unmapped pages without IO.
+ 					 */
+-					if (data_race(!list_empty(&folio->_deferred_list)) &&
++					if (data_race(!list_empty(&folio->_deferred_list) &&
++					    folio_test_partially_mapped(folio)) &&
+ 					    split_folio_to_list(folio, folio_list))
+ 						goto activate_locked;
+ 				}
+-- 
+2.47.0
+
