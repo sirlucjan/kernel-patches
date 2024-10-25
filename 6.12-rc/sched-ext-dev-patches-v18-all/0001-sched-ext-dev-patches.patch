@@ -1,0 +1,1470 @@
+From 9baeb3bc5a7d11f11ae54da1df8a43385670b82a Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 24 Sep 2024 14:08:52 -1000
+Subject: [PATCH 01/14] sched_ext: Factor out move_task_between_dsqs() from
+ scx_dispatch_from_dsq()
+
+Pure reorganization. No functional changes.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 116 +++++++++++++++++++++++++++++----------------
+ 1 file changed, 75 insertions(+), 41 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 5900b06fd..15e788392 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -2396,6 +2396,73 @@ static inline bool task_can_run_on_remote_rq(struct task_struct *p, struct rq *r
+ static inline bool consume_remote_task(struct rq *this_rq, struct task_struct *p, struct scx_dispatch_q *dsq, struct rq *task_rq) { return false; }
+ #endif	/* CONFIG_SMP */
+ 
++/**
++ * move_task_between_dsqs() - Move a task from one DSQ to another
++ * @p: target task
++ * @enq_flags: %SCX_ENQ_*
++ * @src_dsq: DSQ @p is currently on, must not be a local DSQ
++ * @dst_dsq: DSQ @p is being moved to, can be any DSQ
++ *
++ * Must be called with @p's task_rq and @src_dsq locked. If @dst_dsq is a local
++ * DSQ and @p is on a different CPU, @p will be migrated and thus its task_rq
++ * will change. As @p's task_rq is locked, this function doesn't need to use the
++ * holding_cpu mechanism.
++ *
++ * On return, @src_dsq is unlocked and only @p's new task_rq, which is the
++ * return value, is locked.
++ */
++static struct rq *move_task_between_dsqs(struct task_struct *p, u64 enq_flags,
++					 struct scx_dispatch_q *src_dsq,
++					 struct scx_dispatch_q *dst_dsq)
++{
++	struct rq *src_rq = task_rq(p), *dst_rq;
++
++	BUG_ON(src_dsq->id == SCX_DSQ_LOCAL);
++	lockdep_assert_held(&src_dsq->lock);
++	lockdep_assert_rq_held(src_rq);
++
++	if (dst_dsq->id == SCX_DSQ_LOCAL) {
++		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
++		if (!task_can_run_on_remote_rq(p, dst_rq, true)) {
++			dst_dsq = find_global_dsq(p);
++			dst_rq = src_rq;
++		}
++	} else {
++		/* no need to migrate if destination is a non-local DSQ */
++		dst_rq = src_rq;
++	}
++
++	/*
++	 * Move @p into $dst_dsq. If $dst_dsq is the local DSQ of a different
++	 * CPU, @p will be migrated.
++	 */
++	if (dst_dsq->id == SCX_DSQ_LOCAL) {
++		/* @p is going from a non-local DSQ to a local DSQ */
++		if (src_rq == dst_rq) {
++			task_unlink_from_dsq(p, src_dsq);
++			move_local_task_to_local_dsq(p, enq_flags,
++						     src_dsq, dst_rq);
++			raw_spin_unlock(&src_dsq->lock);
++		} else {
++			raw_spin_unlock(&src_dsq->lock);
++			move_remote_task_to_local_dsq(p, enq_flags,
++						      src_rq, dst_rq);
++		}
++	} else {
++		/*
++		 * @p is going from a non-local DSQ to a non-local DSQ. As
++		 * $src_dsq is already locked, do an abbreviated dequeue.
++		 */
++		task_unlink_from_dsq(p, src_dsq);
++		p->scx.dsq = NULL;
++		raw_spin_unlock(&src_dsq->lock);
++
++		dispatch_enqueue(dst_dsq, p, enq_flags);
++	}
++
++	return dst_rq;
++}
++
+ static bool consume_dispatch_q(struct rq *rq, struct scx_dispatch_q *dsq)
+ {
+ 	struct task_struct *p;
+@@ -6057,7 +6124,7 @@ static bool scx_dispatch_from_dsq(struct bpf_iter_scx_dsq_kern *kit,
+ 				  u64 enq_flags)
+ {
+ 	struct scx_dispatch_q *src_dsq = kit->dsq, *dst_dsq;
+-	struct rq *this_rq, *src_rq, *dst_rq, *locked_rq;
++	struct rq *this_rq, *src_rq, *locked_rq;
+ 	bool dispatched = false;
+ 	bool in_balance;
+ 	unsigned long flags;
+@@ -6103,51 +6170,18 @@ static bool scx_dispatch_from_dsq(struct bpf_iter_scx_dsq_kern *kit,
+ 	/* @p is still on $src_dsq and stable, determine the destination */
+ 	dst_dsq = find_dsq_for_dispatch(this_rq, dsq_id, p);
+ 
+-	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+-		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
+-		if (!task_can_run_on_remote_rq(p, dst_rq, true)) {
+-			dst_dsq = find_global_dsq(p);
+-			dst_rq = src_rq;
+-		}
+-	} else {
+-		/* no need to migrate if destination is a non-local DSQ */
+-		dst_rq = src_rq;
+-	}
+-
+ 	/*
+-	 * Move @p into $dst_dsq. If $dst_dsq is the local DSQ of a different
+-	 * CPU, @p will be migrated.
++	 * Apply vtime and slice updates before moving so that the new time is
++	 * visible before inserting into $dst_dsq. @p is still on $src_dsq but
++	 * this is safe as we're locking it.
+ 	 */
+-	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+-		/* @p is going from a non-local DSQ to a local DSQ */
+-		if (src_rq == dst_rq) {
+-			task_unlink_from_dsq(p, src_dsq);
+-			move_local_task_to_local_dsq(p, enq_flags,
+-						     src_dsq, dst_rq);
+-			raw_spin_unlock(&src_dsq->lock);
+-		} else {
+-			raw_spin_unlock(&src_dsq->lock);
+-			move_remote_task_to_local_dsq(p, enq_flags,
+-						      src_rq, dst_rq);
+-			locked_rq = dst_rq;
+-		}
+-	} else {
+-		/*
+-		 * @p is going from a non-local DSQ to a non-local DSQ. As
+-		 * $src_dsq is already locked, do an abbreviated dequeue.
+-		 */
+-		task_unlink_from_dsq(p, src_dsq);
+-		p->scx.dsq = NULL;
+-		raw_spin_unlock(&src_dsq->lock);
+-
+-		if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_VTIME)
+-			p->scx.dsq_vtime = kit->vtime;
+-		dispatch_enqueue(dst_dsq, p, enq_flags);
+-	}
+-
++	if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_VTIME)
++		p->scx.dsq_vtime = kit->vtime;
+ 	if (kit->cursor.flags & __SCX_DSQ_ITER_HAS_SLICE)
+ 		p->scx.slice = kit->slice;
+ 
++	/* execute move */
++	locked_rq = move_task_between_dsqs(p, enq_flags, src_dsq, dst_dsq);
+ 	dispatched = true;
+ out:
+ 	if (in_balance) {
+-- 
+2.47.0
+
+
+From 2bb8b400175a0912b730d8cb2d4de3e25d684559 Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Thu, 26 Sep 2024 10:15:04 +0800
+Subject: [PATCH 02/14] sched/ext: Fix unmatch trailing comment of
+ CONFIG_EXT_GROUP_SCHED
+
+The #endif trailing comment of CONFIG_EXT_GROUP_SCHED is unmatched, so fix
+it.
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 15e788392..520e1cd0d 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -594,7 +594,7 @@ struct sched_ext_ops {
+ 	 * Update @tg's weight to @weight.
+ 	 */
+ 	void (*cgroup_set_weight)(struct cgroup *cgrp, u32 weight);
+-#endif	/* CONFIG_CGROUPS */
++#endif	/* CONFIG_EXT_GROUP_SCHED */
+ 
+ 	/*
+ 	 * All online ops must come before ops.cpu_online().
+-- 
+2.47.0
+
+
+From 007bd4522562ed98f8bc30476fbbd7f92a6271a8 Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Thu, 26 Sep 2024 10:15:05 +0800
+Subject: [PATCH 03/14] sched/ext: Use tg_cgroup() to elieminate duplicate code
+
+Use tg_cgroup() to eliminate duplicate code patterns
+in scx_bpf_task_cgroup().
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 520e1cd0d..609b9fb00 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -7154,15 +7154,8 @@ __bpf_kfunc struct cgroup *scx_bpf_task_cgroup(struct task_struct *p)
+ 	if (!scx_kf_allowed_on_arg_tasks(__SCX_KF_RQ_LOCKED, p))
+ 		goto out;
+ 
+-	/*
+-	 * A task_group may either be a cgroup or an autogroup. In the latter
+-	 * case, @tg->css.cgroup is %NULL. A task_group can't become the other
+-	 * kind once created.
+-	 */
+-	if (tg && tg->css.cgroup)
+-		cgrp = tg->css.cgroup;
+-	else
+-		cgrp = &cgrp_dfl_root.cgrp;
++	cgrp = tg_cgrp(tg);
++
+ out:
+ 	cgroup_get(cgrp);
+ 	return cgrp;
+-- 
+2.47.0
+
+
+From 52f8a8c7f4aa49168454648faced940c1bbd2b5d Mon Sep 17 00:00:00 2001
+From: Tianchen Ding <dtcccc@linux.alibaba.com>
+Date: Thu, 17 Oct 2024 10:44:12 +0800
+Subject: [PATCH 04/14] sched_ext: Use btf_ids to resolve task_struct
+
+Save the searching time during bpf_scx_init.
+
+Signed-off-by: Tianchen Ding <dtcccc@linux.alibaba.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 609b9fb00..09fe4e155 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -5343,7 +5343,6 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ extern struct btf *btf_vmlinux;
+ static const struct btf_type *task_struct_type;
+-static u32 task_struct_type_id;
+ 
+ static bool set_arg_maybe_null(const char *op, int arg_n, int off, int size,
+ 			       enum bpf_access_type type,
+@@ -5395,7 +5394,7 @@ static bool set_arg_maybe_null(const char *op, int arg_n, int off, int size,
+ 		 */
+ 		info->reg_type = PTR_MAYBE_NULL | PTR_TO_BTF_ID | PTR_TRUSTED;
+ 		info->btf = btf_vmlinux;
+-		info->btf_id = task_struct_type_id;
++		info->btf_id = btf_tracing_ids[BTF_TRACING_TYPE_TASK];
+ 
+ 		return true;
+ 	}
+@@ -5547,13 +5546,7 @@ static void bpf_scx_unreg(void *kdata, struct bpf_link *link)
+ 
+ static int bpf_scx_init(struct btf *btf)
+ {
+-	s32 type_id;
+-
+-	type_id = btf_find_by_name_kind(btf, "task_struct", BTF_KIND_STRUCT);
+-	if (type_id < 0)
+-		return -EINVAL;
+-	task_struct_type = btf_type_by_id(btf, type_id);
+-	task_struct_type_id = type_id;
++	task_struct_type = btf_type_by_id(btf, btf_tracing_ids[BTF_TRACING_TYPE_TASK]);
+ 
+ 	return 0;
+ }
+-- 
+2.47.0
+
+
+From 76f695dcff24f2995de65ef16f396551972cc084 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <andrea.righi@linux.dev>
+Date: Fri, 18 Oct 2024 20:09:51 +0200
+Subject: [PATCH 05/14] sched_ext: improve WAKE_SYNC behavior for default idle
+ CPU selection
+
+In the sched_ext built-in idle CPU selection logic, when handling a
+WF_SYNC wakeup, we always attempt to migrate the task to the waker's
+CPU, as the waker is expected to yield the CPU after waking the task.
+
+However, it may be preferable to keep the task on its previous CPU if
+the waker's CPU is cache-affine.
+
+The same approach is also used by the fair class and in other scx
+schedulers, like scx_rusty and scx_bpfland.
+
+Therefore, apply the same logic to the built-in idle CPU selection
+policy as well.
+
+Signed-off-by: Andrea Righi <andrea.righi@linux.dev>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 46 +++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 33 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 09fe4e155..2110d38eb 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -3154,20 +3154,40 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
+ 	*found = false;
+ 
+ 	/*
+-	 * If WAKE_SYNC, the waker's local DSQ is empty, and the system is
+-	 * under utilized, wake up @p to the local DSQ of the waker. Checking
+-	 * only for an empty local DSQ is insufficient as it could give the
+-	 * wakee an unfair advantage when the system is oversaturated.
+-	 * Checking only for the presence of idle CPUs is also insufficient as
+-	 * the local DSQ of the waker could have tasks piled up on it even if
+-	 * there is an idle core elsewhere on the system.
+-	 */
+-	cpu = smp_processor_id();
+-	if ((wake_flags & SCX_WAKE_SYNC) &&
+-	    !cpumask_empty(idle_masks.cpu) && !(current->flags & PF_EXITING) &&
+-	    cpu_rq(cpu)->scx.local_dsq.nr == 0) {
+-		if (cpumask_test_cpu(cpu, p->cpus_ptr))
++	 * If WAKE_SYNC, try to migrate the wakee to the waker's CPU.
++	 */
++	if (wake_flags & SCX_WAKE_SYNC) {
++		cpu = smp_processor_id();
++
++		/*
++		 * If the waker's CPU is cache affine and prev_cpu is idle,
++		 * then avoid a migration.
++		 */
++		if (cpus_share_cache(cpu, prev_cpu) &&
++		    test_and_clear_cpu_idle(prev_cpu)) {
++			cpu = prev_cpu;
+ 			goto cpu_found;
++		}
++
++		/*
++		 * If the waker's local DSQ is empty, and the system is under
++		 * utilized, try to wake up @p to the local DSQ of the waker.
++		 *
++		 * Checking only for an empty local DSQ is insufficient as it
++		 * could give the wakee an unfair advantage when the system is
++		 * oversaturated.
++		 *
++		 * Checking only for the presence of idle CPUs is also
++		 * insufficient as the local DSQ of the waker could have tasks
++		 * piled up on it even if there is an idle core elsewhere on
++		 * the system.
++		 */
++		if (!cpumask_empty(idle_masks.cpu) &&
++		    !(current->flags & PF_EXITING) &&
++		    cpu_rq(cpu)->scx.local_dsq.nr == 0) {
++			if (cpumask_test_cpu(cpu, p->cpus_ptr))
++				goto cpu_found;
++		}
+ 	}
+ 
+ 	/*
+-- 
+2.47.0
+
+
+From 25b37c0ef75169ce32ce8a1f146245b88f9fe48b Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Mon, 21 Oct 2024 13:11:43 -0700
+Subject: [PATCH 06/14] sched-ext: Use correct annotation for strings in kfuncs
+
+The sched-ext kfuncs with bstr suffix need to take a string, but that
+requires annotating the parameters with __str suffix, as right now the
+verifier will treat this parameter as a one-byte memory region.
+
+Fixes: f0e1a0643a59 ("sched_ext: Implement BPF extensible scheduler class")
+Fixes: 07814a9439a3 ("sched_ext: Print debug dump after an error exit")
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 2110d38eb..a8a3a6514 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -6779,7 +6779,7 @@ __bpf_kfunc_start_defs();
+  * Indicate that the BPF scheduler wants to exit gracefully, and initiate ops
+  * disabling.
+  */
+-__bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt,
++__bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt__str,
+ 				   unsigned long long *data, u32 data__sz)
+ {
+ 	unsigned long flags;
+@@ -6800,7 +6800,7 @@ __bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt,
+  * Indicate that the BPF scheduler encountered a fatal error and initiate ops
+  * disabling.
+  */
+-__bpf_kfunc void scx_bpf_error_bstr(char *fmt, unsigned long long *data,
++__bpf_kfunc void scx_bpf_error_bstr(char *fmt__str, unsigned long long *data,
+ 				    u32 data__sz)
+ {
+ 	unsigned long flags;
+@@ -6824,7 +6824,7 @@ __bpf_kfunc void scx_bpf_error_bstr(char *fmt, unsigned long long *data,
+  * The extra dump may be multiple lines. A single line may be split over
+  * multiple calls. The last line is automatically terminated.
+  */
+-__bpf_kfunc void scx_bpf_dump_bstr(char *fmt, unsigned long long *data,
++__bpf_kfunc void scx_bpf_dump_bstr(char *fmt__str, unsigned long long *data,
+ 				   u32 data__sz)
+ {
+ 	struct scx_dump_data *dd = &scx_dump_data;
+-- 
+2.47.0
+
+
+From bba40313eeff7e9e1f169a399ba133efdeefaee7 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <andrea.righi@linux.dev>
+Date: Tue, 22 Oct 2024 09:40:35 +0200
+Subject: [PATCH 07/14] sched_ext: fix fmt__str variables in kfuncs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit 3e99aee7ce48 ("sched-ext: Use correct annotation for strings in
+kfuncs") renamed some parameters without updating the body of the
+functions, triggering build errors like this:
+
+kernel/sched/ext.c:6881:45: error: ‘fmt’ undeclared (first use in this function)
+6881 |       if (bstr_format(&scx_exit_bstr_buf, fmt, data, data__sz) >= 0)
+     |                                             ^~~
+
+Fix by renaming also the varibles in the affected kfuncs.
+
+Fixes: 3e99aee7ce48 ("sched-ext: Use correct annotation for strings in kfuncs")
+Signed-off-by: Andrea Righi <andrea.righi@linux.dev>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index a8a3a6514..c6e105571 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -6785,7 +6785,7 @@ __bpf_kfunc void scx_bpf_exit_bstr(s64 exit_code, char *fmt__str,
+ 	unsigned long flags;
+ 
+ 	raw_spin_lock_irqsave(&scx_exit_bstr_buf_lock, flags);
+-	if (bstr_format(&scx_exit_bstr_buf, fmt, data, data__sz) >= 0)
++	if (bstr_format(&scx_exit_bstr_buf, fmt__str, data, data__sz) >= 0)
+ 		scx_ops_exit_kind(SCX_EXIT_UNREG_BPF, exit_code, "%s",
+ 				  scx_exit_bstr_buf.line);
+ 	raw_spin_unlock_irqrestore(&scx_exit_bstr_buf_lock, flags);
+@@ -6806,7 +6806,7 @@ __bpf_kfunc void scx_bpf_error_bstr(char *fmt__str, unsigned long long *data,
+ 	unsigned long flags;
+ 
+ 	raw_spin_lock_irqsave(&scx_exit_bstr_buf_lock, flags);
+-	if (bstr_format(&scx_exit_bstr_buf, fmt, data, data__sz) >= 0)
++	if (bstr_format(&scx_exit_bstr_buf, fmt__str, data, data__sz) >= 0)
+ 		scx_ops_exit_kind(SCX_EXIT_ERROR_BPF, 0, "%s",
+ 				  scx_exit_bstr_buf.line);
+ 	raw_spin_unlock_irqrestore(&scx_exit_bstr_buf_lock, flags);
+@@ -6838,10 +6838,10 @@ __bpf_kfunc void scx_bpf_dump_bstr(char *fmt__str, unsigned long long *data,
+ 
+ 	/* append the formatted string to the line buf */
+ 	ret = __bstr_format(buf->data, buf->line + dd->cursor,
+-			    sizeof(buf->line) - dd->cursor, fmt, data, data__sz);
++			    sizeof(buf->line) - dd->cursor, fmt__str, data, data__sz);
+ 	if (ret < 0) {
+ 		dump_line(dd->s, "%s[!] (\"%s\", %p, %u) failed to format (%d)",
+-			  dd->prefix, fmt, data, data__sz, ret);
++			  dd->prefix, fmt__str, data, data__sz, ret);
+ 		return;
+ 	}
+ 
+-- 
+2.47.0
+
+
+From 5c8f138a811fffb67724a6d30fe5de01fcfd9e7c Mon Sep 17 00:00:00 2001
+From: Ihor Solodrai <ihor.solodrai@pm.me>
+Date: Mon, 21 Oct 2024 23:16:52 +0000
+Subject: [PATCH 08/14] selftests/sched_ext: add order-only dependency of
+ runner.o on BPFOBJ
+
+The runner.o may start building before libbpf headers are installed,
+and as a result build fails. This happened a couple of times on
+libbpf/ci test jobs:
+  * https://github.com/libbpf/ci/actions/runs/11447667257/job/31849533100
+  * https://github.com/theihor/libbpf-ci/actions/runs/11445162764/job/31841649552
+
+Headers are installed in a recipe for $(BPFOBJ) target, and adding an
+order-only dependency should ensure this doesn't happen.
+
+Signed-off-by: Ihor Solodrai <ihor.solodrai@pm.me>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ tools/testing/selftests/sched_ext/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/testing/selftests/sched_ext/Makefile b/tools/testing/selftests/sched_ext/Makefile
+index 06ae9c107..011762224 100644
+--- a/tools/testing/selftests/sched_ext/Makefile
++++ b/tools/testing/selftests/sched_ext/Makefile
+@@ -184,7 +184,7 @@ auto-test-targets :=			\
+ 
+ testcase-targets := $(addsuffix .o,$(addprefix $(SCXOBJ_DIR)/,$(auto-test-targets)))
+ 
+-$(SCXOBJ_DIR)/runner.o: runner.c | $(SCXOBJ_DIR)
++$(SCXOBJ_DIR)/runner.o: runner.c | $(SCXOBJ_DIR) $(BPFOBJ)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
+ # Create all of the test targets object files, whose testcase objects will be
+-- 
+2.47.0
+
+
+From d45842d83f4f821a1732535bfce03adaa14a4f49 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Wed, 23 Oct 2024 13:19:07 +0200
+Subject: [PATCH 09/14] sched_ext: Clarify ops.select_cpu() for single-CPU
+ tasks
+
+Update ops.select_cpu() documentation to clarify that this method is not
+called for tasks that are restricted to run on a single CPU, as these
+tasks do not have the option to select a different CPU.
+
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index c6e105571..5e04547b0 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -222,6 +222,11 @@ struct sched_ext_ops {
+ 	 * is dispatched, the ops.enqueue() callback will be skipped. Finally,
+ 	 * if @p is dispatched to SCX_DSQ_LOCAL, it will be dispatched to the
+ 	 * local DSQ of whatever CPU is returned by this callback.
++	 *
++	 * Note that select_cpu() is never called for tasks that can only run
++	 * on a single CPU or tasks with migration disabled, as they don't have
++	 * the option to select a different CPU. See select_task_rq() for
++	 * details.
+ 	 */
+ 	s32 (*select_cpu)(struct task_struct *p, s32 prev_cpu, u64 wake_flags);
+ 
+-- 
+2.47.0
+
+
+From 24661f9b6fdef16697b190386be49146f4c31cd4 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Wed, 23 Oct 2024 01:47:18 +0200
+Subject: [PATCH 10/14] sched_ext: Introduce LLC awareness to the default idle
+ selection policy
+
+Rely on the scheduler topology information to implement basic LLC
+awareness in the sched_ext build-in idle selection policy.
+
+This allows schedulers using the built-in policy to make more informed
+decisions when selecting an idle CPU in systems with multiple LLCs, such
+as NUMA systems or chiplet-based architectures, and it helps keep tasks
+within the same LLC domain, thereby improving cache locality.
+
+For efficiency, LLC awareness is applied only to tasks that can run on
+all the CPUs in the system for now. If a task's affinity is modified
+from user space, it's the responsibility of user space to choose the
+appropriate optimized scheduling domain.
+
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c | 60 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 5e04547b0..f2dbbeaa5 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -3151,9 +3151,39 @@ static s32 scx_pick_idle_cpu(const struct cpumask *cpus_allowed, u64 flags)
+ 		goto retry;
+ }
+ 
++#ifdef CONFIG_SCHED_MC
++/*
++ * Return the cpumask of CPUs usable by task @p in the same LLC domain of @cpu,
++ * or NULL if the LLC domain cannot be determined.
++ */
++static const struct cpumask *llc_domain(const struct task_struct *p, s32 cpu)
++{
++	struct sched_domain *sd = rcu_dereference(per_cpu(sd_llc, cpu));
++	const struct cpumask *llc_cpus = sd ? sched_domain_span(sd) : NULL;
++
++	/*
++	 * Return the LLC domain only if the task is allowed to run on all
++	 * CPUs.
++	 */
++	return p->nr_cpus_allowed == nr_cpu_ids ? llc_cpus : NULL;
++}
++#else /* CONFIG_SCHED_MC */
++static inline const struct cpumask *llc_domain(struct task_struct *p, s32 cpu)
++{
++	return NULL;
++}
++#endif /* CONFIG_SCHED_MC */
++
++/*
++ * Built-in cpu idle selection policy.
++ *
++ * NOTE: tasks that can only run on 1 CPU are excluded by this logic, because
++ * we never call ops.select_cpu() for them, see select_task_rq().
++ */
+ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
+ 			      u64 wake_flags, bool *found)
+ {
++	const struct cpumask *llc_cpus = llc_domain(p, prev_cpu);
+ 	s32 cpu;
+ 
+ 	*found = false;
+@@ -3200,22 +3230,52 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
+ 	 * partially idle @prev_cpu.
+ 	 */
+ 	if (sched_smt_active()) {
++		/*
++		 * Keep using @prev_cpu if it's part of a fully idle core.
++		 */
+ 		if (cpumask_test_cpu(prev_cpu, idle_masks.smt) &&
+ 		    test_and_clear_cpu_idle(prev_cpu)) {
+ 			cpu = prev_cpu;
+ 			goto cpu_found;
+ 		}
+ 
++		/*
++		 * Search for any fully idle core in the same LLC domain.
++		 */
++		if (llc_cpus) {
++			cpu = scx_pick_idle_cpu(llc_cpus, SCX_PICK_IDLE_CORE);
++			if (cpu >= 0)
++				goto cpu_found;
++		}
++
++		/*
++		 * Search for any full idle core usable by the task.
++		 */
+ 		cpu = scx_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+ 		if (cpu >= 0)
+ 			goto cpu_found;
+ 	}
+ 
++	/*
++	 * Use @prev_cpu if it's idle.
++	 */
+ 	if (test_and_clear_cpu_idle(prev_cpu)) {
+ 		cpu = prev_cpu;
+ 		goto cpu_found;
+ 	}
+ 
++	/*
++	 * Search for any idle CPU in the same LLC domain.
++	 */
++	if (llc_cpus) {
++		cpu = scx_pick_idle_cpu(llc_cpus, 0);
++		if (cpu >= 0)
++			goto cpu_found;
++	}
++
++	/*
++	 * Search for any idle CPU usable by the task.
++	 */
+ 	cpu = scx_pick_idle_cpu(p->cpus_ptr, 0);
+ 	if (cpu >= 0)
+ 		goto cpu_found;
+-- 
+2.47.0
+
+
+From 8087c3da0a447bdce0b019b2b0a793104f2ac9ec Mon Sep 17 00:00:00 2001
+From: Vishal Chourasia <vishalc@linux.ibm.com>
+Date: Thu, 24 Oct 2024 10:46:09 +0530
+Subject: [PATCH 11/14] sched_ext: Fix function pointer type mismatches in BPF
+ selftests
+
+Fix incompatible function pointer type warnings in sched_ext BPF selftests by
+explicitly casting the function pointers when initializing struct_ops.
+This addresses multiple -Wincompatible-function-pointer-types warnings from the
+clang compiler where function signatures didn't match exactly.
+
+The void * cast ensures the compiler accepts the function pointer
+assignment despite minor type differences in the parameters.
+
+Signed-off-by: Vishal Chourasia <vishalc@linux.ibm.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ .../selftests/sched_ext/create_dsq.bpf.c      |  6 +-
+ .../sched_ext/ddsp_bogus_dsq_fail.bpf.c       |  4 +-
+ .../sched_ext/ddsp_vtimelocal_fail.bpf.c      |  4 +-
+ .../selftests/sched_ext/dsp_local_on.bpf.c    |  8 +--
+ .../sched_ext/enq_select_cpu_fails.bpf.c      |  4 +-
+ tools/testing/selftests/sched_ext/exit.bpf.c  | 14 ++---
+ .../testing/selftests/sched_ext/hotplug.bpf.c |  8 +--
+ .../sched_ext/init_enable_count.bpf.c         |  8 +--
+ .../testing/selftests/sched_ext/maximal.bpf.c | 58 +++++++++----------
+ .../selftests/sched_ext/maybe_null.bpf.c      |  6 +-
+ .../sched_ext/maybe_null_fail_dsp.bpf.c       |  4 +-
+ .../sched_ext/maybe_null_fail_yld.bpf.c       |  4 +-
+ .../selftests/sched_ext/prog_run.bpf.c        |  2 +-
+ .../selftests/sched_ext/select_cpu_dfl.bpf.c  |  2 +-
+ .../sched_ext/select_cpu_dfl_nodispatch.bpf.c |  6 +-
+ .../sched_ext/select_cpu_dispatch.bpf.c       |  2 +-
+ .../select_cpu_dispatch_bad_dsq.bpf.c         |  4 +-
+ .../select_cpu_dispatch_dbl_dsp.bpf.c         |  4 +-
+ .../sched_ext/select_cpu_vtime.bpf.c          | 12 ++--
+ 19 files changed, 80 insertions(+), 80 deletions(-)
+
+diff --git a/tools/testing/selftests/sched_ext/create_dsq.bpf.c b/tools/testing/selftests/sched_ext/create_dsq.bpf.c
+index 23f79ed34..2cfc4ffd6 100644
+--- a/tools/testing/selftests/sched_ext/create_dsq.bpf.c
++++ b/tools/testing/selftests/sched_ext/create_dsq.bpf.c
+@@ -51,8 +51,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(create_dsq_init)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops create_dsq_ops = {
+-	.init_task		= create_dsq_init_task,
+-	.exit_task		= create_dsq_exit_task,
+-	.init			= create_dsq_init,
++	.init_task		= (void *) create_dsq_init_task,
++	.exit_task		= (void *) create_dsq_exit_task,
++	.init			= (void *) create_dsq_init,
+ 	.name			= "create_dsq",
+ };
+diff --git a/tools/testing/selftests/sched_ext/ddsp_bogus_dsq_fail.bpf.c b/tools/testing/selftests/sched_ext/ddsp_bogus_dsq_fail.bpf.c
+index e97ad41d3..37d9bf6fb 100644
+--- a/tools/testing/selftests/sched_ext/ddsp_bogus_dsq_fail.bpf.c
++++ b/tools/testing/selftests/sched_ext/ddsp_bogus_dsq_fail.bpf.c
+@@ -35,8 +35,8 @@ void BPF_STRUCT_OPS(ddsp_bogus_dsq_fail_exit, struct scx_exit_info *ei)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops ddsp_bogus_dsq_fail_ops = {
+-	.select_cpu		= ddsp_bogus_dsq_fail_select_cpu,
+-	.exit			= ddsp_bogus_dsq_fail_exit,
++	.select_cpu		= (void *) ddsp_bogus_dsq_fail_select_cpu,
++	.exit			= (void *) ddsp_bogus_dsq_fail_exit,
+ 	.name			= "ddsp_bogus_dsq_fail",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/ddsp_vtimelocal_fail.bpf.c b/tools/testing/selftests/sched_ext/ddsp_vtimelocal_fail.bpf.c
+index dde7e7daf..dffc97d9c 100644
+--- a/tools/testing/selftests/sched_ext/ddsp_vtimelocal_fail.bpf.c
++++ b/tools/testing/selftests/sched_ext/ddsp_vtimelocal_fail.bpf.c
+@@ -32,8 +32,8 @@ void BPF_STRUCT_OPS(ddsp_vtimelocal_fail_exit, struct scx_exit_info *ei)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops ddsp_vtimelocal_fail_ops = {
+-	.select_cpu		= ddsp_vtimelocal_fail_select_cpu,
+-	.exit			= ddsp_vtimelocal_fail_exit,
++	.select_cpu		= (void *) ddsp_vtimelocal_fail_select_cpu,
++	.exit			= (void *) ddsp_vtimelocal_fail_exit,
+ 	.name			= "ddsp_vtimelocal_fail",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/dsp_local_on.bpf.c b/tools/testing/selftests/sched_ext/dsp_local_on.bpf.c
+index efb4672de..6a7db1502 100644
+--- a/tools/testing/selftests/sched_ext/dsp_local_on.bpf.c
++++ b/tools/testing/selftests/sched_ext/dsp_local_on.bpf.c
+@@ -56,10 +56,10 @@ void BPF_STRUCT_OPS(dsp_local_on_exit, struct scx_exit_info *ei)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops dsp_local_on_ops = {
+-	.select_cpu		= dsp_local_on_select_cpu,
+-	.enqueue		= dsp_local_on_enqueue,
+-	.dispatch		= dsp_local_on_dispatch,
+-	.exit			= dsp_local_on_exit,
++	.select_cpu		= (void *) dsp_local_on_select_cpu,
++	.enqueue		= (void *) dsp_local_on_enqueue,
++	.dispatch		= (void *) dsp_local_on_dispatch,
++	.exit			= (void *) dsp_local_on_exit,
+ 	.name			= "dsp_local_on",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/enq_select_cpu_fails.bpf.c b/tools/testing/selftests/sched_ext/enq_select_cpu_fails.bpf.c
+index b3dfc1033..1efb50d61 100644
+--- a/tools/testing/selftests/sched_ext/enq_select_cpu_fails.bpf.c
++++ b/tools/testing/selftests/sched_ext/enq_select_cpu_fails.bpf.c
+@@ -36,8 +36,8 @@ void BPF_STRUCT_OPS(enq_select_cpu_fails_enqueue, struct task_struct *p,
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops enq_select_cpu_fails_ops = {
+-	.select_cpu		= enq_select_cpu_fails_select_cpu,
+-	.enqueue		= enq_select_cpu_fails_enqueue,
++	.select_cpu		= (void *) enq_select_cpu_fails_select_cpu,
++	.enqueue		= (void *) enq_select_cpu_fails_enqueue,
+ 	.name			= "enq_select_cpu_fails",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/exit.bpf.c b/tools/testing/selftests/sched_ext/exit.bpf.c
+index ae12ddaac..bf79ccd55 100644
+--- a/tools/testing/selftests/sched_ext/exit.bpf.c
++++ b/tools/testing/selftests/sched_ext/exit.bpf.c
+@@ -72,13 +72,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(exit_init)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops exit_ops = {
+-	.select_cpu		= exit_select_cpu,
+-	.enqueue		= exit_enqueue,
+-	.dispatch		= exit_dispatch,
+-	.init_task		= exit_init_task,
+-	.enable			= exit_enable,
+-	.exit			= exit_exit,
+-	.init			= exit_init,
++	.select_cpu		= (void *) exit_select_cpu,
++	.enqueue		= (void *) exit_enqueue,
++	.dispatch		= (void *) exit_dispatch,
++	.init_task		= (void *) exit_init_task,
++	.enable			= (void *) exit_enable,
++	.exit			= (void *) exit_exit,
++	.init			= (void *) exit_init,
+ 	.name			= "exit",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/hotplug.bpf.c b/tools/testing/selftests/sched_ext/hotplug.bpf.c
+index 8f2601db3..6c9f25c9b 100644
+--- a/tools/testing/selftests/sched_ext/hotplug.bpf.c
++++ b/tools/testing/selftests/sched_ext/hotplug.bpf.c
+@@ -46,16 +46,16 @@ void BPF_STRUCT_OPS_SLEEPABLE(hotplug_cpu_offline, s32 cpu)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops hotplug_cb_ops = {
+-	.cpu_online		= hotplug_cpu_online,
+-	.cpu_offline		= hotplug_cpu_offline,
+-	.exit			= hotplug_exit,
++	.cpu_online		= (void *) hotplug_cpu_online,
++	.cpu_offline		= (void *) hotplug_cpu_offline,
++	.exit			= (void *) hotplug_exit,
+ 	.name			= "hotplug_cbs",
+ 	.timeout_ms		= 1000U,
+ };
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops hotplug_nocb_ops = {
+-	.exit			= hotplug_exit,
++	.exit			= (void *) hotplug_exit,
+ 	.name			= "hotplug_nocbs",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/init_enable_count.bpf.c b/tools/testing/selftests/sched_ext/init_enable_count.bpf.c
+index 47ea89a62..5eb9edb18 100644
+--- a/tools/testing/selftests/sched_ext/init_enable_count.bpf.c
++++ b/tools/testing/selftests/sched_ext/init_enable_count.bpf.c
+@@ -45,9 +45,9 @@ void BPF_STRUCT_OPS(cnt_disable, struct task_struct *p)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops init_enable_count_ops = {
+-	.init_task	= cnt_init_task,
+-	.exit_task	= cnt_exit_task,
+-	.enable		= cnt_enable,
+-	.disable	= cnt_disable,
++	.init_task	= (void *) cnt_init_task,
++	.exit_task	= (void *) cnt_exit_task,
++	.enable		= (void *) cnt_enable,
++	.disable	= (void *) cnt_disable,
+ 	.name		= "init_enable_count",
+ };
+diff --git a/tools/testing/selftests/sched_ext/maximal.bpf.c b/tools/testing/selftests/sched_ext/maximal.bpf.c
+index 00bfa9cb9..4d4cd8d96 100644
+--- a/tools/testing/selftests/sched_ext/maximal.bpf.c
++++ b/tools/testing/selftests/sched_ext/maximal.bpf.c
+@@ -131,34 +131,34 @@ void BPF_STRUCT_OPS(maximal_exit, struct scx_exit_info *info)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops maximal_ops = {
+-	.select_cpu		= maximal_select_cpu,
+-	.enqueue		= maximal_enqueue,
+-	.dequeue		= maximal_dequeue,
+-	.dispatch		= maximal_dispatch,
+-	.runnable		= maximal_runnable,
+-	.running		= maximal_running,
+-	.stopping		= maximal_stopping,
+-	.quiescent		= maximal_quiescent,
+-	.yield			= maximal_yield,
+-	.core_sched_before	= maximal_core_sched_before,
+-	.set_weight		= maximal_set_weight,
+-	.set_cpumask		= maximal_set_cpumask,
+-	.update_idle		= maximal_update_idle,
+-	.cpu_acquire		= maximal_cpu_acquire,
+-	.cpu_release		= maximal_cpu_release,
+-	.cpu_online		= maximal_cpu_online,
+-	.cpu_offline		= maximal_cpu_offline,
+-	.init_task		= maximal_init_task,
+-	.enable			= maximal_enable,
+-	.exit_task		= maximal_exit_task,
+-	.disable		= maximal_disable,
+-	.cgroup_init		= maximal_cgroup_init,
+-	.cgroup_exit		= maximal_cgroup_exit,
+-	.cgroup_prep_move	= maximal_cgroup_prep_move,
+-	.cgroup_move		= maximal_cgroup_move,
+-	.cgroup_cancel_move	= maximal_cgroup_cancel_move,
+-	.cgroup_set_weight	= maximal_cgroup_set_weight,
+-	.init			= maximal_init,
+-	.exit			= maximal_exit,
++	.select_cpu		= (void *) maximal_select_cpu,
++	.enqueue		= (void *) maximal_enqueue,
++	.dequeue		= (void *) maximal_dequeue,
++	.dispatch		= (void *) maximal_dispatch,
++	.runnable		= (void *) maximal_runnable,
++	.running		= (void *) maximal_running,
++	.stopping		= (void *) maximal_stopping,
++	.quiescent		= (void *) maximal_quiescent,
++	.yield			= (void *) maximal_yield,
++	.core_sched_before	= (void *) maximal_core_sched_before,
++	.set_weight		= (void *) maximal_set_weight,
++	.set_cpumask		= (void *) maximal_set_cpumask,
++	.update_idle		= (void *) maximal_update_idle,
++	.cpu_acquire		= (void *) maximal_cpu_acquire,
++	.cpu_release		= (void *) maximal_cpu_release,
++	.cpu_online		= (void *) maximal_cpu_online,
++	.cpu_offline		= (void *) maximal_cpu_offline,
++	.init_task		= (void *) maximal_init_task,
++	.enable			= (void *) maximal_enable,
++	.exit_task		= (void *) maximal_exit_task,
++	.disable		= (void *) maximal_disable,
++	.cgroup_init		= (void *) maximal_cgroup_init,
++	.cgroup_exit		= (void *) maximal_cgroup_exit,
++	.cgroup_prep_move	= (void *) maximal_cgroup_prep_move,
++	.cgroup_move		= (void *) maximal_cgroup_move,
++	.cgroup_cancel_move	= (void *) maximal_cgroup_cancel_move,
++	.cgroup_set_weight	= (void *) maximal_cgroup_set_weight,
++	.init			= (void *) maximal_init,
++	.exit			= (void *) maximal_exit,
+ 	.name			= "maximal",
+ };
+diff --git a/tools/testing/selftests/sched_ext/maybe_null.bpf.c b/tools/testing/selftests/sched_ext/maybe_null.bpf.c
+index 27d0f386a..cf4ae870c 100644
+--- a/tools/testing/selftests/sched_ext/maybe_null.bpf.c
++++ b/tools/testing/selftests/sched_ext/maybe_null.bpf.c
+@@ -29,8 +29,8 @@ bool BPF_STRUCT_OPS(maybe_null_success_yield, struct task_struct *from,
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops maybe_null_success = {
+-	.dispatch               = maybe_null_success_dispatch,
+-	.yield			= maybe_null_success_yield,
+-	.enable			= maybe_null_running,
++	.dispatch               = (void *) maybe_null_success_dispatch,
++	.yield			= (void *) maybe_null_success_yield,
++	.enable			= (void *) maybe_null_running,
+ 	.name			= "minimal",
+ };
+diff --git a/tools/testing/selftests/sched_ext/maybe_null_fail_dsp.bpf.c b/tools/testing/selftests/sched_ext/maybe_null_fail_dsp.bpf.c
+index c06410502..ec724d7b3 100644
+--- a/tools/testing/selftests/sched_ext/maybe_null_fail_dsp.bpf.c
++++ b/tools/testing/selftests/sched_ext/maybe_null_fail_dsp.bpf.c
+@@ -19,7 +19,7 @@ void BPF_STRUCT_OPS(maybe_null_fail_dispatch, s32 cpu, struct task_struct *p)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops maybe_null_fail = {
+-	.dispatch               = maybe_null_fail_dispatch,
+-	.enable			= maybe_null_running,
++	.dispatch               = (void *) maybe_null_fail_dispatch,
++	.enable			= (void *) maybe_null_running,
+ 	.name			= "maybe_null_fail_dispatch",
+ };
+diff --git a/tools/testing/selftests/sched_ext/maybe_null_fail_yld.bpf.c b/tools/testing/selftests/sched_ext/maybe_null_fail_yld.bpf.c
+index 3c1740028..e6552cace 100644
+--- a/tools/testing/selftests/sched_ext/maybe_null_fail_yld.bpf.c
++++ b/tools/testing/selftests/sched_ext/maybe_null_fail_yld.bpf.c
+@@ -22,7 +22,7 @@ bool BPF_STRUCT_OPS(maybe_null_fail_yield, struct task_struct *from,
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops maybe_null_fail = {
+-	.yield			= maybe_null_fail_yield,
+-	.enable			= maybe_null_running,
++	.yield			= (void *) maybe_null_fail_yield,
++	.enable			= (void *) maybe_null_running,
+ 	.name			= "maybe_null_fail_yield",
+ };
+diff --git a/tools/testing/selftests/sched_ext/prog_run.bpf.c b/tools/testing/selftests/sched_ext/prog_run.bpf.c
+index 6a4d7c48e..00c267626 100644
+--- a/tools/testing/selftests/sched_ext/prog_run.bpf.c
++++ b/tools/testing/selftests/sched_ext/prog_run.bpf.c
+@@ -28,6 +28,6 @@ void BPF_STRUCT_OPS(prog_run_exit, struct scx_exit_info *ei)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops prog_run_ops = {
+-	.exit			= prog_run_exit,
++	.exit			= (void *) prog_run_exit,
+ 	.name			= "prog_run",
+ };
+diff --git a/tools/testing/selftests/sched_ext/select_cpu_dfl.bpf.c b/tools/testing/selftests/sched_ext/select_cpu_dfl.bpf.c
+index 2ed2991af..f171ac470 100644
+--- a/tools/testing/selftests/sched_ext/select_cpu_dfl.bpf.c
++++ b/tools/testing/selftests/sched_ext/select_cpu_dfl.bpf.c
+@@ -35,6 +35,6 @@ void BPF_STRUCT_OPS(select_cpu_dfl_enqueue, struct task_struct *p,
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops select_cpu_dfl_ops = {
+-	.enqueue		= select_cpu_dfl_enqueue,
++	.enqueue		= (void *) select_cpu_dfl_enqueue,
+ 	.name			= "select_cpu_dfl",
+ };
+diff --git a/tools/testing/selftests/sched_ext/select_cpu_dfl_nodispatch.bpf.c b/tools/testing/selftests/sched_ext/select_cpu_dfl_nodispatch.bpf.c
+index 4bb5abb2d..9efdbb7da 100644
+--- a/tools/testing/selftests/sched_ext/select_cpu_dfl_nodispatch.bpf.c
++++ b/tools/testing/selftests/sched_ext/select_cpu_dfl_nodispatch.bpf.c
+@@ -82,8 +82,8 @@ s32 BPF_STRUCT_OPS(select_cpu_dfl_nodispatch_init_task,
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops select_cpu_dfl_nodispatch_ops = {
+-	.select_cpu		= select_cpu_dfl_nodispatch_select_cpu,
+-	.enqueue		= select_cpu_dfl_nodispatch_enqueue,
+-	.init_task		= select_cpu_dfl_nodispatch_init_task,
++	.select_cpu		= (void *) select_cpu_dfl_nodispatch_select_cpu,
++	.enqueue		= (void *) select_cpu_dfl_nodispatch_enqueue,
++	.init_task		= (void *) select_cpu_dfl_nodispatch_init_task,
+ 	.name			= "select_cpu_dfl_nodispatch",
+ };
+diff --git a/tools/testing/selftests/sched_ext/select_cpu_dispatch.bpf.c b/tools/testing/selftests/sched_ext/select_cpu_dispatch.bpf.c
+index f0b96a4a0..59bfc4f36 100644
+--- a/tools/testing/selftests/sched_ext/select_cpu_dispatch.bpf.c
++++ b/tools/testing/selftests/sched_ext/select_cpu_dispatch.bpf.c
+@@ -35,7 +35,7 @@ s32 BPF_STRUCT_OPS(select_cpu_dispatch_select_cpu, struct task_struct *p,
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops select_cpu_dispatch_ops = {
+-	.select_cpu		= select_cpu_dispatch_select_cpu,
++	.select_cpu		= (void *) select_cpu_dispatch_select_cpu,
+ 	.name			= "select_cpu_dispatch",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/select_cpu_dispatch_bad_dsq.bpf.c b/tools/testing/selftests/sched_ext/select_cpu_dispatch_bad_dsq.bpf.c
+index 7b42ddce0..3bbd5fcdf 100644
+--- a/tools/testing/selftests/sched_ext/select_cpu_dispatch_bad_dsq.bpf.c
++++ b/tools/testing/selftests/sched_ext/select_cpu_dispatch_bad_dsq.bpf.c
+@@ -30,8 +30,8 @@ void BPF_STRUCT_OPS(select_cpu_dispatch_bad_dsq_exit, struct scx_exit_info *ei)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops select_cpu_dispatch_bad_dsq_ops = {
+-	.select_cpu		= select_cpu_dispatch_bad_dsq_select_cpu,
+-	.exit			= select_cpu_dispatch_bad_dsq_exit,
++	.select_cpu		= (void *) select_cpu_dispatch_bad_dsq_select_cpu,
++	.exit			= (void *) select_cpu_dispatch_bad_dsq_exit,
+ 	.name			= "select_cpu_dispatch_bad_dsq",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/select_cpu_dispatch_dbl_dsp.bpf.c b/tools/testing/selftests/sched_ext/select_cpu_dispatch_dbl_dsp.bpf.c
+index 653e3dc0b..0fda57fe0 100644
+--- a/tools/testing/selftests/sched_ext/select_cpu_dispatch_dbl_dsp.bpf.c
++++ b/tools/testing/selftests/sched_ext/select_cpu_dispatch_dbl_dsp.bpf.c
+@@ -31,8 +31,8 @@ void BPF_STRUCT_OPS(select_cpu_dispatch_dbl_dsp_exit, struct scx_exit_info *ei)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops select_cpu_dispatch_dbl_dsp_ops = {
+-	.select_cpu		= select_cpu_dispatch_dbl_dsp_select_cpu,
+-	.exit			= select_cpu_dispatch_dbl_dsp_exit,
++	.select_cpu		= (void *) select_cpu_dispatch_dbl_dsp_select_cpu,
++	.exit			= (void *) select_cpu_dispatch_dbl_dsp_exit,
+ 	.name			= "select_cpu_dispatch_dbl_dsp",
+ 	.timeout_ms		= 1000U,
+ };
+diff --git a/tools/testing/selftests/sched_ext/select_cpu_vtime.bpf.c b/tools/testing/selftests/sched_ext/select_cpu_vtime.bpf.c
+index 7f3ebf4fc..e6c67bcf5 100644
+--- a/tools/testing/selftests/sched_ext/select_cpu_vtime.bpf.c
++++ b/tools/testing/selftests/sched_ext/select_cpu_vtime.bpf.c
+@@ -81,12 +81,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(select_cpu_vtime_init)
+ 
+ SEC(".struct_ops.link")
+ struct sched_ext_ops select_cpu_vtime_ops = {
+-	.select_cpu		= select_cpu_vtime_select_cpu,
+-	.dispatch		= select_cpu_vtime_dispatch,
+-	.running		= select_cpu_vtime_running,
+-	.stopping		= select_cpu_vtime_stopping,
+-	.enable			= select_cpu_vtime_enable,
+-	.init			= select_cpu_vtime_init,
++	.select_cpu		= (void *) select_cpu_vtime_select_cpu,
++	.dispatch		= (void *) select_cpu_vtime_dispatch,
++	.running		= (void *) select_cpu_vtime_running,
++	.stopping		= (void *) select_cpu_vtime_stopping,
++	.enable			= (void *) select_cpu_vtime_enable,
++	.init			= (void *) select_cpu_vtime_init,
+ 	.name			= "select_cpu_vtime",
+ 	.timeout_ms		= 1000U,
+ };
+-- 
+2.47.0
+
+
+From e9f2be31870b943822d92f05af43532ba04c00a9 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Thu, 24 Oct 2024 06:58:09 -1000
+Subject: [PATCH 12/14] sched_ext: Rename CFI stubs to names that are
+ recognized by BPF
+
+CFI stubs can be used to tag arguments with __nullable (and possibly other
+tags in the future) but for that to work the CFI stubs must have names that
+are recognized by BPF. Rename them.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Acked-by: David Vernet <void@manifault.com>
+Acked-by: Martin KaFai Lau <martin.lau@kernel.org>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/sched/ext.c | 132 ++++++++++++++++++++++-----------------------
+ 1 file changed, 66 insertions(+), 66 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index f2dbbeaa5..b2f4e301f 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -5653,78 +5653,78 @@ static int bpf_scx_validate(void *kdata)
+ 	return 0;
+ }
+ 
+-static s32 select_cpu_stub(struct task_struct *p, s32 prev_cpu, u64 wake_flags) { return -EINVAL; }
+-static void enqueue_stub(struct task_struct *p, u64 enq_flags) {}
+-static void dequeue_stub(struct task_struct *p, u64 enq_flags) {}
+-static void dispatch_stub(s32 prev_cpu, struct task_struct *p) {}
+-static void tick_stub(struct task_struct *p) {}
+-static void runnable_stub(struct task_struct *p, u64 enq_flags) {}
+-static void running_stub(struct task_struct *p) {}
+-static void stopping_stub(struct task_struct *p, bool runnable) {}
+-static void quiescent_stub(struct task_struct *p, u64 deq_flags) {}
+-static bool yield_stub(struct task_struct *from, struct task_struct *to) { return false; }
+-static bool core_sched_before_stub(struct task_struct *a, struct task_struct *b) { return false; }
+-static void set_weight_stub(struct task_struct *p, u32 weight) {}
+-static void set_cpumask_stub(struct task_struct *p, const struct cpumask *mask) {}
+-static void update_idle_stub(s32 cpu, bool idle) {}
+-static void cpu_acquire_stub(s32 cpu, struct scx_cpu_acquire_args *args) {}
+-static void cpu_release_stub(s32 cpu, struct scx_cpu_release_args *args) {}
+-static s32 init_task_stub(struct task_struct *p, struct scx_init_task_args *args) { return -EINVAL; }
+-static void exit_task_stub(struct task_struct *p, struct scx_exit_task_args *args) {}
+-static void enable_stub(struct task_struct *p) {}
+-static void disable_stub(struct task_struct *p) {}
++static s32 sched_ext_ops__select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags) { return -EINVAL; }
++static void sched_ext_ops__enqueue(struct task_struct *p, u64 enq_flags) {}
++static void sched_ext_ops__dequeue(struct task_struct *p, u64 enq_flags) {}
++static void sched_ext_ops__dispatch(s32 prev_cpu, struct task_struct *p) {}
++static void sched_ext_ops__tick(struct task_struct *p) {}
++static void sched_ext_ops__runnable(struct task_struct *p, u64 enq_flags) {}
++static void sched_ext_ops__running(struct task_struct *p) {}
++static void sched_ext_ops__stopping(struct task_struct *p, bool runnable) {}
++static void sched_ext_ops__quiescent(struct task_struct *p, u64 deq_flags) {}
++static bool sched_ext_ops__yield(struct task_struct *from, struct task_struct *to) { return false; }
++static bool sched_ext_ops__core_sched_before(struct task_struct *a, struct task_struct *b) { return false; }
++static void sched_ext_ops__set_weight(struct task_struct *p, u32 weight) {}
++static void sched_ext_ops__set_cpumask(struct task_struct *p, const struct cpumask *mask) {}
++static void sched_ext_ops__update_idle(s32 cpu, bool idle) {}
++static void sched_ext_ops__cpu_acquire(s32 cpu, struct scx_cpu_acquire_args *args) {}
++static void sched_ext_ops__cpu_release(s32 cpu, struct scx_cpu_release_args *args) {}
++static s32 sched_ext_ops__init_task(struct task_struct *p, struct scx_init_task_args *args) { return -EINVAL; }
++static void sched_ext_ops__exit_task(struct task_struct *p, struct scx_exit_task_args *args) {}
++static void sched_ext_ops__enable(struct task_struct *p) {}
++static void sched_ext_ops__disable(struct task_struct *p) {}
+ #ifdef CONFIG_EXT_GROUP_SCHED
+-static s32 cgroup_init_stub(struct cgroup *cgrp, struct scx_cgroup_init_args *args) { return -EINVAL; }
+-static void cgroup_exit_stub(struct cgroup *cgrp) {}
+-static s32 cgroup_prep_move_stub(struct task_struct *p, struct cgroup *from, struct cgroup *to) { return -EINVAL; }
+-static void cgroup_move_stub(struct task_struct *p, struct cgroup *from, struct cgroup *to) {}
+-static void cgroup_cancel_move_stub(struct task_struct *p, struct cgroup *from, struct cgroup *to) {}
+-static void cgroup_set_weight_stub(struct cgroup *cgrp, u32 weight) {}
++static s32 sched_ext_ops__cgroup_init(struct cgroup *cgrp, struct scx_cgroup_init_args *args) { return -EINVAL; }
++static void sched_ext_ops__cgroup_exit(struct cgroup *cgrp) {}
++static s32 sched_ext_ops__cgroup_prep_move(struct task_struct *p, struct cgroup *from, struct cgroup *to) { return -EINVAL; }
++static void sched_ext_ops__cgroup_move(struct task_struct *p, struct cgroup *from, struct cgroup *to) {}
++static void sched_ext_ops__cgroup_cancel_move(struct task_struct *p, struct cgroup *from, struct cgroup *to) {}
++static void sched_ext_ops__cgroup_set_weight(struct cgroup *cgrp, u32 weight) {}
+ #endif
+-static void cpu_online_stub(s32 cpu) {}
+-static void cpu_offline_stub(s32 cpu) {}
+-static s32 init_stub(void) { return -EINVAL; }
+-static void exit_stub(struct scx_exit_info *info) {}
+-static void dump_stub(struct scx_dump_ctx *ctx) {}
+-static void dump_cpu_stub(struct scx_dump_ctx *ctx, s32 cpu, bool idle) {}
+-static void dump_task_stub(struct scx_dump_ctx *ctx, struct task_struct *p) {}
++static void sched_ext_ops__cpu_online(s32 cpu) {}
++static void sched_ext_ops__cpu_offline(s32 cpu) {}
++static s32 sched_ext_ops__init(void) { return -EINVAL; }
++static void sched_ext_ops__exit(struct scx_exit_info *info) {}
++static void sched_ext_ops__dump(struct scx_dump_ctx *ctx) {}
++static void sched_ext_ops__dump_cpu(struct scx_dump_ctx *ctx, s32 cpu, bool idle) {}
++static void sched_ext_ops__dump_task(struct scx_dump_ctx *ctx, struct task_struct *p) {}
+ 
+ static struct sched_ext_ops __bpf_ops_sched_ext_ops = {
+-	.select_cpu = select_cpu_stub,
+-	.enqueue = enqueue_stub,
+-	.dequeue = dequeue_stub,
+-	.dispatch = dispatch_stub,
+-	.tick = tick_stub,
+-	.runnable = runnable_stub,
+-	.running = running_stub,
+-	.stopping = stopping_stub,
+-	.quiescent = quiescent_stub,
+-	.yield = yield_stub,
+-	.core_sched_before = core_sched_before_stub,
+-	.set_weight = set_weight_stub,
+-	.set_cpumask = set_cpumask_stub,
+-	.update_idle = update_idle_stub,
+-	.cpu_acquire = cpu_acquire_stub,
+-	.cpu_release = cpu_release_stub,
+-	.init_task = init_task_stub,
+-	.exit_task = exit_task_stub,
+-	.enable = enable_stub,
+-	.disable = disable_stub,
++	.select_cpu		= sched_ext_ops__select_cpu,
++	.enqueue		= sched_ext_ops__enqueue,
++	.dequeue		= sched_ext_ops__dequeue,
++	.dispatch		= sched_ext_ops__dispatch,
++	.tick			= sched_ext_ops__tick,
++	.runnable		= sched_ext_ops__runnable,
++	.running		= sched_ext_ops__running,
++	.stopping		= sched_ext_ops__stopping,
++	.quiescent		= sched_ext_ops__quiescent,
++	.yield			= sched_ext_ops__yield,
++	.core_sched_before	= sched_ext_ops__core_sched_before,
++	.set_weight		= sched_ext_ops__set_weight,
++	.set_cpumask		= sched_ext_ops__set_cpumask,
++	.update_idle		= sched_ext_ops__update_idle,
++	.cpu_acquire		= sched_ext_ops__cpu_acquire,
++	.cpu_release		= sched_ext_ops__cpu_release,
++	.init_task		= sched_ext_ops__init_task,
++	.exit_task		= sched_ext_ops__exit_task,
++	.enable			= sched_ext_ops__enable,
++	.disable		= sched_ext_ops__disable,
+ #ifdef CONFIG_EXT_GROUP_SCHED
+-	.cgroup_init = cgroup_init_stub,
+-	.cgroup_exit = cgroup_exit_stub,
+-	.cgroup_prep_move = cgroup_prep_move_stub,
+-	.cgroup_move = cgroup_move_stub,
+-	.cgroup_cancel_move = cgroup_cancel_move_stub,
+-	.cgroup_set_weight = cgroup_set_weight_stub,
++	.cgroup_init		= sched_ext_ops__cgroup_init,
++	.cgroup_exit		= sched_ext_ops__cgroup_exit,
++	.cgroup_prep_move	= sched_ext_ops__cgroup_prep_move,
++	.cgroup_move		= sched_ext_ops__cgroup_move,
++	.cgroup_cancel_move	= sched_ext_ops__cgroup_cancel_move,
++	.cgroup_set_weight	= sched_ext_ops__cgroup_set_weight,
+ #endif
+-	.cpu_online = cpu_online_stub,
+-	.cpu_offline = cpu_offline_stub,
+-	.init = init_stub,
+-	.exit = exit_stub,
+-	.dump = dump_stub,
+-	.dump_cpu = dump_cpu_stub,
+-	.dump_task = dump_task_stub,
++	.cpu_online		= sched_ext_ops__cpu_online,
++	.cpu_offline		= sched_ext_ops__cpu_offline,
++	.init			= sched_ext_ops__init,
++	.exit			= sched_ext_ops__exit,
++	.dump			= sched_ext_ops__dump,
++	.dump_cpu		= sched_ext_ops__dump_cpu,
++	.dump_task		= sched_ext_ops__dump_task,
+ };
+ 
+ static struct bpf_struct_ops bpf_sched_ext_ops = {
+-- 
+2.47.0
+
+
+From 79727945ed5636529cd081bf1789561805d349cb Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Thu, 24 Oct 2024 06:58:09 -1000
+Subject: [PATCH 13/14] sched_ext: Replace set_arg_maybe_null() with __nullable
+ CFI stub tags
+
+ops.dispatch() and ops.yield() may be fed a NULL task_struct pointer.
+set_arg_maybe_null() is used to tell the verifier that they should be NULL
+checked before being dereferenced. BPF now has an a lot prettier way to
+express this - tagging arguments in CFI stubs with __nullable. Replace
+set_arg_maybe_null() with __nullable CFI stub tags.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Acked-by: David Vernet <void@manifault.com>
+Acked-by: Martin KaFai Lau <martin.lau@kernel.org>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/sched/ext.c | 66 ++--------------------------------------------
+ 1 file changed, 2 insertions(+), 64 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index b2f4e301f..766d9f5ff 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -5426,67 +5426,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ #include <linux/bpf.h>
+ #include <linux/btf.h>
+ 
+-extern struct btf *btf_vmlinux;
+ static const struct btf_type *task_struct_type;
+ 
+-static bool set_arg_maybe_null(const char *op, int arg_n, int off, int size,
+-			       enum bpf_access_type type,
+-			       const struct bpf_prog *prog,
+-			       struct bpf_insn_access_aux *info)
+-{
+-	struct btf *btf = bpf_get_btf_vmlinux();
+-	const struct bpf_struct_ops_desc *st_ops_desc;
+-	const struct btf_member *member;
+-	const struct btf_type *t;
+-	u32 btf_id, member_idx;
+-	const char *mname;
+-
+-	/* struct_ops op args are all sequential, 64-bit numbers */
+-	if (off != arg_n * sizeof(__u64))
+-		return false;
+-
+-	/* btf_id should be the type id of struct sched_ext_ops */
+-	btf_id = prog->aux->attach_btf_id;
+-	st_ops_desc = bpf_struct_ops_find(btf, btf_id);
+-	if (!st_ops_desc)
+-		return false;
+-
+-	/* BTF type of struct sched_ext_ops */
+-	t = st_ops_desc->type;
+-
+-	member_idx = prog->expected_attach_type;
+-	if (member_idx >= btf_type_vlen(t))
+-		return false;
+-
+-	/*
+-	 * Get the member name of this struct_ops program, which corresponds to
+-	 * a field in struct sched_ext_ops. For example, the member name of the
+-	 * dispatch struct_ops program (callback) is "dispatch".
+-	 */
+-	member = &btf_type_member(t)[member_idx];
+-	mname = btf_name_by_offset(btf_vmlinux, member->name_off);
+-
+-	if (!strcmp(mname, op)) {
+-		/*
+-		 * The value is a pointer to a type (struct task_struct) given
+-		 * by a BTF ID (PTR_TO_BTF_ID). It is trusted (PTR_TRUSTED),
+-		 * however, can be a NULL (PTR_MAYBE_NULL). The BPF program
+-		 * should check the pointer to make sure it is not NULL before
+-		 * using it, or the verifier will reject the program.
+-		 *
+-		 * Longer term, this is something that should be addressed by
+-		 * BTF, and be fully contained within the verifier.
+-		 */
+-		info->reg_type = PTR_MAYBE_NULL | PTR_TO_BTF_ID | PTR_TRUSTED;
+-		info->btf = btf_vmlinux;
+-		info->btf_id = btf_tracing_ids[BTF_TRACING_TYPE_TASK];
+-
+-		return true;
+-	}
+-
+-	return false;
+-}
+-
+ static bool bpf_scx_is_valid_access(int off, int size,
+ 				    enum bpf_access_type type,
+ 				    const struct bpf_prog *prog,
+@@ -5494,9 +5435,6 @@ static bool bpf_scx_is_valid_access(int off, int size,
+ {
+ 	if (type != BPF_READ)
+ 		return false;
+-	if (set_arg_maybe_null("dispatch", 1, off, size, type, prog, info) ||
+-	    set_arg_maybe_null("yield", 1, off, size, type, prog, info))
+-		return true;
+ 	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
+ 		return false;
+ 	if (off % size != 0)
+@@ -5656,13 +5594,13 @@ static int bpf_scx_validate(void *kdata)
+ static s32 sched_ext_ops__select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags) { return -EINVAL; }
+ static void sched_ext_ops__enqueue(struct task_struct *p, u64 enq_flags) {}
+ static void sched_ext_ops__dequeue(struct task_struct *p, u64 enq_flags) {}
+-static void sched_ext_ops__dispatch(s32 prev_cpu, struct task_struct *p) {}
++static void sched_ext_ops__dispatch(s32 prev_cpu, struct task_struct *prev__nullable) {}
+ static void sched_ext_ops__tick(struct task_struct *p) {}
+ static void sched_ext_ops__runnable(struct task_struct *p, u64 enq_flags) {}
+ static void sched_ext_ops__running(struct task_struct *p) {}
+ static void sched_ext_ops__stopping(struct task_struct *p, bool runnable) {}
+ static void sched_ext_ops__quiescent(struct task_struct *p, u64 deq_flags) {}
+-static bool sched_ext_ops__yield(struct task_struct *from, struct task_struct *to) { return false; }
++static bool sched_ext_ops__yield(struct task_struct *from, struct task_struct *to__nullable) { return false; }
+ static bool sched_ext_ops__core_sched_before(struct task_struct *a, struct task_struct *b) { return false; }
+ static void sched_ext_ops__set_weight(struct task_struct *p, u32 weight) {}
+ static void sched_ext_ops__set_cpumask(struct task_struct *p, const struct cpumask *mask) {}
+-- 
+2.47.0
+
+
+From bec4b94e28555830bdb5fcd82180f938721d992f Mon Sep 17 00:00:00 2001
+From: David Vernet <void@manifault.com>
+Date: Fri, 25 Oct 2024 00:40:13 -0500
+Subject: [PATCH 14/14] scx: Fix exit selftest to use custom DSQ
+
+In commit 63fb3ec80516 ("sched_ext: Allow only user DSQs for
+scx_bpf_consume(), scx_bpf_dsq_nr_queued() and bpf_iter_scx_dsq_new()"), we
+updated the consume path to only accept user DSQs, thus making it invalid
+to consume SCX_DSQ_GLOBAL. This selftest was doing that, so let's create a
+custom DSQ and use that instead.  The test now passes:
+
+[root@virtme-ng sched_ext]# ./runner -t exit
+===== START =====
+TEST: exit
+DESCRIPTION: Verify we can cleanly exit a scheduler in multiple places
+OUTPUT:
+[   12.387229] sched_ext: BPF scheduler "exit" enabled
+[   12.406064] sched_ext: BPF scheduler "exit" disabled (unregistered from BPF)
+[   12.453325] sched_ext: BPF scheduler "exit" enabled
+[   12.474064] sched_ext: BPF scheduler "exit" disabled (unregistered from BPF)
+[   12.515241] sched_ext: BPF scheduler "exit" enabled
+[   12.532064] sched_ext: BPF scheduler "exit" disabled (unregistered from BPF)
+[   12.592063] sched_ext: BPF scheduler "exit" disabled (unregistered from BPF)
+[   12.654063] sched_ext: BPF scheduler "exit" disabled (unregistered from BPF)
+[   12.715062] sched_ext: BPF scheduler "exit" disabled (unregistered from BPF)
+ok 1 exit #
+=====  END  =====
+
+Signed-off-by: David Vernet <void@manifault.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ tools/testing/selftests/sched_ext/exit.bpf.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/tools/testing/selftests/sched_ext/exit.bpf.c b/tools/testing/selftests/sched_ext/exit.bpf.c
+index bf79ccd55..d75d4faf0 100644
+--- a/tools/testing/selftests/sched_ext/exit.bpf.c
++++ b/tools/testing/selftests/sched_ext/exit.bpf.c
+@@ -15,6 +15,8 @@ UEI_DEFINE(uei);
+ 
+ #define EXIT_CLEANLY() scx_bpf_exit(exit_point, "%d", exit_point)
+ 
++#define DSQ_ID 0
++
+ s32 BPF_STRUCT_OPS(exit_select_cpu, struct task_struct *p,
+ 		   s32 prev_cpu, u64 wake_flags)
+ {
+@@ -31,7 +33,7 @@ void BPF_STRUCT_OPS(exit_enqueue, struct task_struct *p, u64 enq_flags)
+ 	if (exit_point == EXIT_ENQUEUE)
+ 		EXIT_CLEANLY();
+ 
+-	scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
++	scx_bpf_dispatch(p, DSQ_ID, SCX_SLICE_DFL, enq_flags);
+ }
+ 
+ void BPF_STRUCT_OPS(exit_dispatch, s32 cpu, struct task_struct *p)
+@@ -39,7 +41,7 @@ void BPF_STRUCT_OPS(exit_dispatch, s32 cpu, struct task_struct *p)
+ 	if (exit_point == EXIT_DISPATCH)
+ 		EXIT_CLEANLY();
+ 
+-	scx_bpf_consume(SCX_DSQ_GLOBAL);
++	scx_bpf_consume(DSQ_ID);
+ }
+ 
+ void BPF_STRUCT_OPS(exit_enable, struct task_struct *p)
+@@ -67,7 +69,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(exit_init)
+ 	if (exit_point == EXIT_INIT)
+ 		EXIT_CLEANLY();
+ 
+-	return 0;
++	return scx_bpf_create_dsq(DSQ_ID, -1);
+ }
+ 
+ SEC(".struct_ops.link")
+-- 
+2.47.0
+
