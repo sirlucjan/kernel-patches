@@ -1,0 +1,256 @@
+From b3e00035c4304ec537f0d377a766a0dd658f06d5 Mon Sep 17 00:00:00 2001
+From: Antonio Quartulli <antonio@openvpn.net>
+Date: Mon, 4 Mar 2024 02:01:28 +0100
+Subject: [PATCH 10/23] ovpn: store tunnel and transport statistics
+
+Byte/packet counters for in-tunnel and transport streams
+are now initialized and updated as needed.
+
+To be exported via netlink.
+
+Signed-off-by: Antonio Quartulli <antonio@openvpn.net>
+---
+ drivers/net/ovpn/Makefile      |  1 +
+ drivers/net/ovpn/crypto_aead.c |  2 ++
+ drivers/net/ovpn/io.c          | 11 ++++++++
+ drivers/net/ovpn/peer.c        |  2 ++
+ drivers/net/ovpn/peer.h        |  5 ++++
+ drivers/net/ovpn/skb.h         |  1 +
+ drivers/net/ovpn/stats.c       | 21 +++++++++++++++
+ drivers/net/ovpn/stats.h       | 47 ++++++++++++++++++++++++++++++++++
+ 8 files changed, 90 insertions(+)
+ create mode 100644 drivers/net/ovpn/stats.c
+ create mode 100644 drivers/net/ovpn/stats.h
+
+diff --git a/drivers/net/ovpn/Makefile b/drivers/net/ovpn/Makefile
+index ccdaeced1..d43fda726 100644
+--- a/drivers/net/ovpn/Makefile
++++ b/drivers/net/ovpn/Makefile
+@@ -17,4 +17,5 @@ ovpn-y += netlink-gen.o
+ ovpn-y += peer.o
+ ovpn-y += pktid.o
+ ovpn-y += socket.o
++ovpn-y += stats.o
+ ovpn-y += udp.o
+diff --git a/drivers/net/ovpn/crypto_aead.c b/drivers/net/ovpn/crypto_aead.c
+index f9e3feb29..072bb0881 100644
+--- a/drivers/net/ovpn/crypto_aead.c
++++ b/drivers/net/ovpn/crypto_aead.c
+@@ -48,6 +48,7 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
+ 	int nfrags, ret;
+ 	u32 pktid, op;
+ 
++	ovpn_skb_cb(skb)->orig_len = skb->len;
+ 	ovpn_skb_cb(skb)->peer = peer;
+ 	ovpn_skb_cb(skb)->ks = ks;
+ 
+@@ -159,6 +160,7 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
+ 	payload_offset = OVPN_OP_SIZE_V2 + NONCE_WIRE_SIZE + tag_size;
+ 	payload_len = skb->len - payload_offset;
+ 
++	ovpn_skb_cb(skb)->orig_len = skb->len;
+ 	ovpn_skb_cb(skb)->payload_offset = payload_offset;
+ 	ovpn_skb_cb(skb)->peer = peer;
+ 	ovpn_skb_cb(skb)->ks = ks;
+diff --git a/drivers/net/ovpn/io.c b/drivers/net/ovpn/io.c
+index 4c81c4547..d56e74660 100644
+--- a/drivers/net/ovpn/io.c
++++ b/drivers/net/ovpn/io.c
+@@ -12,6 +12,7 @@
+ #include <linux/skbuff.h>
+ #include <net/gro_cells.h>
+ #include <net/gso.h>
++#include <net/ip.h>
+ 
+ #include "ovpnstruct.h"
+ #include "peer.h"
+@@ -68,6 +69,7 @@ void ovpn_decrypt_post(void *data, int ret)
+ 	unsigned int payload_offset = 0;
+ 	struct sk_buff *skb = data;
+ 	struct ovpn_peer *peer;
++	unsigned int orig_len;
+ 	__be16 proto;
+ 	__be32 *pid;
+ 
+@@ -80,6 +82,7 @@ void ovpn_decrypt_post(void *data, int ret)
+ 	payload_offset = ovpn_skb_cb(skb)->payload_offset;
+ 	ks = ovpn_skb_cb(skb)->ks;
+ 	peer = ovpn_skb_cb(skb)->peer;
++	orig_len = ovpn_skb_cb(skb)->orig_len;
+ 
+ 	/* crypto is done, cleanup skb CB and its members */
+ 
+@@ -136,6 +139,10 @@ void ovpn_decrypt_post(void *data, int ret)
+ 		goto drop;
+ 	}
+ 
++	/* increment RX stats */
++	ovpn_peer_stats_increment_rx(&peer->vpn_stats, skb->len);
++	ovpn_peer_stats_increment_rx(&peer->link_stats, orig_len);
++
+ 	ovpn_netdev_write(peer, skb);
+ 	/* skb is passed to upper layer - don't free it */
+ 	skb = NULL;
+@@ -175,6 +182,7 @@ void ovpn_encrypt_post(void *data, int ret)
+ 	struct ovpn_crypto_key_slot *ks;
+ 	struct sk_buff *skb = data;
+ 	struct ovpn_peer *peer;
++	unsigned int orig_len;
+ 
+ 	/* encryption is happening asynchronously. This function will be
+ 	 * called later by the crypto callback with a proper return value
+@@ -184,6 +192,7 @@ void ovpn_encrypt_post(void *data, int ret)
+ 
+ 	ks = ovpn_skb_cb(skb)->ks;
+ 	peer = ovpn_skb_cb(skb)->peer;
++	orig_len = ovpn_skb_cb(skb)->orig_len;
+ 
+ 	/* crypto is done, cleanup skb CB and its members */
+ 
+@@ -197,6 +206,8 @@ void ovpn_encrypt_post(void *data, int ret)
+ 		goto err;
+ 
+ 	skb_mark_not_on_list(skb);
++	ovpn_peer_stats_increment_tx(&peer->link_stats, skb->len);
++	ovpn_peer_stats_increment_tx(&peer->vpn_stats, orig_len);
+ 
+ 	switch (peer->sock->sock->sk->sk_protocol) {
+ 	case IPPROTO_UDP:
+diff --git a/drivers/net/ovpn/peer.c b/drivers/net/ovpn/peer.c
+index 98ae7662f..5025bfb75 100644
+--- a/drivers/net/ovpn/peer.c
++++ b/drivers/net/ovpn/peer.c
+@@ -48,6 +48,8 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_struct *ovpn, u32 id)
+ 	ovpn_crypto_state_init(&peer->crypto);
+ 	spin_lock_init(&peer->lock);
+ 	kref_init(&peer->refcount);
++	ovpn_peer_stats_init(&peer->vpn_stats);
++	ovpn_peer_stats_init(&peer->link_stats);
+ 
+ 	ret = dst_cache_init(&peer->dst_cache, GFP_KERNEL);
+ 	if (ret < 0) {
+diff --git a/drivers/net/ovpn/peer.h b/drivers/net/ovpn/peer.h
+index 754fea470..eb1e31e85 100644
+--- a/drivers/net/ovpn/peer.h
++++ b/drivers/net/ovpn/peer.h
+@@ -13,6 +13,7 @@
+ #include <net/dst_cache.h>
+ 
+ #include "crypto.h"
++#include "stats.h"
+ 
+ /**
+  * struct ovpn_peer - the main remote peer object
+@@ -26,6 +27,8 @@
+  * @dst_cache: cache for dst_entry used to send to peer
+  * @bind: remote peer binding
+  * @halt: true if ovpn_peer_mark_delete was called
++ * @vpn_stats: per-peer in-VPN TX/RX stays
++ * @link_stats: per-peer link/transport TX/RX stats
+  * @delete_reason: why peer was deleted (i.e. timeout, transport error, ..)
+  * @lock: protects binding to peer (bind)
+  * @refcount: reference counter
+@@ -44,6 +47,8 @@ struct ovpn_peer {
+ 	struct dst_cache dst_cache;
+ 	struct ovpn_bind __rcu *bind;
+ 	bool halt;
++	struct ovpn_peer_stats vpn_stats;
++	struct ovpn_peer_stats link_stats;
+ 	enum ovpn_del_peer_reason delete_reason;
+ 	spinlock_t lock; /* protects bind */
+ 	struct kref refcount;
+diff --git a/drivers/net/ovpn/skb.h b/drivers/net/ovpn/skb.h
+index 2a75cef40..96afa0146 100644
+--- a/drivers/net/ovpn/skb.h
++++ b/drivers/net/ovpn/skb.h
+@@ -22,6 +22,7 @@ struct ovpn_cb {
+ 	struct ovpn_crypto_key_slot *ks;
+ 	struct aead_request *req;
+ 	struct scatterlist *sg;
++	unsigned int orig_len;
+ 	unsigned int payload_offset;
+ };
+ 
+diff --git a/drivers/net/ovpn/stats.c b/drivers/net/ovpn/stats.c
+new file mode 100644
+index 000000000..a383842c3
+--- /dev/null
++++ b/drivers/net/ovpn/stats.c
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: GPL-2.0
++/*  OpenVPN data channel offload
++ *
++ *  Copyright (C) 2020-2024 OpenVPN, Inc.
++ *
++ *  Author:	James Yonan <james@openvpn.net>
++ *		Antonio Quartulli <antonio@openvpn.net>
++ */
++
++#include <linux/atomic.h>
++
++#include "stats.h"
++
++void ovpn_peer_stats_init(struct ovpn_peer_stats *ps)
++{
++	atomic64_set(&ps->rx.bytes, 0);
++	atomic64_set(&ps->rx.packets, 0);
++
++	atomic64_set(&ps->tx.bytes, 0);
++	atomic64_set(&ps->tx.packets, 0);
++}
+diff --git a/drivers/net/ovpn/stats.h b/drivers/net/ovpn/stats.h
+new file mode 100644
+index 000000000..868f49d25
+--- /dev/null
++++ b/drivers/net/ovpn/stats.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*  OpenVPN data channel offload
++ *
++ *  Copyright (C) 2020-2024 OpenVPN, Inc.
++ *
++ *  Author:	James Yonan <james@openvpn.net>
++ *		Antonio Quartulli <antonio@openvpn.net>
++ *		Lev Stipakov <lev@openvpn.net>
++ */
++
++#ifndef _NET_OVPN_OVPNSTATS_H_
++#define _NET_OVPN_OVPNSTATS_H_
++
++/* one stat */
++struct ovpn_peer_stat {
++	atomic64_t bytes;
++	atomic64_t packets;
++};
++
++/* rx and tx stats combined */
++struct ovpn_peer_stats {
++	struct ovpn_peer_stat rx;
++	struct ovpn_peer_stat tx;
++};
++
++void ovpn_peer_stats_init(struct ovpn_peer_stats *ps);
++
++static inline void ovpn_peer_stats_increment(struct ovpn_peer_stat *stat,
++					     const unsigned int n)
++{
++	atomic64_add(n, &stat->bytes);
++	atomic64_inc(&stat->packets);
++}
++
++static inline void ovpn_peer_stats_increment_rx(struct ovpn_peer_stats *stats,
++						const unsigned int n)
++{
++	ovpn_peer_stats_increment(&stats->rx, n);
++}
++
++static inline void ovpn_peer_stats_increment_tx(struct ovpn_peer_stats *stats,
++						const unsigned int n)
++{
++	ovpn_peer_stats_increment(&stats->tx, n);
++}
++
++#endif /* _NET_OVPN_OVPNSTATS_H_ */
+-- 
+2.47.0
+
