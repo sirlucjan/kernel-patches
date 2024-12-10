@@ -1,0 +1,137 @@
+From 1e2edb423e53dbecd51a84f2da88b94c74f4132e Mon Sep 17 00:00:00 2001
+From: Carlos Llamas <cmllamas@google.com>
+Date: Tue, 10 Dec 2024 14:30:58 +0000
+Subject: [PATCH 2/9] binder: concurrent page installation
+
+Allow multiple callers to install pages simultaneously by switching the
+mmap_sem from write-mode to read-mode. Races to the same PTE are handled
+using get_user_pages_remote() to retrieve the already installed page.
+This method significantly reduces contention in the mmap semaphore.
+
+To ensure safety, vma_lookup() is used (instead of alloc->vma) to avoid
+operating on an isolated VMA. In addition, zap_page_range_single() is
+called under the alloc->mutex to avoid racing with the shrinker.
+
+Many thanks to Barry Song who posted a similar approach [1].
+
+Link: https://lore.kernel.org/all/20240902225009.34576-1-21cnbao@gmail.com/ [1]
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Barry Song <v-songbaohua@oppo.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Carlos Llamas <cmllamas@google.com>
+---
+ drivers/android/binder_alloc.c | 65 +++++++++++++++++++++-------------
+ 1 file changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/android/binder_alloc.c b/drivers/android/binder_alloc.c
+index 52f6aa323..f26283c2c 100644
+--- a/drivers/android/binder_alloc.c
++++ b/drivers/android/binder_alloc.c
+@@ -221,26 +221,14 @@ static int binder_install_single_page(struct binder_alloc *alloc,
+ 				      struct binder_lru_page *lru_page,
+ 				      unsigned long addr)
+ {
++	struct vm_area_struct *vma;
+ 	struct page *page;
+-	int ret = 0;
++	long npages;
++	int ret;
+ 
+ 	if (!mmget_not_zero(alloc->mm))
+ 		return -ESRCH;
+ 
+-	/*
+-	 * Protected with mmap_sem in write mode as multiple tasks
+-	 * might race to install the same page.
+-	 */
+-	mmap_write_lock(alloc->mm);
+-	if (binder_get_installed_page(lru_page))
+-		goto out;
+-
+-	if (!alloc->vma) {
+-		pr_err("%d: %s failed, no vma\n", alloc->pid, __func__);
+-		ret = -ESRCH;
+-		goto out;
+-	}
+-
+ 	page = alloc_page(GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
+ 	if (!page) {
+ 		pr_err("%d: failed to allocate page\n", alloc->pid);
+@@ -248,19 +236,48 @@ static int binder_install_single_page(struct binder_alloc *alloc,
+ 		goto out;
+ 	}
+ 
+-	ret = vm_insert_page(alloc->vma, addr, page);
+-	if (ret) {
++	mmap_read_lock(alloc->mm);
++	vma = vma_lookup(alloc->mm, addr);
++	if (!vma || vma != alloc->vma) {
++		__free_page(page);
++		pr_err("%d: %s failed, no vma\n", alloc->pid, __func__);
++		ret = -ESRCH;
++		goto unlock;
++	}
++
++	ret = vm_insert_page(vma, addr, page);
++	switch (ret) {
++	case -EBUSY:
++		/*
++		 * EBUSY is ok. Someone installed the pte first but the
++		 * lru_page->page_ptr has not been updated yet. Discard
++		 * our page and look up the one already installed.
++		 */
++		ret = 0;
++		__free_page(page);
++		npages = get_user_pages_remote(alloc->mm, addr, 1,
++					       FOLL_NOFAULT, &page, NULL);
++		if (npages <= 0) {
++			pr_err("%d: failed to find page at offset %lx\n",
++			       alloc->pid, addr - alloc->buffer);
++			ret = -ESRCH;
++			break;
++		}
++		fallthrough;
++	case 0:
++		/* Mark page installation complete and safe to use */
++		binder_set_installed_page(lru_page, page);
++		break;
++	default:
++		__free_page(page);
+ 		pr_err("%d: %s failed to insert page at offset %lx with %d\n",
+ 		       alloc->pid, __func__, addr - alloc->buffer, ret);
+-		__free_page(page);
+ 		ret = -ENOMEM;
+-		goto out;
++		break;
+ 	}
+-
+-	/* Mark page installation complete and safe to use */
+-	binder_set_installed_page(lru_page, page);
++unlock:
++	mmap_read_unlock(alloc->mm);
+ out:
+-	mmap_write_unlock(alloc->mm);
+ 	mmput_async(alloc->mm);
+ 	return ret;
+ }
+@@ -1090,7 +1107,6 @@ enum lru_status binder_alloc_free_page(struct list_head *item,
+ 	trace_binder_unmap_kernel_end(alloc, index);
+ 
+ 	list_lru_isolate(lru, item);
+-	mutex_unlock(&alloc->mutex);
+ 	spin_unlock(&lru->lock);
+ 
+ 	if (vma) {
+@@ -1101,6 +1117,7 @@ enum lru_status binder_alloc_free_page(struct list_head *item,
+ 		trace_binder_unmap_user_end(alloc, index);
+ 	}
+ 
++	mutex_unlock(&alloc->mutex);
+ 	mmap_read_unlock(mm);
+ 	mmput_async(mm);
+ 	__free_page(page_to_free);
+-- 
+2.47.1
+
