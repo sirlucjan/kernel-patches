@@ -1,0 +1,410 @@
+From c6ba10b9248df7a5bbe184eab2a6aab1618c3fe5 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Wed, 11 Dec 2024 20:51:22 +0100
+Subject: [PATCH] x86, sched: Dynamic ITMT core ranking support and some yak
+ shaving
+
+The ITMT infrastructure currently assumes ITMT rankings to be static and
+is set correctly prior to enabling ITMT support which allows the CPU
+with the highest core ranking to be cached as the "asym_prefer_cpu" in
+the sched_group struct. However, with the introduction of Preferred Core
+support in amd-pstate, these rankings can change at runtime.
+
+This series adds support for dynamic ranking in generic scheduler layer
+without the need to rebuild the sched domain hierarchy and fixes an
+issue with x86_die_flags() on AMD systems that support Preferred Core
+ranking with some yak shaving done along the way.
+
+Patch 1 to 4 are independent cleanup around ITMT infrastructure, removal
+of x86_smt_flags wrapper, and moving the "sched_itmt_enabled" sysctl to
+debugfs.
+
+Patch 5 adds the SD_ASYM_PACKING flag to the PKG domain on all ITMT
+enabled systems. The rationale behind the addition is elaborates in the
+same. One open question remains is for Intel processors with multiple
+Tiles in a PKG which advertises itself as multiple LLCs in a PKG and
+supports ITMT - is it okay to set SD_ASYM_PACKING for PKG domain on
+these processors?
+
+Patch 6 and 7 are independent possible micro-optimizations discovered
+when auditing update_sg_lb_stats()
+
+Patch 8 uncaches the asym_prefer_cpu from the sched_group struct and
+finds it during load balancing in update_sg_lb_stats() before it is used
+to make any scheduling decisions. This is the simplest approach; an
+alternate approach would be to move the asym_prefer_cpu to
+sched_domain_shared and allow the first load balancing instance post a
+priority change to update the cached asym_prefer_cpu. On systems with
+static priorities, this would allow benefits of caching while on systems
+with dynamic priorities, it'll reduce the overhead of finding
+"asym_prefer_cpu" each time update_sg_lb_stats() is called however the
+benefits come with added code complexity which is why Patch 8 is marked
+as an RFC.
+
+This series is based on
+
+  git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git sched/core
+
+at commit 2a77e4be12cb ("sched/fair: Untangle NEXT_BUDDY and
+pick_next_task()") and is a spiritual successor to a previous attempt
+at fixing the x86_die_flags() on Preferred Core enabled system by Mario
+that can be found at
+https://lore.kernel.org/lkml/20241203201129.31957-1-mario.limonciello@amd.com/
+---
+ arch/x86/include/asm/topology.h |  4 +-
+ arch/x86/kernel/itmt.c          | 81 ++++++++++++++-------------------
+ arch/x86/kernel/smpboot.c       |  8 +---
+ kernel/sched/fair.c             | 41 +++++++++++++----
+ kernel/sched/sched.h            |  1 -
+ kernel/sched/topology.c         | 15 +-----
+ 6 files changed, 68 insertions(+), 82 deletions(-)
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 92f3664dd..3cb35cfcd 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -241,7 +241,7 @@ extern bool x86_topology_update;
+ #include <asm/percpu.h>
+ 
+ DECLARE_PER_CPU_READ_MOSTLY(int, sched_core_priority);
+-extern unsigned int __read_mostly sysctl_sched_itmt_enabled;
++extern bool __read_mostly sysctl_sched_itmt_enabled;
+ 
+ /* Interface to set priority of a cpu */
+ void sched_set_itmt_core_prio(int prio, int core_cpu);
+@@ -254,7 +254,7 @@ void sched_clear_itmt_support(void);
+ 
+ #else /* CONFIG_SCHED_MC_PRIO */
+ 
+-#define sysctl_sched_itmt_enabled	0
++#define sysctl_sched_itmt_enabled	false
+ static inline void sched_set_itmt_core_prio(int prio, int core_cpu)
+ {
+ }
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 51b805c72..9cea1fc36 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -19,6 +19,7 @@
+ #include <linux/sched.h>
+ #include <linux/cpumask.h>
+ #include <linux/cpuset.h>
++#include <linux/debugfs.h>
+ #include <linux/mutex.h>
+ #include <linux/sysctl.h>
+ #include <linux/nodemask.h>
+@@ -34,49 +35,38 @@ static bool __read_mostly sched_itmt_capable;
+  * of higher turbo frequency for cpus supporting Intel Turbo Boost Max
+  * Technology 3.0.
+  *
+- * It can be set via /proc/sys/kernel/sched_itmt_enabled
++ * It can be set via /sys/kernel/debug/x86/sched_itmt_enabled
+  */
+-unsigned int __read_mostly sysctl_sched_itmt_enabled;
++bool __read_mostly sysctl_sched_itmt_enabled;
+ 
+-static int sched_itmt_update_handler(const struct ctl_table *table, int write,
+-				     void *buffer, size_t *lenp, loff_t *ppos)
++static ssize_t sched_itmt_enabled_write(struct file *filp,
++					const char __user *ubuf,
++					size_t cnt, loff_t *ppos)
+ {
+-	unsigned int old_sysctl;
+-	int ret;
++	ssize_t result;
++	bool orig;
+ 
+-	mutex_lock(&itmt_update_mutex);
++	guard(mutex)(&itmt_update_mutex);
+ 
+-	if (!sched_itmt_capable) {
+-		mutex_unlock(&itmt_update_mutex);
+-		return -EINVAL;
+-	}
+-
+-	old_sysctl = sysctl_sched_itmt_enabled;
+-	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++	orig = sysctl_sched_itmt_enabled;
++	result = debugfs_write_file_bool(filp, ubuf, cnt, ppos);
+ 
+-	if (!ret && write && old_sysctl != sysctl_sched_itmt_enabled) {
++	if (sysctl_sched_itmt_enabled != orig) {
+ 		x86_topology_update = true;
+ 		rebuild_sched_domains();
+ 	}
+ 
+-	mutex_unlock(&itmt_update_mutex);
+-
+-	return ret;
++	return result;
+ }
+ 
+-static struct ctl_table itmt_kern_table[] = {
+-	{
+-		.procname	= "sched_itmt_enabled",
+-		.data		= &sysctl_sched_itmt_enabled,
+-		.maxlen		= sizeof(unsigned int),
+-		.mode		= 0644,
+-		.proc_handler	= sched_itmt_update_handler,
+-		.extra1		= SYSCTL_ZERO,
+-		.extra2		= SYSCTL_ONE,
+-	},
++static const struct file_operations dfs_sched_itmt_fops = {
++	.read =         debugfs_read_file_bool,
++	.write =        sched_itmt_enabled_write,
++	.open =         simple_open,
++	.llseek =       default_llseek,
+ };
+ 
+-static struct ctl_table_header *itmt_sysctl_header;
++static struct dentry *dfs_sched_itmt;
+ 
+ /**
+  * sched_set_itmt_support() - Indicate platform supports ITMT
+@@ -97,16 +87,18 @@ static struct ctl_table_header *itmt_sysctl_header;
+  */
+ int sched_set_itmt_support(void)
+ {
+-	mutex_lock(&itmt_update_mutex);
++	guard(mutex)(&itmt_update_mutex);
+ 
+-	if (sched_itmt_capable) {
+-		mutex_unlock(&itmt_update_mutex);
++	if (sched_itmt_capable)
+ 		return 0;
+-	}
+ 
+-	itmt_sysctl_header = register_sysctl("kernel", itmt_kern_table);
+-	if (!itmt_sysctl_header) {
+-		mutex_unlock(&itmt_update_mutex);
++	dfs_sched_itmt = debugfs_create_file_unsafe("sched_itmt_enabled",
++						    0644,
++						    arch_debugfs_dir,
++						    &sysctl_sched_itmt_enabled,
++						    &dfs_sched_itmt_fops);
++	if (IS_ERR_OR_NULL(dfs_sched_itmt)) {
++		dfs_sched_itmt = NULL;
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -117,8 +109,6 @@ int sched_set_itmt_support(void)
+ 	x86_topology_update = true;
+ 	rebuild_sched_domains();
+ 
+-	mutex_unlock(&itmt_update_mutex);
+-
+ 	return 0;
+ }
+ 
+@@ -134,18 +124,15 @@ int sched_set_itmt_support(void)
+  */
+ void sched_clear_itmt_support(void)
+ {
+-	mutex_lock(&itmt_update_mutex);
++	guard(mutex)(&itmt_update_mutex);
+ 
+-	if (!sched_itmt_capable) {
+-		mutex_unlock(&itmt_update_mutex);
++	if (!sched_itmt_capable)
+ 		return;
+-	}
++
+ 	sched_itmt_capable = false;
+ 
+-	if (itmt_sysctl_header) {
+-		unregister_sysctl_table(itmt_sysctl_header);
+-		itmt_sysctl_header = NULL;
+-	}
++	debugfs_remove(dfs_sched_itmt);
++	dfs_sched_itmt = NULL;
+ 
+ 	if (sysctl_sched_itmt_enabled) {
+ 		/* disable sched_itmt if we are no longer ITMT capable */
+@@ -153,8 +140,6 @@ void sched_clear_itmt_support(void)
+ 		x86_topology_update = true;
+ 		rebuild_sched_domains();
+ 	}
+-
+-	mutex_unlock(&itmt_update_mutex);
+ }
+ 
+ int arch_asym_cpu_priority(int cpu)
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 766f092da..4e7977321 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -482,12 +482,6 @@ static int x86_core_flags(void)
+ 	return cpu_core_flags() | x86_sched_itmt_flags();
+ }
+ #endif
+-#ifdef CONFIG_SCHED_SMT
+-static int x86_smt_flags(void)
+-{
+-	return cpu_smt_flags();
+-}
+-#endif
+ #ifdef CONFIG_SCHED_CLUSTER
+ static int x86_cluster_flags(void)
+ {
+@@ -518,7 +512,7 @@ static void __init build_sched_topology(void)
+ 
+ #ifdef CONFIG_SCHED_SMT
+ 	x86_topology[i++] = (struct sched_domain_topology_level){
+-		cpu_smt_mask, x86_smt_flags, SD_INIT_NAME(SMT)
++		cpu_smt_mask, cpu_smt_flags, SD_INIT_NAME(SMT)
+ 	};
+ #endif
+ #ifdef CONFIG_SCHED_CLUSTER
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 2d16c8545..37163ba86 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9884,6 +9884,8 @@ struct sg_lb_stats {
+ 	unsigned int sum_nr_running;		/* Nr of all tasks running in the group */
+ 	unsigned int sum_h_nr_running;		/* Nr of CFS tasks running in the group */
+ 	unsigned int idle_cpus;                 /* Nr of idle CPUs         in the group */
++	unsigned int asym_prefer_cpu;		/* CPU with highest asym priority */
++	int highest_asym_prio;			/* Asym priority of asym_prefer_cpu */
+ 	unsigned int group_weight;
+ 	enum group_type group_type;
+ 	unsigned int group_asym_packing;	/* Tasks should be moved to preferred CPU */
+@@ -10216,7 +10218,7 @@ sched_group_asym(struct lb_env *env, struct sg_lb_stats *sgs, struct sched_group
+ 	    (sgs->group_weight - sgs->idle_cpus != 1))
+ 		return false;
+ 
+-	return sched_asym(env->sd, env->dst_cpu, group->asym_prefer_cpu);
++	return sched_asym(env->sd, env->dst_cpu, sgs->asym_prefer_cpu);
+ }
+ 
+ /* One group has more than one SMT CPU while the other group does not */
+@@ -10297,6 +10299,17 @@ sched_reduced_capacity(struct rq *rq, struct sched_domain *sd)
+ 	return check_cpu_capacity(rq, sd);
+ }
+ 
++static inline void
++update_sg_pick_asym_prefer(struct sg_lb_stats *sgs, int cpu)
++{
++	int asym_prio = arch_asym_cpu_priority(cpu);
++
++	if (asym_prio > sgs->highest_asym_prio) {
++		sgs->asym_prefer_cpu = cpu;
++		sgs->highest_asym_prio = asym_prio;
++	}
++}
++
+ /**
+  * update_sg_lb_stats - Update sched_group's statistics for load balancing.
+  * @env: The load balancing environment.
+@@ -10313,11 +10326,12 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 				      bool *sg_overloaded,
+ 				      bool *sg_overutilized)
+ {
+-	int i, nr_running, local_group;
++	int i, nr_running, local_group, sd_flags = env->sd->flags;
+ 
+ 	memset(sgs, 0, sizeof(*sgs));
+ 
+ 	local_group = group == sds->local;
++	sgs->highest_asym_prio = INT_MIN;
+ 
+ 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
+ 		struct rq *rq = cpu_rq(i);
+@@ -10331,16 +10345,12 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 		nr_running = rq->nr_running;
+ 		sgs->sum_nr_running += nr_running;
+ 
+-		if (nr_running > 1)
+-			*sg_overloaded = 1;
++		if (sd_flags & SD_ASYM_PACKING)
++			update_sg_pick_asym_prefer(sgs, i);
+ 
+ 		if (cpu_overutilized(i))
+ 			*sg_overutilized = 1;
+ 
+-#ifdef CONFIG_NUMA_BALANCING
+-		sgs->nr_numa_running += rq->nr_numa_running;
+-		sgs->nr_preferred_running += rq->nr_preferred_running;
+-#endif
+ 		/*
+ 		 * No need to call idle_cpu() if nr_running is not 0
+ 		 */
+@@ -10350,10 +10360,21 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 			continue;
+ 		}
+ 
++		/* Overload indicator is only updated at root domain */
++		if (!env->sd->parent && nr_running > 1)
++			*sg_overloaded = 1;
++
++#ifdef CONFIG_NUMA_BALANCING
++		/* Only fbq_classify_group() uses this to classify NUMA groups */
++		if (sd_flags & SD_NUMA) {
++			sgs->nr_numa_running += rq->nr_numa_running;
++			sgs->nr_preferred_running += rq->nr_preferred_running;
++		}
++#endif
+ 		if (local_group)
+ 			continue;
+ 
+-		if (env->sd->flags & SD_ASYM_CPUCAPACITY) {
++		if (sd_flags & SD_ASYM_CPUCAPACITY) {
+ 			/* Check for a misfit task on the cpu */
+ 			if (sgs->group_misfit_task_load < rq->misfit_task_load) {
+ 				sgs->group_misfit_task_load = rq->misfit_task_load;
+@@ -10448,7 +10469,7 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 
+ 	case group_asym_packing:
+ 		/* Prefer to move from lowest priority CPU's work */
+-		return sched_asym_prefer(sds->busiest->asym_prefer_cpu, sg->asym_prefer_cpu);
++		return sched_asym_prefer(busiest->asym_prefer_cpu, sgs->asym_prefer_cpu);
+ 
+ 	case group_misfit_task:
+ 		/*
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index c03b3d7b3..e7d5b0e85 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2039,7 +2039,6 @@ struct sched_group {
+ 	unsigned int		group_weight;
+ 	unsigned int		cores;
+ 	struct sched_group_capacity *sgc;
+-	int			asym_prefer_cpu;	/* CPU of highest priority in group */
+ 	int			flags;
+ 
+ 	/*
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 9748a4c8d..59b8157cb 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1302,7 +1302,7 @@ static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
+ 	WARN_ON(!sg);
+ 
+ 	do {
+-		int cpu, cores = 0, max_cpu = -1;
++		int cpu, cores = 0;
+ 
+ 		sg->group_weight = cpumask_weight(sched_group_span(sg));
+ 
+@@ -1314,19 +1314,6 @@ static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
+ #endif
+ 		}
+ 		sg->cores = cores;
+-
+-		if (!(sd->flags & SD_ASYM_PACKING))
+-			goto next;
+-
+-		for_each_cpu(cpu, sched_group_span(sg)) {
+-			if (max_cpu < 0)
+-				max_cpu = cpu;
+-			else if (sched_asym_prefer(cpu, max_cpu))
+-				max_cpu = cpu;
+-		}
+-		sg->asym_prefer_cpu = max_cpu;
+-
+-next:
+ 		sg = sg->next;
+ 	} while (sg != sd->groups);
+ 
+-- 
+2.47.1
+
