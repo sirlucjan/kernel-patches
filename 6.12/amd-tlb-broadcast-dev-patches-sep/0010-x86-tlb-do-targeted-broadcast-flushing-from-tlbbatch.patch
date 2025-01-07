@@ -1,0 +1,136 @@
+From 2a503724bc7acff6f05347f18ba0c27e13e5d391 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@surriel.com>
+Date: Mon, 30 Dec 2024 12:53:11 -0500
+Subject: [PATCH 10/13] x86,tlb: do targeted broadcast flushing from tlbbatch
+ code
+
+Instead of doing a system-wide TLB flush from arch_tlbbatch_flush,
+queue up asynchronous, targeted flushes from arch_tlbbatch_add_pending.
+
+This also allows us to avoid adding the CPUs of processes using broadcast
+flushing to the batch->cpumask, and will hopefully further reduce TLB
+flushing from the reclaim and compaction paths.
+
+Signed-off-by: Rik van Riel <riel@surriel.com>
+---
+ arch/x86/include/asm/tlbbatch.h |  1 +
+ arch/x86/include/asm/tlbflush.h | 12 +++------
+ arch/x86/mm/tlb.c               | 48 ++++++++++++++++++++++++++-------
+ 3 files changed, 42 insertions(+), 19 deletions(-)
+
+diff --git a/arch/x86/include/asm/tlbbatch.h b/arch/x86/include/asm/tlbbatch.h
+index 1ad56eb3e..f9a17edf6 100644
+--- a/arch/x86/include/asm/tlbbatch.h
++++ b/arch/x86/include/asm/tlbbatch.h
+@@ -10,6 +10,7 @@ struct arch_tlbflush_unmap_batch {
+ 	 * the PFNs being flushed..
+ 	 */
+ 	struct cpumask cpumask;
++	bool used_invlpgb;
+ };
+ 
+ #endif /* _ARCH_X86_TLBBATCH_H */
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 910511c1b..a2f9b7370 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -296,21 +296,15 @@ static inline u64 inc_mm_tlb_gen(struct mm_struct *mm)
+ 	return atomic64_inc_return(&mm->context.tlb_gen);
+ }
+ 
+-static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
+-					     struct mm_struct *mm,
+-					     unsigned long uaddr)
+-{
+-	inc_mm_tlb_gen(mm);
+-	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
+-	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
+-}
+-
+ static inline void arch_flush_tlb_batched_pending(struct mm_struct *mm)
+ {
+ 	flush_tlb_mm(mm);
+ }
+ 
+ extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);
++extern void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
++					     struct mm_struct *mm,
++					     unsigned long uaddr);
+ 
+ static inline bool pte_flags_need_flush(unsigned long oldflags,
+ 					unsigned long newflags,
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index a62e1e6a6..6379017dd 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1573,16 +1573,7 @@ EXPORT_SYMBOL_GPL(__flush_tlb_all);
+ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ {
+ 	struct flush_tlb_info *info;
+-	int cpu;
+-
+-	if (cpu_feature_enabled(X86_FEATURE_INVLPGB)) {
+-		guard(preempt)();
+-		invlpgb_flush_all_nonglobals();
+-		tlbsync();
+-		return;
+-	}
+-
+-	cpu = get_cpu();
++	int cpu = get_cpu();
+ 
+ 	info = get_flush_tlb_info(NULL, 0, TLB_FLUSH_ALL, 0, false,
+ 				  TLB_GENERATION_INVALID);
+@@ -1600,12 +1591,49 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		local_irq_enable();
+ 	}
+ 
++	/*
++	 * If we issued (asynchronous) INVLPGB flushes, wait for them here.
++	 * The cpumask above contains only CPUs that were running tasks
++	 * not using broadcast TLB flushing.
++	 */
++	if (cpu_feature_enabled(X86_FEATURE_INVLPGB) && batch->used_invlpgb) {
++		tlbsync();
++		migrate_enable();
++		batch->used_invlpgb = false;
++	}
++
+ 	cpumask_clear(&batch->cpumask);
+ 
+ 	put_flush_tlb_info();
+ 	put_cpu();
+ }
+ 
++void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
++					     struct mm_struct *mm,
++					     unsigned long uaddr)
++{
++	if (static_cpu_has(X86_FEATURE_INVLPGB) && mm_broadcast_asid(mm)) {
++		u16 asid = mm_broadcast_asid(mm);
++		/*
++		 * Queue up an asynchronous invalidation. The corresponding
++		 * TLBSYNC is done in arch_tlbbatch_flush(), and must be done
++		 * on the same CPU.
++		 */
++		if (!batch->used_invlpgb) {
++			batch->used_invlpgb = true;
++			migrate_disable();
++		}
++		invlpgb_flush_user_nr(kern_pcid(asid), uaddr, 1, 0);
++		/* Do any CPUs supporting INVLPGB need PTI? */
++		if (static_cpu_has(X86_FEATURE_PTI))
++			invlpgb_flush_user_nr(user_pcid(asid), uaddr, 1, 0);
++	} else {
++		inc_mm_tlb_gen(mm);
++		cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
++	}
++	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
++}
++
+ /*
+  * Blindly accessing user memory from NMI context can be dangerous
+  * if we're in the middle of switching the current user task or
+-- 
+2.47.1
+
