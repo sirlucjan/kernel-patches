@@ -1,0 +1,742 @@
+From f75553c525fd0d073a0a1792a2fa5a2e25cd9d18 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Mon, 20 Jan 2025 07:15:01 +0100
+Subject: [PATCH] perf-6.13: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ arch/x86/events/amd/ibs.c                  | 175 ++++++++++++++++++---
+ arch/x86/include/asm/amd-ibs.h             |   3 +-
+ arch/x86/include/asm/perf_event.h          |   4 +
+ tools/arch/x86/include/asm/amd-ibs.h       |   3 +-
+ tools/perf/Documentation/perf-amd-ibs.txt  |   9 ++
+ tools/perf/Documentation/perf-c2c.txt      |  10 +-
+ tools/perf/Documentation/perf-mem.txt      |  12 +-
+ tools/perf/arch/x86/util/mem-events.c      |   6 +
+ tools/perf/arch/x86/util/mem-events.h      |   1 +
+ tools/perf/arch/x86/util/pmu.c             |  20 ++-
+ tools/perf/tests/shell/test_data_symbol.sh |  29 +++-
+ tools/perf/util/amd-sample-raw.c           |  77 +++++++--
+ tools/perf/util/pmu.c                      |  11 ++
+ tools/perf/util/pmu.h                      |   2 +
+ 14 files changed, 310 insertions(+), 52 deletions(-)
+
+diff --git a/arch/x86/events/amd/ibs.c b/arch/x86/events/amd/ibs.c
+index e91970b01..d6d855019 100644
+--- a/arch/x86/events/amd/ibs.c
++++ b/arch/x86/events/amd/ibs.c
+@@ -31,6 +31,8 @@ static u32 ibs_caps;
+ #define IBS_FETCH_CONFIG_MASK	(IBS_FETCH_RAND_EN | IBS_FETCH_MAX_CNT)
+ #define IBS_OP_CONFIG_MASK	IBS_OP_MAX_CNT
+ 
++/* attr.config2 */
++#define IBS_SW_FILTER_MASK	1
+ 
+ /*
+  * IBS states:
+@@ -268,6 +270,14 @@ static int validate_group(struct perf_event *event)
+ 	return 0;
+ }
+ 
++static bool perf_ibs_ldlat_event(struct perf_ibs *perf_ibs,
++				 struct perf_event *event)
++{
++	return perf_ibs == &perf_ibs_op &&
++	       (ibs_caps & IBS_CAPS_OPLDLAT) &&
++	       (event->attr.config1 & 0xFFF);
++}
++
+ static int perf_ibs_init(struct perf_event *event)
+ {
+ 	struct hw_perf_event *hwc = &event->hw;
+@@ -290,6 +300,16 @@ static int perf_ibs_init(struct perf_event *event)
+ 	if (has_branch_stack(event))
+ 		return -EOPNOTSUPP;
+ 
++	/* handle exclude_{user,kernel} in the IRQ handler */
++	if (event->attr.exclude_host || event->attr.exclude_guest ||
++	    event->attr.exclude_idle)
++		return -EINVAL;
++
++	if (!(event->attr.config2 & IBS_SW_FILTER_MASK) &&
++	    (event->attr.exclude_kernel || event->attr.exclude_user ||
++	     event->attr.exclude_hv))
++		return -EINVAL;
++
+ 	ret = validate_group(event);
+ 	if (ret)
+ 		return ret;
+@@ -318,6 +338,17 @@ static int perf_ibs_init(struct perf_event *event)
+ 	if (!hwc->sample_period)
+ 		return -EINVAL;
+ 
++	if (perf_ibs_ldlat_event(perf_ibs, event)) {
++		u64 ldlat = event->attr.config1 & 0xFFF;
++
++		if (ldlat < 128 || ldlat > 2048)
++			return -EINVAL;
++		ldlat >>= 7;
++
++		config |= (ldlat - 1) << 59;
++		config |= IBS_OP_L3MISSONLY | IBS_OP_LDLAT_EN;
++	}
++
+ 	/*
+ 	 * If we modify hwc->sample_period, we also need to update
+ 	 * hwc->last_period and hwc->period_left.
+@@ -550,27 +581,20 @@ static struct attribute *attrs_empty[] = {
+ 	NULL,
+ };
+ 
+-static struct attribute_group empty_format_group = {
+-	.name = "format",
+-	.attrs = attrs_empty,
+-};
+-
+ static struct attribute_group empty_caps_group = {
+ 	.name = "caps",
+ 	.attrs = attrs_empty,
+ };
+ 
+-static const struct attribute_group *empty_attr_groups[] = {
+-	&empty_format_group,
+-	&empty_caps_group,
+-	NULL,
+-};
+-
+ PMU_FORMAT_ATTR(rand_en,	"config:57");
+ PMU_FORMAT_ATTR(cnt_ctl,	"config:19");
++PMU_FORMAT_ATTR(swfilt,		"config2:0");
+ PMU_EVENT_ATTR_STRING(l3missonly, fetch_l3missonly, "config:59");
+ PMU_EVENT_ATTR_STRING(l3missonly, op_l3missonly, "config:16");
++PMU_EVENT_ATTR_STRING(ldlat, ibs_op_ldlat_format, "config1:0-11");
+ PMU_EVENT_ATTR_STRING(zen4_ibs_extensions, zen4_ibs_extensions, "1");
++PMU_EVENT_ATTR_STRING(ldlat, ibs_op_ldlat_cap, "1");
++PMU_EVENT_ATTR_STRING(dtlb_pgsize, ibs_op_dtlb_pgsize_cap, "1");
+ 
+ static umode_t
+ zen4_ibs_extensions_is_visible(struct kobject *kobj, struct attribute *attr, int i)
+@@ -578,8 +602,21 @@ zen4_ibs_extensions_is_visible(struct kobject *kobj, struct attribute *attr, int
+ 	return ibs_caps & IBS_CAPS_ZEN4 ? attr->mode : 0;
+ }
+ 
+-static struct attribute *rand_en_attrs[] = {
++static umode_t
++ibs_op_ldlat_is_visible(struct kobject *kobj, struct attribute *attr, int i)
++{
++	return ibs_caps & IBS_CAPS_OPLDLAT ? attr->mode : 0;
++}
++
++static umode_t
++ibs_op_dtlb_pgsize_is_visible(struct kobject *kobj, struct attribute *attr, int i)
++{
++	return ibs_caps & IBS_CAPS_OPDTLBPGSIZE ? attr->mode : 0;
++}
++
++static struct attribute *fetch_attrs[] = {
+ 	&format_attr_rand_en.attr,
++	&format_attr_swfilt.attr,
+ 	NULL,
+ };
+ 
+@@ -593,9 +630,19 @@ static struct attribute *zen4_ibs_extensions_attrs[] = {
+ 	NULL,
+ };
+ 
+-static struct attribute_group group_rand_en = {
++static struct attribute *ibs_op_ldlat_cap_attrs[] = {
++	&ibs_op_ldlat_cap.attr.attr,
++	NULL,
++};
++
++static struct attribute *ibs_op_dtlb_pgsize_cap_attrs[] = {
++	&ibs_op_dtlb_pgsize_cap.attr.attr,
++	NULL,
++};
++
++static struct attribute_group group_fetch_formats = {
+ 	.name = "format",
+-	.attrs = rand_en_attrs,
++	.attrs = fetch_attrs,
+ };
+ 
+ static struct attribute_group group_fetch_l3missonly = {
+@@ -610,8 +657,20 @@ static struct attribute_group group_zen4_ibs_extensions = {
+ 	.is_visible = zen4_ibs_extensions_is_visible,
+ };
+ 
++static struct attribute_group group_ibs_op_ldlat_cap = {
++	.name = "caps",
++	.attrs = ibs_op_ldlat_cap_attrs,
++	.is_visible = ibs_op_ldlat_is_visible,
++};
++
++static struct attribute_group group_ibs_op_dtlb_pgsize_cap = {
++	.name = "caps",
++	.attrs = ibs_op_dtlb_pgsize_cap_attrs,
++	.is_visible = ibs_op_dtlb_pgsize_is_visible,
++};
++
+ static const struct attribute_group *fetch_attr_groups[] = {
+-	&group_rand_en,
++	&group_fetch_formats,
+ 	&empty_caps_group,
+ 	NULL,
+ };
+@@ -628,6 +687,11 @@ cnt_ctl_is_visible(struct kobject *kobj, struct attribute *attr, int i)
+ 	return ibs_caps & IBS_CAPS_OPCNT ? attr->mode : 0;
+ }
+ 
++static struct attribute *op_attrs[] = {
++	&format_attr_swfilt.attr,
++	NULL,
++};
++
+ static struct attribute *cnt_ctl_attrs[] = {
+ 	&format_attr_cnt_ctl.attr,
+ 	NULL,
+@@ -638,6 +702,16 @@ static struct attribute *op_l3missonly_attrs[] = {
+ 	NULL,
+ };
+ 
++static struct attribute_group group_op_formats = {
++	.name = "format",
++	.attrs = op_attrs,
++};
++
++static struct attribute *ibs_op_ldlat_format_attrs[] = {
++	&ibs_op_ldlat_format.attr.attr,
++	NULL,
++};
++
+ static struct attribute_group group_cnt_ctl = {
+ 	.name = "format",
+ 	.attrs = cnt_ctl_attrs,
+@@ -650,10 +724,25 @@ static struct attribute_group group_op_l3missonly = {
+ 	.is_visible = zen4_ibs_extensions_is_visible,
+ };
+ 
++static const struct attribute_group *op_attr_groups[] = {
++	&group_op_formats,
++	&empty_caps_group,
++	NULL,
++};
++
++static struct attribute_group group_ibs_op_ldlat_format = {
++	.name = "format",
++	.attrs = ibs_op_ldlat_format_attrs,
++	.is_visible = ibs_op_ldlat_is_visible,
++};
++
+ static const struct attribute_group *op_attr_update[] = {
+ 	&group_cnt_ctl,
+ 	&group_op_l3missonly,
+ 	&group_zen4_ibs_extensions,
++	&group_ibs_op_ldlat_cap,
++	&group_ibs_op_ldlat_format,
++	&group_ibs_op_dtlb_pgsize_cap,
+ 	NULL,
+ };
+ 
+@@ -667,7 +756,6 @@ static struct perf_ibs perf_ibs_fetch = {
+ 		.start		= perf_ibs_start,
+ 		.stop		= perf_ibs_stop,
+ 		.read		= perf_ibs_read,
+-		.capabilities	= PERF_PMU_CAP_NO_EXCLUDE,
+ 	},
+ 	.msr			= MSR_AMD64_IBSFETCHCTL,
+ 	.config_mask		= IBS_FETCH_CONFIG_MASK,
+@@ -691,7 +779,6 @@ static struct perf_ibs perf_ibs_op = {
+ 		.start		= perf_ibs_start,
+ 		.stop		= perf_ibs_stop,
+ 		.read		= perf_ibs_read,
+-		.capabilities	= PERF_PMU_CAP_NO_EXCLUDE,
+ 	},
+ 	.msr			= MSR_AMD64_IBSOPCTL,
+ 	.config_mask		= IBS_OP_CONFIG_MASK,
+@@ -900,6 +987,10 @@ static void perf_ibs_get_tlb_lvl(union ibs_op_data3 *op_data3,
+ 	if (!op_data3->dc_lin_addr_valid)
+ 		return;
+ 
++	if ((ibs_caps & IBS_CAPS_OPDTLBPGSIZE) &&
++	    !op_data3->dc_phy_addr_valid)
++		return;
++
+ 	if (!op_data3->dc_l1tlb_miss) {
+ 		data_src->mem_dtlb = PERF_MEM_TLB_L1 | PERF_MEM_TLB_HIT;
+ 		return;
+@@ -1004,15 +1095,25 @@ static void perf_ibs_parse_ld_st_data(__u64 sample_type,
+ 	}
+ }
+ 
+-static int perf_ibs_get_offset_max(struct perf_ibs *perf_ibs, u64 sample_type,
++static bool perf_ibs_is_mem_sample_type(struct perf_ibs *perf_ibs,
++					struct perf_event *event)
++{
++	u64 sample_type = event->attr.sample_type;
++
++	return perf_ibs == &perf_ibs_op &&
++	       sample_type & (PERF_SAMPLE_DATA_SRC |
++			      PERF_SAMPLE_WEIGHT_TYPE |
++			      PERF_SAMPLE_ADDR |
++			      PERF_SAMPLE_PHYS_ADDR);
++}
++
++static int perf_ibs_get_offset_max(struct perf_ibs *perf_ibs,
++				   struct perf_event *event,
+ 				   int check_rip)
+ {
+-	if (sample_type & PERF_SAMPLE_RAW ||
+-	    (perf_ibs == &perf_ibs_op &&
+-	     (sample_type & PERF_SAMPLE_DATA_SRC ||
+-	      sample_type & PERF_SAMPLE_WEIGHT_TYPE ||
+-	      sample_type & PERF_SAMPLE_ADDR ||
+-	      sample_type & PERF_SAMPLE_PHYS_ADDR)))
++	if (event->attr.sample_type & PERF_SAMPLE_RAW ||
++	    perf_ibs_is_mem_sample_type(perf_ibs, event) ||
++	    perf_ibs_ldlat_event(perf_ibs, event))
+ 		return perf_ibs->offset_max;
+ 	else if (check_rip)
+ 		return 3;
+@@ -1067,7 +1168,7 @@ static int perf_ibs_handle_irq(struct perf_ibs *perf_ibs, struct pt_regs *iregs)
+ 	offset = 1;
+ 	check_rip = (perf_ibs == &perf_ibs_op && (ibs_caps & IBS_CAPS_RIPINVALIDCHK));
+ 
+-	offset_max = perf_ibs_get_offset_max(perf_ibs, event->attr.sample_type, check_rip);
++	offset_max = perf_ibs_get_offset_max(perf_ibs, event, check_rip);
+ 
+ 	do {
+ 		rdmsrl(msr + offset, *buf++);
+@@ -1076,6 +1177,22 @@ static int perf_ibs_handle_irq(struct perf_ibs *perf_ibs, struct pt_regs *iregs)
+ 				       perf_ibs->offset_max,
+ 				       offset + 1);
+ 	} while (offset < offset_max);
++
++	if (perf_ibs_ldlat_event(perf_ibs, event)) {
++		union ibs_op_data3 op_data3;
++
++		op_data3.val = ibs_data.regs[ibs_op_msr_idx(MSR_AMD64_IBSOPDATA3)];
++		/*
++		 * Opening event is errored out if load latency threshold is
++		 * outside of [128, 2048] range. Since the event has reached
++		 * interrupt handler, we can safely assume the threshold is
++		 * within [128, 2048] range.
++		 */
++		if (!op_data3.ld_op || !op_data3.dc_miss ||
++		    op_data3.dc_miss_lat <= (event->attr.config1 & 0xFFF))
++			goto out;
++	}
++
+ 	/*
+ 	 * Read IbsBrTarget, IbsOpData4, and IbsExtdCtl separately
+ 	 * depending on their availability.
+@@ -1111,6 +1228,12 @@ static int perf_ibs_handle_irq(struct perf_ibs *perf_ibs, struct pt_regs *iregs)
+ 		regs.flags |= PERF_EFLAGS_EXACT;
+ 	}
+ 
++	if ((event->attr.config2 & IBS_SW_FILTER_MASK) &&
++	    perf_exclude_event(event, &regs)) {
++		throttle = perf_event_account_interrupt(event);
++		goto out;
++	}
++
+ 	if (event->attr.sample_type & PERF_SAMPLE_RAW) {
+ 		raw = (struct perf_raw_record){
+ 			.frag = {
+@@ -1228,7 +1351,7 @@ static __init int perf_ibs_op_init(void)
+ 	if (ibs_caps & IBS_CAPS_ZEN4)
+ 		perf_ibs_op.config_mask |= IBS_OP_L3MISSONLY;
+ 
+-	perf_ibs_op.pmu.attr_groups = empty_attr_groups;
++	perf_ibs_op.pmu.attr_groups = op_attr_groups;
+ 	perf_ibs_op.pmu.attr_update = op_attr_update;
+ 
+ 	return perf_ibs_pmu_init(&perf_ibs_op, "ibs_op");
+diff --git a/arch/x86/include/asm/amd-ibs.h b/arch/x86/include/asm/amd-ibs.h
+index cb2a5e113..77f3a589a 100644
+--- a/arch/x86/include/asm/amd-ibs.h
++++ b/arch/x86/include/asm/amd-ibs.h
+@@ -64,7 +64,8 @@ union ibs_op_ctl {
+ 			opmaxcnt_ext:7,	/* 20-26: upper 7 bits of periodic op maximum count */
+ 			reserved0:5,	/* 27-31: reserved */
+ 			opcurcnt:27,	/* 32-58: periodic op counter current count */
+-			reserved1:5;	/* 59-63: reserved */
++			ldlat_thrsh:4,	/* 59-62: Load Latency threshold */
++			ldlat_en:1;	/* 63: Load Latency enabled */
+ 	};
+ };
+ 
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index d95f902ac..0946d9f2a 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -471,6 +471,8 @@ struct pebs_xmm {
+ #define IBS_CAPS_FETCHCTLEXTD		(1U<<9)
+ #define IBS_CAPS_OPDATA4		(1U<<10)
+ #define IBS_CAPS_ZEN4			(1U<<11)
++#define IBS_CAPS_OPLDLAT		(1U<<12)
++#define IBS_CAPS_OPDTLBPGSIZE		(1U<<19)
+ 
+ #define IBS_CAPS_DEFAULT		(IBS_CAPS_AVAIL		\
+ 					 | IBS_CAPS_FETCHSAM	\
+@@ -496,6 +498,8 @@ struct pebs_xmm {
+  * The lower 7 bits of the current count are random bits
+  * preloaded by hardware and ignored in software
+  */
++#define IBS_OP_LDLAT_EN		(1ULL<<63)
++#define IBS_OP_LDLAT_THRSH	(0xFULL<<59)
+ #define IBS_OP_CUR_CNT		(0xFFF80ULL<<32)
+ #define IBS_OP_CUR_CNT_RAND	(0x0007FULL<<32)
+ #define IBS_OP_CNT_CTL		(1ULL<<19)
+diff --git a/tools/arch/x86/include/asm/amd-ibs.h b/tools/arch/x86/include/asm/amd-ibs.h
+index 93807b437..cb1740bc3 100644
+--- a/tools/arch/x86/include/asm/amd-ibs.h
++++ b/tools/arch/x86/include/asm/amd-ibs.h
+@@ -64,7 +64,8 @@ union ibs_op_ctl {
+ 			opmaxcnt_ext:7,	/* 20-26: upper 7 bits of periodic op maximum count */
+ 			reserved0:5,	/* 27-31: reserved */
+ 			opcurcnt:27,	/* 32-58: periodic op counter current count */
+-			reserved1:5;	/* 59-63: reserved */
++			ldlat_thrsh:4,	/* 59-62: Load Latency threshold */
++			ldlat_en:1;	/* 63: Load Latency enabled */
+ 	};
+ };
+ 
+diff --git a/tools/perf/Documentation/perf-amd-ibs.txt b/tools/perf/Documentation/perf-amd-ibs.txt
+index 2fd31d9d7..55f80beae 100644
+--- a/tools/perf/Documentation/perf-amd-ibs.txt
++++ b/tools/perf/Documentation/perf-amd-ibs.txt
+@@ -85,6 +85,15 @@ System-wide profile, uOps event, sampling period: 100000, L3MissOnly (Zen4 onwar
+ 
+ 	# perf record -e ibs_op/cnt_ctl=1,l3missonly=1/ -c 100000 -a
+ 
++System-wide profile, cycles event, sampling period: 100000, LdLat filtering (Zen5
++onward)
++
++	# perf record -e ibs_op/ldlat=128/ -c 100000 -a
++
++	Supported load latency threshold values are 128 to 2048 (both inclusive).
++	Latency value which is a multiple of 128 incurs a little less profiling
++	overhead compared to other values.
++
+ Per process(upstream v6.2 onward), uOps event, sampling period: 100000
+ 
+ 	# perf record -e ibs_op/cnt_ctl=1/ -c 100000 -p 1234
+diff --git a/tools/perf/Documentation/perf-c2c.txt b/tools/perf/Documentation/perf-c2c.txt
+index 856f0dfb8..3e2f690f1 100644
+--- a/tools/perf/Documentation/perf-c2c.txt
++++ b/tools/perf/Documentation/perf-c2c.txt
+@@ -54,8 +54,14 @@ RECORD OPTIONS
+ 
+ -l::
+ --ldlat::
+-	Configure mem-loads latency. Supported on Intel and Arm64 processors
+-	only. Ignored on other archs.
++	Configure mem-loads latency. Supported on Intel, Arm64 and some variants
++	of AMD platforms. Ignored on other archs.
++
++	On AMD platforms:
++	- Supported latency values are 128 to 2048 (both inclusive).
++	- Latency value which is a multiple of 128 incurs a little less profiling
++	  overhead compared to other values.
++	- Load latency filtering is disabled by default.
+ 
+ -k::
+ --all-kernel::
+diff --git a/tools/perf/Documentation/perf-mem.txt b/tools/perf/Documentation/perf-mem.txt
+index 8a1bd9ff0..f28837d6b 100644
+--- a/tools/perf/Documentation/perf-mem.txt
++++ b/tools/perf/Documentation/perf-mem.txt
+@@ -28,6 +28,8 @@ and kernel support is required. See linkperf:perf-arm-spe[1] for a setup guide.
+ Due to the statistical nature of SPE sampling, not every memory operation will
+ be sampled.
+ 
++On AMD this use IBS Op PMU to sample load-store operations.
++
+ COMMON OPTIONS
+ --------------
+ -f::
+@@ -67,8 +69,14 @@ RECORD OPTIONS
+ 	Configure all used events to run in user space.
+ 
+ --ldlat <n>::
+-	Specify desired latency for loads event. Supported on Intel and Arm64
+-	processors only. Ignored on other archs.
++	Specify desired latency for loads event. Supported on Intel, Arm64 and
++	some variants of AMD platforms. Ignored on other archs.
++
++	On AMD platforms:
++	- Supported latency values are 128 to 2048 (both inclusive).
++	- Latency value which is a multiple of 128 incurs a little less profiling
++	  overhead compared to other values.
++	- Load latency filtering is disabled by default.
+ 
+ REPORT OPTIONS
+ --------------
+diff --git a/tools/perf/arch/x86/util/mem-events.c b/tools/perf/arch/x86/util/mem-events.c
+index 62df03e91..b38f51902 100644
+--- a/tools/perf/arch/x86/util/mem-events.c
++++ b/tools/perf/arch/x86/util/mem-events.c
+@@ -26,3 +26,9 @@ struct perf_mem_event perf_mem_events_amd[PERF_MEM_EVENTS__MAX] = {
+ 	E(NULL,		NULL,		NULL,	false,	0),
+ 	E("mem-ldst",	"%s//",		NULL,	false,	0),
+ };
++
++struct perf_mem_event perf_mem_events_amd_ldlat[PERF_MEM_EVENTS__MAX] = {
++	E(NULL,		NULL,		NULL,	false,	0),
++	E(NULL,		NULL,		NULL,	false,	0),
++	E("mem-ldst",	"%s/ldlat=%u/",	NULL,	true,	0),
++};
+diff --git a/tools/perf/arch/x86/util/mem-events.h b/tools/perf/arch/x86/util/mem-events.h
+index f55c8d3b7..11e09a256 100644
+--- a/tools/perf/arch/x86/util/mem-events.h
++++ b/tools/perf/arch/x86/util/mem-events.h
+@@ -6,5 +6,6 @@ extern struct perf_mem_event perf_mem_events_intel[PERF_MEM_EVENTS__MAX];
+ extern struct perf_mem_event perf_mem_events_intel_aux[PERF_MEM_EVENTS__MAX];
+ 
+ extern struct perf_mem_event perf_mem_events_amd[PERF_MEM_EVENTS__MAX];
++extern struct perf_mem_event perf_mem_events_amd_ldlat[PERF_MEM_EVENTS__MAX];
+ 
+ #endif /* _X86_MEM_EVENTS_H */
+diff --git a/tools/perf/arch/x86/util/pmu.c b/tools/perf/arch/x86/util/pmu.c
+index e0060dac2..8712cbbbc 100644
+--- a/tools/perf/arch/x86/util/pmu.c
++++ b/tools/perf/arch/x86/util/pmu.c
+@@ -18,8 +18,10 @@
+ #include "mem-events.h"
+ #include "util/env.h"
+ 
+-void perf_pmu__arch_init(struct perf_pmu *pmu __maybe_unused)
++void perf_pmu__arch_init(struct perf_pmu *pmu)
+ {
++	struct perf_pmu_caps *ldlat_cap;
++
+ #ifdef HAVE_AUXTRACE_SUPPORT
+ 	if (!strcmp(pmu->name, INTEL_PT_PMU_NAME)) {
+ 		pmu->auxtrace = true;
+@@ -33,8 +35,20 @@ void perf_pmu__arch_init(struct perf_pmu *pmu __maybe_unused)
+ #endif
+ 
+ 	if (x86__is_amd_cpu()) {
+-		if (!strcmp(pmu->name, "ibs_op"))
+-			pmu->mem_events = perf_mem_events_amd;
++		if (strcmp(pmu->name, "ibs_op"))
++			return;
++
++		pmu->mem_events = perf_mem_events_amd;
++
++		if (!perf_pmu__caps_parse(pmu))
++			return;
++
++		ldlat_cap = perf_pmu__get_cap(pmu, "ldlat");
++		if (!ldlat_cap || strcmp(ldlat_cap->value, "1"))
++			return;
++
++		perf_mem_events__loads_ldlat = 0;
++		pmu->mem_events = perf_mem_events_amd_ldlat;
+ 	} else if (pmu->is_core) {
+ 		if (perf_pmu__have_event(pmu, "mem-loads-aux"))
+ 			pmu->mem_events = perf_mem_events_intel_aux;
+diff --git a/tools/perf/tests/shell/test_data_symbol.sh b/tools/perf/tests/shell/test_data_symbol.sh
+index c86da0235..747f5dc9d 100755
+--- a/tools/perf/tests/shell/test_data_symbol.sh
++++ b/tools/perf/tests/shell/test_data_symbol.sh
+@@ -55,11 +55,34 @@ trap cleanup_files exit term int
+ 
+ echo "Recording workload..."
+ 
+-# perf mem/c2c internally uses IBS PMU on AMD CPU which doesn't support
+-# user/kernel filtering and per-process monitoring, spin program on
+-# specific CPU and test in per-CPU mode.
+ is_amd=$(grep -E -c 'vendor_id.*AuthenticAMD' /proc/cpuinfo)
+ if (($is_amd >= 1)); then
++	mem_events="$(perf mem record -v -e list 2>&1)"
++	if ! [[ "$mem_events" =~ ^mem\-ldst.*ibs_op/(.*)/.*available ]]; then
++		echo "ERROR: mem-ldst event is not matching"
++		exit 1
++	fi
++
++	# --ldlat on AMD:
++	# o Zen4 and earlier uarch does not support ldlat
++	# o Even on supported platforms, it's disabled (--ldlat=0) by default.
++	ldlat=${BASH_REMATCH[1]}
++	if [[ -n $ldlat ]]; then
++		if ! [[ "$ldlat" =~ ldlat=0 ]]; then
++			echo "ERROR: ldlat not initialized to 0?"
++			exit 1
++		fi
++
++		mem_events="$(perf mem record -v --ldlat=150 -e list 2>&1)"
++		if ! [[ "$mem_events" =~ ^mem-ldst.*ibs_op/ldlat=150/.*available ]]; then
++			echo "ERROR: --ldlat not honored?"
++			exit 1
++		fi
++	fi
++
++	# perf mem/c2c internally uses IBS PMU on AMD CPU which doesn't
++	# support user/kernel filtering and per-process monitoring on older
++	# kernels, spin program on specific CPU and test in per-CPU mode.
+ 	perf mem record -vvv -o ${PERF_DATA} -C 0 -- taskset -c 0 $TEST_PROGRAM 2>"${ERR_FILE}" &
+ else
+ 	perf mem record -vvv --all-user -o ${PERF_DATA} -- $TEST_PROGRAM 2>"${ERR_FILE}" &
+diff --git a/tools/perf/util/amd-sample-raw.c b/tools/perf/util/amd-sample-raw.c
+index 9d0ce88e9..022c9eb39 100644
+--- a/tools/perf/util/amd-sample-raw.c
++++ b/tools/perf/util/amd-sample-raw.c
+@@ -19,6 +19,8 @@
+ 
+ static u32 cpu_family, cpu_model, ibs_fetch_type, ibs_op_type;
+ static bool zen4_ibs_extensions;
++static bool ldlat_cap;
++static bool dtlb_pgsize_cap;
+ 
+ static void pr_ibs_fetch_ctl(union ibs_fetch_ctl reg)
+ {
+@@ -78,14 +80,20 @@ static void pr_ic_ibs_extd_ctl(union ic_ibs_extd_ctl reg)
+ static void pr_ibs_op_ctl(union ibs_op_ctl reg)
+ {
+ 	char l3_miss_only[sizeof(" L3MissOnly _")] = "";
++	char ldlat[sizeof(" LdLatThrsh __ LdLatEn _")] = "";
+ 
+ 	if (zen4_ibs_extensions)
+ 		snprintf(l3_miss_only, sizeof(l3_miss_only), " L3MissOnly %d", reg.l3_miss_only);
+ 
+-	printf("ibs_op_ctl:\t%016llx MaxCnt %9d%s En %d Val %d CntCtl %d=%s CurCnt %9d\n",
++	if (ldlat_cap) {
++		snprintf(ldlat, sizeof(ldlat), " LdLatThrsh %2d LdLatEn %d",
++			 reg.ldlat_thrsh, reg.ldlat_en);
++	}
++
++	printf("ibs_op_ctl:\t%016llx MaxCnt %9d%s En %d Val %d CntCtl %d=%s CurCnt %9d%s\n",
+ 		reg.val, ((reg.opmaxcnt_ext << 16) | reg.opmaxcnt) << 4, l3_miss_only,
+ 		reg.op_en, reg.op_val, reg.cnt_ctl,
+-		reg.cnt_ctl ? "uOps" : "cycles", reg.opcurcnt);
++		reg.cnt_ctl ? "uOps" : "cycles", reg.opcurcnt, ldlat);
+ }
+ 
+ static void pr_ibs_op_data(union ibs_op_data reg)
+@@ -154,9 +162,20 @@ static void pr_ibs_op_data2(union ibs_op_data2 reg)
+ 
+ static void pr_ibs_op_data3(union ibs_op_data3 reg)
+ {
+-	char l2_miss_str[sizeof(" L2Miss _")] = "";
+-	char op_mem_width_str[sizeof(" OpMemWidth _____ bytes")] = "";
++	static const char * const dc_page_sizes[] = {
++		"  4K",
++		"  2M",
++		"  1G",
++		"  ??",
++	};
+ 	char op_dc_miss_open_mem_reqs_str[sizeof(" OpDcMissOpenMemReqs __")] = "";
++	char dc_l1_l2tlb_miss_str[sizeof(" DcL1TlbMiss _ DcL2TlbMiss _")] = "";
++	char dc_l1tlb_hit_str[sizeof(" DcL1TlbHit2M _ DcL1TlbHit1G _")] = "";
++	char op_mem_width_str[sizeof(" OpMemWidth _____ bytes")] = "";
++	char dc_l2tlb_hit_2m_str[sizeof(" DcL2TlbHit2M _")] = "";
++	char dc_l2tlb_hit_1g_str[sizeof(" DcL2TlbHit1G _")] = "";
++	char dc_page_size_str[sizeof(" DcPageSize ____")] = "";
++	char l2_miss_str[sizeof(" L2Miss _")] = "";
+ 
+ 	/*
+ 	 * Erratum #1293
+@@ -172,16 +191,40 @@ static void pr_ibs_op_data3(union ibs_op_data3 reg)
+ 		snprintf(op_mem_width_str, sizeof(op_mem_width_str),
+ 			 " OpMemWidth %2d bytes", 1 << (reg.op_mem_width - 1));
+ 
+-	printf("ibs_op_data3:\t%016llx LdOp %d StOp %d DcL1TlbMiss %d DcL2TlbMiss %d "
+-		"DcL1TlbHit2M %d DcL1TlbHit1G %d DcL2TlbHit2M %d DcMiss %d DcMisAcc %d "
+-		"DcWcMemAcc %d DcUcMemAcc %d DcLockedOp %d DcMissNoMabAlloc %d DcLinAddrValid %d "
+-		"DcPhyAddrValid %d DcL2TlbHit1G %d%s SwPf %d%s%s DcMissLat %5d TlbRefillLat %5d\n",
+-		reg.val, reg.ld_op, reg.st_op, reg.dc_l1tlb_miss, reg.dc_l2tlb_miss,
+-		reg.dc_l1tlb_hit_2m, reg.dc_l1tlb_hit_1g, reg.dc_l2tlb_hit_2m, reg.dc_miss,
+-		reg.dc_mis_acc, reg.dc_wc_mem_acc, reg.dc_uc_mem_acc, reg.dc_locked_op,
+-		reg.dc_miss_no_mab_alloc, reg.dc_lin_addr_valid, reg.dc_phy_addr_valid,
+-		reg.dc_l2_tlb_hit_1g, l2_miss_str, reg.sw_pf, op_mem_width_str,
+-		op_dc_miss_open_mem_reqs_str, reg.dc_miss_lat, reg.tlb_refill_lat);
++	if (dtlb_pgsize_cap) {
++		if (reg.dc_phy_addr_valid) {
++			int idx = (reg.dc_l1tlb_hit_1g << 1) | reg.dc_l1tlb_hit_2m;
++
++			snprintf(dc_l1_l2tlb_miss_str, sizeof(dc_l1_l2tlb_miss_str),
++				 " DcL1TlbMiss %d DcL2TlbMiss %d",
++				 reg.dc_l1tlb_miss, reg.dc_l2tlb_miss);
++			snprintf(dc_page_size_str, sizeof(dc_page_size_str),
++				 " DcPageSize %4s", dc_page_sizes[idx]);
++		}
++	} else {
++		snprintf(dc_l1_l2tlb_miss_str, sizeof(dc_l1_l2tlb_miss_str),
++			 " DcL1TlbMiss %d DcL2TlbMiss %d",
++			 reg.dc_l1tlb_miss, reg.dc_l2tlb_miss);
++		snprintf(dc_l1tlb_hit_str, sizeof(dc_l1tlb_hit_str),
++			 " DcL1TlbHit2M %d DcL1TlbHit1G %d",
++			 reg.dc_l1tlb_hit_2m, reg.dc_l1tlb_hit_1g);
++		snprintf(dc_l2tlb_hit_2m_str, sizeof(dc_l2tlb_hit_2m_str),
++			 " DcL2TlbHit2M %d", reg.dc_l2tlb_hit_2m);
++		snprintf(dc_l2tlb_hit_1g_str, sizeof(dc_l2tlb_hit_1g_str),
++			 " DcL2TlbHit1G %d", reg.dc_l2_tlb_hit_1g);
++	}
++
++	printf("ibs_op_data3:\t%016llx LdOp %d StOp %d%s%s%s DcMiss %d DcMisAcc %d "
++		"DcWcMemAcc %d DcUcMemAcc %d DcLockedOp %d DcMissNoMabAlloc %d "
++		"DcLinAddrValid %d DcPhyAddrValid %d%s%s SwPf %d%s%s "
++		"DcMissLat %5d TlbRefillLat %5d\n",
++		reg.val, reg.ld_op, reg.st_op, dc_l1_l2tlb_miss_str,
++		dtlb_pgsize_cap ? dc_page_size_str : dc_l1tlb_hit_str,
++		dc_l2tlb_hit_2m_str, reg.dc_miss, reg.dc_mis_acc, reg.dc_wc_mem_acc,
++		reg.dc_uc_mem_acc, reg.dc_locked_op, reg.dc_miss_no_mab_alloc,
++		reg.dc_lin_addr_valid, reg.dc_phy_addr_valid, dc_l2tlb_hit_1g_str,
++		l2_miss_str, reg.sw_pf, op_mem_width_str, op_dc_miss_open_mem_reqs_str,
++		reg.dc_miss_lat, reg.tlb_refill_lat);
+ }
+ 
+ /*
+@@ -331,6 +374,12 @@ bool evlist__has_amd_ibs(struct evlist *evlist)
+ 	if (perf_env__find_pmu_cap(env, "ibs_op", "zen4_ibs_extensions"))
+ 		zen4_ibs_extensions = 1;
+ 
++	if (perf_env__find_pmu_cap(env, "ibs_op", "ldlat"))
++		ldlat_cap = 1;
++
++	if (perf_env__find_pmu_cap(env, "ibs_op", "dtlb_pgsize"))
++		dtlb_pgsize_cap = 1;
++
+ 	if (ibs_fetch_type || ibs_op_type) {
+ 		if (!cpu_family)
+ 			parse_cpuid(env);
+diff --git a/tools/perf/util/pmu.c b/tools/perf/util/pmu.c
+index 08a9d0bd9..e480fd474 100644
+--- a/tools/perf/util/pmu.c
++++ b/tools/perf/util/pmu.c
+@@ -2103,6 +2103,17 @@ static void perf_pmu__del_caps(struct perf_pmu *pmu)
+ 	}
+ }
+ 
++struct perf_pmu_caps *perf_pmu__get_cap(struct perf_pmu *pmu, const char *name)
++{
++	struct perf_pmu_caps *caps;
++
++	list_for_each_entry(caps, &pmu->caps, list) {
++		if (!strcmp(caps->name, name))
++			return caps;
++	}
++	return NULL;
++}
++
+ /*
+  * Reading/parsing the given pmu capabilities, which should be located at:
+  * /sys/bus/event_source/devices/<dev>/caps as sysfs group attributes.
+diff --git a/tools/perf/util/pmu.h b/tools/perf/util/pmu.h
+index dbed6c243..b3d4d7c5b 100644
+--- a/tools/perf/util/pmu.h
++++ b/tools/perf/util/pmu.h
+@@ -266,6 +266,8 @@ bool pmu_uncore_identifier_match(const char *compat, const char *id);
+ 
+ int perf_pmu__convert_scale(const char *scale, char **end, double *sval);
+ 
++struct perf_pmu_caps *perf_pmu__get_cap(struct perf_pmu *pmu, const char *name);
++
+ int perf_pmu__caps_parse(struct perf_pmu *pmu);
+ 
+ void perf_pmu__warn_invalid_config(struct perf_pmu *pmu, __u64 config,
+-- 
+2.48.1
+
