@@ -1,0 +1,275 @@
+From 683fd1cb75d0579ebcf1f403cc59351124fa1d7c Mon Sep 17 00:00:00 2001
+From: Changwoo Min <changwoo@igalia.com>
+Date: Thu, 9 Jan 2025 22:14:52 +0900
+Subject: [PATCH 11/20] sched_ext: Implement scx_bpf_now()
+
+Returns a high-performance monotonically non-decreasing clock for the current
+CPU. The clock returned is in nanoseconds.
+
+It provides the following properties:
+
+1) High performance: Many BPF schedulers call bpf_ktime_get_ns() frequently
+ to account for execution time and track tasks' runtime properties.
+ Unfortunately, in some hardware platforms, bpf_ktime_get_ns() -- which
+ eventually reads a hardware timestamp counter -- is neither performant nor
+ scalable. scx_bpf_now() aims to provide a high-performance clock by
+ using the rq clock in the scheduler core whenever possible.
+
+2) High enough resolution for the BPF scheduler use cases: In most BPF
+ scheduler use cases, the required clock resolution is lower than the most
+ accurate hardware clock (e.g., rdtsc in x86). scx_bpf_now() basically
+ uses the rq clock in the scheduler core whenever it is valid. It considers
+ that the rq clock is valid from the time the rq clock is updated
+ (update_rq_clock) until the rq is unlocked (rq_unpin_lock).
+
+3) Monotonically non-decreasing clock for the same CPU: scx_bpf_now()
+ guarantees the clock never goes backward when comparing them in the same
+ CPU. On the other hand, when comparing clocks in different CPUs, there
+ is no such guarantee -- the clock can go backward. It provides a
+ monotonically *non-decreasing* clock so that it would provide the same
+ clock values in two different scx_bpf_now() calls in the same CPU
+ during the same period of when the rq clock is valid.
+
+An rq clock becomes valid when it is updated using update_rq_clock()
+and invalidated when the rq is unlocked using rq_unpin_lock().
+
+Let's suppose the following timeline in the scheduler core:
+
+   T1. rq_lock(rq)
+   T2. update_rq_clock(rq)
+   T3. a sched_ext BPF operation
+   T4. rq_unlock(rq)
+   T5. a sched_ext BPF operation
+   T6. rq_lock(rq)
+   T7. update_rq_clock(rq)
+
+For [T2, T4), we consider that rq clock is valid (SCX_RQ_CLK_VALID is
+set), so scx_bpf_now() calls during [T2, T4) (including T3) will
+return the rq clock updated at T2. For duration [T4, T7), when a BPF
+scheduler can still call scx_bpf_now() (T5), we consider the rq clock
+is invalid (SCX_RQ_CLK_VALID is unset at T4). So when calling
+scx_bpf_now() at T5, we will return a fresh clock value by calling
+sched_clock_cpu() internally. Also, to prevent getting outdated rq clocks
+from a previous scx scheduler, invalidate all the rq clocks when unloading
+a BPF scheduler.
+
+One example of calling scx_bpf_now(), when the rq clock is invalid
+(like T5), is in scx_central [1]. The scx_central scheduler uses a BPF
+timer for preemptive scheduling. In every msec, the timer callback checks
+if the currently running tasks exceed their timeslice. At the beginning of
+the BPF timer callback (central_timerfn in scx_central.bpf.c), scx_central
+gets the current time. When the BPF timer callback runs, the rq clock could
+be invalid, the same as T5. In this case, scx_bpf_now() returns a fresh
+clock value rather than returning the old one (T2).
+
+[1] https://github.com/sched-ext/scx/blob/main/scheds/c/scx_central.bpf.c
+
+Signed-off-by: Changwoo Min <changwoo@igalia.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/core.c  |  6 +++-
+ kernel/sched/ext.c   | 74 +++++++++++++++++++++++++++++++++++++++++++-
+ kernel/sched/sched.h | 25 +++++++++++++--
+ 3 files changed, 101 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 3e5a6bf58..f415713a3 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -789,6 +789,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
+ void update_rq_clock(struct rq *rq)
+ {
+ 	s64 delta;
++	u64 clock;
+ 
+ 	lockdep_assert_rq_held(rq);
+ 
+@@ -800,11 +801,14 @@ void update_rq_clock(struct rq *rq)
+ 		SCHED_WARN_ON(rq->clock_update_flags & RQCF_UPDATED);
+ 	rq->clock_update_flags |= RQCF_UPDATED;
+ #endif
++	clock = sched_clock_cpu(cpu_of(rq));
++	scx_rq_clock_update(rq, clock);
+ 
+-	delta = sched_clock_cpu(cpu_of(rq)) - rq->clock;
++	delta = clock - rq->clock;
+ 	if (delta < 0)
+ 		return;
+ 	rq->clock += delta;
++
+ 	update_rq_clock_task(rq, delta);
+ }
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index fdeb5bb04..0c6178048 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -4900,7 +4900,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
+ 	struct task_struct *p;
+ 	struct rhashtable_iter rht_iter;
+ 	struct scx_dispatch_q *dsq;
+-	int i, kind;
++	int i, kind, cpu;
+ 
+ 	kind = atomic_read(&scx_exit_kind);
+ 	while (true) {
+@@ -4983,6 +4983,15 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
+ 	scx_task_iter_stop(&sti);
+ 	percpu_up_write(&scx_fork_rwsem);
+ 
++	/*
++	 * Invalidate all the rq clocks to prevent getting outdated
++	 * rq clocks from a previous scx scheduler.
++	 */
++	for_each_possible_cpu(cpu) {
++		struct rq *rq = cpu_rq(cpu);
++		scx_rq_clock_invalidate(rq);
++	}
++
+ 	/* no task is on scx, turn off all the switches and flush in-progress calls */
+ 	static_branch_disable(&__scx_ops_enabled);
+ 	for (i = SCX_OPI_BEGIN; i < SCX_OPI_END; i++)
+@@ -7588,6 +7597,68 @@ __bpf_kfunc struct cgroup *scx_bpf_task_cgroup(struct task_struct *p)
+ }
+ #endif
+ 
++/**
++ * scx_bpf_now - Returns a high-performance monotonically non-decreasing
++ * clock for the current CPU. The clock returned is in nanoseconds.
++ *
++ * It provides the following properties:
++ *
++ * 1) High performance: Many BPF schedulers call bpf_ktime_get_ns() frequently
++ *  to account for execution time and track tasks' runtime properties.
++ *  Unfortunately, in some hardware platforms, bpf_ktime_get_ns() -- which
++ *  eventually reads a hardware timestamp counter -- is neither performant nor
++ *  scalable. scx_bpf_now() aims to provide a high-performance clock by
++ *  using the rq clock in the scheduler core whenever possible.
++ *
++ * 2) High enough resolution for the BPF scheduler use cases: In most BPF
++ *  scheduler use cases, the required clock resolution is lower than the most
++ *  accurate hardware clock (e.g., rdtsc in x86). scx_bpf_now() basically
++ *  uses the rq clock in the scheduler core whenever it is valid. It considers
++ *  that the rq clock is valid from the time the rq clock is updated
++ *  (update_rq_clock) until the rq is unlocked (rq_unpin_lock).
++ *
++ * 3) Monotonically non-decreasing clock for the same CPU: scx_bpf_now()
++ *  guarantees the clock never goes backward when comparing them in the same
++ *  CPU. On the other hand, when comparing clocks in different CPUs, there
++ *  is no such guarantee -- the clock can go backward. It provides a
++ *  monotonically *non-decreasing* clock so that it would provide the same
++ *  clock values in two different scx_bpf_now() calls in the same CPU
++ *  during the same period of when the rq clock is valid.
++ */
++__bpf_kfunc u64 scx_bpf_now(void)
++{
++	struct rq *rq;
++	u64 clock;
++
++	preempt_disable();
++
++	rq = this_rq();
++	if (smp_load_acquire(&rq->scx.flags) & SCX_RQ_CLK_VALID) {
++		/*
++		 * If the rq clock is valid, use the cached rq clock.
++		 *
++		 * Note that scx_bpf_now() is re-entrant between a process
++		 * context and an interrupt context (e.g., timer interrupt).
++		 * However, we don't need to consider the race between them
++		 * because such race is not observable from a caller.
++		 */
++		clock = READ_ONCE(rq->scx.clock);
++	} else {
++		/*
++		 * Otherwise, return a fresh rq clock.
++		 *
++		 * The rq clock is updated outside of the rq lock.
++		 * In this case, keep the updated rq clock invalid so the next
++		 * kfunc call outside the rq lock gets a fresh rq clock.
++		 */
++		clock = sched_clock_cpu(cpu_of(rq));
++	}
++
++	preempt_enable();
++
++	return clock;
++}
++
+ __bpf_kfunc_end_defs();
+ 
+ BTF_KFUNCS_START(scx_kfunc_ids_any)
+@@ -7619,6 +7690,7 @@ BTF_ID_FLAGS(func, scx_bpf_cpu_rq)
+ #ifdef CONFIG_CGROUP_SCHED
+ BTF_ID_FLAGS(func, scx_bpf_task_cgroup, KF_RCU | KF_ACQUIRE)
+ #endif
++BTF_ID_FLAGS(func, scx_bpf_now)
+ BTF_KFUNCS_END(scx_kfunc_ids_any)
+ 
+ static const struct btf_kfunc_id_set scx_kfunc_set_any = {
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index c5d67a43f..bba867540 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -760,6 +760,7 @@ enum scx_rq_flags {
+ 	SCX_RQ_BAL_PENDING	= 1 << 2, /* balance hasn't run yet */
+ 	SCX_RQ_BAL_KEEP		= 1 << 3, /* balance decided to keep current */
+ 	SCX_RQ_BYPASSING	= 1 << 4,
++	SCX_RQ_CLK_VALID	= 1 << 5, /* RQ clock is fresh and valid */
+ 
+ 	SCX_RQ_IN_WAKEUP	= 1 << 16,
+ 	SCX_RQ_IN_BALANCE	= 1 << 17,
+@@ -772,9 +773,10 @@ struct scx_rq {
+ 	unsigned long		ops_qseq;
+ 	u64			extra_enq_flags;	/* see move_task_to_local_dsq() */
+ 	u32			nr_running;
+-	u32			flags;
+ 	u32			cpuperf_target;		/* [0, SCHED_CAPACITY_SCALE] */
+ 	bool			cpu_released;
++	u32			flags;
++	u64			clock;			/* current per-rq clock -- see scx_bpf_now() */
+ 	cpumask_var_t		cpus_to_kick;
+ 	cpumask_var_t		cpus_to_kick_if_idle;
+ 	cpumask_var_t		cpus_to_preempt;
+@@ -1755,7 +1757,7 @@ static inline void rq_unpin_lock(struct rq *rq, struct rq_flags *rf)
+ 	if (rq->clock_update_flags > RQCF_ACT_SKIP)
+ 		rf->clock_update_flags = RQCF_UPDATED;
+ #endif
+-
++	scx_rq_clock_invalidate(rq);
+ 	lockdep_unpin_lock(__rq_lockp(rq), rf->cookie);
+ }
+ 
+@@ -2522,9 +2524,28 @@ DECLARE_STATIC_KEY_FALSE(__scx_switched_all);	/* all fair class tasks on SCX */
+ 
+ #define scx_enabled()		static_branch_unlikely(&__scx_ops_enabled)
+ #define scx_switched_all()	static_branch_unlikely(&__scx_switched_all)
++
++static inline void scx_rq_clock_update(struct rq *rq, u64 clock)
++{
++	if (!scx_enabled())
++		return;
++	WRITE_ONCE(rq->scx.clock, clock);
++	smp_store_release(&rq->scx.flags, rq->scx.flags | SCX_RQ_CLK_VALID);
++}
++
++static inline void scx_rq_clock_invalidate(struct rq *rq)
++{
++	if (!scx_enabled())
++		return;
++	WRITE_ONCE(rq->scx.flags, rq->scx.flags & ~SCX_RQ_CLK_VALID);
++}
++
+ #else /* !CONFIG_SCHED_CLASS_EXT */
+ #define scx_enabled()		false
+ #define scx_switched_all()	false
++
++static inline void scx_rq_clock_update(struct rq *rq, u64 clock) {}
++static inline void scx_rq_clock_invalidate(struct rq *rq) {}
+ #endif /* !CONFIG_SCHED_CLASS_EXT */
+ 
+ /*
+-- 
+2.48.1
+
