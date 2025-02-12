@@ -1,0 +1,308 @@
+From 3cc1dfd2ec934cb094e41d5fc88bb825c763ae69 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 27 Jan 2025 13:19:31 -0800
+Subject: [PATCH 7/9] nvme-tcp: switch to using the crc32c library
+
+Now that the crc32c() library function directly takes advantage of
+architecture-specific optimizations, it is unnecessary to go through the
+crypto API.  Just use crc32c().  This is much simpler, and it improves
+performance due to eliminating the crypto API overhead.
+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+---
+ drivers/nvme/host/Kconfig |   3 +-
+ drivers/nvme/host/tcp.c   | 122 +++++++++++++-------------------------
+ 2 files changed, 43 insertions(+), 82 deletions(-)
+
+diff --git a/drivers/nvme/host/Kconfig b/drivers/nvme/host/Kconfig
+index 486afe598..0e1a554c5 100644
+--- a/drivers/nvme/host/Kconfig
++++ b/drivers/nvme/host/Kconfig
+@@ -80,8 +80,7 @@ config NVME_TCP
+ 	depends on INET
+ 	depends on BLOCK
+ 	select NVME_FABRICS
+-	select CRYPTO
+-	select CRYPTO_CRC32C
++	select CRC32
+ 	help
+ 	  This provides support for the NVMe over Fabrics protocol using
+ 	  the TCP transport.  This allows you to use remote block devices
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index 841238f38..5668df688 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -8,6 +8,7 @@
+ #include <linux/init.h>
+ #include <linux/slab.h>
+ #include <linux/err.h>
++#include <linux/crc32c.h>
+ #include <linux/key.h>
+ #include <linux/nvme-tcp.h>
+ #include <linux/nvme-keyring.h>
+@@ -17,7 +18,6 @@
+ #include <net/tls_prot.h>
+ #include <net/handshake.h>
+ #include <linux/blk-mq.h>
+-#include <crypto/hash.h>
+ #include <net/busy_poll.h>
+ #include <trace/events/sock.h>
+ 
+@@ -169,8 +169,8 @@ struct nvme_tcp_queue {
+ 	bool			hdr_digest;
+ 	bool			data_digest;
+ 	bool			tls_enabled;
+-	struct ahash_request	*rcv_hash;
+-	struct ahash_request	*snd_hash;
++	u32			rcv_crc;
++	u32			snd_crc;
+ 	__le32			exp_ddgst;
+ 	__le32			recv_ddgst;
+ 	struct completion       tls_complete;
+@@ -444,32 +444,29 @@ nvme_tcp_fetch_request(struct nvme_tcp_queue *queue)
+ 	return req;
+ }
+ 
+-static inline void nvme_tcp_ddgst_final(struct ahash_request *hash,
+-		__le32 *dgst)
++static inline void nvme_tcp_ddgst_init(u32 *crcp)
+ {
+-	ahash_request_set_crypt(hash, NULL, (u8 *)dgst, 0);
+-	crypto_ahash_final(hash);
++	*crcp = ~0;
+ }
+ 
+-static inline void nvme_tcp_ddgst_update(struct ahash_request *hash,
++static inline void nvme_tcp_ddgst_update(u32 *crcp,
+ 		struct page *page, off_t off, size_t len)
+ {
+-	struct scatterlist sg;
++	const void *virt = kmap_local_page(page + (off >> PAGE_SHIFT));
+ 
+-	sg_init_table(&sg, 1);
+-	sg_set_page(&sg, page, len, off);
+-	ahash_request_set_crypt(hash, &sg, NULL, len);
+-	crypto_ahash_update(hash);
++	*crcp = crc32c(*crcp, virt + (off & ~PAGE_MASK), len);
++
++	kunmap_local(virt);
+ }
+ 
+-static inline void nvme_tcp_hdgst(struct ahash_request *hash,
+-		void *pdu, size_t len)
++static inline void nvme_tcp_ddgst_final(u32 *crcp, __le32 *dgst)
+ {
+-	struct scatterlist sg;
++	*dgst = cpu_to_le32(~*crcp);
++}
+ 
+-	sg_init_one(&sg, pdu, len);
+-	ahash_request_set_crypt(hash, &sg, pdu + len, len);
+-	crypto_ahash_digest(hash);
++static inline void nvme_tcp_hdgst(void *pdu, size_t len)
++{
++	put_unaligned_le32(~crc32c(~0, pdu, len), pdu + len);
+ }
+ 
+ static int nvme_tcp_verify_hdgst(struct nvme_tcp_queue *queue,
+@@ -487,7 +484,7 @@ static int nvme_tcp_verify_hdgst(struct nvme_tcp_queue *queue,
+ 	}
+ 
+ 	recv_digest = *(__le32 *)(pdu + hdr->hlen);
+-	nvme_tcp_hdgst(queue->rcv_hash, pdu, pdu_len);
++	nvme_tcp_hdgst(pdu, pdu_len);
+ 	exp_digest = *(__le32 *)(pdu + hdr->hlen);
+ 	if (recv_digest != exp_digest) {
+ 		dev_err(queue->ctrl->ctrl.device,
+@@ -514,7 +511,7 @@ static int nvme_tcp_check_ddgst(struct nvme_tcp_queue *queue, void *pdu)
+ 		nvme_tcp_queue_id(queue));
+ 		return -EPROTO;
+ 	}
+-	crypto_ahash_init(queue->rcv_hash);
++	nvme_tcp_ddgst_init(&queue->rcv_crc);
+ 
+ 	return 0;
+ }
+@@ -821,6 +818,17 @@ static inline void nvme_tcp_end_request(struct request *rq, u16 status)
+ 		nvme_complete_rq(rq);
+ }
+ 
++static size_t crc_and_copy_to_iter(const void *addr, size_t bytes, void *crcp_,
++				   struct iov_iter *i)
++{
++	u32 *crcp = crcp_;
++	size_t copied;
++
++	copied = copy_to_iter(addr, bytes, i);
++	*crcp = crc32c(*crcp, addr, copied);
++	return copied;
++}
++
+ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
+ 			      unsigned int *offset, size_t *len)
+ {
+@@ -858,8 +866,10 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
+ 				iov_iter_count(&req->iter));
+ 
+ 		if (queue->data_digest)
+-			ret = skb_copy_and_hash_datagram_iter(skb, *offset,
+-				&req->iter, recv_len, queue->rcv_hash);
++			ret = __skb_datagram_iter(skb, *offset, &req->iter,
++						  recv_len, true,
++						  crc_and_copy_to_iter,
++						  &queue->rcv_crc);
+ 		else
+ 			ret = skb_copy_datagram_iter(skb, *offset,
+ 					&req->iter, recv_len);
+@@ -877,7 +887,8 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
+ 
+ 	if (!queue->data_remaining) {
+ 		if (queue->data_digest) {
+-			nvme_tcp_ddgst_final(queue->rcv_hash, &queue->exp_ddgst);
++			nvme_tcp_ddgst_final(&queue->rcv_crc,
++					     &queue->exp_ddgst);
+ 			queue->ddgst_remaining = NVME_TCP_DIGEST_LENGTH;
+ 		} else {
+ 			if (pdu->hdr.flags & NVME_TCP_F_DATA_SUCCESS) {
+@@ -1079,7 +1090,7 @@ static int nvme_tcp_try_send_data(struct nvme_tcp_request *req)
+ 			return ret;
+ 
+ 		if (queue->data_digest)
+-			nvme_tcp_ddgst_update(queue->snd_hash, page,
++			nvme_tcp_ddgst_update(&queue->snd_crc, page,
+ 					offset, ret);
+ 
+ 		/*
+@@ -1093,7 +1104,7 @@ static int nvme_tcp_try_send_data(struct nvme_tcp_request *req)
+ 		/* fully successful last send in current PDU */
+ 		if (last && ret == len) {
+ 			if (queue->data_digest) {
+-				nvme_tcp_ddgst_final(queue->snd_hash,
++				nvme_tcp_ddgst_final(&queue->snd_crc,
+ 					&req->ddgst);
+ 				req->state = NVME_TCP_SEND_DDGST;
+ 				req->offset = 0;
+@@ -1126,7 +1137,7 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
+ 		msg.msg_flags |= MSG_EOR;
+ 
+ 	if (queue->hdr_digest && !req->offset)
+-		nvme_tcp_hdgst(queue->snd_hash, pdu, sizeof(*pdu));
++		nvme_tcp_hdgst(pdu, sizeof(*pdu));
+ 
+ 	bvec_set_virt(&bvec, (void *)pdu + req->offset, len);
+ 	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, len);
+@@ -1139,7 +1150,7 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
+ 		if (inline_data) {
+ 			req->state = NVME_TCP_SEND_DATA;
+ 			if (queue->data_digest)
+-				crypto_ahash_init(queue->snd_hash);
++				nvme_tcp_ddgst_init(&queue->snd_crc);
+ 		} else {
+ 			nvme_tcp_done_send_req(queue);
+ 		}
+@@ -1161,7 +1172,7 @@ static int nvme_tcp_try_send_data_pdu(struct nvme_tcp_request *req)
+ 	int ret;
+ 
+ 	if (queue->hdr_digest && !req->offset)
+-		nvme_tcp_hdgst(queue->snd_hash, pdu, sizeof(*pdu));
++		nvme_tcp_hdgst(pdu, sizeof(*pdu));
+ 
+ 	if (!req->h2cdata_left)
+ 		msg.msg_flags |= MSG_SPLICE_PAGES;
+@@ -1176,7 +1187,7 @@ static int nvme_tcp_try_send_data_pdu(struct nvme_tcp_request *req)
+ 	if (!len) {
+ 		req->state = NVME_TCP_SEND_DATA;
+ 		if (queue->data_digest)
+-			crypto_ahash_init(queue->snd_hash);
++			nvme_tcp_ddgst_init(&queue->snd_crc);
+ 		return 1;
+ 	}
+ 	req->offset += ret;
+@@ -1316,41 +1327,6 @@ static void nvme_tcp_io_work(struct work_struct *w)
+ 	queue_work_on(queue->io_cpu, nvme_tcp_wq, &queue->io_work);
+ }
+ 
+-static void nvme_tcp_free_crypto(struct nvme_tcp_queue *queue)
+-{
+-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(queue->rcv_hash);
+-
+-	ahash_request_free(queue->rcv_hash);
+-	ahash_request_free(queue->snd_hash);
+-	crypto_free_ahash(tfm);
+-}
+-
+-static int nvme_tcp_alloc_crypto(struct nvme_tcp_queue *queue)
+-{
+-	struct crypto_ahash *tfm;
+-
+-	tfm = crypto_alloc_ahash("crc32c", 0, CRYPTO_ALG_ASYNC);
+-	if (IS_ERR(tfm))
+-		return PTR_ERR(tfm);
+-
+-	queue->snd_hash = ahash_request_alloc(tfm, GFP_KERNEL);
+-	if (!queue->snd_hash)
+-		goto free_tfm;
+-	ahash_request_set_callback(queue->snd_hash, 0, NULL, NULL);
+-
+-	queue->rcv_hash = ahash_request_alloc(tfm, GFP_KERNEL);
+-	if (!queue->rcv_hash)
+-		goto free_snd_hash;
+-	ahash_request_set_callback(queue->rcv_hash, 0, NULL, NULL);
+-
+-	return 0;
+-free_snd_hash:
+-	ahash_request_free(queue->snd_hash);
+-free_tfm:
+-	crypto_free_ahash(tfm);
+-	return -ENOMEM;
+-}
+-
+ static void nvme_tcp_free_async_req(struct nvme_tcp_ctrl *ctrl)
+ {
+ 	struct nvme_tcp_request *async = &ctrl->async_req;
+@@ -1383,9 +1359,6 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
+ 	if (!test_and_clear_bit(NVME_TCP_Q_ALLOCATED, &queue->flags))
+ 		return;
+ 
+-	if (queue->hdr_digest || queue->data_digest)
+-		nvme_tcp_free_crypto(queue);
+-
+ 	page_frag_cache_drain(&queue->pf_cache);
+ 
+ 	noreclaim_flag = memalloc_noreclaim_save();
+@@ -1793,21 +1766,13 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
+ 
+ 	queue->hdr_digest = nctrl->opts->hdr_digest;
+ 	queue->data_digest = nctrl->opts->data_digest;
+-	if (queue->hdr_digest || queue->data_digest) {
+-		ret = nvme_tcp_alloc_crypto(queue);
+-		if (ret) {
+-			dev_err(nctrl->device,
+-				"failed to allocate queue %d crypto\n", qid);
+-			goto err_sock;
+-		}
+-	}
+ 
+ 	rcv_pdu_size = sizeof(struct nvme_tcp_rsp_pdu) +
+ 			nvme_tcp_hdgst_len(queue);
+ 	queue->pdu = kmalloc(rcv_pdu_size, GFP_KERNEL);
+ 	if (!queue->pdu) {
+ 		ret = -ENOMEM;
+-		goto err_crypto;
++		goto err_sock;
+ 	}
+ 
+ 	dev_dbg(nctrl->device, "connecting queue %d\n",
+@@ -1840,9 +1805,6 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
+ 	kernel_sock_shutdown(queue->sock, SHUT_RDWR);
+ err_rcv_pdu:
+ 	kfree(queue->pdu);
+-err_crypto:
+-	if (queue->hdr_digest || queue->data_digest)
+-		nvme_tcp_free_crypto(queue);
+ err_sock:
+ 	/* ->sock will be released by fput() */
+ 	fput(queue->sock->file);
+-- 
+2.48.1
+
