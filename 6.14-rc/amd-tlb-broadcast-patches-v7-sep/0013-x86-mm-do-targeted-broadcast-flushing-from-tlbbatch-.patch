@@ -1,0 +1,236 @@
+From ac76f6d87e806ad80e48400811fcd7ce92b81e87 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@surriel.com>
+Date: Sun, 23 Feb 2025 14:49:01 -0500
+Subject: [PATCH 13/16] x86/mm: do targeted broadcast flushing from tlbbatch
+ code
+
+Instead of doing a system-wide TLB flush from arch_tlbbatch_flush,
+queue up asynchronous, targeted flushes from arch_tlbbatch_add_pending.
+
+This also allows us to avoid adding the CPUs of processes using broadcast
+flushing to the batch->cpumask, and will hopefully further reduce TLB
+flushing from the reclaim and compaction paths.
+
+Signed-off-by: Rik van Riel <riel@surriel.com>
+Tested-by: Manali Shukla <Manali.Shukla@amd.com>
+Tested-by: Brendan Jackman <jackmanb@google.com>
+Tested-by: Michael Kelley <mhklinux@outlook.com>
+---
+ arch/x86/include/asm/tlb.h      | 12 ++---
+ arch/x86/include/asm/tlbflush.h | 20 +++++----
+ arch/x86/mm/tlb.c               | 79 +++++++++++++++++++++++++++++++--
+ 3 files changed, 93 insertions(+), 18 deletions(-)
+
+diff --git a/arch/x86/include/asm/tlb.h b/arch/x86/include/asm/tlb.h
+index b3cd521e5..f69b24368 100644
+--- a/arch/x86/include/asm/tlb.h
++++ b/arch/x86/include/asm/tlb.h
+@@ -83,16 +83,16 @@ static inline void __tlbsync(void)
+ #define INVLPGB_FINAL_ONLY		BIT(4)
+ #define INVLPGB_INCLUDE_NESTED		BIT(5)
+ 
+-static inline void invlpgb_flush_user_nr_nosync(unsigned long pcid,
+-						unsigned long addr,
+-						u16 nr,
+-						bool pmd_stride)
++static inline void __invlpgb_flush_user_nr_nosync(unsigned long pcid,
++						  unsigned long addr,
++						  u16 nr,
++						  bool pmd_stride)
+ {
+ 	__invlpgb(0, pcid, addr, nr, pmd_stride, INVLPGB_PCID | INVLPGB_VA);
+ }
+ 
+ /* Flush all mappings for a given PCID, not including globals. */
+-static inline void invlpgb_flush_single_pcid_nosync(unsigned long pcid)
++static inline void __invlpgb_flush_single_pcid_nosync(unsigned long pcid)
+ {
+ 	__invlpgb(0, pcid, 0, 1, 0, INVLPGB_PCID);
+ }
+@@ -105,7 +105,7 @@ static inline void invlpgb_flush_all(void)
+ }
+ 
+ /* Flush addr, including globals, for all PCIDs. */
+-static inline void invlpgb_flush_addr_nosync(unsigned long addr, u16 nr)
++static inline void __invlpgb_flush_addr_nosync(unsigned long addr, u16 nr)
+ {
+ 	__invlpgb(0, 0, addr, nr, 0, INVLPGB_INCLUDE_GLOBAL);
+ }
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 2dadb9253..7094bc8d4 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -105,6 +105,9 @@ struct tlb_state {
+ 	 * need to be invalidated.
+ 	 */
+ 	bool invalidate_other;
++#ifdef CONFIG_X86_BROADCAST_TLB_FLUSH
++	bool need_tlbsync;
++#endif
+ 
+ #ifdef CONFIG_ADDRESS_MASKING
+ 	/*
+@@ -293,6 +296,11 @@ static inline bool in_asid_transition(struct mm_struct *mm)
+ {
+ 	return false;
+ }
++
++static inline void tlbsync(void)
++{
++
++}
+ #endif
+ 
+ #ifdef CONFIG_PARAVIRT
+@@ -342,21 +350,15 @@ static inline u64 inc_mm_tlb_gen(struct mm_struct *mm)
+ 	return atomic64_inc_return(&mm->context.tlb_gen);
+ }
+ 
+-static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
+-					     struct mm_struct *mm,
+-					     unsigned long uaddr)
+-{
+-	inc_mm_tlb_gen(mm);
+-	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
+-	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
+-}
+-
+ static inline void arch_flush_tlb_batched_pending(struct mm_struct *mm)
+ {
+ 	flush_tlb_mm(mm);
+ }
+ 
+ extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);
++extern void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
++					     struct mm_struct *mm,
++					     unsigned long uaddr);
+ 
+ static inline bool pte_flags_need_flush(unsigned long oldflags,
+ 					unsigned long newflags,
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 459e5a9ac..889e50c45 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -487,6 +487,37 @@ static void finish_asid_transition(struct flush_tlb_info *info)
+ 	WRITE_ONCE(mm->context.asid_transition, false);
+ }
+ 
++static inline void tlbsync(void)
++{
++	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
++		return;
++	__tlbsync();
++	this_cpu_write(cpu_tlbstate.need_tlbsync, false);
++}
++
++static inline void invlpgb_flush_user_nr_nosync(unsigned long pcid,
++						unsigned long addr,
++						u16 nr, bool pmd_stride)
++{
++	__invlpgb_flush_user_nr_nosync(pcid, addr, nr, pmd_stride);
++	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
++		this_cpu_write(cpu_tlbstate.need_tlbsync, true);
++}
++
++static inline void invlpgb_flush_single_pcid_nosync(unsigned long pcid)
++{
++	__invlpgb_flush_single_pcid_nosync(pcid);
++	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
++		this_cpu_write(cpu_tlbstate.need_tlbsync, true);
++}
++
++static inline void invlpgb_flush_addr_nosync(unsigned long addr, u16 nr)
++{
++	__invlpgb_flush_addr_nosync(addr, nr);
++	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
++		this_cpu_write(cpu_tlbstate.need_tlbsync, true);
++}
++
+ static void broadcast_tlb_flush(struct flush_tlb_info *info)
+ {
+ 	bool pmd = info->stride_shift == PMD_SHIFT;
+@@ -785,6 +816,8 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
+ 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
+ 		WARN_ON_ONCE(!irqs_disabled());
+ 
++	tlbsync();
++
+ 	/*
+ 	 * Verify that CR3 is what we think it is.  This will catch
+ 	 * hypothetical buggy code that directly switches to swapper_pg_dir
+@@ -961,6 +994,8 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
+  */
+ void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
++	tlbsync();
++
+ 	if (this_cpu_read(cpu_tlbstate.loaded_mm) == &init_mm)
+ 		return;
+ 
+@@ -1634,9 +1669,7 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 	 * a local TLB flush is needed. Optimize this use-case by calling
+ 	 * flush_tlb_func_local() directly in this case.
+ 	 */
+-	if (cpu_feature_enabled(X86_FEATURE_INVLPGB)) {
+-		invlpgb_flush_all_nonglobals();
+-	} else if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
++	if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
+ 		flush_tlb_multi(&batch->cpumask, info);
+ 	} else if (cpumask_test_cpu(cpu, &batch->cpumask)) {
+ 		lockdep_assert_irqs_enabled();
+@@ -1645,12 +1678,52 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		local_irq_enable();
+ 	}
+ 
++	/*
++	 * If we issued (asynchronous) INVLPGB flushes, wait for them here.
++	 * The cpumask above contains only CPUs that were running tasks
++	 * not using broadcast TLB flushing.
++	 */
++	tlbsync();
++
+ 	cpumask_clear(&batch->cpumask);
+ 
+ 	put_flush_tlb_info();
+ 	put_cpu();
+ }
+ 
++void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
++					     struct mm_struct *mm,
++					     unsigned long uaddr)
++{
++	u16 asid = mm_global_asid(mm);
++
++	if (asid) {
++		invlpgb_flush_user_nr_nosync(kern_pcid(asid), uaddr, 1, false);
++		/* Do any CPUs supporting INVLPGB need PTI? */
++		if (static_cpu_has(X86_FEATURE_PTI))
++			invlpgb_flush_user_nr_nosync(user_pcid(asid), uaddr, 1, false);
++
++		/*
++		 * Some CPUs might still be using a local ASID for this
++		 * process, and require IPIs, while others are using the
++		 * global ASID.
++		 *
++		 * In this corner case we need to do both the broadcast
++		 * TLB invalidation, and send IPIs. The IPIs will help
++		 * stragglers transition to the broadcast ASID.
++		 */
++		if (in_asid_transition(mm))
++			asid = 0;
++	}
++
++	if (!asid) {
++		inc_mm_tlb_gen(mm);
++		cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
++	}
++
++	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
++}
++
+ /*
+  * Blindly accessing user memory from NMI context can be dangerous
+  * if we're in the middle of switching the current user task or
+-- 
+2.48.1
+
