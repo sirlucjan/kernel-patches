@@ -22,6 +22,6 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [AUFS](https://github.com/sfjro/aufs5-standalone)
 
-- [linux-vd](https://gitlab.com/torvic9)
+- [zstd](https://github.com/facebook/zstd/commits/dev/)
 
 - [Linux Kernel Mailing List Archive](https://lkml.org) / [Linux Kernel Mailing List Archive](https://lore.kernel.org/lkml/) / [Linux Kernel Mailing List Archive](https://patchwork.kernel.org)
