@@ -1,0 +1,297 @@
+From 12103a9f5814b543e86770025620f30b2c0bb530 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Wed, 5 Mar 2025 16:52:26 +0000
+Subject: [PATCH 1/5] btrfs: fix non-empty delayed iputs list on unmount due to
+ compressed write workers
+
+At close_ctree() after we have ran delayed iputs either through explicitly
+calling btrfs_run_delayed_iputs() or later during the call to
+btrfs_commit_super() or btrfs_error_commit_super(), we assert that the
+delayed iputs list is empty.
+
+When we have compressed writes this assertion may fail because delayed
+iputs may have been added to the list after we last ran delayed iputs.
+This happens like this:
+
+1) We have a compressed write bio executing;
+
+2) We enter close_ctree() and flush the fs_info->endio_write_workers
+   queue which is the queue used for running ordered extent completion;
+
+3) The compressed write bio finishes and enters
+   btrfs_finish_compressed_write_work(), where it calls
+   btrfs_finish_ordered_extent() which in turn calls
+   btrfs_queue_ordered_fn(), which queues a work item in the
+   fs_info->endio_write_workers queue that we have flushed before;
+
+4) At close_ctree() we proceed, run all existing delayed iputs and
+   call btrfs_commit_super() (which also runs delayed iputs), but before
+   we run the following assertion below:
+
+      ASSERT(list_empty(&fs_info->delayed_iputs))
+
+   A delayed iput is added by the step below...
+
+5) The ordered extent completion job queued in step 3 runs and results in
+   creating a delayed iput when dropping the last reference of the ordered
+   extent (a call to btrfs_put_ordered_extent() made from
+   btrfs_finish_one_ordered());
+
+6) At this point the delayed iputs list is not empty, so the assertion at
+   close_ctree() fails.
+
+Fix this by flushing the fs_info->compressed_write_workers queue at
+close_ctree() before flushing the fs_info->endio_write_workers queue,
+respecting the queue dependency as the later is responsible for the
+execution of ordered extent completion.
+
+CC: stable@vger.kernel.org # 5.15+
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/disk-io.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 70b61bc23..ca821e596 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -4348,6 +4348,18 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
+ 	 */
+ 	btrfs_flush_workqueue(fs_info->delalloc_workers);
+ 
++	/*
++	 * When finishing a compressed write bio we schedule a work queue item
++	 * to finish an ordered extent - btrfs_finish_compressed_write_work()
++	 * calls btrfs_finish_ordered_extent() which in turns does a call to
++	 * btrfs_queue_ordered_fn(), and that queues the ordered extent
++	 * completion either in the endio_write_workers work queue or in the
++	 * fs_info->endio_freespace_worker work queue. We flush those queues
++	 * below, so before we flush them we must flush this queue for the
++	 * workers of compressed writes.
++	 */
++	flush_workqueue(fs_info->compressed_write_workers);
++
+ 	/*
+ 	 * After we parked the cleaner kthread, ordered extents may have
+ 	 * completed and created new delayed iputs. If one of the async reclaim
+-- 
+2.49.0
+
+
+From f9301614e75f440a1371be21ca5dd0fdd477e9cd Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Tue, 11 Mar 2025 15:50:50 +0000
+Subject: [PATCH 2/5] btrfs: tests: fix chunk map leak after failure to add it
+ to the tree
+
+If we fail to add the chunk map to the fs mapping tree we exit
+test_rmap_block() without freeing the chunk map. Fix this by adding a
+call to btrfs_free_chunk_map() before exiting the test function if the
+call to btrfs_add_chunk_map() failed.
+
+Fixes: 7dc66abb5a47 ("btrfs: use a dedicated data structure for chunk maps")
+CC: stable@vger.kernel.org # 6.12+
+Reviewed-by: Boris Burkov <boris@bur.io>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/tests/extent-map-tests.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/btrfs/tests/extent-map-tests.c b/fs/btrfs/tests/extent-map-tests.c
+index 56e61ac1c..609bb6c9c 100644
+--- a/fs/btrfs/tests/extent-map-tests.c
++++ b/fs/btrfs/tests/extent-map-tests.c
+@@ -1045,6 +1045,7 @@ static int test_rmap_block(struct btrfs_fs_info *fs_info,
+ 	ret = btrfs_add_chunk_map(fs_info, map);
+ 	if (ret) {
+ 		test_err("error adding chunk map to mapping tree");
++		btrfs_free_chunk_map(map);
+ 		goto out_free;
+ 	}
+ 
+-- 
+2.49.0
+
+
+From 77dfc3b4e0ba64a697ca20ef220ede5f00ec4625 Mon Sep 17 00:00:00 2001
+From: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Date: Mon, 17 Mar 2025 12:24:58 +0100
+Subject: [PATCH 3/5] btrfs: zoned: fix zone activation with missing devices
+
+If btrfs_zone_activate() is called with a filesystem that has missing
+devices (e.g. a RAID file system mounted in degraded mode) it is accessing
+the btrfs_device::zone_info pointer, which will not be set if the device in
+question is missing.
+
+Check if the device is present (by checking if it has a valid block
+device pointer associated) and if not, skip zone activation for it.
+
+Fixes: f9a912a3c45f ("btrfs: zoned: make zone activation multi stripe capable")
+CC: stable@vger.kernel.org # 6.1+
+Reviewed-by: Naohiro Aota <naohiro.aota@wdc.com>
+Reviewed-by: Anand Jain <anand.jain@oracle.com>
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/zoned.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index 73e0aa9fc..7ffbc52b9 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -2111,6 +2111,9 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+ 		physical = map->stripes[i].physical;
+ 		zinfo = device->zone_info;
+ 
++		if (!device->bdev)
++			continue;
++
+ 		if (zinfo->max_active_zones == 0)
+ 			continue;
+ 
+-- 
+2.49.0
+
+
+From 4ddf9f5cb7e5646c907b2455571e4c2301e9f4ae Mon Sep 17 00:00:00 2001
+From: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Date: Mon, 17 Mar 2025 12:24:59 +0100
+Subject: [PATCH 4/5] btrfs: zoned: fix zone finishing with missing devices
+
+If do_zone_finish() is called with a filesystem that has missing devices
+(e.g. a RAID file system mounted in degraded mode) it is accessing the
+btrfs_device::zone_info pointer, which will not be set if the device
+in question is missing.
+
+Check if the device is present (by checking if it has a valid block device
+pointer associated) and if not, skip zone finishing for it.
+
+Fixes: 4dcbb8ab31c1 ("btrfs: zoned: make zone finishing multi stripe capable")
+CC: stable@vger.kernel.org # 6.1+
+Reviewed-by: Naohiro Aota <naohiro.aota@wdc.com>
+Reviewed-by: Anand Jain <anand.jain@oracle.com>
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/zoned.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index 7ffbc52b9..aaf925897 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -2275,6 +2275,9 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+ 		struct btrfs_zoned_device_info *zinfo = device->zone_info;
+ 		unsigned int nofs_flags;
+ 
++		if (!device->bdev)
++			continue;
++
+ 		if (zinfo->max_active_zones == 0)
+ 			continue;
+ 
+-- 
+2.49.0
+
+
+From 2162e551f88647751004e341b4f501f24c4424df Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Wed, 5 Mar 2025 15:16:57 -0800
+Subject: [PATCH 5/5] btrfs: harden block_group::bg_list against list_del()
+ races
+
+As far as I can tell, these calls of list_del_init() on bg_list cannot
+run concurrently with btrfs_mark_bg_unused() or btrfs_mark_bg_to_reclaim(),
+as they are in transaction error paths and situations where the block
+group is readonly.
+
+However, if there is any chance at all of racing with mark_bg_unused(),
+or a different future user of bg_list, better to be safe than sorry.
+
+Otherwise we risk the following interleaving (bg_list refcount in parens)
+
+T1 (some random op)                       T2 (btrfs_mark_bg_unused)
+                                        !list_empty(&bg->bg_list); (1)
+list_del_init(&bg->bg_list); (1)
+                                        list_move_tail (1)
+btrfs_put_block_group (0)
+                                        btrfs_delete_unused_bgs
+                                             bg = list_first_entry
+                                             list_del_init(&bg->bg_list);
+                                             btrfs_put_block_group(bg); (-1)
+
+Ultimately, this results in a broken ref count that hits zero one deref
+early and the real final deref underflows the refcount, resulting in a WARNING.
+
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Boris Burkov <boris@bur.io>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/extent-tree.c |  8 ++++++++
+ fs/btrfs/transaction.c | 12 ++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 3014a1a23..6d615711f 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -2874,7 +2874,15 @@ int btrfs_finish_extent_commit(struct btrfs_trans_handle *trans)
+ 						   block_group->length,
+ 						   &trimmed);
+ 
++		/*
++		 * Not strictly necessary to lock, as the block_group should be
++		 * read-only from btrfs_delete_unused_bgs().
++		 */
++		ASSERT(block_group->ro);
++		spin_lock(&fs_info->unused_bgs_lock);
+ 		list_del_init(&block_group->bg_list);
++		spin_unlock(&fs_info->unused_bgs_lock);
++
+ 		btrfs_unfreeze_block_group(block_group);
+ 		btrfs_put_block_group(block_group);
+ 
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index aca83a98b..c0e9d4bbe 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -160,7 +160,13 @@ void btrfs_put_transaction(struct btrfs_transaction *transaction)
+ 			cache = list_first_entry(&transaction->deleted_bgs,
+ 						 struct btrfs_block_group,
+ 						 bg_list);
++			/*
++			 * Not strictly necessary to lock, as no other task will be using a
++			 * block_group on the deleted_bgs list during a transaction abort.
++			 */
++			spin_lock(&transaction->fs_info->unused_bgs_lock);
+ 			list_del_init(&cache->bg_list);
++			spin_unlock(&transaction->fs_info->unused_bgs_lock);
+ 			btrfs_unfreeze_block_group(cache);
+ 			btrfs_put_block_group(cache);
+ 		}
+@@ -2096,7 +2102,13 @@ static void btrfs_cleanup_pending_block_groups(struct btrfs_trans_handle *trans)
+ 
+        list_for_each_entry_safe(block_group, tmp, &trans->new_bgs, bg_list) {
+                btrfs_dec_delayed_refs_rsv_bg_inserts(fs_info);
++		/*
++		* Not strictly necessary to lock, as no other task will be using a
++		* block_group on the new_bgs list during a transaction abort.
++		*/
++	       spin_lock(&fs_info->unused_bgs_lock);
+                list_del_init(&block_group->bg_list);
++	       spin_unlock(&fs_info->unused_bgs_lock);
+        }
+ }
+ 
+-- 
+2.49.0
+
