@@ -1,0 +1,992 @@
+From 63487a1a4f7720d84179059298a7a4aaf59afaae Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Tue, 22 Apr 2025 09:16:28 +0200
+Subject: [PATCH] cache-6.14: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ include/linux/mm_types.h       |  44 ++++
+ include/linux/sched.h          |   4 +
+ include/linux/sched/topology.h |   4 +
+ include/trace/events/sched.h   |  51 ++++
+ init/Kconfig                   |   4 +
+ kernel/fork.c                  |   5 +
+ kernel/sched/core.c            |  13 +-
+ kernel/sched/fair.c            | 461 +++++++++++++++++++++++++++++++--
+ kernel/sched/features.h        |   1 +
+ kernel/sched/sched.h           |   8 +
+ 10 files changed, 569 insertions(+), 26 deletions(-)
+
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 0234f14f2..4fec2c18a 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -800,6 +800,12 @@ struct mm_cid {
+ };
+ #endif
+ 
++struct mm_sched {
++	u64 runtime;
++	unsigned long epoch;
++	unsigned long occ;
++};
++
+ struct kioctx_table;
+ struct iommu_mm_data;
+ struct mm_struct {
+@@ -890,6 +896,17 @@ struct mm_struct {
+ 		 */
+ 		raw_spinlock_t cpus_allowed_lock;
+ #endif
++#ifdef CONFIG_SCHED_CACHE
++		/*
++		 * Track per-cpu-per-process occupancy as a proxy for cache residency.
++		 * See account_mm_sched() and ...
++		 */
++		struct mm_sched __percpu *pcpu_sched;
++		raw_spinlock_t mm_sched_lock;
++		unsigned long mm_sched_epoch;
++		int mm_sched_cpu;
++#endif
++
+ #ifdef CONFIG_MMU
+ 		atomic_long_t pgtables_bytes;	/* size of all page tables */
+ #endif
+@@ -1296,6 +1313,33 @@ static inline unsigned int mm_cid_size(void)
+ static inline void mm_set_cpus_allowed(struct mm_struct *mm, const struct cpumask *cpumask) { }
+ #endif /* CONFIG_SCHED_MM_CID */
+ 
++#ifdef CONFIG_SCHED_CACHE
++extern void mm_init_sched(struct mm_struct *mm, struct mm_sched __percpu *pcpu_sched);
++
++static inline int mm_alloc_sched_noprof(struct mm_struct *mm)
++{
++	struct mm_sched __percpu *pcpu_sched = alloc_percpu_noprof(struct mm_sched);
++	if (!pcpu_sched)
++		return -ENOMEM;
++
++	mm_init_sched(mm, pcpu_sched);
++	return 0;
++}
++
++#define mm_alloc_sched(...)	alloc_hooks(mm_alloc_sched_noprof(__VA_ARGS__))
++
++static inline void mm_destroy_sched(struct mm_struct *mm)
++{
++	free_percpu(mm->pcpu_sched);
++	mm->pcpu_sched = NULL;
++}
++#else /* !CONFIG_SCHED_CACHE */
++
++static inline int mm_alloc_sched(struct mm_struct *mm) { return 0; }
++static inline void mm_destroy_sched(struct mm_struct *mm) { }
++
++#endif /* CONFIG_SCHED_CACHE */
++
+ struct mmu_gather;
+ extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm);
+ extern void tlb_gather_mmu_fullmm(struct mmu_gather *tlb, struct mm_struct *mm);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 6e5c38718..f8eafe440 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1379,6 +1379,10 @@ struct task_struct {
+ 	unsigned long			numa_pages_migrated;
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
++#ifdef CONFIG_SCHED_CACHE
++	struct callback_head		cache_work;
++#endif
++
+ #ifdef CONFIG_RSEQ
+ 	struct rseq __user *rseq;
+ 	u32 rseq_len;
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 7f3dbafe1..0ee4fc6fc 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -82,6 +82,10 @@ struct sched_domain_shared {
+ 	atomic_t	nr_busy_cpus;
+ 	int		has_idle_cores;
+ 	int		nr_idle_scan;
++#ifdef CONFIG_SCHED_CACHE
++	unsigned long	util_avg;
++	u64		nr_avg;
++#endif
+ };
+ 
+ struct sched_domain {
+diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
+index 9ea4c404b..e6cbe0b06 100644
+--- a/include/trace/events/sched.h
++++ b/include/trace/events/sched.h
+@@ -10,6 +10,57 @@
+ #include <linux/tracepoint.h>
+ #include <linux/binfmts.h>
+ 
++TRACE_EVENT(sched_attach_task,
++
++	TP_PROTO(int src_cpu, int dst_cpu, int src_llc, int dst_llc, int idle),
++
++	TP_ARGS(src_cpu, dst_cpu, src_llc, dst_llc, idle),
++
++	TP_STRUCT__entry(
++		__field(	int,	src_cpu		)
++		__field(	int,	dst_cpu		)
++		__field(	int,	src_llc		)
++		__field(	int,	dst_llc		)
++		__field(	int,	idle		)
++	),
++
++	TP_fast_assign(
++		__entry->src_cpu	= src_cpu;
++		__entry->dst_cpu	= dst_cpu;
++		__entry->src_llc	= src_llc;
++		__entry->dst_llc	= dst_llc;
++		__entry->idle		= idle;
++	),
++
++	TP_printk("src_cpu=%d dst_cpu=%d src_llc=%d dst_llc=%d idle=%d",
++		  __entry->src_cpu, __entry->dst_cpu, __entry->src_llc,
++		  __entry->dst_llc, __entry->idle)
++);
++
++TRACE_EVENT(sched_select_task_rq,
++
++	TP_PROTO(int new_cpu, int old_cpu, int new_llc, int old_llc),
++
++	TP_ARGS(new_cpu, old_cpu, new_llc, old_llc),
++
++	TP_STRUCT__entry(
++		__field(	int,	new_cpu		)
++		__field(	int,	old_cpu		)
++		__field(	int,	new_llc		)
++		__field(	int,	old_llc		)
++	),
++
++	TP_fast_assign(
++		__entry->new_cpu	= new_cpu;
++		__entry->old_cpu	= old_cpu;
++		__entry->new_llc	= new_llc;
++		__entry->old_llc	= old_llc;
++	),
++
++	TP_printk("new_cpu=%d old_cpu=%d new_llc=%d old_llc=%d",
++		  __entry->new_cpu, __entry->old_cpu, __entry->new_llc, __entry->old_llc)
++);
++
+ /*
+  * Tracepoint for calling kthread_stop, performed to end a kthread:
+  */
+diff --git a/init/Kconfig b/init/Kconfig
+index 5ab47c346..c47435381 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -952,6 +952,10 @@ config NUMA_BALANCING
+ 
+ 	  This system will be inactive on UMA systems.
+ 
++config SCHED_CACHE
++	bool "Cache aware scheduler"
++	default y
++
+ config NUMA_BALANCING_DEFAULT_ENABLED
+ 	bool "Automatically enable NUMA aware memory/task placement"
+ 	default y
+diff --git a/kernel/fork.c b/kernel/fork.c
+index ca2ca3884..04d1b7b26 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1314,6 +1314,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	if (mm_alloc_cid(mm, p))
+ 		goto fail_cid;
+ 
++	if (mm_alloc_sched(mm))
++		goto fail_sched;
++
+ 	if (percpu_counter_init_many(mm->rss_stat, 0, GFP_KERNEL_ACCOUNT,
+ 				     NR_MM_COUNTERS))
+ 		goto fail_pcpu;
+@@ -1323,6 +1326,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	return mm;
+ 
+ fail_pcpu:
++	mm_destroy_sched(mm);
++fail_sched:
+ 	mm_destroy_cid(mm);
+ fail_cid:
+ 	destroy_context(mm);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 3c7c942c7..0a0d45f55 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4526,6 +4526,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->migration_pending = NULL;
+ #endif
+ 	init_sched_mm_cid(p);
++	init_sched_mm(p);
+ }
+ 
+ DEFINE_STATIC_KEY_FALSE(sched_numa_balancing);
+@@ -8475,6 +8476,7 @@ static struct kmem_cache *task_group_cache __ro_after_init;
+ 
+ void __init sched_init(void)
+ {
++	unsigned long now = jiffies;
+ 	unsigned long ptr = 0;
+ 	int i;
+ 
+@@ -8549,7 +8551,7 @@ void __init sched_init(void)
+ 		raw_spin_lock_init(&rq->__lock);
+ 		rq->nr_running = 0;
+ 		rq->calc_load_active = 0;
+-		rq->calc_load_update = jiffies + LOAD_FREQ;
++		rq->calc_load_update = now + LOAD_FREQ;
+ 		init_cfs_rq(&rq->cfs);
+ 		init_rt_rq(&rq->rt);
+ 		init_dl_rq(&rq->dl);
+@@ -8593,7 +8595,7 @@ void __init sched_init(void)
+ 		rq->cpu_capacity = SCHED_CAPACITY_SCALE;
+ 		rq->balance_callback = &balance_push_callback;
+ 		rq->active_balance = 0;
+-		rq->next_balance = jiffies;
++		rq->next_balance = now;
+ 		rq->push_cpu = 0;
+ 		rq->cpu = i;
+ 		rq->online = 0;
+@@ -8605,7 +8607,7 @@ void __init sched_init(void)
+ 
+ 		rq_attach_root(rq, &def_root_domain);
+ #ifdef CONFIG_NO_HZ_COMMON
+-		rq->last_blocked_load_update_tick = jiffies;
++		rq->last_blocked_load_update_tick = now;
+ 		atomic_set(&rq->nohz_flags, 0);
+ 
+ 		INIT_CSD(&rq->nohz_csd, nohz_csd_func, rq);
+@@ -8630,6 +8632,11 @@ void __init sched_init(void)
+ 
+ 		rq->core_cookie = 0UL;
+ #endif
++#ifdef CONFIG_SCHED_CACHE
++		raw_spin_lock_init(&rq->cpu_epoch_lock);
++		rq->cpu_epoch_next = now;
++#endif
++
+ 		zalloc_cpumask_var_node(&rq->scratch_mask, GFP_KERNEL, cpu_to_node(i));
+ 	}
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 89c726010..818e823d4 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1168,10 +1168,229 @@ static s64 update_curr_se(struct rq *rq, struct sched_entity *curr)
+ 	return delta_exec;
+ }
+ 
+-static inline void update_curr_task(struct task_struct *p, s64 delta_exec)
++#ifdef CONFIG_SCHED_CACHE
++
++/*
++ * XXX numbers come from a place the sun don't shine -- probably wants to be SD
++ * tunable or so.
++ */
++#define EPOCH_PERIOD	(HZ/100)	/* 10 ms */
++#define EPOCH_OLD	5		/* 50 ms */
++
++void mm_init_sched(struct mm_struct *mm, struct mm_sched __percpu *_pcpu_sched)
++{
++	unsigned long epoch;
++	int i;
++
++	for_each_possible_cpu(i) {
++		struct mm_sched *pcpu_sched = per_cpu_ptr(_pcpu_sched, i);
++		struct rq *rq = cpu_rq(i);
++
++		pcpu_sched->runtime = 0;
++		pcpu_sched->epoch = epoch = rq->cpu_epoch;
++		pcpu_sched->occ = -1;
++	}
++
++	raw_spin_lock_init(&mm->mm_sched_lock);
++	mm->mm_sched_epoch = epoch;
++	mm->mm_sched_cpu = -1;
++
++	smp_store_release(&mm->pcpu_sched, _pcpu_sched);
++}
++
++/* because why would C be fully specified */
++static __always_inline void __shr_u64(u64 *val, unsigned int n)
++{
++	if (n >= 64) {
++		*val = 0;
++		return;
++	}
++	*val >>= n;
++}
++
++static inline void __update_mm_sched(struct rq *rq, struct mm_sched *pcpu_sched)
++{
++	lockdep_assert_held(&rq->cpu_epoch_lock);
++
++	unsigned long n, now = jiffies;
++	long delta = now - rq->cpu_epoch_next;
++
++	if (delta > 0) {
++		n = (delta + EPOCH_PERIOD - 1) / EPOCH_PERIOD;
++		rq->cpu_epoch += n;
++		rq->cpu_epoch_next += n * EPOCH_PERIOD;
++		__shr_u64(&rq->cpu_runtime, n);
++	}
++
++	n = rq->cpu_epoch - pcpu_sched->epoch;
++	if (n) {
++		pcpu_sched->epoch += n;
++		__shr_u64(&pcpu_sched->runtime, n);
++	}
++}
++
++static unsigned long fraction_mm_sched(struct rq *rq, struct mm_sched *pcpu_sched)
++{
++	guard(raw_spinlock_irqsave)(&rq->cpu_epoch_lock);
++
++	__update_mm_sched(rq, pcpu_sched);
++
++	/*
++	 * Runtime is a geometric series (r=0.5) and as such will sum to twice
++	 * the accumulation period, this means the multiplcation here should
++	 * not overflow.
++	 */
++	return div64_u64(NICE_0_LOAD * pcpu_sched->runtime, rq->cpu_runtime + 1);
++}
++
++static inline
++void account_mm_sched(struct rq *rq, struct task_struct *p, s64 delta_exec)
++{
++	struct mm_struct *mm = p->mm;
++	struct mm_sched *pcpu_sched;
++	unsigned long epoch;
++
++	/*
++	 * init_task and kthreads don't be having no mm
++	 */
++	if (!mm || !mm->pcpu_sched)
++		return;
++
++	pcpu_sched = per_cpu_ptr(p->mm->pcpu_sched, cpu_of(rq));
++
++	scoped_guard (raw_spinlock, &rq->cpu_epoch_lock) {
++		__update_mm_sched(rq, pcpu_sched);
++		pcpu_sched->runtime += delta_exec;
++		rq->cpu_runtime += delta_exec;
++		epoch = rq->cpu_epoch;
++	}
++
++	/*
++	 * If this task hasn't hit task_cache_work() for a while, invalidate
++	 * it's preferred state.
++	 */
++	if (epoch - READ_ONCE(mm->mm_sched_epoch) > EPOCH_OLD) {
++		mm->mm_sched_cpu = -1;
++		pcpu_sched->occ = -1;
++	}
++}
++
++static void task_tick_cache(struct rq *rq, struct task_struct *p)
++{
++	struct callback_head *work = &p->cache_work;
++	struct mm_struct *mm = p->mm;
++
++	if (!mm || !mm->pcpu_sched)
++		return;
++
++	if (mm->mm_sched_epoch == rq->cpu_epoch)
++		return;
++
++	guard(raw_spinlock)(&mm->mm_sched_lock);
++
++	if (work->next == work) {
++		task_work_add(p, work, TWA_RESUME);
++		WRITE_ONCE(mm->mm_sched_epoch, rq->cpu_epoch);
++	}
++}
++
++static void task_cache_work(struct callback_head *work)
++{
++	struct task_struct *p = current;
++	struct mm_struct *mm = p->mm;
++	unsigned long m_a_occ = 0;
++	int cpu, m_a_cpu = -1;
++	cpumask_var_t cpus;
++
++	WARN_ON_ONCE(work != &p->cache_work);
++
++	work->next = work;
++
++	if (p->flags & PF_EXITING)
++		return;
++
++	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
++		return;
++
++	scoped_guard (cpus_read_lock) {
++		cpumask_copy(cpus, cpu_online_mask);
++
++		for_each_cpu(cpu, cpus) {
++			/* XXX sched_cluster_active */
++			struct sched_domain *sd = per_cpu(sd_llc, cpu);
++			unsigned long occ, m_occ = 0, a_occ = 0;
++			int m_cpu = -1, nr = 0, i;
++
++			if (!sd)
++				continue;
++
++			for_each_cpu(i, sched_domain_span(sd)) {
++				occ = fraction_mm_sched(cpu_rq(i),
++							per_cpu_ptr(mm->pcpu_sched, i));
++				a_occ += occ;
++				if (occ > m_occ) {
++					m_occ = occ;
++					m_cpu = i;
++				}
++				nr++;
++				trace_printk("(%d) occ: %ld m_occ: %ld m_cpu: %d nr: %d\n",
++					     per_cpu(sd_llc_id, i), occ, m_occ, m_cpu, nr);
++			}
++
++			a_occ /= nr;
++			if (a_occ > m_a_occ) {
++				m_a_occ = a_occ;
++				m_a_cpu = m_cpu;
++			}
++
++			trace_printk("(%d) a_occ: %ld m_a_occ: %ld\n",
++				     per_cpu(sd_llc_id, cpu), a_occ, m_a_occ);
++
++			for_each_cpu(i, sched_domain_span(sd)) {
++				/* XXX threshold ? */
++				per_cpu_ptr(mm->pcpu_sched, i)->occ = a_occ;
++			}
++
++			cpumask_andnot(cpus, cpus, sched_domain_span(sd));
++		}
++	}
++
++	/*
++	 * If the max average cache occupancy is 'small' we don't care.
++	 */
++	if (m_a_occ < (NICE_0_LOAD >> EPOCH_OLD))
++		m_a_cpu = -1;
++
++	mm->mm_sched_cpu = m_a_cpu;
++
++	free_cpumask_var(cpus);
++}
++
++void init_sched_mm(struct task_struct *p)
++{
++	struct callback_head *work = &p->cache_work;
++	init_task_work(work, task_cache_work);
++	work->next = work;
++}
++
++#else
++
++static inline void account_mm_sched(struct rq *rq, struct task_struct *p,
++				    s64 delta_exec) { }
++
++
++void init_sched_mm(struct task_struct *p) { }
++
++static void task_tick_cache(struct rq *rq, struct task_struct *p) { }
++
++#endif
++
++static inline
++void update_curr_task(struct rq *rq, struct task_struct *p, s64 delta_exec)
+ {
+ 	trace_sched_stat_runtime(p, delta_exec);
+ 	account_group_exec_runtime(p, delta_exec);
++	account_mm_sched(rq, p, delta_exec);
+ 	cgroup_account_cputime(p, delta_exec);
+ }
+ 
+@@ -1217,7 +1436,7 @@ s64 update_curr_common(struct rq *rq)
+ 
+ 	delta_exec = update_curr_se(rq, &donor->se);
+ 	if (likely(delta_exec > 0))
+-		update_curr_task(donor, delta_exec);
++		update_curr_task(rq, donor, delta_exec);
+ 
+ 	return delta_exec;
+ }
+@@ -1246,7 +1465,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 	if (entity_is_task(curr)) {
+ 		struct task_struct *p = task_of(curr);
+ 
+-		update_curr_task(p, delta_exec);
++		update_curr_task(rq, p, delta_exec);
+ 
+ 		/*
+ 		 * If the fair_server is active, we need to account for the
+@@ -7852,7 +8071,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	 * per-cpu select_rq_mask usage
+ 	 */
+ 	lockdep_assert_irqs_disabled();
+-
++again:
+ 	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+ 	    asym_fits_cpu(task_util, util_min, util_max, target))
+ 		return target;
+@@ -7890,7 +8109,8 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	/* Check a recently used CPU as a potential idle candidate: */
+ 	recent_used_cpu = p->recent_used_cpu;
+ 	p->recent_used_cpu = prev;
+-	if (recent_used_cpu != prev &&
++	if (prev == p->wake_cpu &&
++	    recent_used_cpu != prev &&
+ 	    recent_used_cpu != target &&
+ 	    cpus_share_cache(recent_used_cpu, target) &&
+ 	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
+@@ -7943,6 +8163,18 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
++	if (prev != p->wake_cpu && !cpus_share_cache(prev, p->wake_cpu)) {
++		/*
++		 * Most likely select_cache_cpu() will have re-directed
++		 * the wakeup, but getting here means the preferred cache is
++		 * too busy, so re-try with the actual previous.
++		 *
++		 * XXX wake_affine is lost for this pass.
++		 */
++		prev = target = p->wake_cpu;
++		goto again;
++	}
++
+ 	/*
+ 	 * For cluster machines which have lower sharing cache like L2 or
+ 	 * LLC Tag, we tend to find an idle CPU in the target's cluster
+@@ -8565,6 +8797,104 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 	return target;
+ }
+ 
++#ifdef CONFIG_SCHED_CACHE
++static long __migrate_degrades_locality(struct task_struct *p, int src_cpu, int dst_cpu, bool idle);
++
++/* expected to be protected by rcu_read_lock() */
++static bool get_llc_stats(int cpu, int *nr, int *weight, unsigned long *util)
++{
++	struct sched_domain_shared *sd_share;
++
++	sd_share = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (!sd_share)
++		return false;
++
++	*nr = READ_ONCE(sd_share->nr_avg);
++	*util = READ_ONCE(sd_share->util_avg);
++	*weight = per_cpu(sd_llc_size, cpu);
++
++	return true;
++}
++
++static bool valid_target_cpu(int cpu, struct task_struct *p)
++{
++	int nr_running, llc_weight;
++	unsigned long util, llc_cap;
++
++	if (!get_llc_stats(cpu, &nr_running, &llc_weight,
++			   &util))
++		return false;
++
++	llc_cap = llc_weight * SCHED_CAPACITY_SCALE;
++
++	/*
++	 * If this process has many threads, be careful to avoid
++	 * task stacking on the preferred LLC, by checking the system's
++	 * utilization and runnable tasks. Otherwise, if this
++	 * process does not have many threads, honor the cache
++	 * aware wakeup.
++	 */
++	if (get_nr_threads(p) < llc_weight)
++		return true;
++
++	/*
++	 * Check if it exceeded 25% of average utiliazation,
++	 * or if it exceeded 33% of CPUs. This is a magic number
++	 * that did not cause heavy cache contention on Xeon or
++	 * Zen.
++	 */
++	if (util * 4 >= llc_cap)
++		return false;
++
++	if (nr_running * 3 >= llc_weight)
++		return false;
++
++	return true;
++}
++
++static int select_cache_cpu(struct task_struct *p, int prev_cpu)
++{
++	struct mm_struct *mm = p->mm;
++	int cpu;
++
++	if (!sched_feat(SCHED_CACHE))
++		return prev_cpu;
++
++	if (!mm || p->nr_cpus_allowed == 1)
++		return prev_cpu;
++
++	cpu = mm->mm_sched_cpu;
++	if (cpu < 0)
++		return prev_cpu;
++
++	/*
++	 * No need to migrate the task if previous and preferred CPU
++	 * are in the same LLC.
++	 */
++	if (cpus_share_cache(prev_cpu, cpu))
++		return prev_cpu;
++
++	if (!valid_target_cpu(cpu, p))
++		return prev_cpu;
++
++	if (static_branch_likely(&sched_numa_balancing) &&
++	    __migrate_degrades_locality(p, prev_cpu, cpu, false) > 0) {
++		/*
++		 * XXX look for max occupancy inside prev_cpu's node
++		 */
++		return prev_cpu;
++	}
++
++	return cpu;
++}
++#else
++static int select_cache_cpu(struct task_struct *p, int prev_cpu)
++{
++	return prev_cpu;
++}
++#endif
++
++
+ /*
+  * select_task_rq_fair: Select target runqueue for the waking task in domains
+  * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
+@@ -8581,7 +8911,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+ 	struct sched_domain *tmp, *sd = NULL;
+ 	int cpu = smp_processor_id();
+-	int new_cpu = prev_cpu;
++	int new_cpu = prev_cpu, orig_prev_cpu = prev_cpu;
+ 	int want_affine = 0;
+ 	/* SD_flags and WF_flags share the first nibble */
+ 	int sd_flag = wake_flags & 0xF;
+@@ -8590,6 +8920,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	 * required for stable ->cpus_allowed
+ 	 */
+ 	lockdep_assert_held(&p->pi_lock);
++	guard(rcu)();
++
+ 	if (wake_flags & WF_TTWU) {
+ 		record_wakee(p);
+ 
+@@ -8597,6 +8929,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 		    cpumask_test_cpu(cpu, p->cpus_ptr))
+ 			return cpu;
+ 
++		new_cpu = prev_cpu = select_cache_cpu(p, prev_cpu);
++
+ 		if (!is_rd_overutilized(this_rq()->rd)) {
+ 			new_cpu = find_energy_efficient_cpu(p, prev_cpu);
+ 			if (new_cpu >= 0)
+@@ -8607,7 +8941,6 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+ 	}
+ 
+-	rcu_read_lock();
+ 	for_each_domain(cpu, tmp) {
+ 		/*
+ 		 * If both 'cpu' and 'prev_cpu' are part of this domain,
+@@ -8640,7 +8973,10 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 		/* Fast path */
+ 		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
+ 	}
+-	rcu_read_unlock();
++
++	trace_sched_select_task_rq(new_cpu, orig_prev_cpu,
++				   per_cpu(sd_llc_id, new_cpu),
++				   per_cpu(sd_llc_id, orig_prev_cpu));
+ 
+ 	return new_cpu;
+ }
+@@ -9290,6 +9626,17 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
+ 	if (sysctl_sched_migration_cost == 0)
+ 		return 0;
+ 
++#ifdef CONFIG_SCHED_CACHE
++	/*
++	 * Don't migrate task out of its preferred LLC.
++	 */
++	if (sched_feat(SCHED_CACHE) && p->mm && p->mm->mm_sched_cpu >= 0 &&
++	    cpus_share_cache(env->src_cpu, p->mm->mm_sched_cpu) &&
++	    !cpus_share_cache(env->src_cpu, env->dst_cpu) &&
++	     !valid_target_cpu(env->dst_cpu, p))
++		return 1;
++#endif
++
+ 	delta = rq_clock_task(env->src_rq) - p->se.exec_start;
+ 
+ 	return delta < (s64)sysctl_sched_migration_cost;
+@@ -9301,27 +9648,25 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
+  * Returns 0, if task migration is not affected by locality.
+  * Returns a negative value, if task migration improves locality i.e migration preferred.
+  */
+-static long migrate_degrades_locality(struct task_struct *p, struct lb_env *env)
++static long __migrate_degrades_locality(struct task_struct *p, int src_cpu, int dst_cpu, bool idle)
+ {
+ 	struct numa_group *numa_group = rcu_dereference(p->numa_group);
+ 	unsigned long src_weight, dst_weight;
+ 	int src_nid, dst_nid, dist;
+ 
+-	if (!static_branch_likely(&sched_numa_balancing))
+-		return 0;
+-
+-	if (!p->numa_faults || !(env->sd->flags & SD_NUMA))
++	if (!p->numa_faults)
+ 		return 0;
+ 
+-	src_nid = cpu_to_node(env->src_cpu);
+-	dst_nid = cpu_to_node(env->dst_cpu);
++	src_nid = cpu_to_node(src_cpu);
++	dst_nid = cpu_to_node(dst_cpu);
+ 
+ 	if (src_nid == dst_nid)
+ 		return 0;
+ 
+ 	/* Migrating away from the preferred node is always bad. */
+ 	if (src_nid == p->numa_preferred_nid) {
+-		if (env->src_rq->nr_running > env->src_rq->nr_preferred_running)
++		struct rq *src_rq = cpu_rq(src_cpu);
++		if (src_rq->nr_running > src_rq->nr_preferred_running)
+ 			return 1;
+ 		else
+ 			return 0;
+@@ -9332,7 +9677,7 @@ static long migrate_degrades_locality(struct task_struct *p, struct lb_env *env)
+ 		return -1;
+ 
+ 	/* Leaving a core idle is often worse than degrading locality. */
+-	if (env->idle == CPU_IDLE)
++	if (idle)
+ 		return 0;
+ 
+ 	dist = node_distance(src_nid, dst_nid);
+@@ -9347,7 +9692,24 @@ static long migrate_degrades_locality(struct task_struct *p, struct lb_env *env)
+ 	return src_weight - dst_weight;
+ }
+ 
++static long migrate_degrades_locality(struct task_struct *p, struct lb_env *env)
++{
++	if (!static_branch_likely(&sched_numa_balancing))
++		return 0;
++
++	if (!(env->sd->flags & SD_NUMA))
++		return 0;
++
++	return __migrate_degrades_locality(p, env->src_cpu, env->dst_cpu,
++					   env->idle == CPU_IDLE);
++}
++
+ #else
++static long __migrate_degrades_locality(struct task_struct *p, int src_cpu, int dst_cpu, bool idle)
++{
++	return 0;
++}
++
+ static inline long migrate_degrades_locality(struct task_struct *p,
+ 					     struct lb_env *env)
+ {
+@@ -9678,11 +10040,17 @@ static int detach_tasks(struct lb_env *env)
+ /*
+  * attach_task() -- attach the task detached by detach_task() to its new rq.
+  */
+-static void attach_task(struct rq *rq, struct task_struct *p)
++static void attach_task(struct rq *rq, struct task_struct *p, struct lb_env *env)
+ {
+ 	lockdep_assert_rq_held(rq);
+ 
+ 	WARN_ON_ONCE(task_rq(p) != rq);
++
++	if (env)
++		trace_sched_attach_task(env->src_cpu, env->dst_cpu,
++					per_cpu(sd_llc_id, env->src_cpu),
++					per_cpu(sd_llc_id, env->dst_cpu),
++					env->idle);
+ 	activate_task(rq, p, ENQUEUE_NOCLOCK);
+ 	wakeup_preempt(rq, p, 0);
+ }
+@@ -9691,13 +10059,13 @@ static void attach_task(struct rq *rq, struct task_struct *p)
+  * attach_one_task() -- attaches the task returned from detach_one_task() to
+  * its new rq.
+  */
+-static void attach_one_task(struct rq *rq, struct task_struct *p)
++static void attach_one_task(struct rq *rq, struct task_struct *p, struct lb_env *env)
+ {
+ 	struct rq_flags rf;
+ 
+ 	rq_lock(rq, &rf);
+ 	update_rq_clock(rq);
+-	attach_task(rq, p);
++	attach_task(rq, p, env);
+ 	rq_unlock(rq, &rf);
+ }
+ 
+@@ -9718,7 +10086,7 @@ static void attach_tasks(struct lb_env *env)
+ 		p = list_first_entry(tasks, struct task_struct, se.group_node);
+ 		list_del_init(&p->se.group_node);
+ 
+-		attach_task(env->dst_rq, p);
++		attach_task(env->dst_rq, p, env);
+ 	}
+ 
+ 	rq_unlock(env->dst_rq, &rf);
+@@ -10342,6 +10710,48 @@ sched_reduced_capacity(struct rq *rq, struct sched_domain *sd)
+ 	return check_cpu_capacity(rq, sd);
+ }
+ 
++#ifdef CONFIG_SCHED_CACHE
++/*
++ * Save this sched group's statistic for later use:
++ * The task wakeup and load balance can make better
++ * decision based on these statistics.
++ */
++static void update_sg_if_llc(struct lb_env *env, struct sg_lb_stats *sgs,
++			     struct sched_group *group)
++{
++	/* Find the sched domain that spans this group. */
++	struct sched_domain *sd = env->sd->child;
++	struct sched_domain_shared *sd_share;
++	u64 last_nr;
++
++	if (!sched_feat(SCHED_CACHE) || env->idle == CPU_NEWLY_IDLE)
++		return;
++
++	/* only care the sched domain that spans 1 LLC */
++	if (!sd || !(sd->flags & SD_SHARE_LLC) ||
++	    !sd->parent || (sd->parent->flags & SD_SHARE_LLC))
++		return;
++
++	sd_share = rcu_dereference(per_cpu(sd_llc_shared,
++				   cpumask_first(sched_group_span(group))));
++	if (!sd_share)
++		return;
++
++	last_nr = READ_ONCE(sd_share->nr_avg);
++	update_avg(&last_nr, sgs->sum_nr_running);
++
++	if (likely(READ_ONCE(sd_share->util_avg) != sgs->group_util))
++		WRITE_ONCE(sd_share->util_avg, sgs->group_util);
++
++	WRITE_ONCE(sd_share->nr_avg, last_nr);
++}
++#else
++static inline void update_sg_if_llc(struct lb_env *env, struct sg_lb_stats *sgs,
++				    struct sched_group *group)
++{
++}
++#endif
++
+ /**
+  * update_sg_lb_stats - Update sched_group's statistics for load balancing.
+  * @env: The load balancing environment.
+@@ -10431,6 +10841,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 
+ 	sgs->group_type = group_classify(env->sd->imbalance_pct, group, sgs);
+ 
++	update_sg_if_llc(env, sgs, group);
+ 	/* Computing avg_load makes sense only when group is overloaded */
+ 	if (sgs->group_type == group_overloaded)
+ 		sgs->avg_load = (sgs->group_load * SCHED_CAPACITY_SCALE) /
+@@ -12065,6 +12476,7 @@ static int active_load_balance_cpu_stop(void *data)
+ 	struct sched_domain *sd;
+ 	struct task_struct *p = NULL;
+ 	struct rq_flags rf;
++	struct lb_env env_tmp;
+ 
+ 	rq_lock_irq(busiest_rq, &rf);
+ 	/*
+@@ -12120,6 +12532,7 @@ static int active_load_balance_cpu_stop(void *data)
+ 		} else {
+ 			schedstat_inc(sd->alb_failed);
+ 		}
++		memcpy(&env_tmp, &env, sizeof(env));
+ 	}
+ 	rcu_read_unlock();
+ out_unlock:
+@@ -12127,7 +12540,7 @@ static int active_load_balance_cpu_stop(void *data)
+ 	rq_unlock(busiest_rq, &rf);
+ 
+ 	if (p)
+-		attach_one_task(target_rq, p);
++		attach_one_task(target_rq, p, sd ? &env_tmp : NULL);
+ 
+ 	local_irq_enable();
+ 
+@@ -13107,8 +13520,8 @@ static inline void task_tick_core(struct rq *rq, struct task_struct *curr) {}
+  */
+ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
+ {
+-	struct cfs_rq *cfs_rq;
+ 	struct sched_entity *se = &curr->se;
++	struct cfs_rq *cfs_rq;
+ 
+ 	for_each_sched_entity(se) {
+ 		cfs_rq = cfs_rq_of(se);
+@@ -13118,6 +13531,8 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
+ 	if (static_branch_unlikely(&sched_numa_balancing))
+ 		task_tick_numa(rq, curr);
+ 
++	task_tick_cache(rq, curr);
++
+ 	update_misfit_status(curr, rq);
+ 	check_update_overutilized_status(task_rq(curr));
+ 
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 3c12d9f93..d2af7bfd3 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -87,6 +87,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
+  */
+ SCHED_FEAT(SIS_UTIL, true)
+ 
++SCHED_FEAT(SCHED_CACHE, true)
+ /*
+  * Issue a WARN when we do multiple update_rq_clock() calls
+  * in a single rq->lock section. Default disabled because the
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 1aa65a0ac..1b7cb7049 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1177,6 +1177,12 @@ struct rq {
+ 	u64			clock_pelt_idle_copy;
+ 	u64			clock_idle_copy;
+ #endif
++#ifdef CONFIG_SCHED_CACHE
++	raw_spinlock_t		cpu_epoch_lock;
++	u64			cpu_runtime;
++	unsigned long		cpu_epoch;
++	unsigned long		cpu_epoch_next;
++#endif
+ 
+ 	atomic_t		nr_iowait;
+ 
+@@ -3903,6 +3909,8 @@ static inline void task_tick_mm_cid(struct rq *rq, struct task_struct *curr) { }
+ static inline void init_sched_mm_cid(struct task_struct *t) { }
+ #endif /* !CONFIG_SCHED_MM_CID */
+ 
++extern void init_sched_mm(struct task_struct *p);
++
+ extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
+ extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+ #ifdef CONFIG_SMP
+-- 
+2.49.0
+
