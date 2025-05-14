@@ -1,0 +1,4335 @@
+From e4aa837b5e8006b79cb1bbc108687a96912abe3b Mon Sep 17 00:00:00 2001
+From: Andrey Smirnov <andrew.smirnov@gmail.com>
+Date: Sun, 27 Feb 2022 14:46:08 -0800
+Subject: [PATCH 01/34] extcon: Add driver for Steam Deck
+
+(cherry picked from commit f9f2eddae582ae39d5f89c1218448fc259b90aa8)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Alexandre Frade <kernel@xanmod.org>
+---
+ drivers/extcon/Kconfig            |   7 ++
+ drivers/extcon/Makefile           |   1 +
+ drivers/extcon/extcon-steamdeck.c | 180 ++++++++++++++++++++++++++++++
+ 3 files changed, 188 insertions(+)
+ create mode 100644 drivers/extcon/extcon-steamdeck.c
+
+diff --git a/drivers/extcon/Kconfig b/drivers/extcon/Kconfig
+index a6f6d467a..4adec844c 100644
+--- a/drivers/extcon/Kconfig
++++ b/drivers/extcon/Kconfig
+@@ -214,4 +214,11 @@ config EXTCON_RTK_TYPE_C
+ 	  The DHC (Digital Home Hub) RTD series SoC contains a type c module.
+ 	  This driver will detect the status of the type-c port.
+ 
++config EXTCON_STEAMDECK
++	tristate "Steam Deck extcon support"
++	depends on MFD_STEAMDECK
++	help
++	  Say Y here to enable support of USB Type C cable detection extcon
++	  support on Steam Deck devices
++
+ endif
+diff --git a/drivers/extcon/Makefile b/drivers/extcon/Makefile
+index 0d6d23faf..6eb613e0b 100644
+--- a/drivers/extcon/Makefile
++++ b/drivers/extcon/Makefile
+@@ -27,3 +27,4 @@ obj-$(CONFIG_EXTCON_USB_GPIO)	+= extcon-usb-gpio.o
+ obj-$(CONFIG_EXTCON_USBC_CROS_EC) += extcon-usbc-cros-ec.o
+ obj-$(CONFIG_EXTCON_USBC_TUSB320) += extcon-usbc-tusb320.o
+ obj-$(CONFIG_EXTCON_RTK_TYPE_C) += extcon-rtk-type-c.o
++obj-$(CONFIG_EXTCON_STEAMDECK)  += extcon-steamdeck.o
+diff --git a/drivers/extcon/extcon-steamdeck.c b/drivers/extcon/extcon-steamdeck.c
+new file mode 100644
+index 000000000..49cb5d30b
+--- /dev/null
++++ b/drivers/extcon/extcon-steamdeck.c
+@@ -0,0 +1,180 @@
++
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++#include <linux/extcon-provider.h>
++
++#define ACPI_STEAMDECK_NOTIFY_STATUS	0x80
++
++/* 0 - port connected, 1 -port disconnected */
++#define ACPI_STEAMDECK_PORT_CONNECT	BIT(0)
++/* 0 - Upstream Facing Port, 1 - Downdstream Facing Port */
++#define ACPI_STEAMDECK_CUR_DATA_ROLE	BIT(3)
++/*
++ * Debouncing delay to allow negotiation process to settle. 2s value
++ * was arrived at via trial and error.
++ */
++#define STEAMDECK_ROLE_SWITCH_DELAY	(msecs_to_jiffies(2000))
++
++struct steamdeck_extcon {
++	struct acpi_device *adev;
++	struct delayed_work role_work;
++	struct extcon_dev *edev;
++	struct device *dev;
++};
++
++static int steamdeck_read_pdcs(struct steamdeck_extcon *sd, unsigned long long *pdcs)
++{
++	acpi_status status;
++
++	status = acpi_evaluate_integer(sd->adev->handle, "PDCS", NULL, pdcs);
++	if (ACPI_FAILURE(status)) {
++		dev_err(sd->dev, "PDCS evaluation failed: %s\n",
++			acpi_format_exception(status));
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static void steamdeck_usb_role_work(struct work_struct *work)
++{
++	struct steamdeck_extcon *sd =
++		container_of(work, struct steamdeck_extcon, role_work.work);
++	unsigned long long pdcs;
++	bool usb_host;
++
++	if (steamdeck_read_pdcs(sd, &pdcs))
++		return;
++
++	/*
++	 * We only care about these two
++	 */
++	pdcs &= ACPI_STEAMDECK_PORT_CONNECT | ACPI_STEAMDECK_CUR_DATA_ROLE;
++
++	/*
++	 * For "connect" events our role is determined by a bit in
++	 * PDCS, for "disconnect" we switch to being a gadget
++	 * unconditionally. The thinking for the latter is we don't
++	 * want to start acting as a USB host until we get
++	 * confirmation from the firmware that we are a USB host
++	 */
++	usb_host = (pdcs & ACPI_STEAMDECK_PORT_CONNECT) ?
++		pdcs & ACPI_STEAMDECK_CUR_DATA_ROLE : false;
++
++	dev_dbg(sd->dev, "USB role is %s\n", usb_host ? "host" : "device");
++	WARN_ON(extcon_set_state_sync(sd->edev, EXTCON_USB_HOST,
++				      usb_host));
++
++}
++
++static void steamdeck_notify(acpi_handle handle, u32 event, void *context)
++{
++	struct device *dev = context;
++	struct steamdeck_extcon *sd = dev_get_drvdata(dev);
++	unsigned long long pdcs;
++	unsigned long delay;
++
++	switch (event) {
++	case ACPI_STEAMDECK_NOTIFY_STATUS:
++		if (steamdeck_read_pdcs(sd, &pdcs))
++			return;
++		/*
++		 * We process "disconnect" events immediately and
++		 * "connect" events with a delay to give the HW time
++		 * to settle. For example attaching USB hub (at least
++		 * for HW used for testing) will generate intermediary
++		 * event with "host" bit not set, followed by the one
++		 * that does have it set.
++		 */
++		delay = (pdcs & ACPI_STEAMDECK_PORT_CONNECT) ?
++			STEAMDECK_ROLE_SWITCH_DELAY : 0;
++
++		queue_delayed_work(system_long_wq, &sd->role_work, delay);
++		break;
++	default:
++		dev_warn(dev, "Unsupported event [0x%x]\n", event);
++	}
++}
++
++static void steamdeck_remove_notify_handler(void *data)
++{
++	struct steamdeck_extcon *sd = data;
++
++	acpi_remove_notify_handler(sd->adev->handle, ACPI_DEVICE_NOTIFY,
++				   steamdeck_notify);
++	cancel_delayed_work_sync(&sd->role_work);
++}
++
++static const unsigned int steamdeck_extcon_cable[] = {
++	EXTCON_USB,
++	EXTCON_USB_HOST,
++	EXTCON_CHG_USB_SDP,
++	EXTCON_CHG_USB_CDP,
++	EXTCON_CHG_USB_DCP,
++	EXTCON_CHG_USB_ACA,
++	EXTCON_NONE,
++};
++
++static int steamdeck_extcon_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct steamdeck_extcon *sd;
++	acpi_status status;
++	int ret;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++
++	INIT_DELAYED_WORK(&sd->role_work, steamdeck_usb_role_work);
++	platform_set_drvdata(pdev, sd);
++	sd->adev = ACPI_COMPANION(dev->parent);
++	sd->dev  = dev;
++	sd->edev = devm_extcon_dev_allocate(dev, steamdeck_extcon_cable);
++	if (IS_ERR(sd->edev))
++		return PTR_ERR(sd->edev);
++
++	ret = devm_extcon_dev_register(dev, sd->edev);
++	if (ret < 0) {
++		dev_err(dev, "Failed to register extcon device: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Set initial role value
++	 */
++	queue_delayed_work(system_long_wq, &sd->role_work, 0);
++	flush_delayed_work(&sd->role_work);
++
++	status = acpi_install_notify_handler(sd->adev->handle,
++					     ACPI_DEVICE_NOTIFY,
++					     steamdeck_notify,
++					     dev);
++	if (ACPI_FAILURE(status)) {
++		dev_err(dev, "Error installing ACPI notify handler\n");
++		return -EIO;
++	}
++
++	ret = devm_add_action_or_reset(dev, steamdeck_remove_notify_handler,
++				       sd);
++	return ret;
++}
++
++static const struct platform_device_id steamdeck_extcon_id_table[] = {
++	{ .name = "steamdeck-extcon" },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, steamdeck_extcon_id_table);
++
++static struct platform_driver steamdeck_extcon_driver = {
++	.probe = steamdeck_extcon_probe,
++	.driver = {
++		.name = "steamdeck-extcon",
++	},
++	.id_table = steamdeck_extcon_id_table,
++};
++module_platform_driver(steamdeck_extcon_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck extcon driver");
++MODULE_LICENSE("GPL");
+-- 
+2.49.0
+
+
+From 991a835da7dca00c7f697eb05be15181dfc07bcd Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 10 May 2024 22:51:54 +0200
+Subject: [PATCH 02/34] hwmon: Add driver for Steam Deck's EC sensors
+
+Add driver for sensors exposed by EC firmware on Steam Deck hardware.
+
+(cherry picked from commit 6917aac77bee6185ae3920b936cdbe7876118c0b)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/hwmon/Kconfig           |  11 ++
+ drivers/hwmon/Makefile          |   1 +
+ drivers/hwmon/steamdeck-hwmon.c | 224 ++++++++++++++++++++++++++++++++
+ 3 files changed, 236 insertions(+)
+ create mode 100644 drivers/hwmon/steamdeck-hwmon.c
+
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index 4cbaba15d..12bfba749 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -2089,6 +2089,17 @@ config SENSORS_SCH5636
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called sch5636.
+ 
++config SENSORS_STEAMDECK
++	tristate "Steam Deck EC sensors"
++	depends on MFD_STEAMDECK
++	help
++	  If you say yes here you get support for the hardware
++	  monitoring features exposed by EC firmware on Steam Deck
++	  devices
++
++	  This driver can also be built as a module. If so, the module
++	  will be called steamdeck-hwmon.
++
+ config SENSORS_STTS751
+ 	tristate "ST Microelectronics STTS751"
+ 	depends on I2C
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+index b7ef0f056..664e79b09 100644
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -210,6 +210,7 @@ obj-$(CONFIG_SENSORS_SMSC47B397)+= smsc47b397.o
+ obj-$(CONFIG_SENSORS_SMSC47M1)	+= smsc47m1.o
+ obj-$(CONFIG_SENSORS_SMSC47M192)+= smsc47m192.o
+ obj-$(CONFIG_SENSORS_SPARX5)	+= sparx5-temp.o
++obj-$(CONFIG_SENSORS_STEAMDECK) += steamdeck-hwmon.o
+ obj-$(CONFIG_SENSORS_SPD5118)	+= spd5118.o
+ obj-$(CONFIG_SENSORS_STTS751)	+= stts751.o
+ obj-$(CONFIG_SENSORS_SURFACE_FAN)+= surface_fan.o
+diff --git a/drivers/hwmon/steamdeck-hwmon.c b/drivers/hwmon/steamdeck-hwmon.c
+new file mode 100644
+index 000000000..fab9e9460
+--- /dev/null
++++ b/drivers/hwmon/steamdeck-hwmon.c
+@@ -0,0 +1,224 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Steam Deck EC sensors driver
++ *
++ * Copyright (C) 2021-2022 Valve Corporation
++ */
++
++#include <linux/acpi.h>
++#include <linux/hwmon.h>
++#include <linux/platform_device.h>
++
++#define STEAMDECK_HWMON_NAME	"steamdeck-hwmon"
++
++struct steamdeck_hwmon {
++	struct acpi_device *adev;
++};
++
++static long
++steamdeck_hwmon_get(struct steamdeck_hwmon *sd, const char *method)
++{
++	unsigned long long val;
++	if (ACPI_FAILURE(acpi_evaluate_integer(sd->adev->handle,
++					       (char *)method, NULL, &val)))
++		return -EIO;
++
++	return val;
++}
++
++static int
++steamdeck_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
++		     u32 attr, int channel, long *out)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++
++	switch (type) {
++	case hwmon_curr:
++		if (attr != hwmon_curr_input)
++			return -EOPNOTSUPP;
++
++		*out = steamdeck_hwmon_get(sd, "PDAM");
++		if (*out < 0)
++			return *out;
++		break;
++	case hwmon_in:
++		if (attr != hwmon_in_input)
++			return -EOPNOTSUPP;
++
++		*out = steamdeck_hwmon_get(sd, "PDVL");
++		if (*out < 0)
++			return *out;
++		break;
++	case hwmon_temp:
++		if (attr != hwmon_temp_input)
++			return -EOPNOTSUPP;
++
++		*out = steamdeck_hwmon_get(sd, "BATT");
++		if (*out < 0)
++			return *out;
++		/*
++		 * Assuming BATT returns deg C we need to mutiply it
++		 * by 1000 to convert to mC
++		 */
++		*out *= 1000;
++		break;
++	case hwmon_fan:
++		switch (attr) {
++		case hwmon_fan_input:
++			*out = steamdeck_hwmon_get(sd, "FANR");
++			if (*out < 0)
++				return *out;
++			break;
++		case hwmon_fan_target:
++			*out = steamdeck_hwmon_get(sd, "FSSR");
++			if (*out < 0)
++				return *out;
++			break;
++		case hwmon_fan_fault:
++			*out = steamdeck_hwmon_get(sd, "FANC");
++			if (*out < 0)
++				return *out;
++			/*
++			 * FANC (Fan check):
++			 * 0: Abnormal
++			 * 1: Normal
++			 */
++			*out = !*out;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
++static int
++steamdeck_hwmon_read_string(struct device *dev, enum hwmon_sensor_types type,
++			    u32 attr, int channel, const char **str)
++{
++	switch (type) {
++		/*
++		 * These two aren't, strictly speaking, measured. EC
++		 * firmware just reports what PD negotiation resulted
++		 * in.
++		 */
++	case hwmon_curr:
++		*str = "PD Contract Current";
++		break;
++	case hwmon_in:
++		*str = "PD Contract Voltage";
++		break;
++	case hwmon_temp:
++		*str = "Battery Temp";
++		break;
++	case hwmon_fan:
++		*str = "System Fan";
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
++static int
++steamdeck_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
++		      u32 attr, int channel, long val)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++
++	if (type != hwmon_fan ||
++	    attr != hwmon_fan_target)
++		return -EOPNOTSUPP;
++
++	val = clamp_val(val, 0, 7300);
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    "FANS", val)))
++		return -EIO;
++
++	return 0;
++}
++
++static umode_t
++steamdeck_hwmon_is_visible(const void *data, enum hwmon_sensor_types type,
++			   u32 attr, int channel)
++{
++	if (type == hwmon_fan &&
++	    attr == hwmon_fan_target)
++		return 0644;
++
++	return 0444;
++}
++
++static const struct hwmon_channel_info *steamdeck_hwmon_info[] = {
++	HWMON_CHANNEL_INFO(in,
++			   HWMON_I_INPUT | HWMON_I_LABEL),
++	HWMON_CHANNEL_INFO(curr,
++			   HWMON_C_INPUT | HWMON_C_LABEL),
++	HWMON_CHANNEL_INFO(temp,
++			   HWMON_T_INPUT | HWMON_T_LABEL),
++	HWMON_CHANNEL_INFO(fan,
++			   HWMON_F_INPUT | HWMON_F_LABEL |
++			   HWMON_F_TARGET | HWMON_F_FAULT),
++	NULL
++};
++
++static const struct hwmon_ops steamdeck_hwmon_ops = {
++	.is_visible = steamdeck_hwmon_is_visible,
++	.read = steamdeck_hwmon_read,
++	.read_string = steamdeck_hwmon_read_string,
++	.write = steamdeck_hwmon_write,
++};
++
++static const struct hwmon_chip_info steamdeck_hwmon_chip_info = {
++	.ops = &steamdeck_hwmon_ops,
++	.info = steamdeck_hwmon_info,
++};
++
++static int steamdeck_hwmon_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct steamdeck_hwmon *sd;
++	struct device *hwmon;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++
++	sd->adev = ACPI_COMPANION(dev->parent);
++	hwmon = devm_hwmon_device_register_with_info(dev,
++						     "steamdeck_hwmon",
++						     sd,
++						     &steamdeck_hwmon_chip_info,
++						     NULL);
++	if (IS_ERR(hwmon)) {
++		dev_err(dev, "Failed to register HWMON device");
++		return PTR_ERR(hwmon);
++	}
++
++	return 0;
++}
++
++static const struct platform_device_id steamdeck_hwmon_id_table[] = {
++	{ .name = STEAMDECK_HWMON_NAME },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, steamdeck_hwmon_id_table);
++
++static struct platform_driver steamdeck_hwmon_driver = {
++	.probe = steamdeck_hwmon_probe,
++	.driver = {
++		.name = STEAMDECK_HWMON_NAME,
++	},
++	.id_table = steamdeck_hwmon_id_table,
++};
++module_platform_driver(steamdeck_hwmon_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck EC sensors driver");
++MODULE_LICENSE("GPL");
+-- 
+2.49.0
+
+
+From 8c330db12b72e5c1b37b13699b1bc4dda1337db5 Mon Sep 17 00:00:00 2001
+From: Andrey Smirnov <andrew.smirnov@gmail.com>
+Date: Sat, 15 Jul 2023 12:58:54 -0700
+Subject: [PATCH 03/34] hwmon: steamdeck-hwmon: Add support for max battery
+ level/rate
+
+Add support for max battery level/charge rate attributes.
+
+Signed-off-by: Andrey Smirnov <andrew.smirnov@gmail.com>
+(cherry picked from commit 50af83e8fd75dc52221edd3fb6fd7a7f70c4d8a4)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Alexandre Frade <kernel@xanmod.org>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/hwmon/steamdeck-hwmon.c | 72 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/hwmon/steamdeck-hwmon.c b/drivers/hwmon/steamdeck-hwmon.c
+index fab9e9460..9d0a5471b 100644
+--- a/drivers/hwmon/steamdeck-hwmon.c
++++ b/drivers/hwmon/steamdeck-hwmon.c
+@@ -180,6 +180,76 @@ static const struct hwmon_chip_info steamdeck_hwmon_chip_info = {
+ 	.info = steamdeck_hwmon_info,
+ };
+ 
++
++static ssize_t
++steamdeck_hwmon_simple_store(struct device *dev, const char *buf, size_t count,
++			     const char *method,
++			     unsigned long upper_limit)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++	unsigned long value;
++
++	if (kstrtoul(buf, 10, &value) || value >= upper_limit)
++		return -EINVAL;
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    (char *)method, value)))
++		return -EIO;
++
++	return count;
++}
++
++static ssize_t
++steamdeck_hwmon_simple_show(struct device *dev, char *buf,
++			    const char *method)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++	unsigned long value;
++
++	value = steamdeck_hwmon_get(sd, method);
++	if (value < 0)
++		return value;
++
++	return sprintf(buf, "%ld\n", value);
++}
++
++#define STEAMDECK_HWMON_ATTR_RW(_name, _set_method, _get_method,	\
++				_upper_limit)				\
++	static ssize_t _name##_show(struct device *dev,			\
++				    struct device_attribute *attr,	\
++				    char *buf)				\
++	{								\
++		return steamdeck_hwmon_simple_show(dev, buf,		\
++						   _get_method);	\
++	}								\
++	static ssize_t _name##_store(struct device *dev,		\
++				     struct device_attribute *attr,	\
++				     const char *buf, size_t count)	\
++	{								\
++		return steamdeck_hwmon_simple_store(dev, buf, count,	\
++						    _set_method,	\
++						    _upper_limit);	\
++	}								\
++	static DEVICE_ATTR_RW(_name)
++
++STEAMDECK_HWMON_ATTR_RW(max_battery_charge_level, "FCBL", "SFBL", 101);
++STEAMDECK_HWMON_ATTR_RW(max_battery_charge_rate,  "CHGR", "GCHR", 101);
++
++static struct attribute *steamdeck_hwmon_attributes[] = {
++	&dev_attr_max_battery_charge_level.attr,
++	&dev_attr_max_battery_charge_rate.attr,
++	NULL
++};
++
++static const struct attribute_group steamdeck_hwmon_group = {
++	.attrs = steamdeck_hwmon_attributes,
++};
++
++static const struct attribute_group *steamdeck_hwmon_groups[] = {
++	&steamdeck_hwmon_group,
++	NULL
++};
++
+ static int steamdeck_hwmon_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -195,7 +265,7 @@ static int steamdeck_hwmon_probe(struct platform_device *pdev)
+ 						     "steamdeck_hwmon",
+ 						     sd,
+ 						     &steamdeck_hwmon_chip_info,
+-						     NULL);
++						     steamdeck_hwmon_groups);
+ 	if (IS_ERR(hwmon)) {
+ 		dev_err(dev, "Failed to register HWMON device");
+ 		return PTR_ERR(hwmon);
+-- 
+2.49.0
+
+
+From d4106c6eea1167955a90615ab5851ce2b289ddfd Mon Sep 17 00:00:00 2001
+From: Andrey Smirnov <andrew.smirnov@gmail.com>
+Date: Sun, 27 Feb 2022 12:58:05 -0800
+Subject: [PATCH 04/34] leds: steamdeck: Add support for Steam Deck LED
+
+(cherry picked from commit 85a86d19aa7022ff0555023d53aef78323a42d0c)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Alexandre Frade <kernel@xanmod.org>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/leds/Kconfig          |  7 ++++
+ drivers/leds/Makefile         |  1 +
+ drivers/leds/leds-steamdeck.c | 74 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 82 insertions(+)
+ create mode 100644 drivers/leds/leds-steamdeck.c
+
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index 2b27d0439..e39a279d5 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -1003,6 +1003,13 @@ config LEDS_ACER_A500
+ 	  This option enables support for the Power Button LED of
+ 	  Acer Iconia Tab A500.
+ 
++config LEDS_STEAMDECK
++	tristate "LED support for Steam Deck"
++	depends on LEDS_CLASS && MFD_STEAMDECK
++	help
++	  This option enabled support for the status LED (next to the
++	  power button) on Steam Deck
++
+ source "drivers/leds/blink/Kconfig"
+ 
+ comment "Flash and Torch LED drivers"
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index 6ad52e219..2ec1c8913 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -84,6 +84,7 @@ obj-$(CONFIG_LEDS_QNAP_MCU)		+= leds-qnap-mcu.o
+ obj-$(CONFIG_LEDS_REGULATOR)		+= leds-regulator.o
+ obj-$(CONFIG_LEDS_SC27XX_BLTC)		+= leds-sc27xx-bltc.o
+ obj-$(CONFIG_LEDS_ST1202)		+= leds-st1202.o
++obj-$(CONFIG_LEDS_STEAMDECK)		+= leds-steamdeck.o
+ obj-$(CONFIG_LEDS_SUN50I_A100)		+= leds-sun50i-a100.o
+ obj-$(CONFIG_LEDS_SUNFIRE)		+= leds-sunfire.o
+ obj-$(CONFIG_LEDS_SYSCON)		+= leds-syscon.o
+diff --git a/drivers/leds/leds-steamdeck.c b/drivers/leds/leds-steamdeck.c
+new file mode 100644
+index 000000000..56d31d2dd
+--- /dev/null
++++ b/drivers/leds/leds-steamdeck.c
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++/*
++ * Steam Deck EC MFD LED cell driver
++ *
++ * Copyright (C) 2021-2022 Valve Corporation
++ *
++ */
++
++#include <linux/acpi.h>
++#include <linux/leds.h>
++#include <linux/platform_device.h>
++
++struct steamdeck_led {
++	struct acpi_device *adev;
++	struct led_classdev cdev;
++};
++
++static int steamdeck_leds_brightness_set(struct led_classdev *cdev,
++					 enum led_brightness value)
++{
++	struct steamdeck_led *sd = container_of(cdev, struct steamdeck_led,
++						cdev);
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    "CHBV", value)))
++		return -EIO;
++
++	return 0;
++}
++
++static int steamdeck_leds_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct steamdeck_led *sd;
++	int ret;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++
++	sd->adev = ACPI_COMPANION(dev->parent);
++
++	sd->cdev.name = "status:white";
++	sd->cdev.brightness_set_blocking = steamdeck_leds_brightness_set;
++	sd->cdev.max_brightness = 100;
++
++	ret = devm_led_classdev_register(dev, &sd->cdev);
++	if (ret) {
++		dev_err(dev, "Failed to register LEDs device: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static const struct platform_device_id steamdeck_leds_id_table[] = {
++	{ .name = "steamdeck-leds" },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, steamdeck_leds_id_table);
++
++static struct platform_driver steamdeck_leds_driver = {
++	.probe = steamdeck_leds_probe,
++	.driver = {
++		.name = "steamdeck-leds",
++	},
++	.id_table = steamdeck_leds_id_table,
++};
++module_platform_driver(steamdeck_leds_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck LEDs driver");
++MODULE_LICENSE("GPL");
+-- 
+2.49.0
+
+
+From fe8214b917d3263e9cf76b836f31e66a504aa3ca Mon Sep 17 00:00:00 2001
+From: Andrey Smirnov <andrew.smirnov@gmail.com>
+Date: Sat, 19 Feb 2022 16:08:36 -0800
+Subject: [PATCH 05/34] mfd: Add MFD core driver for Steam Deck
+
+Add MFD core driver for Steam Deck. Doesn't really do much so far
+besides instantiating a number of MFD cells that implement all the
+interesting functionality.
+
+(cherry picked from commit 5f534c2d6ebdefccb9c024eb0f013bc1c0c622d9)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Alexandre Frade <kernel@xanmod.org>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/mfd/Kconfig     |  11 ++++
+ drivers/mfd/Makefile    |   2 +
+ drivers/mfd/steamdeck.c | 127 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 140 insertions(+)
+ create mode 100644 drivers/mfd/steamdeck.c
+
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index 6b0682af6..d4ce0aaa6 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -2439,5 +2439,16 @@ config MFD_UPBOARD_FPGA
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called upboard-fpga.
+ 
++config MFD_STEAMDECK
++	tristate "Valve Steam Deck"
++	select MFD_CORE
++	depends on ACPI
++	depends on X86_64 || COMPILE_TEST
++	help
++	  This driver registers various MFD cells that expose aspects
++	  of Steam Deck specific ACPI functionality.
++
++	  Say N here, unless you are running on Steam Deck hardware.
++
+ endmenu
+ endif
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index 9220eaf7c..16f91a3e1 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -293,4 +293,6 @@ obj-$(CONFIG_MFD_QNAP_MCU)	+= qnap-mcu.o
+ obj-$(CONFIG_MFD_RSMU_I2C)	+= rsmu_i2c.o rsmu_core.o
+ obj-$(CONFIG_MFD_RSMU_SPI)	+= rsmu_spi.o rsmu_core.o
+ 
++obj-$(CONFIG_MFD_STEAMDECK)	+= steamdeck.o
++
+ obj-$(CONFIG_MFD_UPBOARD_FPGA)	+= upboard-fpga.o
+diff --git a/drivers/mfd/steamdeck.c b/drivers/mfd/steamdeck.c
+new file mode 100644
+index 000000000..0e504b3c2
+--- /dev/null
++++ b/drivers/mfd/steamdeck.c
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++/*
++ * Steam Deck EC MFD core driver
++ *
++ * Copyright (C) 2021-2022 Valve Corporation
++ *
++ */
++
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++#include <linux/mfd/core.h>
++
++#define STEAMDECK_STA_OK			\
++	(ACPI_STA_DEVICE_ENABLED |		\
++	 ACPI_STA_DEVICE_PRESENT |		\
++	 ACPI_STA_DEVICE_FUNCTIONING)
++
++struct steamdeck {
++	struct acpi_device *adev;
++	struct device *dev;
++};
++
++#define STEAMDECK_ATTR_RO(_name, _method)				\
++	static ssize_t _name##_show(struct device *dev,			\
++				    struct device_attribute *attr,	\
++				    char *buf)				\
++	{								\
++		struct steamdeck *sd = dev_get_drvdata(dev);		\
++		unsigned long long val;					\
++									\
++		if (ACPI_FAILURE(acpi_evaluate_integer(			\
++					 sd->adev->handle,		\
++					 _method, NULL, &val)))		\
++			return -EIO;					\
++									\
++		return sysfs_emit(buf, "%llu\n", val);			\
++	}								\
++	static DEVICE_ATTR_RO(_name)
++
++STEAMDECK_ATTR_RO(firmware_version, "PDFW");
++STEAMDECK_ATTR_RO(board_id, "BOID");
++
++static struct attribute *steamdeck_attrs[] = {
++	&dev_attr_firmware_version.attr,
++	&dev_attr_board_id.attr,
++	NULL
++};
++
++ATTRIBUTE_GROUPS(steamdeck);
++
++static const struct mfd_cell steamdeck_cells[] = {
++	{ .name = "steamdeck-hwmon"  },
++	{ .name = "steamdeck-leds"   },
++	{ .name = "steamdeck-extcon" },
++};
++
++static void steamdeck_remove_sysfs_groups(void *data)
++{
++	struct steamdeck *sd = data;
++
++	sysfs_remove_groups(&sd->dev->kobj, steamdeck_groups);
++}
++
++static int steamdeck_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	unsigned long long sta;
++	struct steamdeck *sd;
++	acpi_status status;
++	int ret;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++	sd->adev = ACPI_COMPANION(dev);
++	sd->dev = dev;
++	platform_set_drvdata(pdev, sd);
++
++	status = acpi_evaluate_integer(sd->adev->handle, "_STA",
++				       NULL, &sta);
++	if (ACPI_FAILURE(status)) {
++		dev_err(dev, "Status check failed (0x%x)\n", status);
++		return -EINVAL;
++	}
++
++	if ((sta & STEAMDECK_STA_OK) != STEAMDECK_STA_OK) {
++		dev_err(dev, "Device is not ready\n");
++		return -EINVAL;
++	}
++
++	ret = sysfs_create_groups(&dev->kobj, steamdeck_groups);
++	if (ret) {
++		dev_err(dev, "Failed to create sysfs group\n");
++		return ret;
++	}
++
++	ret = devm_add_action_or_reset(dev, steamdeck_remove_sysfs_groups,
++				       sd);
++	if (ret) {
++		dev_err(dev, "Failed to register devres action\n");
++		return ret;
++	}
++
++	return devm_mfd_add_devices(dev, PLATFORM_DEVID_NONE,
++				    steamdeck_cells, ARRAY_SIZE(steamdeck_cells),
++				    NULL, 0, NULL);
++}
++
++static const struct acpi_device_id steamdeck_device_ids[] = {
++	{ "VLV0100", 0 },
++	{ "", 0 },
++};
++MODULE_DEVICE_TABLE(acpi, steamdeck_device_ids);
++
++static struct platform_driver steamdeck_driver = {
++	.probe = steamdeck_probe,
++	.driver = {
++		.name = "steamdeck",
++		.acpi_match_table = steamdeck_device_ids,
++	},
++};
++module_platform_driver(steamdeck_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck EC MFD core driver");
++MODULE_LICENSE("GPL");
+-- 
+2.49.0
+
+
+From d3daeb13e3bbc00a3cc9d1f8db2ea2ffd7cc0c51 Mon Sep 17 00:00:00 2001
+From: Andrey Smirnov <andrew.smirnov@gmail.com>
+Date: Sun, 24 Sep 2023 15:02:33 -0700
+Subject: [PATCH 06/34] mfd: steamdeck: Expose controller board power in sysfs
+
+As of version 118 Deck's BIOS implements "SCBP" method that allows
+gating power of the controller board (VBUS). Add a basic WO method to
+our root MFD device to allow toggling that.
+
+Signed-off-by: Andrey Smirnov <andrew.smirnov@gmail.com>
+(cherry picked from commit f97f32718acc10cbb51fef925842392e80904d74)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Alexandre Frade <kernel@xanmod.org>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/mfd/steamdeck.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/drivers/mfd/steamdeck.c b/drivers/mfd/steamdeck.c
+index 0e504b3c2..a60fa7db9 100644
+--- a/drivers/mfd/steamdeck.c
++++ b/drivers/mfd/steamdeck.c
+@@ -41,9 +41,29 @@ struct steamdeck {
+ STEAMDECK_ATTR_RO(firmware_version, "PDFW");
+ STEAMDECK_ATTR_RO(board_id, "BOID");
+ 
++static ssize_t controller_board_power_store(struct device *dev,
++					    struct device_attribute *attr,
++					    const char *buf, size_t count)
++{
++	struct steamdeck *sd = dev_get_drvdata(dev);
++	bool enabled;
++	ssize_t ret = kstrtobool(buf, &enabled);
++
++	if (ret)
++		return ret;
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    "SCBP", enabled)))
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_WO(controller_board_power);
++
+ static struct attribute *steamdeck_attrs[] = {
+ 	&dev_attr_firmware_version.attr,
+ 	&dev_attr_board_id.attr,
++	&dev_attr_controller_board_power.attr,
+ 	NULL
+ };
+ 
+-- 
+2.49.0
+
+
+From 8719f4f92c6a516d09c3de3543ef58df421b2c0b Mon Sep 17 00:00:00 2001
+From: Jeremy Selan <jeremys@valvesoftware.com>
+Date: Wed, 28 Apr 2021 14:33:36 -0700
+Subject: [PATCH 07/34] drm/amd: bump backlight brightness precision from 8 ->
+ 16-bits
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+[Fwd-ported to DC_VER 3.2.237]
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h          |  2 --
+ drivers/gpu/drm/amd/amdgpu/atombios_encoders.c    | 10 +++++++---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  3 +++
+ 3 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index 5e3faefc5..09748a2c5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -435,8 +435,6 @@ struct amdgpu_mode_info {
+ 	struct drm_property *regamma_tf_property;
+ };
+ 
+-#define AMDGPU_MAX_BL_LEVEL 0xFF
+-
+ struct amdgpu_backlight_privdata {
+ 	struct amdgpu_encoder *encoder;
+ 	uint8_t negative;
+diff --git a/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c b/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c
+index a51f3414b..bc0f9759c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c
++++ b/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c
+@@ -39,6 +39,10 @@
+ #include <linux/backlight.h>
+ #include "bif/bif_4_1_d.h"
+ 
++
++/* Maximum backlight level. */
++#define AMDGPU_ATOM_MAX_BL_LEVEL 0xFF
++
+ u8
+ amdgpu_atombios_encoder_get_backlight_level_from_reg(struct amdgpu_device *adev)
+ {
+@@ -127,8 +131,8 @@ static u8 amdgpu_atombios_encoder_backlight_level(struct backlight_device *bd)
+ 	/* Convert brightness to hardware level */
+ 	if (bd->props.brightness < 0)
+ 		level = 0;
+-	else if (bd->props.brightness > AMDGPU_MAX_BL_LEVEL)
+-		level = AMDGPU_MAX_BL_LEVEL;
++	else if (bd->props.brightness > AMDGPU_ATOM_MAX_BL_LEVEL)
++		level = AMDGPU_ATOM_MAX_BL_LEVEL;
+ 	else
+ 		level = bd->props.brightness;
+ 
+@@ -198,7 +202,7 @@ void amdgpu_atombios_encoder_init_backlight(struct amdgpu_encoder *amdgpu_encode
+ 	}
+ 
+ 	memset(&props, 0, sizeof(props));
+-	props.max_brightness = AMDGPU_MAX_BL_LEVEL;
++	props.max_brightness = AMDGPU_ATOM_MAX_BL_LEVEL;
+ 	props.type = BACKLIGHT_RAW;
+ 	snprintf(bl_name, sizeof(bl_name),
+ 		 "amdgpu_bl%d", dev->primary->index);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 2dbd71fba..f0131c3d6 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -164,6 +164,9 @@ MODULE_FIRMWARE(FIRMWARE_DCN_401_DMUB);
+ /* Number of bytes in PSP footer for firmware. */
+ #define PSP_FOOTER_BYTES 0x100
+ 
++/* Maximum backlight level. */
++#define AMDGPU_MAX_BL_LEVEL 0xFFFF
++
+ /**
+  * DOC: overview
+  *
+-- 
+2.49.0
+
+
+From d9ff85cb14eb66b7f6fdb97803c398d144a45e29 Mon Sep 17 00:00:00 2001
+From: Jeremy Selan <jeremys@valvesoftware.com>
+Date: Fri, 12 Nov 2021 10:03:20 -0800
+Subject: [PATCH 08/34] amd/drm: override backlight min value from 12 -> 0
+
+This overrides backlight handling to the FULL range of the device {0,max}
+with no additional interpretation / rescaling. This places the burden
+of selecting appropriate device-specific minimum ranges fully on
+userspace.
+
+Device defaults provided by ACPI/ATIF are logged, but ignored.
+
+[Merge, add line breaks]
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 25 ++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index f0131c3d6..8b2a53075 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -4680,7 +4680,7 @@ static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
+-#define AMDGPU_DM_DEFAULT_MIN_BACKLIGHT 12
++#define AMDGPU_DM_DEFAULT_MIN_BACKLIGHT 0
+ #define AMDGPU_DM_DEFAULT_MAX_BACKLIGHT 255
+ #define AMDGPU_DM_MIN_SPREAD ((AMDGPU_DM_DEFAULT_MAX_BACKLIGHT - AMDGPU_DM_DEFAULT_MIN_BACKLIGHT) / 2)
+ #define AUX_BL_DEFAULT_TRANSITION_TIME_MS 50
+@@ -4714,11 +4714,27 @@ static void amdgpu_dm_update_backlight_caps(struct amdgpu_display_manager *dm,
+ 
+ 	if (caps.caps_valid) {
+ 		dm->backlight_caps[bl_idx].caps_valid = true;
++
++		printk(KERN_NOTICE"VLV Successfully queried backlight range over ACPI: %d %d\n",
++		       (int) caps.min_input_signal, (int) caps.max_input_signal);
++
++		if ( caps.min_input_signal != AMDGPU_DM_DEFAULT_MIN_BACKLIGHT ||
++			caps.max_input_signal != AMDGPU_DM_DEFAULT_MAX_BACKLIGHT )
++		{
++			caps.min_input_signal = AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
++			caps.max_input_signal = AMDGPU_DM_DEFAULT_MAX_BACKLIGHT;
++
++			printk(KERN_NOTICE"VLV OVERRIDE backlight range: %d %d\n",
++			       (int) caps.min_input_signal, (int) caps.max_input_signal);
++		}
++
+ 		if (caps.aux_support)
+ 			return;
+ 		dm->backlight_caps[bl_idx].min_input_signal = caps.min_input_signal;
+ 		dm->backlight_caps[bl_idx].max_input_signal = caps.max_input_signal;
+ 	} else {
++		printk(KERN_NOTICE"VLV ACPI does not provide backlight range, using defaults: %d %d\n",
++		       AMDGPU_DM_DEFAULT_MIN_BACKLIGHT, AMDGPU_DM_DEFAULT_MAX_BACKLIGHT);
+ 		dm->backlight_caps[bl_idx].min_input_signal =
+ 				AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
+ 		dm->backlight_caps[bl_idx].max_input_signal =
+@@ -4728,6 +4744,9 @@ static void amdgpu_dm_update_backlight_caps(struct amdgpu_display_manager *dm,
+ 	if (dm->backlight_caps[bl_idx].aux_support)
+ 		return;
+ 
++	printk(KERN_NOTICE"VLV Kernel built without ACPI. using backlight range defaults: %d %d\n",
++	       AMDGPU_DM_DEFAULT_MIN_BACKLIGHT, AMDGPU_DM_DEFAULT_MAX_BACKLIGHT);
++
+ 	dm->backlight_caps[bl_idx].min_input_signal = AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
+ 	dm->backlight_caps[bl_idx].max_input_signal = AMDGPU_DM_DEFAULT_MAX_BACKLIGHT;
+ #endif
+@@ -4759,7 +4778,7 @@ static u32 convert_brightness_from_user(const struct amdgpu_dm_backlight_caps *c
+ 	if (!get_brightness_range(caps, &min, &max))
+ 		return brightness;
+ 
+-	// Rescale 0..255 to min..max
++	// Rescale 0..AMDGPU_MAX_BL_LEVEL to min..max
+ 	return min + DIV_ROUND_CLOSEST((max - min) * brightness,
+ 				       AMDGPU_MAX_BL_LEVEL);
+ }
+@@ -4774,7 +4793,7 @@ static u32 convert_brightness_to_user(const struct amdgpu_dm_backlight_caps *cap
+ 
+ 	if (brightness < min)
+ 		return 0;
+-	// Rescale min..max to 0..255
++	// Rescale min..max to 0..AMDGPU_MAX_BL_LEVEL
+ 	return DIV_ROUND_CLOSEST(AMDGPU_MAX_BL_LEVEL * (brightness - min),
+ 				 max - min);
+ }
+-- 
+2.49.0
+
+
+From e0543382d0e8ff40c0fcd9070b78867bd6ad5af4 Mon Sep 17 00:00:00 2001
+From: Swapnil Patel <swapatel@amd.com>
+Date: Thu, 2 Nov 2023 16:16:49 -0400
+Subject: [PATCH 09/34] Disable modes with >1200 MHz Pixel clocks when
+ connected via dock
+
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/gpu/drm/amd/display/dc/link/link_validation.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_validation.c b/drivers/gpu/drm/amd/display/dc/link/link_validation.c
+index 29606fda0..ff127f8a4 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_validation.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_validation.c
+@@ -35,6 +35,8 @@
+ 
+ #define DC_LOGGER_INIT(logger)
+ 
++static const uint8_t DP_SINK_BRANCH_DEV_NAME_KT50X0[] = "KT50X0!";
++
+ static uint32_t get_tmds_output_pixel_clock_100hz(const struct dc_crtc_timing *timing)
+ {
+ 
+@@ -276,6 +278,15 @@ static bool dp_validate_mode_timing(
+ 		timing->v_addressable == (uint32_t) 480)
+ 		return true;
+ 
++	if (link->ctx->dce_version == DCN_VERSION_3_01 &&
++	    link->dpcd_caps.sink_dev_id == DP_BRANCH_DEVICE_ID_0060AD &&
++	    memcmp(&link->dpcd_caps.branch_dev_name,
++		   DP_SINK_BRANCH_DEV_NAME_KT50X0,
++		   sizeof(link->dpcd_caps.branch_dev_name)) == 0) {
++		if (timing->pix_clk_100hz / 10 >= (uint32_t) 1200000)
++			return false; /* KT50X0 does not support Pxl clock >= 1200MHz */
++	}
++
+ 	link_setting = dp_get_verified_link_cap(link);
+ 
+ 	/* TODO: DYNAMIC_VALIDATION needs to be implemented */
+-- 
+2.49.0
+
+
+From 2db57a071ec979c53bfa49e7ee5b3df39d584aac Mon Sep 17 00:00:00 2001
+From: Friedrich Vock <friedrich.vock@gmx.de>
+Date: Thu, 20 Jun 2024 14:12:15 +0200
+Subject: [PATCH 10/34] drm/amdgpu: Don't use doorbells for SDMA 5.2
+
+There seems to be a race condition and they can cause hangs in rare
+scenarios.
+
+Signed-off-by: Friedrich Vock <friedrich.vock@gmx.de>
+(cherry picked from commit 9264ec783c738b272d94a72542524223b65255ef)
+(cherry picked from commit beec5cbd7260be325d8b20cc5314dfbd38332aae)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/gpu/drm/amd/amdgpu/sdma_v5_2.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v5_2.c b/drivers/gpu/drm/amd/amdgpu/sdma_v5_2.c
+index b1818e878..f13e5eecd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v5_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v5_2.c
+@@ -1339,7 +1339,7 @@ static int sdma_v5_2_sw_init(struct amdgpu_ip_block *ip_block)
+ 	for (i = 0; i < adev->sdma.num_instances; i++) {
+ 		ring = &adev->sdma.instance[i].ring;
+ 		ring->ring_obj = NULL;
+-		ring->use_doorbell = true;
++		ring->use_doorbell = false;
+ 		ring->me = i;
+ 
+ 		DRM_INFO("use_doorbell being set to: [%s]\n",
+-- 
+2.49.0
+
+
+From a8aeab076e8f54de4dc7deb92a7b5cb0434093ea Mon Sep 17 00:00:00 2001
+From: Swapnil Patel <swapatel@amd.com>
+Date: Tue, 21 Nov 2023 17:00:14 -0500
+Subject: [PATCH 11/34] Add 2s delay before enabling DP link for dock
+
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ .../gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c    | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index 81f4c386c..1f9e10caf 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -95,6 +95,8 @@
+ #define FN(reg_name, field_name) \
+ 	hws->shifts->field_name, hws->masks->field_name
+ 
++static const uint8_t DP_SINK_BRANCH_DEV_NAME_KT50X0[] = "KT50X0!";
++
+ struct dce110_hw_seq_reg_offsets {
+ 	uint32_t crtc;
+ };
+@@ -3243,6 +3245,13 @@ void dce110_enable_dp_link_output(
+ 			link->dc->res_pool->dp_clock_source;
+ 	const struct link_hwss *link_hwss = get_link_hwss(link, link_res);
+ 	unsigned int i;
++	if (link->ctx->dce_version == DCN_VERSION_3_01 &&
++	    link->dpcd_caps.sink_dev_id == DP_BRANCH_DEVICE_ID_0060AD &&
++	    memcmp(&link->dpcd_caps.branch_dev_name,
++		   DP_SINK_BRANCH_DEV_NAME_KT50X0,
++		   sizeof(link->dpcd_caps.branch_dev_name)) == 0) {
++		msleep(2000);
++	}
+ 
+ 	/*
+ 	 * Add the logic to extract BOTH power up and power down sequences
+-- 
+2.49.0
+
+
+From 095d63a1e0140a0321e1abadd57071b3d3c02deb Mon Sep 17 00:00:00 2001
+From: "Pierre-Loup A. Griffais" <pgriffais@valvesoftware.com>
+Date: Tue, 14 Jun 2022 14:31:18 -0700
+Subject: [PATCH 12/34] drivers: video: backlight: Disable backlight
+ notification events
+
+We don't want to generate udev events for brightness changes on Steam
+Deck, as some games like Celeste will re-enumerate controller devices in
+response to this event.
+
+Patch from Sam Lantinga.
+
+(cherry picked from commit 85da5a5f7b69f22f960776cde3bf5862f3613363)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/video/backlight/backlight.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/video/backlight/backlight.c b/drivers/video/backlight/backlight.c
+index f699e5827..99e86b983 100644
+--- a/drivers/video/backlight/backlight.c
++++ b/drivers/video/backlight/backlight.c
+@@ -161,6 +161,7 @@ static inline void backlight_unregister_fb(struct backlight_device *bd)
+ static void backlight_generate_event(struct backlight_device *bd,
+ 				     enum backlight_update_reason reason)
+ {
++#if 0 // We don't want to generate udev events for brightness changes on Steam Deck, as some games like Celeste will re-enumerate controller devices in response to this event.
+ 	char *envp[2];
+ 
+ 	switch (reason) {
+@@ -176,6 +177,7 @@ static void backlight_generate_event(struct backlight_device *bd,
+ 	}
+ 	envp[1] = NULL;
+ 	kobject_uevent_env(&bd->dev.kobj, KOBJ_CHANGE, envp);
++#endif // 0
+ 	sysfs_notify(&bd->dev.kobj, NULL, "actual_brightness");
+ }
+ 
+-- 
+2.49.0
+
+
+From f9171e48d6b6d6207165afa4808d9643cb2b336b Mon Sep 17 00:00:00 2001
+From: Joshua Ashton <joshua@froggi.es>
+Date: Wed, 6 Sep 2023 22:00:26 +0100
+Subject: [PATCH 13/34] drm/amd/display: Don't consider vblank passed if
+ currently in vertical front porch time
+
+Changing refresh rates on OLED displays works differently to typical
+LCD panels in that instead of changing the clock, the vertical porch
+is extended significantly for lower rates.
+
+This can mean that the vertical porch can be incredibly large for
+non-base refresh rates eg. 60Hz on a 90Hz display.
+
+This isn't an issue for X11/typical compositors as their present slop
+is 1/2th of the refresh interval so the issue never manifests.
+
+However in Gamescope, the present slop very small and tuned to be
+optimal in real-time to try and reduce display latency significantly.
+This results in us queueing up the atomic commit inside the vertical
+porch region which, due to legacy X11/sync control reasons, means that
+AMDGPU must target the next vblank.
+
+This patch changes that behaviour to make FRR displays match what occurs
+on VRR/Freesync displays where the vertical porch time is not included
+in determining what vblank to target and solves the issue.
+
+This means that smarter compositors can get large input latency
+reductions when using OLED displays at lower than base refresh rates.
+
+For upstreaming this patch, it will need to be considered what the best
+solution is to enable this behaviour from the userspace side.
+Obviously the X11/legacy stuff probably cannot change here -- so we
+either need to enable this new behaviour globally for all DRM atomic
+clients (ie. basically Wayland compositors) or have a
+new DRM_MODE_ATOMIC flag.
+
+Signed-off-by: Joshua Ashton <joshua@froggi.es>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 8b2a53075..b96ac00e4 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -476,7 +476,7 @@ static void dm_pflip_high_irq(void *interrupt_params)
+ 
+ 	WARN_ON(!e);
+ 
+-	vrr_active = amdgpu_dm_crtc_vrr_active_irq(amdgpu_crtc);
++	vrr_active = true;//amdgpu_dm_crtc_vrr_active_irq(amdgpu_crtc);
+ 
+ 	/* Fixed refresh rate, or VRR scanout position outside front-porch? */
+ 	if (!vrr_active ||
+@@ -573,11 +573,11 @@ static void dm_vupdate_high_irq(void *interrupt_params)
+ 		 * page-flip completion events that have been queued to us
+ 		 * if a pageflip happened inside front-porch.
+ 		 */
+-		if (vrr_active) {
++		if (true) {
+ 			amdgpu_dm_crtc_handle_vblank(acrtc);
+ 
+ 			/* BTR processing for pre-DCE12 ASICs */
+-			if (acrtc->dm_irq_params.stream &&
++			if (vrr_active && acrtc->dm_irq_params.stream &&
+ 			    adev->family < AMDGPU_FAMILY_AI) {
+ 				spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
+ 				mod_freesync_handle_v_update(
+@@ -9187,7 +9187,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+ 	int planes_count = 0, vpos, hpos;
+ 	unsigned long flags;
+ 	u32 target_vblank, last_flip_vblank;
+-	bool vrr_active = amdgpu_dm_crtc_vrr_active(acrtc_state);
++	bool vrr_active = true;//amdgpu_dm_crtc_vrr_active(acrtc_state);
+ 	bool cursor_update = false;
+ 	bool pflip_present = false;
+ 	bool dirty_rects_changed = false;
+-- 
+2.49.0
+
+
+From e3009e5f14c61c6f60842cb61ea6863cc4f3b5b7 Mon Sep 17 00:00:00 2001
+From: Joshua Ashton <joshua@froggi.es>
+Date: Sun, 3 Dec 2023 11:35:06 +0000
+Subject: [PATCH 14/34] drm/amd/display: Revert some of the vrr always on hack
+
+Fixes frame timings on some non)-VRR external displays going all whacky.
+
+This makes us not use the late vblank irq handler (backporch line 0) and instead send the vblank event immediately on page flip when we know where the vblank is going to be.
+
+Should also improve latency/stutter on internal display potentially too.
+
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index b96ac00e4..f74811492 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -476,7 +476,7 @@ static void dm_pflip_high_irq(void *interrupt_params)
+ 
+ 	WARN_ON(!e);
+ 
+-	vrr_active = true;//amdgpu_dm_crtc_vrr_active_irq(amdgpu_crtc);
++	vrr_active = amdgpu_dm_crtc_vrr_active_irq(amdgpu_crtc);
+ 
+ 	/* Fixed refresh rate, or VRR scanout position outside front-porch? */
+ 	if (!vrr_active ||
+@@ -573,11 +573,11 @@ static void dm_vupdate_high_irq(void *interrupt_params)
+ 		 * page-flip completion events that have been queued to us
+ 		 * if a pageflip happened inside front-porch.
+ 		 */
+-		if (true) {
++		if (vrr_active) {
+ 			amdgpu_dm_crtc_handle_vblank(acrtc);
+ 
+ 			/* BTR processing for pre-DCE12 ASICs */
+-			if (vrr_active && acrtc->dm_irq_params.stream &&
++			if (acrtc->dm_irq_params.stream &&
+ 			    adev->family < AMDGPU_FAMILY_AI) {
+ 				spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
+ 				mod_freesync_handle_v_update(
+-- 
+2.49.0
+
+
+From bb33500bbbeba5af917f55050dbd9c6fe01edd14 Mon Sep 17 00:00:00 2001
+From: Ethan Geller <ethang@valvesoftware.com>
+Date: Thu, 16 Nov 2023 21:31:48 +0000
+Subject: [PATCH 15/34] ASoC: max98388: Fix power on when resuming from suspend
+
+Fix Max98388 issue where speakers would not be powered on when we resume
+from S3.
+
+The issue was that when we flush the regmap to the amp on resume, we
+were also flushing a value of 1 to the SW_RESET pin.
+
+Theoretically, this is fixed by marking the SW_RESET register volatile.
+However, we did not observe a fix after marking the register volatile,
+so we opted for a more complete fix of ensuring SW_RESET is zero in our
+regmap after we have waited for the reset loop to be complete.
+
+(cherry picked from commit c0c65da7ca4b0a4f93272f5e932dd7eed90703c8)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ sound/soc/codecs/max98388.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/codecs/max98388.c b/sound/soc/codecs/max98388.c
+index 99986090b..e259be44c 100644
+--- a/sound/soc/codecs/max98388.c
++++ b/sound/soc/codecs/max98388.c
+@@ -390,27 +390,43 @@ static void max98388_reset(struct max98388_priv *max98388, struct device *dev)
+ {
+ 	int ret, reg, count;
+ 
++
+ 	/* Software Reset */
+ 	ret = regmap_update_bits(max98388->regmap,
+ 				 MAX98388_R2000_SW_RESET,
+ 				 MAX98388_SOFT_RESET,
+ 				 MAX98388_SOFT_RESET);
+-	if (ret)
++
++	if (ret) {
+ 		dev_err(dev, "Reset command failed. (ret:%d)\n", ret);
++		goto exit;
++	}
++
+ 
+ 	count = 0;
+ 	while (count < 3) {
+ 		usleep_range(10000, 11000);
++
+ 		/* Software Reset Verification */
+ 		ret = regmap_read(max98388->regmap,
+ 				  MAX98388_R22FF_REV_ID, &reg);
++
+ 		if (!ret) {
+ 			dev_info(dev, "Reset completed (retry:%d)\n", count);
+-			return;
++			goto exit;
+ 		}
+ 		count++;
+ 	}
++
+ 	dev_err(dev, "Reset failed. (ret:%d)\n", ret);
++
++
++exit:
++	regcache_cache_only(max98388->regmap, true);
++	ret = regmap_update_bits(max98388->regmap,
++				 MAX98388_R2000_SW_RESET,
++				 MAX98388_SOFT_RESET, 0);
++	regcache_cache_only(max98388->regmap, false);
+ }
+ 
+ static int max98388_probe(struct snd_soc_component *component)
+@@ -419,6 +435,7 @@ static int max98388_probe(struct snd_soc_component *component)
+ 
+ 	/* Software Reset */
+ 	max98388_reset(max98388, component->dev);
++	usleep_range(400, 1000);
+ 
+ 	/* General channel source configuration */
+ 	regmap_write(max98388->regmap,
+@@ -812,6 +829,7 @@ static bool max98388_readable_register(struct device *dev,
+ 	case MAX98388_R210E_AUTO_RESTART:
+ 	case MAX98388_R210F_GLOBAL_EN:
+ 	case MAX98388_R22FF_REV_ID:
++	case MAX98388_R2000_SW_RESET:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -824,6 +842,7 @@ static bool max98388_volatile_reg(struct device *dev, unsigned int reg)
+ 	case MAX98388_R2001_INT_RAW1 ... MAX98388_R2005_INT_STATE2:
+ 	case MAX98388_R210F_GLOBAL_EN:
+ 	case MAX98388_R22FF_REV_ID:
++	case MAX98388_R2000_SW_RESET:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -867,6 +886,7 @@ static int max98388_resume(struct device *dev)
+ 
+ 	regcache_cache_only(max98388->regmap, false);
+ 	max98388_reset(max98388, dev);
++	usleep_range(400, 1000);
+ 	regcache_sync(max98388->regmap);
+ 
+ 	return 0;
+-- 
+2.49.0
+
+
+From 3eb1289b3178e64e67b0d07485866df53205078e Mon Sep 17 00:00:00 2001
+From: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Date: Sat, 9 Dec 2023 20:03:30 +0200
+Subject: [PATCH 16/34] ASoC: amd: acp: Use correct DAI link ID for BT codec
+
+Commit 671dd2ffbd8b ("ASoC: amd: acp: Add new cpu dai and dailink
+creation for I2S BT instance") added I2S BT support in ACP common
+machine driver, but using an unexpected BT_BE_ID set to 3 instead of 2:
+
+[ 7.799659] snd_sof_amd_vangogh 0000:04:00.5: Firmware info: version 0:0:0-7863d
+[ 7.803906] snd_sof_amd_vangogh 0000:04:00.5: Firmware: ABI 3:26:0 Kernel ABI 3:23:0
+[ 7.872873] snd_sof_amd_vangogh 0000:04:00.5: Topology: ABI 3:26:0 Kernel ABI 3:23:0
+[ 8.508218] sof_mach nau8821-max: ASoC: physical link acp-bt-codec (id 2) not exist
+[ 8.513468] sof_mach nau8821-max: ASoC: topology: could not load header: -22
+[ 8.518853] snd_sof_amd_vangogh 0000:04:00.5: error: tplg component load failed -22
+[ 8.524049] snd_sof_amd_vangogh 0000:04:00.5: error: failed to load DSP topology -22
+[ 8.529230] snd_sof_amd_vangogh 0000:04:00.5: ASoC: error at snd_soc_component_probe on 0000:04:00.5: -22
+[ 8.534465] sof_mach nau8821-max: ASoC: failed to instantiate card -22
+[ 8.539820] sof_mach nau8821-max: error -EINVAL: Failed to register card(sof-nau8821-max)
+[ 8.545022] sof_mach: probe of nau8821-max failed with error -22
+
+Move BT_BE_ID to position 2 in the enum, as expected by the current
+topology found on Steam Deck.
+
+Note this is not accepted upstream as it would break the other devices
+which rely on BT_BE_ID set to 3.  The proper solution would be to update
+the topology file on Steam Deck.
+
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ sound/soc/amd/acp/acp-mach.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sound/soc/amd/acp/acp-mach.h b/sound/soc/amd/acp/acp-mach.h
+index f94c30c20..c3b3f0479 100644
+--- a/sound/soc/amd/acp/acp-mach.h
++++ b/sound/soc/amd/acp/acp-mach.h
+@@ -29,8 +29,8 @@
+ enum be_id {
+ 	HEADSET_BE_ID = 0,
+ 	AMP_BE_ID,
+-	DMIC_BE_ID,
+ 	BT_BE_ID,
++	DMIC_BE_ID,
+ };
+ 
+ enum cpu_endpoints {
+-- 
+2.49.0
+
+
+From d8715fe0025729e4707043070fadd8c9571878d8 Mon Sep 17 00:00:00 2001
+From: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Date: Thu, 22 Feb 2024 10:09:04 +0200
+Subject: [PATCH 17/34] wifi: ath11k: Rename QCA2066 fw dir to QCA206X
+
+This is a temporary workaround to match the current path of the firmware
+files on Steam Deck OLED: ath11k/QCA206X/hw2.1
+
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/net/wireless/ath/ath11k/core.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index 12dd37c2e..c61a92308 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -732,7 +732,7 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.name = "qca2066 hw2.1",
+ 		.hw_rev = ATH11K_HW_QCA2066_HW21,
+ 		.fw = {
+-			.dir = "QCA2066/hw2.1",
++			.dir = "QCA206X/hw2.1",
+ 			.board_size = 256 * 1024,
+ 			.cal_offset = 128 * 1024,
+ 		},
+-- 
+2.49.0
+
+
+From e0caedbf57b55fa11d83450ebd2aff84e5075a78 Mon Sep 17 00:00:00 2001
+From: "Pierre-Loup A. Griffais" <pgriffais@valvesoftware.com>
+Date: Wed, 8 Nov 2023 19:45:52 -0800
+Subject: [PATCH 18/34] drm/amdgpu/display: fix backlight brightness
+ overflowing
+
+500k uNits * 65k max brightness range overflows in the conversion code.
+Use 64 bit dividend to avoid the overflow
+
+Signed-off-by: Robert Beckett <bob.beckett@collabora.com>
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index f74811492..b589d4786 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -4779,8 +4779,8 @@ static u32 convert_brightness_from_user(const struct amdgpu_dm_backlight_caps *c
+ 		return brightness;
+ 
+ 	// Rescale 0..AMDGPU_MAX_BL_LEVEL to min..max
+-	return min + DIV_ROUND_CLOSEST((max - min) * brightness,
+-				       AMDGPU_MAX_BL_LEVEL);
++	return min + DIV_ROUND_CLOSEST_ULL((u64)(max - min) * brightness,
++					   AMDGPU_MAX_BL_LEVEL);
+ }
+ 
+ static u32 convert_brightness_to_user(const struct amdgpu_dm_backlight_caps *caps,
+@@ -4794,8 +4794,8 @@ static u32 convert_brightness_to_user(const struct amdgpu_dm_backlight_caps *cap
+ 	if (brightness < min)
+ 		return 0;
+ 	// Rescale min..max to 0..AMDGPU_MAX_BL_LEVEL
+-	return DIV_ROUND_CLOSEST(AMDGPU_MAX_BL_LEVEL * (brightness - min),
+-				 max - min);
++	return DIV_ROUND_CLOSEST_ULL((u64)AMDGPU_MAX_BL_LEVEL * (brightness - min),
++				     max - min);
+ }
+ 
+ static void amdgpu_dm_backlight_set_level(struct amdgpu_display_manager *dm,
+-- 
+2.49.0
+
+
+From 050e04f833346a10ab6afa155f754ac36f138ee0 Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sat, 22 Feb 2025 17:43:17 +0100
+Subject: [PATCH 19/34] drm: panel-orientation-quirks: Add OneXPlayer X1 AMD
+ and Intel quirk
+
+The OneXPlayer X1 series features a 2k 10.95 display with a portrait
+orientation. Add a quirk to set the panel orientation to portrait mode
+to both the Intel and AMD variants.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/gpu/drm/drm_panel_orientation_quirks.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_panel_orientation_quirks.c b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+index c554ad8f2..9a4cde0dd 100644
+--- a/drivers/gpu/drm/drm_panel_orientation_quirks.c
++++ b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+@@ -485,6 +485,18 @@ static const struct dmi_system_id orientation_data[] = {
+ 		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONE XPLAYER"),
+ 		},
+ 		.driver_data = (void *)&lcd1200x1920_leftside_up,
++	}, {	/* OneXPlayer X1 AMD */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ONE-NETBOOK"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER X1 A"),
++		},
++		.driver_data = (void *)&lcd1600x2560_leftside_up,
++	}, {	/* OneXPlayer X1 AMD Strix Point */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ONE-NETBOOK"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER X1Pro"),
++		},
++		.driver_data = (void *)&lcd1600x2560_leftside_up,
+ 	}, {	/* OrangePi Neo */
+ 		.matches = {
+ 		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "OrangePi"),
+-- 
+2.49.0
+
+
+From 8bafbfc692a93b10fe1122aa4c57faee92f033ce Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sat, 22 Feb 2025 17:43:18 +0100
+Subject: [PATCH 20/34] drm: panel-orientation-quirks: Add OneXPlayer X1 Mini
+ (AMD) quirk
+
+The OneXPlayer X1 mini features a 2k 8.8 display with a portrait
+orientation. Add a quirk to set the panel orientation to portrait
+mode. There is no Intel variant.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/gpu/drm/drm_panel_orientation_quirks.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_panel_orientation_quirks.c b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+index 9a4cde0dd..59d70b360 100644
+--- a/drivers/gpu/drm/drm_panel_orientation_quirks.c
++++ b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+@@ -497,6 +497,12 @@ static const struct dmi_system_id orientation_data[] = {
+ 		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER X1Pro"),
+ 		},
+ 		.driver_data = (void *)&lcd1600x2560_leftside_up,
++	}, {	/* OneXPlayer X1 mini (AMD) */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ONE-NETBOOK"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER X1 mini"),
++		},
++		.driver_data = (void *)&lcd1600x2560_leftside_up,
+ 	}, {	/* OrangePi Neo */
+ 		.matches = {
+ 		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "OrangePi"),
+-- 
+2.49.0
+
+
+From 8556887c60f2cbdb065ae6995cc9c2ad5b99c9b7 Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sat, 22 Feb 2025 17:43:19 +0100
+Subject: [PATCH 21/34] drm: panel-orientation-quirks: Add OneXPlayer F1Pro
+ quirk
+
+The OneXPlayer F1Pro has a 144hz 1920x1080 portrait OLED panel.
+Add a quirk to correct the panel portrait orientation. In addition,
+it comes with a red limited edition variant in the Chinese market,
+so add that as well.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/gpu/drm/drm_panel_orientation_quirks.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_panel_orientation_quirks.c b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+index 59d70b360..0bd9259b8 100644
+--- a/drivers/gpu/drm/drm_panel_orientation_quirks.c
++++ b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+@@ -503,6 +503,18 @@ static const struct dmi_system_id orientation_data[] = {
+ 		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER X1 mini"),
+ 		},
+ 		.driver_data = (void *)&lcd1600x2560_leftside_up,
++	}, {	/* OneXPlayer OneXFly F1 Pro (OLED) */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ONE-NETBOOK"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER F1Pro"),
++		},
++		.driver_data = (void *)&lcd1080x1920_leftside_up,
++	}, {	/* OneXPlayer OneXFly F1 Pro (OLED) LE Red variant */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ONE-NETBOOK"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER F1 EVA-02"),
++		},
++		.driver_data = (void *)&lcd1080x1920_leftside_up,
+ 	}, {	/* OrangePi Neo */
+ 		.matches = {
+ 		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "OrangePi"),
+-- 
+2.49.0
+
+
+From aaee23b5000ce7c67ffb7e74bc5b9da073553382 Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sat, 22 Feb 2025 17:43:20 +0100
+Subject: [PATCH 22/34] HID: Add quirk to ignore the touchscreen battery on
+ OneXPlayer X1
+
+The X1 devices come with a pen-capable touchscreen, in which the HID
+descriptor reports there is always a battery at 100% charge. Quirk it
+to not report the battery status.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/hid/hid-ids.h   | 1 +
+ drivers/hid/hid-input.c | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
+index 288a2b864..eddc8d716 100644
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -1035,6 +1035,7 @@
+ #define USB_VENDOR_ID_NOVATEK		0x0603
+ #define USB_DEVICE_ID_NOVATEK_PCT	0x0600
+ #define USB_DEVICE_ID_NOVATEK_MOUSE	0x1602
++#define I2C_DEVICE_ID_ONEXPLAYER_X1    0xF001
+ 
+ #define USB_VENDOR_ID_NTI               0x0757
+ #define USB_DEVICE_ID_USB_SUN           0x0a00
+diff --git a/drivers/hid/hid-input.c b/drivers/hid/hid-input.c
+index 9d80635a9..08e87577f 100644
+--- a/drivers/hid/hid-input.c
++++ b/drivers/hid/hid-input.c
+@@ -390,6 +390,8 @@ static const struct hid_device_id hid_battery_quirks[] = {
+ 	 * set HID_BATTERY_QUIRK_IGNORE for all Elan I2C-HID devices.
+ 	 */
+ 	{ HID_I2C_DEVICE(USB_VENDOR_ID_ELAN, HID_ANY_ID), HID_BATTERY_QUIRK_IGNORE },
++	{ HID_I2C_DEVICE(USB_VENDOR_ID_NOVATEK, I2C_DEVICE_ID_ONEXPLAYER_X1),
++	  HID_BATTERY_QUIRK_IGNORE },
+ 	{}
+ };
+ 
+-- 
+2.49.0
+
+
+From 30a6e453c60451cbf43bfb65e1d83a0a3149af2f Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sat, 22 Feb 2025 17:43:21 +0100
+Subject: [PATCH 23/34] drm: panel-orientation-quirks: Add Zotac Gaming Zone
+ quirk
+
+The Zotac Gaming Zone handheld features a 1080p portrait OLED screen.
+Add the rotation to the panel orientation quirks.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/gpu/drm/drm_panel_orientation_quirks.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_panel_orientation_quirks.c b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+index 0bd9259b8..8a323ba82 100644
+--- a/drivers/gpu/drm/drm_panel_orientation_quirks.c
++++ b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+@@ -515,6 +515,12 @@ static const struct dmi_system_id orientation_data[] = {
+ 		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ONEXPLAYER F1 EVA-02"),
+ 		},
+ 		.driver_data = (void *)&lcd1080x1920_leftside_up,
++	}, {	/* Zotac Gaming Zone (OLED) */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ZOTAC"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "ZOTAC GAMING ZONE"),
++		},
++		.driver_data = (void *)&lcd1080x1920_leftside_up,
+ 	}, {	/* OrangePi Neo */
+ 		.matches = {
+ 		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "OrangePi"),
+-- 
+2.49.0
+
+
+From 5ce7e835ae87f390be7ee9d6d6070d0a2d42998b Mon Sep 17 00:00:00 2001
+From: Eric Naim <dnaim@cachyos.org>
+Date: Wed, 30 Apr 2025 11:59:40 +0800
+Subject: [PATCH 24/34] Revert "platform/x86: msi-wmi-platform: Workaround a
+ ACPI firmware bug"
+
+This reverts commit 608e7c0f7f3b66de96116431cb3582d3dac43d9a.
+
+Signed-off-by: Eric Naim <dnaim@cachyos.org>
+---
+ .../wmi/devices/msi-wmi-platform.rst          |  4 -
+ drivers/platform/x86/msi-wmi-platform.c       | 91 +++++++------------
+ 2 files changed, 32 insertions(+), 63 deletions(-)
+
+diff --git a/Documentation/wmi/devices/msi-wmi-platform.rst b/Documentation/wmi/devices/msi-wmi-platform.rst
+index 73197b319..31a136942 100644
+--- a/Documentation/wmi/devices/msi-wmi-platform.rst
++++ b/Documentation/wmi/devices/msi-wmi-platform.rst
+@@ -138,10 +138,6 @@ input data, the meaning of which depends on the subfeature being accessed.
+ The output buffer contains a single byte which signals success or failure (``0x00`` on failure)
+ and 31 bytes of output data, the meaning if which depends on the subfeature being accessed.
+ 
+-.. note::
+-   The ACPI control method responsible for handling the WMI method calls is not thread-safe.
+-   This is a firmware bug that needs to be handled inside the driver itself.
+-
+ WMI method Get_EC()
+ -------------------
+ 
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index dc5e9878c..e15681dfc 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -10,7 +10,6 @@
+ #include <linux/acpi.h>
+ #include <linux/bits.h>
+ #include <linux/bitfield.h>
+-#include <linux/cleanup.h>
+ #include <linux/debugfs.h>
+ #include <linux/device.h>
+ #include <linux/device/driver.h>
+@@ -18,7 +17,6 @@
+ #include <linux/hwmon.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+-#include <linux/mutex.h>
+ #include <linux/printk.h>
+ #include <linux/rwsem.h>
+ #include <linux/types.h>
+@@ -78,13 +76,8 @@ enum msi_wmi_platform_method {
+ 	MSI_PLATFORM_GET_WMI		= 0x1d,
+ };
+ 
+-struct msi_wmi_platform_data {
+-	struct wmi_device *wdev;
+-	struct mutex wmi_lock;	/* Necessary when calling WMI methods */
+-};
+-
+ struct msi_wmi_platform_debugfs_data {
+-	struct msi_wmi_platform_data *data;
++	struct wmi_device *wdev;
+ 	enum msi_wmi_platform_method method;
+ 	struct rw_semaphore buffer_lock;	/* Protects debugfs buffer */
+ 	size_t length;
+@@ -139,9 +132,8 @@ static int msi_wmi_platform_parse_buffer(union acpi_object *obj, u8 *output, siz
+ 	return 0;
+ }
+ 
+-static int msi_wmi_platform_query(struct msi_wmi_platform_data *data,
+-				  enum msi_wmi_platform_method method, u8 *input,
+-				  size_t input_length, u8 *output, size_t output_length)
++static int msi_wmi_platform_query(struct wmi_device *wdev, enum msi_wmi_platform_method method,
++				  u8 *input, size_t input_length, u8 *output, size_t output_length)
+ {
+ 	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+ 	struct acpi_buffer in = {
+@@ -155,15 +147,9 @@ static int msi_wmi_platform_query(struct msi_wmi_platform_data *data,
+ 	if (!input_length || !output_length)
+ 		return -EINVAL;
+ 
+-	/*
+-	 * The ACPI control method responsible for handling the WMI method calls
+-	 * is not thread-safe. Because of this we have to do the locking ourself.
+-	 */
+-	scoped_guard(mutex, &data->wmi_lock) {
+-		status = wmidev_evaluate_method(data->wdev, 0x0, method, &in, &out);
+-		if (ACPI_FAILURE(status))
+-			return -EIO;
+-	}
++	status = wmidev_evaluate_method(wdev, 0x0, method, &in, &out);
++	if (ACPI_FAILURE(status))
++		return -EIO;
+ 
+ 	obj = out.pointer;
+ 	if (!obj)
+@@ -184,13 +170,13 @@ static umode_t msi_wmi_platform_is_visible(const void *drvdata, enum hwmon_senso
+ static int msi_wmi_platform_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+ 				 int channel, long *val)
+ {
+-	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	struct wmi_device *wdev = dev_get_drvdata(dev);
+ 	u8 input[32] = { 0 };
+ 	u8 output[32];
+ 	u16 value;
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(data, MSI_PLATFORM_GET_FAN, input, sizeof(input), output,
++	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_FAN, input, sizeof(input), output,
+ 				     sizeof(output));
+ 	if (ret < 0)
+ 		return ret;
+@@ -245,7 +231,7 @@ static ssize_t msi_wmi_platform_write(struct file *fp, const char __user *input,
+ 		return ret;
+ 
+ 	down_write(&data->buffer_lock);
+-	ret = msi_wmi_platform_query(data->data, data->method, payload, data->length, data->buffer,
++	ret = msi_wmi_platform_query(data->wdev, data->method, payload, data->length, data->buffer,
+ 				     data->length);
+ 	up_write(&data->buffer_lock);
+ 
+@@ -291,17 +277,17 @@ static void msi_wmi_platform_debugfs_remove(void *data)
+ 	debugfs_remove_recursive(dir);
+ }
+ 
+-static void msi_wmi_platform_debugfs_add(struct msi_wmi_platform_data *drvdata, struct dentry *dir,
++static void msi_wmi_platform_debugfs_add(struct wmi_device *wdev, struct dentry *dir,
+ 					 const char *name, enum msi_wmi_platform_method method)
+ {
+ 	struct msi_wmi_platform_debugfs_data *data;
+ 	struct dentry *entry;
+ 
+-	data = devm_kzalloc(&drvdata->wdev->dev, sizeof(*data), GFP_KERNEL);
++	data = devm_kzalloc(&wdev->dev, sizeof(*data), GFP_KERNEL);
+ 	if (!data)
+ 		return;
+ 
+-	data->data = drvdata;
++	data->wdev = wdev;
+ 	data->method = method;
+ 	init_rwsem(&data->buffer_lock);
+ 
+@@ -312,82 +298,82 @@ static void msi_wmi_platform_debugfs_add(struct msi_wmi_platform_data *drvdata,
+ 
+ 	entry = debugfs_create_file(name, 0600, dir, data, &msi_wmi_platform_debugfs_fops);
+ 	if (IS_ERR(entry))
+-		devm_kfree(&drvdata->wdev->dev, data);
++		devm_kfree(&wdev->dev, data);
+ }
+ 
+-static void msi_wmi_platform_debugfs_init(struct msi_wmi_platform_data *data)
++static void msi_wmi_platform_debugfs_init(struct wmi_device *wdev)
+ {
+ 	struct dentry *dir;
+ 	char dir_name[64];
+ 	int ret, method;
+ 
+-	scnprintf(dir_name, ARRAY_SIZE(dir_name), "%s-%s", DRIVER_NAME, dev_name(&data->wdev->dev));
++	scnprintf(dir_name, ARRAY_SIZE(dir_name), "%s-%s", DRIVER_NAME, dev_name(&wdev->dev));
+ 
+ 	dir = debugfs_create_dir(dir_name, NULL);
+ 	if (IS_ERR(dir))
+ 		return;
+ 
+-	ret = devm_add_action_or_reset(&data->wdev->dev, msi_wmi_platform_debugfs_remove, dir);
++	ret = devm_add_action_or_reset(&wdev->dev, msi_wmi_platform_debugfs_remove, dir);
+ 	if (ret < 0)
+ 		return;
+ 
+ 	for (method = MSI_PLATFORM_GET_PACKAGE; method <= MSI_PLATFORM_GET_WMI; method++)
+-		msi_wmi_platform_debugfs_add(data, dir, msi_wmi_platform_debugfs_names[method - 1],
++		msi_wmi_platform_debugfs_add(wdev, dir, msi_wmi_platform_debugfs_names[method - 1],
+ 					     method);
+ }
+ 
+-static int msi_wmi_platform_hwmon_init(struct msi_wmi_platform_data *data)
++static int msi_wmi_platform_hwmon_init(struct wmi_device *wdev)
+ {
+ 	struct device *hdev;
+ 
+-	hdev = devm_hwmon_device_register_with_info(&data->wdev->dev, "msi_wmi_platform", data,
++	hdev = devm_hwmon_device_register_with_info(&wdev->dev, "msi_wmi_platform", wdev,
+ 						    &msi_wmi_platform_chip_info, NULL);
+ 
+ 	return PTR_ERR_OR_ZERO(hdev);
+ }
+ 
+-static int msi_wmi_platform_ec_init(struct msi_wmi_platform_data *data)
++static int msi_wmi_platform_ec_init(struct wmi_device *wdev)
+ {
+ 	u8 input[32] = { 0 };
+ 	u8 output[32];
+ 	u8 flags;
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(data, MSI_PLATFORM_GET_EC, input, sizeof(input), output,
++	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_EC, input, sizeof(input), output,
+ 				     sizeof(output));
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	flags = output[MSI_PLATFORM_EC_FLAGS_OFFSET];
+ 
+-	dev_dbg(&data->wdev->dev, "EC RAM version %lu.%lu\n",
++	dev_dbg(&wdev->dev, "EC RAM version %lu.%lu\n",
+ 		FIELD_GET(MSI_PLATFORM_EC_MAJOR_MASK, flags),
+ 		FIELD_GET(MSI_PLATFORM_EC_MINOR_MASK, flags));
+-	dev_dbg(&data->wdev->dev, "EC firmware version %.28s\n",
++	dev_dbg(&wdev->dev, "EC firmware version %.28s\n",
+ 		&output[MSI_PLATFORM_EC_VERSION_OFFSET]);
+ 
+ 	if (!(flags & MSI_PLATFORM_EC_IS_TIGERLAKE)) {
+ 		if (!force)
+ 			return -ENODEV;
+ 
+-		dev_warn(&data->wdev->dev, "Loading on a non-Tigerlake platform\n");
++		dev_warn(&wdev->dev, "Loading on a non-Tigerlake platform\n");
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static int msi_wmi_platform_init(struct msi_wmi_platform_data *data)
++static int msi_wmi_platform_init(struct wmi_device *wdev)
+ {
+ 	u8 input[32] = { 0 };
+ 	u8 output[32];
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(data, MSI_PLATFORM_GET_WMI, input, sizeof(input), output,
++	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_WMI, input, sizeof(input), output,
+ 				     sizeof(output));
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	dev_dbg(&data->wdev->dev, "WMI interface version %u.%u\n",
++	dev_dbg(&wdev->dev, "WMI interface version %u.%u\n",
+ 		output[MSI_PLATFORM_WMI_MAJOR_OFFSET],
+ 		output[MSI_PLATFORM_WMI_MINOR_OFFSET]);
+ 
+@@ -395,8 +381,7 @@ static int msi_wmi_platform_init(struct msi_wmi_platform_data *data)
+ 		if (!force)
+ 			return -ENODEV;
+ 
+-		dev_warn(&data->wdev->dev,
+-			 "Loading despite unsupported WMI interface version (%u.%u)\n",
++		dev_warn(&wdev->dev, "Loading despite unsupported WMI interface version (%u.%u)\n",
+ 			 output[MSI_PLATFORM_WMI_MAJOR_OFFSET],
+ 			 output[MSI_PLATFORM_WMI_MINOR_OFFSET]);
+ 	}
+@@ -406,31 +391,19 @@ static int msi_wmi_platform_init(struct msi_wmi_platform_data *data)
+ 
+ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ {
+-	struct msi_wmi_platform_data *data;
+ 	int ret;
+ 
+-	data = devm_kzalloc(&wdev->dev, sizeof(*data), GFP_KERNEL);
+-	if (!data)
+-		return -ENOMEM;
+-
+-	data->wdev = wdev;
+-	dev_set_drvdata(&wdev->dev, data);
+-
+-	ret = devm_mutex_init(&wdev->dev, &data->wmi_lock);
+-	if (ret < 0)
+-		return ret;
+-
+-	ret = msi_wmi_platform_init(data);
++	ret = msi_wmi_platform_init(wdev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = msi_wmi_platform_ec_init(data);
++	ret = msi_wmi_platform_ec_init(wdev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	msi_wmi_platform_debugfs_init(data);
++	msi_wmi_platform_debugfs_init(wdev);
+ 
+-	return msi_wmi_platform_hwmon_init(data);
++	return msi_wmi_platform_hwmon_init(wdev);
+ }
+ 
+ static const struct wmi_device_id msi_wmi_platform_id_table[] = {
+-- 
+2.49.0
+
+
+From 7e26d8c8fc43fcdd735e7891b61a59c5ae326443 Mon Sep 17 00:00:00 2001
+From: Eric Naim <dnaim@cachyos.org>
+Date: Wed, 30 Apr 2025 11:59:45 +0800
+Subject: [PATCH 25/34] Revert "platform/x86: msi-wmi-platform: Rename "data"
+ variable"
+
+This reverts commit 284efa5bc3dae7c8bc136191e44bff66e706c4e0.
+
+Signed-off-by: Eric Naim <dnaim@cachyos.org>
+---
+ drivers/platform/x86/msi-wmi-platform.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index e15681dfc..9b5c7f8c7 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -173,7 +173,7 @@ static int msi_wmi_platform_read(struct device *dev, enum hwmon_sensor_types typ
+ 	struct wmi_device *wdev = dev_get_drvdata(dev);
+ 	u8 input[32] = { 0 };
+ 	u8 output[32];
+-	u16 value;
++	u16 data;
+ 	int ret;
+ 
+ 	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_FAN, input, sizeof(input), output,
+@@ -181,11 +181,11 @@ static int msi_wmi_platform_read(struct device *dev, enum hwmon_sensor_types typ
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	value = get_unaligned_be16(&output[channel * 2 + 1]);
+-	if (!value)
++	data = get_unaligned_be16(&output[channel * 2 + 1]);
++	if (!data)
+ 		*val = 0;
+ 	else
+-		*val = 480000 / value;
++		*val = 480000 / data;
+ 
+ 	return 0;
+ }
+-- 
+2.49.0
+
+
+From 4cdfe3c7ac132e39bb59057efa5de4dcf2380717 Mon Sep 17 00:00:00 2001
+From: Armin Wolf <W_Armin@gmx.de>
+Date: Mon, 31 Mar 2025 17:42:17 +0200
+Subject: [PATCH 26/34] platform/x86: msi-wmi-platform: Use input buffer for
+ returning result
+
+Modify msi_wmi_platform_query() to reuse the input buffer for
+returning the result of a WMI method call. Using a separate output
+buffer to return the result is unnecessary because the WMI interface
+requires both buffers to have the same length anyway.
+
+Signed-off-by: Armin Wolf <W_Armin@gmx.de>
+---
+ drivers/platform/x86/msi-wmi-platform.c | 61 ++++++++++++-------------
+ 1 file changed, 28 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index 9b5c7f8c7..30f5b63b1 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -19,6 +19,7 @@
+ #include <linux/module.h>
+ #include <linux/printk.h>
+ #include <linux/rwsem.h>
++#include <linux/string.h>
+ #include <linux/types.h>
+ #include <linux/wmi.h>
+ 
+@@ -133,18 +134,18 @@ static int msi_wmi_platform_parse_buffer(union acpi_object *obj, u8 *output, siz
+ }
+ 
+ static int msi_wmi_platform_query(struct wmi_device *wdev, enum msi_wmi_platform_method method,
+-				  u8 *input, size_t input_length, u8 *output, size_t output_length)
++				  u8 *data, size_t length)
+ {
+ 	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+ 	struct acpi_buffer in = {
+-		.length = input_length,
+-		.pointer = input
++		.length = length,
++		.pointer = data
+ 	};
+ 	union acpi_object *obj;
+ 	acpi_status status;
+ 	int ret;
+ 
+-	if (!input_length || !output_length)
++	if (!length)
+ 		return -EINVAL;
+ 
+ 	status = wmidev_evaluate_method(wdev, 0x0, method, &in, &out);
+@@ -155,7 +156,7 @@ static int msi_wmi_platform_query(struct wmi_device *wdev, enum msi_wmi_platform
+ 	if (!obj)
+ 		return -ENODATA;
+ 
+-	ret = msi_wmi_platform_parse_buffer(obj, output, output_length);
++	ret = msi_wmi_platform_parse_buffer(obj, data, length);
+ 	kfree(obj);
+ 
+ 	return ret;
+@@ -171,21 +172,19 @@ static int msi_wmi_platform_read(struct device *dev, enum hwmon_sensor_types typ
+ 				 int channel, long *val)
+ {
+ 	struct wmi_device *wdev = dev_get_drvdata(dev);
+-	u8 input[32] = { 0 };
+-	u8 output[32];
+-	u16 data;
++	u8 data[32] = { 0 };
++	u16 value;
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_FAN, input, sizeof(input), output,
+-				     sizeof(output));
++	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_FAN, data, sizeof(data));
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	data = get_unaligned_be16(&output[channel * 2 + 1]);
+-	if (!data)
++	value = get_unaligned_be16(&data[channel * 2 + 1]);
++	if (!value)
+ 		*val = 0;
+ 	else
+-		*val = 480000 / data;
++		*val = 480000 / value;
+ 
+ 	return 0;
+ }
+@@ -230,14 +229,14 @@ static ssize_t msi_wmi_platform_write(struct file *fp, const char __user *input,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	down_write(&data->buffer_lock);
+-	ret = msi_wmi_platform_query(data->wdev, data->method, payload, data->length, data->buffer,
+-				     data->length);
+-	up_write(&data->buffer_lock);
+-
++	ret = msi_wmi_platform_query(data->wdev, data->method, payload, data->length);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	down_write(&data->buffer_lock);
++	memcpy(data->buffer, payload, data->length);
++	up_write(&data->buffer_lock);
++
+ 	return length;
+ }
+ 
+@@ -334,23 +333,21 @@ static int msi_wmi_platform_hwmon_init(struct wmi_device *wdev)
+ 
+ static int msi_wmi_platform_ec_init(struct wmi_device *wdev)
+ {
+-	u8 input[32] = { 0 };
+-	u8 output[32];
++	u8 data[32] = { 0 };
+ 	u8 flags;
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_EC, input, sizeof(input), output,
+-				     sizeof(output));
++	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_EC, data, sizeof(data));
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	flags = output[MSI_PLATFORM_EC_FLAGS_OFFSET];
++	flags = data[MSI_PLATFORM_EC_FLAGS_OFFSET];
+ 
+ 	dev_dbg(&wdev->dev, "EC RAM version %lu.%lu\n",
+ 		FIELD_GET(MSI_PLATFORM_EC_MAJOR_MASK, flags),
+ 		FIELD_GET(MSI_PLATFORM_EC_MINOR_MASK, flags));
+ 	dev_dbg(&wdev->dev, "EC firmware version %.28s\n",
+-		&output[MSI_PLATFORM_EC_VERSION_OFFSET]);
++		&data[MSI_PLATFORM_EC_VERSION_OFFSET]);
+ 
+ 	if (!(flags & MSI_PLATFORM_EC_IS_TIGERLAKE)) {
+ 		if (!force)
+@@ -364,26 +361,24 @@ static int msi_wmi_platform_ec_init(struct wmi_device *wdev)
+ 
+ static int msi_wmi_platform_init(struct wmi_device *wdev)
+ {
+-	u8 input[32] = { 0 };
+-	u8 output[32];
++	u8 data[32] = { 0 };
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_WMI, input, sizeof(input), output,
+-				     sizeof(output));
++	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_WMI, data, sizeof(data));
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	dev_dbg(&wdev->dev, "WMI interface version %u.%u\n",
+-		output[MSI_PLATFORM_WMI_MAJOR_OFFSET],
+-		output[MSI_PLATFORM_WMI_MINOR_OFFSET]);
++		data[MSI_PLATFORM_WMI_MAJOR_OFFSET],
++		data[MSI_PLATFORM_WMI_MINOR_OFFSET]);
+ 
+-	if (output[MSI_PLATFORM_WMI_MAJOR_OFFSET] != MSI_WMI_PLATFORM_INTERFACE_VERSION) {
++	if (data[MSI_PLATFORM_WMI_MAJOR_OFFSET] != MSI_WMI_PLATFORM_INTERFACE_VERSION) {
+ 		if (!force)
+ 			return -ENODEV;
+ 
+ 		dev_warn(&wdev->dev, "Loading despite unsupported WMI interface version (%u.%u)\n",
+-			 output[MSI_PLATFORM_WMI_MAJOR_OFFSET],
+-			 output[MSI_PLATFORM_WMI_MINOR_OFFSET]);
++			 data[MSI_PLATFORM_WMI_MAJOR_OFFSET],
++			 data[MSI_PLATFORM_WMI_MINOR_OFFSET]);
+ 	}
+ 
+ 	return 0;
+-- 
+2.49.0
+
+
+From 112a6814696ced760cb39a9ab708ff1af82f03e8 Mon Sep 17 00:00:00 2001
+From: Armin Wolf <W_Armin@gmx.de>
+Date: Mon, 31 Mar 2025 17:28:39 +0200
+Subject: [PATCH 27/34] platform/x86: msi-wmi-platform: Add support for fan
+ control
+
+Adds fan curve support for the MSI platform. These devices contain
+support for two fans, where they are named CPU and GPU but in the
+case of the Claw series just map to left and right fan.
+
+Co-developed-by: Antheas Kapenekakis <lkml@antheas.dev>
+Signed-off-by: Armin Wolf <W_Armin@gmx.de>
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ .../wmi/devices/msi-wmi-platform.rst          |  26 ++
+ drivers/platform/x86/msi-wmi-platform.c       | 358 ++++++++++++++++--
+ 2 files changed, 359 insertions(+), 25 deletions(-)
+
+diff --git a/Documentation/wmi/devices/msi-wmi-platform.rst b/Documentation/wmi/devices/msi-wmi-platform.rst
+index 31a136942..ac5f1c72d 100644
+--- a/Documentation/wmi/devices/msi-wmi-platform.rst
++++ b/Documentation/wmi/devices/msi-wmi-platform.rst
+@@ -165,6 +165,32 @@ The fan RPM readings can be calculated with the following formula:
+ 
+ If the fan speed reading is zero, then the fan RPM is zero too.
+ 
++The subfeature ``0x01`` is used to retrieve the fan speed table for the CPU fan. The output
++data contains the fan speed table and two bytes with unknown data. The fan speed table
++consists of six 8-bit entries, each containing a fan speed value in percent.
++
++The subfeature ``0x02`` is used tho retrieve the same data for the GPU fan.
++
++WMI method Set_Fan()
++--------------------
++
++The fan speed tables can be accessed using subfeature ``0x01`` (CPU fan) and subfeature ``0x02``
++(GPU fan). The input data has the same format as the output data of the ``Get_Fan`` WMI method.
++
++WMI method Get_AP()
++-------------------
++
++The current fan mode can be accessed using subfeature ``0x01``. The output data contains a flag
++byte and two bytes of unknown data. If the 7th bit inside the flag byte is cleared then all fans
++are operating in automatic mode, otherwise the fans operate based on the fan speed tables
++accessible thru the ``Get_Fan``/``Set_Fan`` WMI methods.
++
++WMI method Set_AP()
++-------------------
++
++The current fan mode can be changed using subfeature ``0x01``. The input data has the same format
++as the output data of the ``Get_AP`` WMI method.
++
+ WMI method Get_WMI()
+ --------------------
+ 
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index 30f5b63b1..d28d01c9d 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -14,12 +14,18 @@
+ #include <linux/device.h>
+ #include <linux/device/driver.h>
+ #include <linux/errno.h>
++#include <linux/fixp-arith.h>
+ #include <linux/hwmon.h>
++#include <linux/hwmon-sysfs.h>
+ #include <linux/kernel.h>
++#include <linux/kstrtox.h>
++#include <linux/minmax.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/printk.h>
+ #include <linux/rwsem.h>
+ #include <linux/string.h>
++#include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/wmi.h>
+ 
+@@ -31,9 +37,7 @@
+ 
+ #define MSI_WMI_PLATFORM_INTERFACE_VERSION	2
+ 
+-#define MSI_PLATFORM_WMI_MAJOR_OFFSET	1
+-#define MSI_PLATFORM_WMI_MINOR_OFFSET	2
+-
++/* Get_EC() and Set_EC() WMI methods */
+ #define MSI_PLATFORM_EC_FLAGS_OFFSET	1
+ #define MSI_PLATFORM_EC_MINOR_MASK	GENMASK(3, 0)
+ #define MSI_PLATFORM_EC_MAJOR_MASK	GENMASK(5, 4)
+@@ -41,6 +45,22 @@
+ #define MSI_PLATFORM_EC_IS_TIGERLAKE	BIT(7)
+ #define MSI_PLATFORM_EC_VERSION_OFFSET	2
+ 
++/* Get_Fan() and Set_Fan() WMI methods */
++#define MSI_PLATFORM_FAN_SUBFEATURE_FAN_SPEED		0x0
++#define MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE	0x1
++#define MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE	0x2
++#define MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE	0x1
++#define MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE	0x2
++
++/* Get_AP() and Set_AP() WMI methods */
++#define MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE	0x1
++#define MSI_PLATFORM_AP_FAN_FLAGS_OFFSET	1
++#define MSI_PLATFORM_AP_ENABLE_FAN_TABLES	BIT(7)
++
++/* Get_WMI() WMI method */
++#define MSI_PLATFORM_WMI_MAJOR_OFFSET		1
++#define MSI_PLATFORM_WMI_MINOR_OFFSET		2
++
+ static bool force;
+ module_param_unsafe(force, bool, 0);
+ MODULE_PARM_DESC(force, "Force loading without checking for supported WMI interface versions");
+@@ -77,6 +97,11 @@ enum msi_wmi_platform_method {
+ 	MSI_PLATFORM_GET_WMI		= 0x1d,
+ };
+ 
++struct msi_wmi_platform_data {
++	struct wmi_device *wdev;
++	struct mutex write_lock;
++};
++
+ struct msi_wmi_platform_debugfs_data {
+ 	struct wmi_device *wdev;
+ 	enum msi_wmi_platform_method method;
+@@ -162,36 +187,302 @@ static int msi_wmi_platform_query(struct wmi_device *wdev, enum msi_wmi_platform
+ 	return ret;
+ }
+ 
++static ssize_t msi_wmi_platform_fan_table_show(struct device *dev, struct device_attribute *attr,
++					       char *buf)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	u8 fan_percent;
++	int ret;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_FAN, buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	fan_percent = buffer[sattr->index + 1];
++	if (fan_percent > 100)
++		return -EIO;
++
++	return sysfs_emit(buf, "%d\n", fixp_linear_interpolate(0, 0, 100, 255, fan_percent));
++}
++
++static ssize_t msi_wmi_platform_fan_table_store(struct device *dev, struct device_attribute *attr,
++						const char *buf, size_t count)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	long speed;
++	int ret;
++
++	ret = kstrtol(buf, 10, &speed);
++	if (ret < 0)
++		return ret;
++
++	speed = clamp_val(speed, 0, 255);
++
++	guard(mutex)(&data->write_lock);
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_FAN, buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	buffer[0] = sattr->nr;
++	buffer[sattr->index + 1] = fixp_linear_interpolate(0, 0, 255, 100, speed);
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_FAN, buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	return count;
++}
++
++static ssize_t msi_wmi_platform_temp_table_show(struct device *dev, struct device_attribute *attr,
++						char *buf)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	u8 temp_c;
++	int ret;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	temp_c = buffer[sattr->index + 1];
++
++	return sysfs_emit(buf, "%d\n", temp_c);
++}
++
++static ssize_t msi_wmi_platform_temp_table_store(struct device *dev, struct device_attribute *attr,
++						 const char *buf, size_t count)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	long temp_c;
++	int ret;
++
++	ret = kstrtol(buf, 10, &temp_c);
++	if (ret < 0)
++		return ret;
++
++	temp_c = clamp_val(temp_c, 0, 255);
++
++	guard(mutex)(&data->write_lock);
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	buffer[0] = sattr->nr;
++	buffer[sattr->index + 1] = temp_c;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	return count;
++}
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point1_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x0);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point2_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point3_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point4_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point5_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x6);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point6_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x7);
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point1_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x1);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point2_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x2);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point3_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point4_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point5_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point6_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x6);
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point1_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x0);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point2_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point3_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point4_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point5_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x6);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point6_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x7);
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point1_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x1);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point2_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x2);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point3_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point4_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point5_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point6_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x6);
++
++static struct attribute *msi_wmi_platform_hwmon_attrs[] = {
++	&sensor_dev_attr_pwm1_auto_point1_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point2_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point3_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point4_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point5_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point6_temp.dev_attr.attr,
++
++	&sensor_dev_attr_pwm1_auto_point1_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point2_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point3_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point4_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point5_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point6_pwm.dev_attr.attr,
++
++	&sensor_dev_attr_pwm2_auto_point1_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point2_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point3_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point4_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point5_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point6_temp.dev_attr.attr,
++
++	&sensor_dev_attr_pwm2_auto_point1_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point2_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point3_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point4_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point5_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point6_pwm.dev_attr.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(msi_wmi_platform_hwmon);
++
+ static umode_t msi_wmi_platform_is_visible(const void *drvdata, enum hwmon_sensor_types type,
+ 					   u32 attr, int channel)
+ {
++	if (type == hwmon_pwm && attr == hwmon_pwm_enable)
++		return 0644;
++
+ 	return 0444;
+ }
+ 
+ static int msi_wmi_platform_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+ 				 int channel, long *val)
+ {
+-	struct wmi_device *wdev = dev_get_drvdata(dev);
+-	u8 data[32] = { 0 };
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { };
+ 	u16 value;
++	u8 flags;
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_FAN, data, sizeof(data));
+-	if (ret < 0)
+-		return ret;
++	switch (type) {
++	case hwmon_fan:
++		switch (attr) {
++		case hwmon_fan_input:
++			buffer[0] = MSI_PLATFORM_FAN_SUBFEATURE_FAN_SPEED;
++			ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_FAN, buffer,
++						     sizeof(buffer));
++			if (ret < 0)
++				return ret;
++
++			value = get_unaligned_be16(&buffer[channel * 2 + 1]);
++			if (!value)
++				*val = 0;
++			else
++				*val = 480000 / value;
++
++			return 0;
++		default:
++			return -EOPNOTSUPP;
++		}
++	case hwmon_pwm:
++		switch (attr) {
++		case hwmon_pwm_enable:
++			buffer[0] = MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE;
++			ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_AP, buffer,
++						     sizeof(buffer));
++			if (ret < 0)
++				return ret;
++
++			flags = buffer[MSI_PLATFORM_AP_FAN_FLAGS_OFFSET];
++			if (flags & MSI_PLATFORM_AP_ENABLE_FAN_TABLES)
++				*val = 1;	// TODO: Do fan tables count as "manual fan control"?
++			else
++				*val = 2;
++
++			return 0;
++		default:
++			return -EOPNOTSUPP;
++		}
++	default:
++		return -EOPNOTSUPP;
++	}
++}
+ 
+-	value = get_unaligned_be16(&data[channel * 2 + 1]);
+-	if (!value)
+-		*val = 0;
+-	else
+-		*val = 480000 / value;
++static int msi_wmi_platform_write(struct device *dev, enum hwmon_sensor_types type, u32 attr,
++				  int channel, long val)
++{
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { };
++	int ret;
+ 
+-	return 0;
++	switch (type) {
++	case hwmon_pwm:
++		switch (attr) {
++		case hwmon_pwm_enable:
++			guard(mutex)(&data->write_lock);
++
++			buffer[0] = MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE;
++			ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_AP, buffer,
++						     sizeof(buffer));
++			if (ret < 0)
++				return ret;
++
++			buffer[0] = MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE;
++			switch (val) {
++			case 1:
++				buffer[MSI_PLATFORM_AP_FAN_FLAGS_OFFSET] |=
++					MSI_PLATFORM_AP_ENABLE_FAN_TABLES;
++				break;
++			case 2:
++				buffer[MSI_PLATFORM_AP_FAN_FLAGS_OFFSET] &=
++					~MSI_PLATFORM_AP_ENABLE_FAN_TABLES;
++				break;
++			default:
++				return -EINVAL;
++			}
++
++			return msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_AP, buffer,
++						      sizeof(buffer));
++		default:
++			return -EOPNOTSUPP;
++		}
++	default:
++		return -EOPNOTSUPP;
++	}
+ }
+ 
+ static const struct hwmon_ops msi_wmi_platform_ops = {
+ 	.is_visible = msi_wmi_platform_is_visible,
+ 	.read = msi_wmi_platform_read,
++	.write = msi_wmi_platform_write,
+ };
+ 
+ static const struct hwmon_channel_info * const msi_wmi_platform_info[] = {
+@@ -201,6 +492,10 @@ static const struct hwmon_channel_info * const msi_wmi_platform_info[] = {
+ 			   HWMON_F_INPUT,
+ 			   HWMON_F_INPUT
+ 			   ),
++	HWMON_CHANNEL_INFO(pwm,
++			   HWMON_PWM_ENABLE,
++			   HWMON_PWM_ENABLE
++			   ),
+ 	NULL
+ };
+ 
+@@ -209,8 +504,8 @@ static const struct hwmon_chip_info msi_wmi_platform_chip_info = {
+ 	.info = msi_wmi_platform_info,
+ };
+ 
+-static ssize_t msi_wmi_platform_write(struct file *fp, const char __user *input, size_t length,
+-				      loff_t *offset)
++static ssize_t msi_wmi_platform_debugfs_write(struct file *fp, const char __user *input,
++					      size_t length, loff_t *offset)
+ {
+ 	struct seq_file *seq = fp->private_data;
+ 	struct msi_wmi_platform_debugfs_data *data = seq->private;
+@@ -240,7 +535,7 @@ static ssize_t msi_wmi_platform_write(struct file *fp, const char __user *input,
+ 	return length;
+ }
+ 
+-static int msi_wmi_platform_show(struct seq_file *seq, void *p)
++static int msi_wmi_platform_debugfs_show(struct seq_file *seq, void *p)
+ {
+ 	struct msi_wmi_platform_debugfs_data *data = seq->private;
+ 	int ret;
+@@ -252,19 +547,19 @@ static int msi_wmi_platform_show(struct seq_file *seq, void *p)
+ 	return ret;
+ }
+ 
+-static int msi_wmi_platform_open(struct inode *inode, struct file *fp)
++static int msi_wmi_platform_debugfs_open(struct inode *inode, struct file *fp)
+ {
+ 	struct msi_wmi_platform_debugfs_data *data = inode->i_private;
+ 
+ 	/* The seq_file uses the last byte of the buffer for detecting buffer overflows */
+-	return single_open_size(fp, msi_wmi_platform_show, data, data->length + 1);
++	return single_open_size(fp, msi_wmi_platform_debugfs_show, data, data->length + 1);
+ }
+ 
+ static const struct file_operations msi_wmi_platform_debugfs_fops = {
+ 	.owner = THIS_MODULE,
+-	.open = msi_wmi_platform_open,
++	.open = msi_wmi_platform_debugfs_open,
+ 	.read = seq_read,
+-	.write = msi_wmi_platform_write,
++	.write = msi_wmi_platform_debugfs_write,
+ 	.llseek = seq_lseek,
+ 	.release = single_release,
+ };
+@@ -321,12 +616,13 @@ static void msi_wmi_platform_debugfs_init(struct wmi_device *wdev)
+ 					     method);
+ }
+ 
+-static int msi_wmi_platform_hwmon_init(struct wmi_device *wdev)
++static int msi_wmi_platform_hwmon_init(struct msi_wmi_platform_data *data)
+ {
+ 	struct device *hdev;
+ 
+-	hdev = devm_hwmon_device_register_with_info(&wdev->dev, "msi_wmi_platform", wdev,
+-						    &msi_wmi_platform_chip_info, NULL);
++	hdev = devm_hwmon_device_register_with_info(&data->wdev->dev, "msi_wmi_platform", data,
++						    &msi_wmi_platform_chip_info,
++						    msi_wmi_platform_hwmon_groups);
+ 
+ 	return PTR_ERR_OR_ZERO(hdev);
+ }
+@@ -386,6 +682,7 @@ static int msi_wmi_platform_init(struct wmi_device *wdev)
+ 
+ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ {
++	struct msi_wmi_platform_data *data;
+ 	int ret;
+ 
+ 	ret = msi_wmi_platform_init(wdev);
+@@ -396,9 +693,20 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	data = devm_kzalloc(&wdev->dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENODATA;
++
++	data->wdev = wdev;
++	dev_set_drvdata(&wdev->dev, data);
++
++	ret = devm_mutex_init(&wdev->dev, &data->write_lock);
++	if (ret < 0)
++		return ret;
++
+ 	msi_wmi_platform_debugfs_init(wdev);
+ 
+-	return msi_wmi_platform_hwmon_init(wdev);
++	return msi_wmi_platform_hwmon_init(data);
+ }
+ 
+ static const struct wmi_device_id msi_wmi_platform_id_table[] = {
+-- 
+2.49.0
+
+
+From 2bb8d914f001f45fc68e4255f0b2525be43c23a4 Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Fri, 4 Apr 2025 11:07:54 +0200
+Subject: [PATCH 28/34] platform/x86: msi-wmi-platform: Add quirk system
+
+MSI uses the WMI interface as a passthrough for writes to the EC
+and uses a board name match and a quirk table from userspace on
+Windows. Therefore, there is no auto-detection functionality and
+we have to fallback to a quirk table.
+
+Introduce it here, prior to starting to add features to it.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/platform/x86/msi-wmi-platform.c | 45 +++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index d28d01c9d..df1c3b91c 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -13,6 +13,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/device.h>
+ #include <linux/device/driver.h>
++#include <linux/dmi.h>
+ #include <linux/errno.h>
+ #include <linux/fixp-arith.h>
+ #include <linux/hwmon.h>
+@@ -97,8 +98,12 @@ enum msi_wmi_platform_method {
+ 	MSI_PLATFORM_GET_WMI		= 0x1d,
+ };
+ 
++struct msi_wmi_platform_quirk {
++};
++
+ struct msi_wmi_platform_data {
+ 	struct wmi_device *wdev;
++	struct msi_wmi_platform_quirk *quirks;
+ 	struct mutex write_lock;
+ };
+ 
+@@ -142,6 +147,39 @@ static const char * const msi_wmi_platform_debugfs_names[] = {
+ 	"get_wmi"
+ };
+ 
++static struct msi_wmi_platform_quirk quirk_default = {};
++static struct msi_wmi_platform_quirk quirk_gen1 = {
++};
++static struct msi_wmi_platform_quirk quirk_gen2 = {
++};
++
++static const struct dmi_system_id msi_quirks[] = {
++	{
++		.ident = "MSI Claw (gen 1)",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Micro-Star International Co., Ltd."),
++			DMI_MATCH(DMI_BOARD_NAME, "MS-1T41"),
++		},
++		.driver_data = &quirk_gen1,
++	},
++	{
++		.ident = "MSI Claw AI+ 7",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Micro-Star International Co., Ltd."),
++			DMI_MATCH(DMI_BOARD_NAME, "MS-1T42"),
++		},
++		.driver_data = &quirk_gen2,
++	},
++	{
++		.ident = "MSI Claw AI+ 8",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Micro-Star International Co., Ltd."),
++			DMI_MATCH(DMI_BOARD_NAME, "MS-1T52"),
++		},
++		.driver_data = &quirk_gen2,
++	},
++};
++
+ static int msi_wmi_platform_parse_buffer(union acpi_object *obj, u8 *output, size_t length)
+ {
+ 	if (obj->type != ACPI_TYPE_BUFFER)
+@@ -683,6 +721,7 @@ static int msi_wmi_platform_init(struct wmi_device *wdev)
+ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ {
+ 	struct msi_wmi_platform_data *data;
++	const struct dmi_system_id *dmi_id;
+ 	int ret;
+ 
+ 	ret = msi_wmi_platform_init(wdev);
+@@ -700,6 +739,12 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 	data->wdev = wdev;
+ 	dev_set_drvdata(&wdev->dev, data);
+ 
++	dmi_id = dmi_first_match(msi_quirks);
++	if (dmi_id)
++		data->quirks = dmi_id->driver_data;
++	else
++		data->quirks = &quirk_default;
++
+ 	ret = devm_mutex_init(&wdev->dev, &data->write_lock);
+ 	if (ret < 0)
+ 		return ret;
+-- 
+2.49.0
+
+
+From 13e25595e2b8ec79633fdb1d027143a3f171f02d Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Fri, 4 Apr 2025 10:18:43 +0200
+Subject: [PATCH 29/34] platform/x86: msi-wmi-platform: Add platform profile
+ through shift mode
+
+MSI's version of platform profile in Windows is called shift mode.
+Introduce it here, and add a profile handler to it.
+
+It has 5 modes: sport, comfort, green, eco, and user.
+Confusingly, for the Claw, MSI only uses sport, green, and eco,
+where they correspond to performance, balanced, and low-power.
+Therefore, comfort is mapped to balanced-performance, and user to
+custom.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/platform/x86/Kconfig            |   1 +
+ drivers/platform/x86/msi-wmi-platform.c | 122 +++++++++++++++++++++++-
+ 2 files changed, 122 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 0258dd879..3a347ce81 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -729,6 +729,7 @@ config MSI_WMI_PLATFORM
+ 	tristate "MSI WMI Platform features"
+ 	depends on ACPI_WMI
+ 	depends on HWMON
++	select ACPI_PLATFORM_PROFILE
+ 	help
+ 	  Say Y here if you want to have support for WMI-based platform features
+ 	  like fan sensor access on MSI machines.
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index df1c3b91c..77d30e066 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -16,6 +16,7 @@
+ #include <linux/dmi.h>
+ #include <linux/errno.h>
+ #include <linux/fixp-arith.h>
++#include <linux/platform_profile.h>
+ #include <linux/hwmon.h>
+ #include <linux/hwmon-sysfs.h>
+ #include <linux/kernel.h>
+@@ -58,6 +59,16 @@
+ #define MSI_PLATFORM_AP_FAN_FLAGS_OFFSET	1
+ #define MSI_PLATFORM_AP_ENABLE_FAN_TABLES	BIT(7)
+ 
++/* Get_Data() and Set_Data() Shift Mode Register */
++#define MSI_PLATFORM_SHIFT_ADDR		0xd2
++#define MSI_PLATFORM_SHIFT_DISABLE	BIT(7)
++#define MSI_PLATFORM_SHIFT_ENABLE	(BIT(7) | BIT(6))
++#define MSI_PLATFORM_SHIFT_SPORT	(MSI_PLATFORM_SHIFT_ENABLE + 4)
++#define MSI_PLATFORM_SHIFT_COMFORT 	(MSI_PLATFORM_SHIFT_ENABLE + 0)
++#define MSI_PLATFORM_SHIFT_GREEN	(MSI_PLATFORM_SHIFT_ENABLE + 1)
++#define MSI_PLATFORM_SHIFT_ECO		(MSI_PLATFORM_SHIFT_ENABLE + 2)
++#define MSI_PLATFORM_SHIFT_USER		(MSI_PLATFORM_SHIFT_ENABLE + 3)
++
+ /* Get_WMI() WMI method */
+ #define MSI_PLATFORM_WMI_MAJOR_OFFSET		1
+ #define MSI_PLATFORM_WMI_MINOR_OFFSET		2
+@@ -99,11 +110,13 @@ enum msi_wmi_platform_method {
+ };
+ 
+ struct msi_wmi_platform_quirk {
++	bool shift_mode;	/* Shift mode is supported */
+ };
+ 
+ struct msi_wmi_platform_data {
+ 	struct wmi_device *wdev;
+ 	struct msi_wmi_platform_quirk *quirks;
++	struct device *ppdev;
+ 	struct mutex write_lock;
+ };
+ 
+@@ -149,8 +162,10 @@ static const char * const msi_wmi_platform_debugfs_names[] = {
+ 
+ static struct msi_wmi_platform_quirk quirk_default = {};
+ static struct msi_wmi_platform_quirk quirk_gen1 = {
++	.shift_mode = true
+ };
+ static struct msi_wmi_platform_quirk quirk_gen2 = {
++	.shift_mode = true
+ };
+ 
+ static const struct dmi_system_id msi_quirks[] = {
+@@ -542,6 +557,89 @@ static const struct hwmon_chip_info msi_wmi_platform_chip_info = {
+ 	.info = msi_wmi_platform_info,
+ };
+ 
++static int msi_wmi_platform_profile_probe(void *drvdata, unsigned long *choices)
++{
++	set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
++	set_bit(PLATFORM_PROFILE_BALANCED, choices);
++	set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, choices);
++	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
++	return 0;
++}
++
++static int msi_wmi_platform_profile_get(struct device *dev,
++					enum platform_profile_option *profile)
++{
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++
++	u8 buffer[32] = { };
++
++	buffer[0] = MSI_PLATFORM_SHIFT_ADDR;
++
++	int ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_DATA, buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++	
++	if (buffer[0] != 1)
++		return -EINVAL;
++	
++	switch (buffer[1]) {
++	case MSI_PLATFORM_SHIFT_SPORT:
++		*profile = PLATFORM_PROFILE_PERFORMANCE;
++		return 0;
++	case MSI_PLATFORM_SHIFT_COMFORT:
++		*profile = PLATFORM_PROFILE_BALANCED_PERFORMANCE;
++		return 0;
++	case MSI_PLATFORM_SHIFT_GREEN:
++		*profile = PLATFORM_PROFILE_BALANCED;
++		return 0;
++	case MSI_PLATFORM_SHIFT_ECO:
++		*profile = PLATFORM_PROFILE_LOW_POWER;
++		return 0;
++	case MSI_PLATFORM_SHIFT_USER:
++		*profile = PLATFORM_PROFILE_CUSTOM;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int msi_wmi_platform_profile_set(struct device *dev,
++					enum platform_profile_option profile)
++{
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { };
++
++	buffer[0] = MSI_PLATFORM_SHIFT_ADDR;
++
++	switch (profile) {
++	case PLATFORM_PROFILE_PERFORMANCE:
++		buffer[1] = MSI_PLATFORM_SHIFT_SPORT;
++		break;
++	case PLATFORM_PROFILE_BALANCED_PERFORMANCE:
++		buffer[1] = MSI_PLATFORM_SHIFT_COMFORT;
++		break;
++	case PLATFORM_PROFILE_BALANCED:
++		buffer[1] = MSI_PLATFORM_SHIFT_GREEN;
++		break;
++	case PLATFORM_PROFILE_LOW_POWER:
++		buffer[1] = MSI_PLATFORM_SHIFT_ECO;
++		break;
++	case PLATFORM_PROFILE_CUSTOM:
++		buffer[1] = MSI_PLATFORM_SHIFT_USER;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_DATA, buffer, sizeof(buffer));
++}
++
++static const struct platform_profile_ops msi_wmi_platform_profile_ops = {
++	.probe = msi_wmi_platform_profile_probe,
++	.profile_get = msi_wmi_platform_profile_get,
++	.profile_set = msi_wmi_platform_profile_set,
++};
++
+ static ssize_t msi_wmi_platform_debugfs_write(struct file *fp, const char __user *input,
+ 					      size_t length, loff_t *offset)
+ {
+@@ -718,6 +816,22 @@ static int msi_wmi_platform_init(struct wmi_device *wdev)
+ 	return 0;
+ }
+ 
++static int msi_wmi_platform_profile_setup(struct msi_wmi_platform_data *data)
++{
++	int err;
++
++	if (!data->quirks->shift_mode)
++		return 0;
++
++	data->ppdev = devm_platform_profile_register(
++		&data->wdev->dev, "msi-wmi-platform", data,
++		&msi_wmi_platform_profile_ops);
++	if (err)
++		return err;
++
++	return PTR_ERR_OR_ZERO(data->ppdev);
++}
++
+ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ {
+ 	struct msi_wmi_platform_data *data;
+@@ -749,9 +863,15 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	ret = msi_wmi_platform_hwmon_init(data);
++	if (ret < 0)
++		return ret;
++
++	msi_wmi_platform_profile_setup(data);
++
+ 	msi_wmi_platform_debugfs_init(wdev);
+ 
+-	return msi_wmi_platform_hwmon_init(data);
++	return 0;
+ }
+ 
+ static const struct wmi_device_id msi_wmi_platform_id_table[] = {
+-- 
+2.49.0
+
+
+From 8a5330760efd7e66b9dc05a497ccbff0de08fb4d Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Fri, 4 Apr 2025 10:43:25 +0200
+Subject: [PATCH 30/34] platform/x86: msi-wmi-platform: Add PL1/PL2 support via
+ firmware attributes
+
+Adds PL1, and PL2 support through the firmware attributes interface.
+The min and max values are quirked, and the attributes are only defined
+if they are set to a non-zero value. These values are meant to be set
+in conjunction with shift mode, where shift mode automatically sets
+an upper bound on PL1/PL2 (e.g., low-power would be used with 8W).
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/platform/x86/Kconfig            |   1 +
+ drivers/platform/x86/msi-wmi-platform.c | 364 +++++++++++++++++++++++-
+ 2 files changed, 363 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 3a347ce81..58d61d723 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -730,6 +730,7 @@ config MSI_WMI_PLATFORM
+ 	depends on ACPI_WMI
+ 	depends on HWMON
+ 	select ACPI_PLATFORM_PROFILE
++	select FW_ATTR_CLASS
+ 	help
+ 	  Say Y here if you want to have support for WMI-based platform features
+ 	  like fan sensor access on MSI machines.
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index 77d30e066..edb1adfe4 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -33,6 +33,8 @@
+ 
+ #include <linux/unaligned.h>
+ 
++#include "firmware_attributes_class.h"
++
+ #define DRIVER_NAME	"msi-wmi-platform"
+ 
+ #define MSI_PLATFORM_GUID	"ABBC0F6E-8EA1-11d1-00A0-C90629100000"
+@@ -69,6 +71,10 @@
+ #define MSI_PLATFORM_SHIFT_ECO		(MSI_PLATFORM_SHIFT_ENABLE + 2)
+ #define MSI_PLATFORM_SHIFT_USER		(MSI_PLATFORM_SHIFT_ENABLE + 3)
+ 
++/* Get_Data() and Set_Data() Params */
++#define MSI_PLATFORM_PL1_ADDR	0x50
++#define MSI_PLATFORM_PL2_ADDR	0x51
++
+ /* Get_WMI() WMI method */
+ #define MSI_PLATFORM_WMI_MAJOR_OFFSET		1
+ #define MSI_PLATFORM_WMI_MINOR_OFFSET		2
+@@ -111,15 +117,56 @@ enum msi_wmi_platform_method {
+ 
+ struct msi_wmi_platform_quirk {
+ 	bool shift_mode;	/* Shift mode is supported */
++	int pl_min;		/* Minimum PLx value */
++	int pl1_max;		/* Maximum PL1 value */
++	int pl2_max;		/* Maximum PL2 value */
+ };
+ 
+ struct msi_wmi_platform_data {
+ 	struct wmi_device *wdev;
+ 	struct msi_wmi_platform_quirk *quirks;
+ 	struct device *ppdev;
++	struct device *fw_attrs_dev;
++	struct kset *fw_attrs_kset;
+ 	struct mutex write_lock;
+ };
+ 
++enum msi_fw_attr_id {
++	MSI_ATTR_PPT_PL1_SPL,
++	MSI_ATTR_PPT_PL2_SPPT,
++};
++
++static const char *const msi_fw_attr_name[] = {
++	[MSI_ATTR_PPT_PL1_SPL] = "ppt_pl1_spl",
++	[MSI_ATTR_PPT_PL2_SPPT] = "ppt_pl2_sppt",
++};
++
++static const char *const msi_fw_attr_desc[] = {
++	[MSI_ATTR_PPT_PL1_SPL] = "CPU Steady package limit (PL1/SPL)",
++	[MSI_ATTR_PPT_PL2_SPPT] = "CPU Boost slow package limit (PL2/SPPT)",
++};
++
++#define MSI_ATTR_LANGUAGE_CODE "en_US.UTF-8"
++
++struct msi_fw_attr {
++	struct msi_wmi_platform_data *data;
++	enum msi_fw_attr_id fw_attr_id;
++	struct attribute_group attr_group;
++	struct kobj_attribute display_name;
++	struct kobj_attribute current_value;
++	struct kobj_attribute min_value;
++	struct kobj_attribute max_value;
++
++	u32 min;
++	u32 max;
++
++	int (*get_value)(struct msi_wmi_platform_data *data,
++			 struct msi_fw_attr *fw_attr, char *buf);
++	ssize_t (*set_value)(struct msi_wmi_platform_data *data,
++			     struct msi_fw_attr *fw_attr, const char *buf,
++			     size_t count);
++};
++
+ struct msi_wmi_platform_debugfs_data {
+ 	struct wmi_device *wdev;
+ 	enum msi_wmi_platform_method method;
+@@ -162,10 +209,16 @@ static const char * const msi_wmi_platform_debugfs_names[] = {
+ 
+ static struct msi_wmi_platform_quirk quirk_default = {};
+ static struct msi_wmi_platform_quirk quirk_gen1 = {
+-	.shift_mode = true
++	.shift_mode = true,
++	.pl_min = 8,
++	.pl1_max = 43,
++	.pl2_max = 45
+ };
+ static struct msi_wmi_platform_quirk quirk_gen2 = {
+-	.shift_mode = true
++	.shift_mode = true,
++	.pl_min = 8,
++	.pl1_max = 30,
++	.pl2_max = 37
+ };
+ 
+ static const struct dmi_system_id msi_quirks[] = {
+@@ -640,6 +693,309 @@ static const struct platform_profile_ops msi_wmi_platform_profile_ops = {
+ 	.profile_set = msi_wmi_platform_profile_set,
+ };
+ 
++/* Firmware Attributes setup */
++static int data_get_addr(struct msi_wmi_platform_data *data,
++			 const enum msi_fw_attr_id id)
++{
++	switch (id) {
++	case MSI_ATTR_PPT_PL1_SPL:
++		return MSI_PLATFORM_PL1_ADDR;
++	case MSI_ATTR_PPT_PL2_SPPT:
++		return MSI_PLATFORM_PL2_ADDR;
++	default:
++		pr_warn("Invalid attribute id %d\n", id);
++		return -EINVAL;
++	}
++}
++
++static ssize_t data_set_value(struct msi_wmi_platform_data *data,
++			      struct msi_fw_attr *fw_attr, const char *buf,
++			      size_t count)
++{
++	u8 buffer[32] = { 0 };
++	int ret, fwid;
++	u32 value;
++
++	fwid = data_get_addr(data, fw_attr->fw_attr_id);
++	if (fwid < 0)
++		return fwid;
++
++	ret = kstrtou32(buf, 10, &value);
++	if (ret)
++		return ret;
++
++	if (fw_attr->min >= 0 && value < fw_attr->min)
++		return -EINVAL;
++	if (fw_attr->max >= 0 && value > fw_attr->max)
++		return -EINVAL;
++
++	buffer[0] = fwid;
++	put_unaligned_le32(value, &buffer[1]);
++
++	guard(mutex)(&data->write_lock);
++	
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_DATA, buffer, sizeof(buffer));
++	if (ret) {
++		pr_warn("Failed to set_data with id %d: %d\n",
++			fw_attr->fw_attr_id, ret);
++		return ret;
++	}
++
++	return count;
++}
++
++static int data_get_value(struct msi_wmi_platform_data *data,
++			  struct msi_fw_attr *fw_attr, char *buf)
++{
++	u8 buffer[32] = { 0 };
++	u32 value;
++	int ret, addr;
++
++	addr = data_get_addr(data, fw_attr->fw_attr_id);
++	if (addr < 0)
++		return addr;
++
++	buffer[0] = addr;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_DATA, buffer,
++				     sizeof(buffer));
++	if (ret) {
++		pr_warn("Failed to show set_data for id %d: %d\n",
++			fw_attr->fw_attr_id, ret);
++		return ret;
++	}
++
++	value = get_unaligned_le32(&buffer[1]);
++
++	return sysfs_emit(buf, "%d\n", value);
++}
++
++static ssize_t display_name_language_code_show(struct kobject *kobj, struct kobj_attribute *attr,
++					       char *buf)
++{
++	return sysfs_emit(buf, "%s\n", MSI_ATTR_LANGUAGE_CODE);
++}
++
++static struct kobj_attribute fw_attr_display_name_language_code =
++	__ATTR_RO(display_name_language_code);
++
++static ssize_t scalar_increment_show(struct kobject *kobj,
++					       struct kobj_attribute *attr,
++					       char *buf)
++{
++	return sysfs_emit(buf, "1\n");
++}
++
++static struct kobj_attribute fw_attr_scalar_increment =
++	__ATTR_RO(scalar_increment);
++
++static ssize_t pending_reboot_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "0\n");
++}
++
++static struct kobj_attribute fw_attr_pending_reboot = __ATTR_RO(pending_reboot);
++
++static ssize_t display_name_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++	struct msi_fw_attr *fw_attr =
++		container_of(attr, struct msi_fw_attr, display_name);
++
++	return sysfs_emit(buf, "%s\n", msi_fw_attr_desc[fw_attr->fw_attr_id]);
++}
++
++static ssize_t current_value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++	struct msi_fw_attr *fw_attr =
++		container_of(attr, struct msi_fw_attr, current_value);
++
++	return fw_attr->get_value(fw_attr->data, fw_attr, buf);
++}
++
++static ssize_t current_value_store(struct kobject *kobj, struct kobj_attribute *attr,
++				   const char *buf, size_t count)
++{
++	struct msi_fw_attr *fw_attr =
++		container_of(attr, struct msi_fw_attr, current_value);
++
++	return fw_attr->set_value(fw_attr->data, fw_attr, buf, count);
++}
++
++static ssize_t type_show(struct kobject *kobj, struct kobj_attribute *attr,
++			 char *buf)
++{
++	return sysfs_emit(buf, "integer\n");
++}
++
++static struct kobj_attribute fw_attr_type_int = {
++	.attr = { .name = "type", .mode = 0444 },
++	.show = type_show,
++};
++
++static ssize_t min_value_show(struct kobject *kobj, struct kobj_attribute *attr,
++			      char *buf)
++{
++	struct msi_fw_attr *fw_attr =
++		container_of(attr, struct msi_fw_attr, min_value);
++
++	return sysfs_emit(buf, "%d\n", fw_attr->min);
++}
++
++static ssize_t max_value_show(struct kobject *kobj, struct kobj_attribute *attr,
++			      char *buf)
++{
++	struct msi_fw_attr *fw_attr =
++		container_of(attr, struct msi_fw_attr, max_value);
++
++	return sysfs_emit(buf, "%d\n", fw_attr->max);
++}
++
++#define FW_ATTR_ENUM_MAX_ATTRS  7
++
++static int
++msi_fw_attr_init(struct msi_wmi_platform_data *data,
++		 const enum msi_fw_attr_id fw_attr_id,
++		 struct kobj_attribute *fw_attr_type, const s32 min,
++		 const s32 max,
++		 int (*get_value)(struct msi_wmi_platform_data *data,
++				  struct msi_fw_attr *fw_attr, char *buf),
++		 ssize_t (*set_value)(struct msi_wmi_platform_data *data,
++				      struct msi_fw_attr *fw_attr,
++				      const char *buf, size_t count))
++{
++	struct msi_fw_attr *fw_attr;
++	struct attribute **attrs;
++	int idx = 0;
++
++	fw_attr = devm_kzalloc(&data->wdev->dev, sizeof(*fw_attr), GFP_KERNEL);
++	if (!fw_attr)
++		return -ENOMEM;
++
++	attrs = devm_kcalloc(&data->wdev->dev, FW_ATTR_ENUM_MAX_ATTRS + 1,
++			     sizeof(*attrs), GFP_KERNEL);
++	if (!attrs)
++		return -ENOMEM;
++
++	fw_attr->data = data;
++	fw_attr->fw_attr_id = fw_attr_id;
++	fw_attr->attr_group.name = msi_fw_attr_name[fw_attr_id];
++	fw_attr->attr_group.attrs = attrs;
++	fw_attr->get_value = get_value;
++	fw_attr->set_value = set_value;
++
++	attrs[idx++] = &fw_attr_type->attr;
++	if (fw_attr_type == &fw_attr_type_int)
++		attrs[idx++] = &fw_attr_scalar_increment.attr;
++	attrs[idx++] = &fw_attr_display_name_language_code.attr;
++
++	sysfs_attr_init(&fw_attr->display_name.attr);
++	fw_attr->display_name.attr.name = "display_name";
++	fw_attr->display_name.attr.mode = 0444;
++	fw_attr->display_name.show = display_name_show;
++	attrs[idx++] = &fw_attr->display_name.attr;
++
++	sysfs_attr_init(&fw_attr->current_value.attr);
++	fw_attr->current_value.attr.name = "current_value";
++	fw_attr->current_value.attr.mode = 0644;
++	fw_attr->current_value.show = current_value_show;
++	fw_attr->current_value.store = current_value_store;
++	attrs[idx++] = &fw_attr->current_value.attr;
++
++	if (min >= 0) {
++		fw_attr->min = min;
++		sysfs_attr_init(&fw_attr->min_value.attr);
++		fw_attr->min_value.attr.name = "min_value";
++		fw_attr->min_value.attr.mode = 0444;
++		fw_attr->min_value.show = min_value_show;
++		attrs[idx++] = &fw_attr->min_value.attr;
++	} else {
++		fw_attr->min = -1;
++	}
++
++	if (max >= 0) {
++		fw_attr->max = max;
++		sysfs_attr_init(&fw_attr->max_value.attr);
++		fw_attr->max_value.attr.name = "max_value";
++		fw_attr->max_value.attr.mode = 0444;
++		fw_attr->max_value.show = max_value_show;
++		attrs[idx++] = &fw_attr->max_value.attr;
++	} else {
++		fw_attr->max = -1;
++	}
++
++	attrs[idx] = NULL;
++	return sysfs_create_group(&data->fw_attrs_kset->kobj, &fw_attr->attr_group);
++}
++
++static void msi_kset_unregister(void *data)
++{
++	struct kset *kset = data;
++
++	sysfs_remove_file(&kset->kobj, &fw_attr_pending_reboot.attr);
++	kset_unregister(kset);
++}
++
++static void msi_fw_attrs_dev_unregister(void *data)
++{
++	struct device *fw_attrs_dev = data;
++
++	device_unregister(fw_attrs_dev);
++}
++
++static int msi_wmi_fw_attrs_init(struct msi_wmi_platform_data *data)
++{
++	int err;
++
++	data->fw_attrs_dev = device_create(&firmware_attributes_class, NULL, MKDEV(0, 0),
++						 NULL, "%s", DRIVER_NAME);
++	if (IS_ERR(data->fw_attrs_dev))
++		return PTR_ERR(data->fw_attrs_dev);
++
++	err = devm_add_action_or_reset(&data->wdev->dev,
++				       msi_fw_attrs_dev_unregister,
++				       data->fw_attrs_dev);
++	if (err)
++		return err;
++
++	data->fw_attrs_kset = kset_create_and_add("attributes", NULL,
++						  &data->fw_attrs_dev->kobj);
++	if (!data->fw_attrs_kset)
++		return -ENOMEM;
++
++	err = sysfs_create_file(&data->fw_attrs_kset->kobj,
++				&fw_attr_pending_reboot.attr);
++	if (err) {
++		kset_unregister(data->fw_attrs_kset);
++		return err;
++	}
++
++	err = devm_add_action_or_reset(&data->wdev->dev, msi_kset_unregister,
++				       data->fw_attrs_kset);
++	if (err)
++		return err;
++
++	if (data->quirks->pl1_max) {
++		err = msi_fw_attr_init(data, MSI_ATTR_PPT_PL1_SPL,
++					&fw_attr_type_int, data->quirks->pl_min,
++					data->quirks->pl1_max, &data_get_value,
++					&data_set_value);
++		if (err)
++			return err;
++	}
++
++	if (data->quirks->pl2_max) {
++		err = msi_fw_attr_init(data, MSI_ATTR_PPT_PL2_SPPT,
++				       &fw_attr_type_int, data->quirks->pl_min,
++				       data->quirks->pl2_max, &data_get_value,
++				       &data_set_value);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
+ static ssize_t msi_wmi_platform_debugfs_write(struct file *fp, const char __user *input,
+ 					      size_t length, loff_t *offset)
+ {
+@@ -867,6 +1223,10 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	ret = msi_wmi_fw_attrs_init(data);
++	if (ret < 0)
++		return ret;
++
+ 	msi_wmi_platform_profile_setup(data);
+ 
+ 	msi_wmi_platform_debugfs_init(wdev);
+-- 
+2.49.0
+
+
+From cbd2b8bab8af8f58a49295456fe290a0b734aa8c Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sat, 5 Apr 2025 00:28:19 +0200
+Subject: [PATCH 31/34] platform/x86: msi-wmi-platform: Add charge_threshold
+ support
+
+The battery of MSI laptops supports charge threshold. Add support for it.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/platform/x86/Kconfig            |   1 +
+ drivers/platform/x86/msi-wmi-platform.c | 112 ++++++++++++++++++++++++
+ 2 files changed, 113 insertions(+)
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 58d61d723..f7fbb289d 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -727,6 +727,7 @@ config MSI_WMI
+ 
+ config MSI_WMI_PLATFORM
+ 	tristate "MSI WMI Platform features"
++	depends on ACPI_BATTERY
+ 	depends on ACPI_WMI
+ 	depends on HWMON
+ 	select ACPI_PLATFORM_PROFILE
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index edb1adfe4..93ca416b3 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -30,6 +30,7 @@
+ #include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/wmi.h>
++#include <acpi/battery.h>
+ 
+ #include <linux/unaligned.h>
+ 
+@@ -74,6 +75,7 @@
+ /* Get_Data() and Set_Data() Params */
+ #define MSI_PLATFORM_PL1_ADDR	0x50
+ #define MSI_PLATFORM_PL2_ADDR	0x51
++#define MSI_PLATFORM_BAT_ADDR	0xd7
+ 
+ /* Get_WMI() WMI method */
+ #define MSI_PLATFORM_WMI_MAJOR_OFFSET		1
+@@ -117,6 +119,7 @@ enum msi_wmi_platform_method {
+ 
+ struct msi_wmi_platform_quirk {
+ 	bool shift_mode;	/* Shift mode is supported */
++	bool charge_threshold;	/* Charge threshold is supported */
+ 	int pl_min;		/* Minimum PLx value */
+ 	int pl1_max;		/* Maximum PL1 value */
+ 	int pl2_max;		/* Maximum PL2 value */
+@@ -126,6 +129,8 @@ struct msi_wmi_platform_data {
+ 	struct wmi_device *wdev;
+ 	struct msi_wmi_platform_quirk *quirks;
+ 	struct device *ppdev;
++	struct acpi_battery_hook battery_hook;
++	struct device_attribute battery_attr;
+ 	struct device *fw_attrs_dev;
+ 	struct kset *fw_attrs_kset;
+ 	struct mutex write_lock;
+@@ -210,12 +215,14 @@ static const char * const msi_wmi_platform_debugfs_names[] = {
+ static struct msi_wmi_platform_quirk quirk_default = {};
+ static struct msi_wmi_platform_quirk quirk_gen1 = {
+ 	.shift_mode = true,
++	.charge_threshold = true,
+ 	.pl_min = 8,
+ 	.pl1_max = 43,
+ 	.pl2_max = 45
+ };
+ static struct msi_wmi_platform_quirk quirk_gen2 = {
+ 	.shift_mode = true,
++	.charge_threshold = true,
+ 	.pl_min = 8,
+ 	.pl1_max = 30,
+ 	.pl2_max = 37
+@@ -996,6 +1003,91 @@ static int msi_wmi_fw_attrs_init(struct msi_wmi_platform_data *data)
+ 	return 0;
+ }
+ 
++static ssize_t charge_control_end_threshold_store(struct device *dev,
++						  struct device_attribute *attr,
++						  const char *buf, size_t count)
++{
++	const struct msi_wmi_platform_data *data =
++		container_of(attr, struct msi_wmi_platform_data, battery_attr);
++	u8 buffer[32] = { 0 };
++	u32 val;
++	int ret;
++
++	ret = kstrtou32(buf, 10, &val);
++	if (ret)
++		return ret;
++
++	if (val > 100)
++		return -EINVAL;
++
++	buffer[0] = MSI_PLATFORM_BAT_ADDR;
++	buffer[1] = val | BIT(7);
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_DATA, buffer,
++				     sizeof(buffer));
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static ssize_t charge_control_end_threshold_show(struct device *dev,
++						 struct device_attribute *attr,
++						 char *buf)
++{
++	const struct msi_wmi_platform_data *data =
++		container_of(attr, struct msi_wmi_platform_data, battery_attr);
++	u8 buffer[32] = { 0 };
++	u8 value;
++	int ret;
++
++	buffer[0] = MSI_PLATFORM_BAT_ADDR;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_DATA, buffer,
++				     sizeof(buffer));
++
++	if (ret)
++		return ret;
++
++	value = buffer[1] & ~BIT(7);
++
++	if (value > 100)
++		return -EIO;
++
++	return sysfs_emit(buf, "%d\n", value);
++}
++
++static int msi_platform_battery_add(struct power_supply *battery,
++			   struct acpi_battery_hook *hook)
++{
++	struct msi_wmi_platform_data *data = container_of(hook,
++						struct msi_wmi_platform_data, battery_hook);
++
++	/* MSI devices only have one battery. */
++	if (strcmp(battery->desc->name, "BAT0") != 0 &&
++	    strcmp(battery->desc->name, "BAT1") != 0 &&
++	    strcmp(battery->desc->name, "BATC") != 0 &&
++	    strcmp(battery->desc->name, "BATT") != 0)
++		return -ENODEV;
++
++	if (device_create_file(&battery->dev,
++			       &data->battery_attr))
++		return -ENODEV;
++
++	return 0;
++}
++
++static int msi_platform_battery_remove(struct power_supply *battery,
++			      struct acpi_battery_hook *hook)
++{
++	struct msi_wmi_platform_data *data = container_of(hook,
++						struct msi_wmi_platform_data, battery_hook);
++
++	device_remove_file(&battery->dev,
++			   &data->battery_attr);
++	return 0;
++}
++
+ static ssize_t msi_wmi_platform_debugfs_write(struct file *fp, const char __user *input,
+ 					      size_t length, loff_t *offset)
+ {
+@@ -1226,6 +1318,17 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 	ret = msi_wmi_fw_attrs_init(data);
+ 	if (ret < 0)
+ 		return ret;
++	
++	if (data->quirks->charge_threshold) {
++		data->battery_hook.name = "MSI Battery";
++		data->battery_hook.add_battery = msi_platform_battery_add;
++		data->battery_hook.remove_battery = msi_platform_battery_remove;
++		data->battery_attr.attr.name = "charge_control_end_threshold";
++		data->battery_attr.attr.mode = 0644;
++		data->battery_attr.show = charge_control_end_threshold_show;
++		data->battery_attr.store = charge_control_end_threshold_store;
++		battery_hook_register(&data->battery_hook);
++	}
+ 
+ 	msi_wmi_platform_profile_setup(data);
+ 
+@@ -1234,6 +1337,14 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 	return 0;
+ }
+ 
++static void msi_wmi_platform_remove(struct wmi_device *wdev)
++{
++	struct msi_wmi_platform_data *data = dev_get_drvdata(&wdev->dev);
++	
++	if (data->quirks->charge_threshold)
++		battery_hook_unregister(&data->battery_hook);
++}
++
+ static const struct wmi_device_id msi_wmi_platform_id_table[] = {
+ 	{ MSI_PLATFORM_GUID, NULL },
+ 	{ }
+@@ -1247,6 +1358,7 @@ static struct wmi_driver msi_wmi_platform_driver = {
+ 	},
+ 	.id_table = msi_wmi_platform_id_table,
+ 	.probe = msi_wmi_platform_probe,
++	.remove = msi_wmi_platform_remove,
+ 	.no_singleton = true,
+ };
+ module_wmi_driver(msi_wmi_platform_driver);
+-- 
+2.49.0
+
+
+From 67c59ef88b8d37d8b33b76ec7b0fdf495967e6fa Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sun, 6 Apr 2025 10:33:17 +0200
+Subject: [PATCH 32/34] platform/x86: msi-wmi-platform: Drop excess fans in
+ dual fan devices
+
+Currently, the platform driver always exposes 4 fans, since the
+underlying WMI interface reads 4 values from the EC. However, most
+devices only have two fans. Therefore, at least in the case of the
+Claw series, quirk the driver to only show two hwmon fans.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/platform/x86/msi-wmi-platform.c | 28 ++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index 93ca416b3..fd56b62ad 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -120,6 +120,7 @@ enum msi_wmi_platform_method {
+ struct msi_wmi_platform_quirk {
+ 	bool shift_mode;	/* Shift mode is supported */
+ 	bool charge_threshold;	/* Charge threshold is supported */
++	bool dual_fans; 	/* For devices with two hwmon fans */
+ 	int pl_min;		/* Minimum PLx value */
+ 	int pl1_max;		/* Maximum PL1 value */
+ 	int pl2_max;		/* Maximum PL2 value */
+@@ -216,6 +217,7 @@ static struct msi_wmi_platform_quirk quirk_default = {};
+ static struct msi_wmi_platform_quirk quirk_gen1 = {
+ 	.shift_mode = true,
+ 	.charge_threshold = true,
++	.dual_fans = true,
+ 	.pl_min = 8,
+ 	.pl1_max = 43,
+ 	.pl2_max = 45
+@@ -223,6 +225,7 @@ static struct msi_wmi_platform_quirk quirk_gen1 = {
+ static struct msi_wmi_platform_quirk quirk_gen2 = {
+ 	.shift_mode = true,
+ 	.charge_threshold = true,
++	.dual_fans = true,
+ 	.pl_min = 8,
+ 	.pl1_max = 30,
+ 	.pl2_max = 37
+@@ -617,6 +620,23 @@ static const struct hwmon_chip_info msi_wmi_platform_chip_info = {
+ 	.info = msi_wmi_platform_info,
+ };
+ 
++static const struct hwmon_channel_info * const msi_wmi_platform_info_dual[] = {
++	HWMON_CHANNEL_INFO(fan,
++			   HWMON_F_INPUT,
++			   HWMON_F_INPUT
++			   ),
++	HWMON_CHANNEL_INFO(pwm,
++			   HWMON_PWM_ENABLE,
++			   HWMON_PWM_ENABLE
++			   ),
++	NULL
++};
++
++static const struct hwmon_chip_info msi_wmi_platform_chip_info_dual = {
++	.ops = &msi_wmi_platform_ops,
++	.info = msi_wmi_platform_info_dual,
++};
++
+ static int msi_wmi_platform_profile_probe(void *drvdata, unsigned long *choices)
+ {
+ 	set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
+@@ -1204,9 +1224,11 @@ static int msi_wmi_platform_hwmon_init(struct msi_wmi_platform_data *data)
+ {
+ 	struct device *hdev;
+ 
+-	hdev = devm_hwmon_device_register_with_info(&data->wdev->dev, "msi_wmi_platform", data,
+-						    &msi_wmi_platform_chip_info,
+-						    msi_wmi_platform_hwmon_groups);
++	hdev = devm_hwmon_device_register_with_info(
++		&data->wdev->dev, "msi_wmi_platform", data,
++		data->quirks->dual_fans ? &msi_wmi_platform_chip_info_dual :
++					&msi_wmi_platform_chip_info,
++		msi_wmi_platform_hwmon_groups);
+ 
+ 	return PTR_ERR_OR_ZERO(hdev);
+ }
+-- 
+2.49.0
+
+
+From cb1dc12f86b5ebafba6c6afc9d20149e03a2a2dd Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Sun, 6 Apr 2025 14:44:36 +0200
+Subject: [PATCH 33/34] platform/x86: msi-wmi-platform: Restore fan curves on
+ PWM disable and unload
+
+MSI software is a bit weird in that even when the manual fan curve is
+disabled, the fan speed is still somewhat affected by the curve. So
+we have to restore the fan curves on unload and PWM disable, as it
+is done in Windows.
+
+Suggested-by: Armin Wolf <W_Armin@gmx.de>
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/platform/x86/msi-wmi-platform.c | 124 +++++++++++++++++++++++-
+ 1 file changed, 122 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index fd56b62ad..acd343f53 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -121,15 +121,24 @@ struct msi_wmi_platform_quirk {
+ 	bool shift_mode;	/* Shift mode is supported */
+ 	bool charge_threshold;	/* Charge threshold is supported */
+ 	bool dual_fans; 	/* For devices with two hwmon fans */
++	bool restore_curves;	/* Restore factory curves on unload */
+ 	int pl_min;		/* Minimum PLx value */
+ 	int pl1_max;		/* Maximum PL1 value */
+ 	int pl2_max;		/* Maximum PL2 value */
+ };
+ 
++struct msi_wmi_platform_factory_curves {
++	u8 cpu_fan_table[32];
++	u8 gpu_fan_table[32];
++	u8 cpu_temp_table[32];
++	u8 gpu_temp_table[32];
++};
++
+ struct msi_wmi_platform_data {
+ 	struct wmi_device *wdev;
+ 	struct msi_wmi_platform_quirk *quirks;
+ 	struct device *ppdev;
++	struct msi_wmi_platform_factory_curves factory_curves;
+ 	struct acpi_battery_hook battery_hook;
+ 	struct device_attribute battery_attr;
+ 	struct device *fw_attrs_dev;
+@@ -218,6 +227,7 @@ static struct msi_wmi_platform_quirk quirk_gen1 = {
+ 	.shift_mode = true,
+ 	.charge_threshold = true,
+ 	.dual_fans = true,
++	.restore_curves = true,
+ 	.pl_min = 8,
+ 	.pl1_max = 43,
+ 	.pl2_max = 45
+@@ -226,6 +236,7 @@ static struct msi_wmi_platform_quirk quirk_gen2 = {
+ 	.shift_mode = true,
+ 	.charge_threshold = true,
+ 	.dual_fans = true,
++	.restore_curves = true,
+ 	.pl_min = 8,
+ 	.pl1_max = 30,
+ 	.pl2_max = 37
+@@ -490,6 +501,94 @@ static struct attribute *msi_wmi_platform_hwmon_attrs[] = {
+ };
+ ATTRIBUTE_GROUPS(msi_wmi_platform_hwmon);
+ 
++static int msi_wmi_platform_curves_save(struct msi_wmi_platform_data *data)
++{
++	int ret;
++
++	data->factory_curves.cpu_fan_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE;
++	ret = msi_wmi_platform_query(
++		data->wdev, MSI_PLATFORM_GET_FAN,
++		data->factory_curves.cpu_fan_table,
++		sizeof(data->factory_curves.cpu_fan_table));
++	if (ret < 0)
++		return ret;
++	data->factory_curves.cpu_fan_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE;
++
++	data->factory_curves.gpu_fan_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE;
++	ret = msi_wmi_platform_query(
++		data->wdev, MSI_PLATFORM_GET_FAN,
++		data->factory_curves.gpu_fan_table,
++		sizeof(data->factory_curves.gpu_fan_table));
++	if (ret < 0)
++		return ret;
++	data->factory_curves.gpu_fan_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE;
++
++	data->factory_curves.cpu_temp_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE;
++	ret = msi_wmi_platform_query(
++		data->wdev, MSI_PLATFORM_GET_TEMPERATURE,
++		data->factory_curves.cpu_temp_table,
++		sizeof(data->factory_curves.cpu_temp_table));
++	if (ret < 0)
++		return ret;
++	data->factory_curves.cpu_temp_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE;
++
++	data->factory_curves.gpu_temp_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE;
++	ret = msi_wmi_platform_query(
++		data->wdev, MSI_PLATFORM_GET_TEMPERATURE,
++		data->factory_curves.gpu_temp_table,
++		sizeof(data->factory_curves.gpu_temp_table));
++	if (ret < 0)
++		return ret;
++	data->factory_curves.gpu_temp_table[0] =
++		MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE;
++
++	return 0;
++}
++
++static int msi_wmi_platform_curves_load(struct msi_wmi_platform_data *data)
++{
++	u8 buffer[32] = { };
++	int ret;
++
++	memcpy(buffer, data->factory_curves.cpu_fan_table,
++	       sizeof(data->factory_curves.cpu_fan_table));
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_FAN, buffer,
++				     sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	memcpy(buffer, data->factory_curves.gpu_fan_table,
++	       sizeof(data->factory_curves.gpu_fan_table));
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_FAN, buffer,
++				     sizeof(buffer));
++	if (ret < 0)
++		return ret;
++	
++	memcpy(buffer, data->factory_curves.cpu_temp_table,
++	       sizeof(data->factory_curves.cpu_temp_table));
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++	
++	memcpy(buffer, data->factory_curves.gpu_temp_table,
++	       sizeof(data->factory_curves.gpu_temp_table));
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++
+ static umode_t msi_wmi_platform_is_visible(const void *drvdata, enum hwmon_sensor_types type,
+ 					   u32 attr, int channel)
+ {
+@@ -585,8 +684,18 @@ static int msi_wmi_platform_write(struct device *dev, enum hwmon_sensor_types ty
+ 				return -EINVAL;
+ 			}
+ 
+-			return msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_AP, buffer,
+-						      sizeof(buffer));
++			ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_AP, buffer,
++						     sizeof(buffer));
++			if (ret < 0)
++				return ret;
++			
++			if (val == 2 && data->quirks->restore_curves) {
++				ret = msi_wmi_platform_curves_load(data);
++				if (ret < 0)
++					return ret;
++			}
++
++			return 0;
+ 		default:
+ 			return -EOPNOTSUPP;
+ 		}
+@@ -1356,6 +1465,12 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 
+ 	msi_wmi_platform_debugfs_init(wdev);
+ 
++	if (data->quirks->restore_curves) {
++		ret = msi_wmi_platform_curves_save(data);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1365,6 +1480,11 @@ static void msi_wmi_platform_remove(struct wmi_device *wdev)
+ 	
+ 	if (data->quirks->charge_threshold)
+ 		battery_hook_unregister(&data->battery_hook);
++
++	if (data->quirks->restore_curves) {
++		guard(mutex)(&data->write_lock);
++		msi_wmi_platform_curves_load(data);
++	}
+ }
+ 
+ static const struct wmi_device_id msi_wmi_platform_id_table[] = {
+-- 
+2.49.0
+
+
+From 31b3e1118900cf225a6d984fce7cc55503effaed Mon Sep 17 00:00:00 2001
+From: Andrey Smirnov <andrew.smirnov@gmail.com>
+Date: Mon, 20 Nov 2023 05:42:03 -0800
+Subject: [PATCH 34/34] leds-steamdeck: Add support for LED birghtness
+ multiplier
+
+Add support for LED birghtness multiplier exposed via custom sysfs
+attribute (led_brightness_multiplier).
+
+Signed-off-by: Andrey Smirnov <andrew.smirnov@gmail.com>
+(cherry picked from commit c4ea057992e189ec8821cde3a65e2cc0529a5088)
+(cherry picked from commit e90fb9bec45c15c0c541ce60b994bab3922ddadf)
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+---
+ drivers/leds/leds-steamdeck.c | 49 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/drivers/leds/leds-steamdeck.c b/drivers/leds/leds-steamdeck.c
+index 56d31d2dd..3d56ec440 100644
+--- a/drivers/leds/leds-steamdeck.c
++++ b/drivers/leds/leds-steamdeck.c
+@@ -16,6 +16,54 @@ struct steamdeck_led {
+ 	struct led_classdev cdev;
+ };
+ 
++static ssize_t led_brightness_multiplier_show(struct device *dev,
++					      struct device_attribute *attr,
++					      char *buf)
++{
++	struct led_classdev *cdev = dev_get_drvdata(dev);
++	struct steamdeck_led *sd = container_of(cdev, struct steamdeck_led,
++						cdev);
++	unsigned long long led_brightness_multiplier;
++
++	if (ACPI_FAILURE(acpi_evaluate_integer(sd->adev->handle,
++					       "GLDM",
++					       NULL,
++					       &led_brightness_multiplier)))
++		return -EIO;
++
++
++	return sprintf(buf, "%llu", led_brightness_multiplier);
++}
++
++static ssize_t led_brightness_multiplier_store(struct device *dev,
++					       struct device_attribute *attr,
++					       const char *buf, size_t count)
++{
++	struct led_classdev *cdev = dev_get_drvdata(dev);
++	struct steamdeck_led *sd = container_of(cdev, struct steamdeck_led,
++						cdev);
++	unsigned long value;
++
++	if (kstrtoul(buf, 10, &value) || value > 100)
++		return -EINVAL;
++
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    "SLDM", value)))
++		return -EIO;
++
++
++	return count;
++}
++
++static DEVICE_ATTR_RW(led_brightness_multiplier);
++
++static struct attribute *steamdeck_led_attrs[] = {
++	&dev_attr_led_brightness_multiplier.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(steamdeck_led);
++
+ static int steamdeck_leds_brightness_set(struct led_classdev *cdev,
+ 					 enum led_brightness value)
+ {
+@@ -44,6 +92,7 @@ static int steamdeck_leds_probe(struct platform_device *pdev)
+ 	sd->cdev.name = "status:white";
+ 	sd->cdev.brightness_set_blocking = steamdeck_leds_brightness_set;
+ 	sd->cdev.max_brightness = 100;
++	sd->cdev.groups = steamdeck_led_groups;
+ 
+ 	ret = devm_led_classdev_register(dev, &sd->cdev);
+ 	if (ret) {
+-- 
+2.49.0
+

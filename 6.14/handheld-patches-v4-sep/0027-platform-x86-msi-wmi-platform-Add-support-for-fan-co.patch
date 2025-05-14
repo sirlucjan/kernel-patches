@@ -1,0 +1,543 @@
+From 112a6814696ced760cb39a9ab708ff1af82f03e8 Mon Sep 17 00:00:00 2001
+From: Armin Wolf <W_Armin@gmx.de>
+Date: Mon, 31 Mar 2025 17:28:39 +0200
+Subject: [PATCH 27/34] platform/x86: msi-wmi-platform: Add support for fan
+ control
+
+Adds fan curve support for the MSI platform. These devices contain
+support for two fans, where they are named CPU and GPU but in the
+case of the Claw series just map to left and right fan.
+
+Co-developed-by: Antheas Kapenekakis <lkml@antheas.dev>
+Signed-off-by: Armin Wolf <W_Armin@gmx.de>
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ .../wmi/devices/msi-wmi-platform.rst          |  26 ++
+ drivers/platform/x86/msi-wmi-platform.c       | 358 ++++++++++++++++--
+ 2 files changed, 359 insertions(+), 25 deletions(-)
+
+diff --git a/Documentation/wmi/devices/msi-wmi-platform.rst b/Documentation/wmi/devices/msi-wmi-platform.rst
+index 31a136942..ac5f1c72d 100644
+--- a/Documentation/wmi/devices/msi-wmi-platform.rst
++++ b/Documentation/wmi/devices/msi-wmi-platform.rst
+@@ -165,6 +165,32 @@ The fan RPM readings can be calculated with the following formula:
+ 
+ If the fan speed reading is zero, then the fan RPM is zero too.
+ 
++The subfeature ``0x01`` is used to retrieve the fan speed table for the CPU fan. The output
++data contains the fan speed table and two bytes with unknown data. The fan speed table
++consists of six 8-bit entries, each containing a fan speed value in percent.
++
++The subfeature ``0x02`` is used tho retrieve the same data for the GPU fan.
++
++WMI method Set_Fan()
++--------------------
++
++The fan speed tables can be accessed using subfeature ``0x01`` (CPU fan) and subfeature ``0x02``
++(GPU fan). The input data has the same format as the output data of the ``Get_Fan`` WMI method.
++
++WMI method Get_AP()
++-------------------
++
++The current fan mode can be accessed using subfeature ``0x01``. The output data contains a flag
++byte and two bytes of unknown data. If the 7th bit inside the flag byte is cleared then all fans
++are operating in automatic mode, otherwise the fans operate based on the fan speed tables
++accessible thru the ``Get_Fan``/``Set_Fan`` WMI methods.
++
++WMI method Set_AP()
++-------------------
++
++The current fan mode can be changed using subfeature ``0x01``. The input data has the same format
++as the output data of the ``Get_AP`` WMI method.
++
+ WMI method Get_WMI()
+ --------------------
+ 
+diff --git a/drivers/platform/x86/msi-wmi-platform.c b/drivers/platform/x86/msi-wmi-platform.c
+index 30f5b63b1..d28d01c9d 100644
+--- a/drivers/platform/x86/msi-wmi-platform.c
++++ b/drivers/platform/x86/msi-wmi-platform.c
+@@ -14,12 +14,18 @@
+ #include <linux/device.h>
+ #include <linux/device/driver.h>
+ #include <linux/errno.h>
++#include <linux/fixp-arith.h>
+ #include <linux/hwmon.h>
++#include <linux/hwmon-sysfs.h>
+ #include <linux/kernel.h>
++#include <linux/kstrtox.h>
++#include <linux/minmax.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/printk.h>
+ #include <linux/rwsem.h>
+ #include <linux/string.h>
++#include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/wmi.h>
+ 
+@@ -31,9 +37,7 @@
+ 
+ #define MSI_WMI_PLATFORM_INTERFACE_VERSION	2
+ 
+-#define MSI_PLATFORM_WMI_MAJOR_OFFSET	1
+-#define MSI_PLATFORM_WMI_MINOR_OFFSET	2
+-
++/* Get_EC() and Set_EC() WMI methods */
+ #define MSI_PLATFORM_EC_FLAGS_OFFSET	1
+ #define MSI_PLATFORM_EC_MINOR_MASK	GENMASK(3, 0)
+ #define MSI_PLATFORM_EC_MAJOR_MASK	GENMASK(5, 4)
+@@ -41,6 +45,22 @@
+ #define MSI_PLATFORM_EC_IS_TIGERLAKE	BIT(7)
+ #define MSI_PLATFORM_EC_VERSION_OFFSET	2
+ 
++/* Get_Fan() and Set_Fan() WMI methods */
++#define MSI_PLATFORM_FAN_SUBFEATURE_FAN_SPEED		0x0
++#define MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE	0x1
++#define MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE	0x2
++#define MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE	0x1
++#define MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE	0x2
++
++/* Get_AP() and Set_AP() WMI methods */
++#define MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE	0x1
++#define MSI_PLATFORM_AP_FAN_FLAGS_OFFSET	1
++#define MSI_PLATFORM_AP_ENABLE_FAN_TABLES	BIT(7)
++
++/* Get_WMI() WMI method */
++#define MSI_PLATFORM_WMI_MAJOR_OFFSET		1
++#define MSI_PLATFORM_WMI_MINOR_OFFSET		2
++
+ static bool force;
+ module_param_unsafe(force, bool, 0);
+ MODULE_PARM_DESC(force, "Force loading without checking for supported WMI interface versions");
+@@ -77,6 +97,11 @@ enum msi_wmi_platform_method {
+ 	MSI_PLATFORM_GET_WMI		= 0x1d,
+ };
+ 
++struct msi_wmi_platform_data {
++	struct wmi_device *wdev;
++	struct mutex write_lock;
++};
++
+ struct msi_wmi_platform_debugfs_data {
+ 	struct wmi_device *wdev;
+ 	enum msi_wmi_platform_method method;
+@@ -162,36 +187,302 @@ static int msi_wmi_platform_query(struct wmi_device *wdev, enum msi_wmi_platform
+ 	return ret;
+ }
+ 
++static ssize_t msi_wmi_platform_fan_table_show(struct device *dev, struct device_attribute *attr,
++					       char *buf)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	u8 fan_percent;
++	int ret;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_FAN, buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	fan_percent = buffer[sattr->index + 1];
++	if (fan_percent > 100)
++		return -EIO;
++
++	return sysfs_emit(buf, "%d\n", fixp_linear_interpolate(0, 0, 100, 255, fan_percent));
++}
++
++static ssize_t msi_wmi_platform_fan_table_store(struct device *dev, struct device_attribute *attr,
++						const char *buf, size_t count)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	long speed;
++	int ret;
++
++	ret = kstrtol(buf, 10, &speed);
++	if (ret < 0)
++		return ret;
++
++	speed = clamp_val(speed, 0, 255);
++
++	guard(mutex)(&data->write_lock);
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_FAN, buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	buffer[0] = sattr->nr;
++	buffer[sattr->index + 1] = fixp_linear_interpolate(0, 0, 255, 100, speed);
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_FAN, buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	return count;
++}
++
++static ssize_t msi_wmi_platform_temp_table_show(struct device *dev, struct device_attribute *attr,
++						char *buf)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	u8 temp_c;
++	int ret;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	temp_c = buffer[sattr->index + 1];
++
++	return sysfs_emit(buf, "%d\n", temp_c);
++}
++
++static ssize_t msi_wmi_platform_temp_table_store(struct device *dev, struct device_attribute *attr,
++						 const char *buf, size_t count)
++{
++	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { sattr->nr };
++	long temp_c;
++	int ret;
++
++	ret = kstrtol(buf, 10, &temp_c);
++	if (ret < 0)
++		return ret;
++
++	temp_c = clamp_val(temp_c, 0, 255);
++
++	guard(mutex)(&data->write_lock);
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	buffer[0] = sattr->nr;
++	buffer[sattr->index + 1] = temp_c;
++
++	ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_TEMPERATURE,
++				     buffer, sizeof(buffer));
++	if (ret < 0)
++		return ret;
++
++	return count;
++}
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point1_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x0);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point2_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point3_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point4_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point5_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x6);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point6_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_TEMP_TABLE, 0x7);
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point1_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x1);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point2_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x2);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point3_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point4_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point5_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point6_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_CPU_FAN_TABLE, 0x6);
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point1_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x0);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point2_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point3_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point4_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point5_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x6);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point6_temp, msi_wmi_platform_temp_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_TEMP_TABLE, 0x7);
++
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point1_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x1);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point2_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x2);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point3_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x3);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point4_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x4);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point5_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x5);
++static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point6_pwm, msi_wmi_platform_fan_table,
++			       MSI_PLATFORM_FAN_SUBFEATURE_GPU_FAN_TABLE, 0x6);
++
++static struct attribute *msi_wmi_platform_hwmon_attrs[] = {
++	&sensor_dev_attr_pwm1_auto_point1_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point2_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point3_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point4_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point5_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point6_temp.dev_attr.attr,
++
++	&sensor_dev_attr_pwm1_auto_point1_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point2_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point3_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point4_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point5_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm1_auto_point6_pwm.dev_attr.attr,
++
++	&sensor_dev_attr_pwm2_auto_point1_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point2_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point3_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point4_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point5_temp.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point6_temp.dev_attr.attr,
++
++	&sensor_dev_attr_pwm2_auto_point1_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point2_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point3_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point4_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point5_pwm.dev_attr.attr,
++	&sensor_dev_attr_pwm2_auto_point6_pwm.dev_attr.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(msi_wmi_platform_hwmon);
++
+ static umode_t msi_wmi_platform_is_visible(const void *drvdata, enum hwmon_sensor_types type,
+ 					   u32 attr, int channel)
+ {
++	if (type == hwmon_pwm && attr == hwmon_pwm_enable)
++		return 0644;
++
+ 	return 0444;
+ }
+ 
+ static int msi_wmi_platform_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+ 				 int channel, long *val)
+ {
+-	struct wmi_device *wdev = dev_get_drvdata(dev);
+-	u8 data[32] = { 0 };
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { };
+ 	u16 value;
++	u8 flags;
+ 	int ret;
+ 
+-	ret = msi_wmi_platform_query(wdev, MSI_PLATFORM_GET_FAN, data, sizeof(data));
+-	if (ret < 0)
+-		return ret;
++	switch (type) {
++	case hwmon_fan:
++		switch (attr) {
++		case hwmon_fan_input:
++			buffer[0] = MSI_PLATFORM_FAN_SUBFEATURE_FAN_SPEED;
++			ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_FAN, buffer,
++						     sizeof(buffer));
++			if (ret < 0)
++				return ret;
++
++			value = get_unaligned_be16(&buffer[channel * 2 + 1]);
++			if (!value)
++				*val = 0;
++			else
++				*val = 480000 / value;
++
++			return 0;
++		default:
++			return -EOPNOTSUPP;
++		}
++	case hwmon_pwm:
++		switch (attr) {
++		case hwmon_pwm_enable:
++			buffer[0] = MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE;
++			ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_AP, buffer,
++						     sizeof(buffer));
++			if (ret < 0)
++				return ret;
++
++			flags = buffer[MSI_PLATFORM_AP_FAN_FLAGS_OFFSET];
++			if (flags & MSI_PLATFORM_AP_ENABLE_FAN_TABLES)
++				*val = 1;	// TODO: Do fan tables count as "manual fan control"?
++			else
++				*val = 2;
++
++			return 0;
++		default:
++			return -EOPNOTSUPP;
++		}
++	default:
++		return -EOPNOTSUPP;
++	}
++}
+ 
+-	value = get_unaligned_be16(&data[channel * 2 + 1]);
+-	if (!value)
+-		*val = 0;
+-	else
+-		*val = 480000 / value;
++static int msi_wmi_platform_write(struct device *dev, enum hwmon_sensor_types type, u32 attr,
++				  int channel, long val)
++{
++	struct msi_wmi_platform_data *data = dev_get_drvdata(dev);
++	u8 buffer[32] = { };
++	int ret;
+ 
+-	return 0;
++	switch (type) {
++	case hwmon_pwm:
++		switch (attr) {
++		case hwmon_pwm_enable:
++			guard(mutex)(&data->write_lock);
++
++			buffer[0] = MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE;
++			ret = msi_wmi_platform_query(data->wdev, MSI_PLATFORM_GET_AP, buffer,
++						     sizeof(buffer));
++			if (ret < 0)
++				return ret;
++
++			buffer[0] = MSI_PLATFORM_AP_SUBFEATURE_FAN_MODE;
++			switch (val) {
++			case 1:
++				buffer[MSI_PLATFORM_AP_FAN_FLAGS_OFFSET] |=
++					MSI_PLATFORM_AP_ENABLE_FAN_TABLES;
++				break;
++			case 2:
++				buffer[MSI_PLATFORM_AP_FAN_FLAGS_OFFSET] &=
++					~MSI_PLATFORM_AP_ENABLE_FAN_TABLES;
++				break;
++			default:
++				return -EINVAL;
++			}
++
++			return msi_wmi_platform_query(data->wdev, MSI_PLATFORM_SET_AP, buffer,
++						      sizeof(buffer));
++		default:
++			return -EOPNOTSUPP;
++		}
++	default:
++		return -EOPNOTSUPP;
++	}
+ }
+ 
+ static const struct hwmon_ops msi_wmi_platform_ops = {
+ 	.is_visible = msi_wmi_platform_is_visible,
+ 	.read = msi_wmi_platform_read,
++	.write = msi_wmi_platform_write,
+ };
+ 
+ static const struct hwmon_channel_info * const msi_wmi_platform_info[] = {
+@@ -201,6 +492,10 @@ static const struct hwmon_channel_info * const msi_wmi_platform_info[] = {
+ 			   HWMON_F_INPUT,
+ 			   HWMON_F_INPUT
+ 			   ),
++	HWMON_CHANNEL_INFO(pwm,
++			   HWMON_PWM_ENABLE,
++			   HWMON_PWM_ENABLE
++			   ),
+ 	NULL
+ };
+ 
+@@ -209,8 +504,8 @@ static const struct hwmon_chip_info msi_wmi_platform_chip_info = {
+ 	.info = msi_wmi_platform_info,
+ };
+ 
+-static ssize_t msi_wmi_platform_write(struct file *fp, const char __user *input, size_t length,
+-				      loff_t *offset)
++static ssize_t msi_wmi_platform_debugfs_write(struct file *fp, const char __user *input,
++					      size_t length, loff_t *offset)
+ {
+ 	struct seq_file *seq = fp->private_data;
+ 	struct msi_wmi_platform_debugfs_data *data = seq->private;
+@@ -240,7 +535,7 @@ static ssize_t msi_wmi_platform_write(struct file *fp, const char __user *input,
+ 	return length;
+ }
+ 
+-static int msi_wmi_platform_show(struct seq_file *seq, void *p)
++static int msi_wmi_platform_debugfs_show(struct seq_file *seq, void *p)
+ {
+ 	struct msi_wmi_platform_debugfs_data *data = seq->private;
+ 	int ret;
+@@ -252,19 +547,19 @@ static int msi_wmi_platform_show(struct seq_file *seq, void *p)
+ 	return ret;
+ }
+ 
+-static int msi_wmi_platform_open(struct inode *inode, struct file *fp)
++static int msi_wmi_platform_debugfs_open(struct inode *inode, struct file *fp)
+ {
+ 	struct msi_wmi_platform_debugfs_data *data = inode->i_private;
+ 
+ 	/* The seq_file uses the last byte of the buffer for detecting buffer overflows */
+-	return single_open_size(fp, msi_wmi_platform_show, data, data->length + 1);
++	return single_open_size(fp, msi_wmi_platform_debugfs_show, data, data->length + 1);
+ }
+ 
+ static const struct file_operations msi_wmi_platform_debugfs_fops = {
+ 	.owner = THIS_MODULE,
+-	.open = msi_wmi_platform_open,
++	.open = msi_wmi_platform_debugfs_open,
+ 	.read = seq_read,
+-	.write = msi_wmi_platform_write,
++	.write = msi_wmi_platform_debugfs_write,
+ 	.llseek = seq_lseek,
+ 	.release = single_release,
+ };
+@@ -321,12 +616,13 @@ static void msi_wmi_platform_debugfs_init(struct wmi_device *wdev)
+ 					     method);
+ }
+ 
+-static int msi_wmi_platform_hwmon_init(struct wmi_device *wdev)
++static int msi_wmi_platform_hwmon_init(struct msi_wmi_platform_data *data)
+ {
+ 	struct device *hdev;
+ 
+-	hdev = devm_hwmon_device_register_with_info(&wdev->dev, "msi_wmi_platform", wdev,
+-						    &msi_wmi_platform_chip_info, NULL);
++	hdev = devm_hwmon_device_register_with_info(&data->wdev->dev, "msi_wmi_platform", data,
++						    &msi_wmi_platform_chip_info,
++						    msi_wmi_platform_hwmon_groups);
+ 
+ 	return PTR_ERR_OR_ZERO(hdev);
+ }
+@@ -386,6 +682,7 @@ static int msi_wmi_platform_init(struct wmi_device *wdev)
+ 
+ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ {
++	struct msi_wmi_platform_data *data;
+ 	int ret;
+ 
+ 	ret = msi_wmi_platform_init(wdev);
+@@ -396,9 +693,20 @@ static int msi_wmi_platform_probe(struct wmi_device *wdev, const void *context)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	data = devm_kzalloc(&wdev->dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENODATA;
++
++	data->wdev = wdev;
++	dev_set_drvdata(&wdev->dev, data);
++
++	ret = devm_mutex_init(&wdev->dev, &data->write_lock);
++	if (ret < 0)
++		return ret;
++
+ 	msi_wmi_platform_debugfs_init(wdev);
+ 
+-	return msi_wmi_platform_hwmon_init(wdev);
++	return msi_wmi_platform_hwmon_init(data);
+ }
+ 
+ static const struct wmi_device_id msi_wmi_platform_id_table[] = {
+-- 
+2.49.0
+
