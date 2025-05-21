@@ -1,0 +1,226 @@
+From b009854d8f0d41658b7f1cf7b38ef3f5f69bc787 Mon Sep 17 00:00:00 2001
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Mon, 7 Apr 2025 17:45:42 +0200
+Subject: [PATCH 42/42] udp_tunnel: use static call for GRO hooks when possible
+
+It's quite common to have a single UDP tunnel type active in the
+whole system. In such a case we can replace the indirect call for
+the UDP tunnel GRO callback with a static call.
+
+Add the related accounting in the control path and switch to static
+call when possible. To keep the code simple use a static array for
+the registered tunnel types, and size such array based on the kernel
+config.
+
+Note that there are valid kernel configurations leading to
+UDP_MAX_TUNNEL_TYPES == 0 even with IS_ENABLED(CONFIG_NET_UDP_TUNNEL),
+Explicitly skip the accounting in such a case, to avoid compile warning
+when accessing "udp_tunnel_gro_types".
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/53d156cdfddcc9678449e873cc83e68fa1582653.1744040675.git.pabeni@redhat.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+---
+ include/net/udp_tunnel.h |   4 ++
+ net/ipv4/udp_offload.c   | 135 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 138 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/udp_tunnel.h b/include/net/udp_tunnel.h
+index db3491d80..5c42f0f0f 100644
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@ -194,13 +194,16 @@ static inline int udp_tunnel_handle_offloads(struct sk_buff *skb, bool udp_csum)
+ 
+ #if IS_ENABLED(CONFIG_NET_UDP_TUNNEL)
+ void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add);
++void udp_tunnel_update_gro_rcv(struct sock *sk, bool add);
+ #else
+ static inline void udp_tunnel_update_gro_lookup(struct net *net,
+ 						struct sock *sk, bool add) {}
++static inline void udp_tunnel_update_gro_rcv(struct sock *sk, bool add) {}
+ #endif
+ 
+ static inline void udp_tunnel_cleanup_gro(struct sock *sk)
+ {
++	udp_tunnel_update_gro_rcv(sk, false);
+ 	udp_tunnel_update_gro_lookup(sock_net(sk), sk, false);
+ }
+ 
+@@ -213,6 +216,7 @@ static inline void udp_tunnel_encap_enable(struct sock *sk)
+ 	if (READ_ONCE(sk->sk_family) == PF_INET6)
+ 		ipv6_stub->udpv6_encap_enable();
+ #endif
++	udp_tunnel_update_gro_rcv(sk, true);
+ 	udp_encap_enable();
+ }
+ 
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index 67641945b..9c775f8aa 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -15,6 +15,38 @@
+ #include <net/udp_tunnel.h>
+ 
+ #if IS_ENABLED(CONFIG_NET_UDP_TUNNEL)
++
++/*
++ * Dummy GRO tunnel callback, exists mainly to avoid dangling/NULL
++ * values for the udp tunnel static call.
++ */
++static struct sk_buff *dummy_gro_rcv(struct sock *sk,
++				     struct list_head *head,
++				     struct sk_buff *skb)
++{
++	NAPI_GRO_CB(skb)->flush = 1;
++	return NULL;
++}
++
++typedef struct sk_buff *(*udp_tunnel_gro_rcv_t)(struct sock *sk,
++						struct list_head *head,
++						struct sk_buff *skb);
++
++struct udp_tunnel_type_entry {
++	udp_tunnel_gro_rcv_t gro_receive;
++	refcount_t count;
++};
++
++#define UDP_MAX_TUNNEL_TYPES (IS_ENABLED(CONFIG_GENEVE) + \
++			      IS_ENABLED(CONFIG_VXLAN) * 2 + \
++			      IS_ENABLED(CONFIG_NET_FOU) * 2 + \
++			      IS_ENABLED(CONFIG_XFRM) * 2)
++
++DEFINE_STATIC_CALL(udp_tunnel_gro_rcv, dummy_gro_rcv);
++static DEFINE_STATIC_KEY_FALSE(udp_tunnel_static_call);
++static struct mutex udp_tunnel_gro_type_lock;
++static struct udp_tunnel_type_entry udp_tunnel_gro_types[UDP_MAX_TUNNEL_TYPES];
++static unsigned int udp_tunnel_gro_type_nr;
+ static DEFINE_SPINLOCK(udp_tunnel_gro_lock);
+ 
+ void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add)
+@@ -43,6 +75,105 @@ void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add)
+ 	spin_unlock(&udp_tunnel_gro_lock);
+ }
+ EXPORT_SYMBOL_GPL(udp_tunnel_update_gro_lookup);
++
++void udp_tunnel_update_gro_rcv(struct sock *sk, bool add)
++{
++	struct udp_tunnel_type_entry *cur = NULL;
++	struct udp_sock *up = udp_sk(sk);
++	int i, old_gro_type_nr;
++
++	if (!UDP_MAX_TUNNEL_TYPES || !up->gro_receive)
++		return;
++
++	mutex_lock(&udp_tunnel_gro_type_lock);
++
++	/* Check if the static call is permanently disabled. */
++	if (udp_tunnel_gro_type_nr > UDP_MAX_TUNNEL_TYPES)
++		goto out;
++
++	for (i = 0; i < udp_tunnel_gro_type_nr; i++)
++		if (udp_tunnel_gro_types[i].gro_receive == up->gro_receive)
++			cur = &udp_tunnel_gro_types[i];
++
++	old_gro_type_nr = udp_tunnel_gro_type_nr;
++	if (add) {
++		/*
++		 * Update the matching entry, if found, or add a new one
++		 * if needed
++		 */
++		if (cur) {
++			refcount_inc(&cur->count);
++			goto out;
++		}
++
++		if (unlikely(udp_tunnel_gro_type_nr == UDP_MAX_TUNNEL_TYPES)) {
++			pr_err_once("Too many UDP tunnel types, please increase UDP_MAX_TUNNEL_TYPES\n");
++			/* Ensure static call will never be enabled */
++			udp_tunnel_gro_type_nr = UDP_MAX_TUNNEL_TYPES + 1;
++		} else {
++			cur = &udp_tunnel_gro_types[udp_tunnel_gro_type_nr++];
++			refcount_set(&cur->count, 1);
++			cur->gro_receive = up->gro_receive;
++		}
++	} else {
++		/*
++		 * The stack cleanups only successfully added tunnel, the
++		 * lookup on removal should never fail.
++		 */
++		if (WARN_ON_ONCE(!cur))
++			goto out;
++
++		if (!refcount_dec_and_test(&cur->count))
++			goto out;
++
++		/* Avoid gaps, so that the enable tunnel has always id 0 */
++		*cur = udp_tunnel_gro_types[--udp_tunnel_gro_type_nr];
++	}
++
++	if (udp_tunnel_gro_type_nr == 1) {
++		static_call_update(udp_tunnel_gro_rcv,
++				   udp_tunnel_gro_types[0].gro_receive);
++		static_branch_enable(&udp_tunnel_static_call);
++	} else if (old_gro_type_nr == 1) {
++		static_branch_disable(&udp_tunnel_static_call);
++		static_call_update(udp_tunnel_gro_rcv, dummy_gro_rcv);
++	}
++
++out:
++	mutex_unlock(&udp_tunnel_gro_type_lock);
++}
++EXPORT_SYMBOL_GPL(udp_tunnel_update_gro_rcv);
++
++static void udp_tunnel_gro_init(void)
++{
++	mutex_init(&udp_tunnel_gro_type_lock);
++}
++
++static struct sk_buff *udp_tunnel_gro_rcv(struct sock *sk,
++					  struct list_head *head,
++					  struct sk_buff *skb)
++{
++	if (static_branch_likely(&udp_tunnel_static_call)) {
++		if (unlikely(gro_recursion_inc_test(skb))) {
++			NAPI_GRO_CB(skb)->flush |= 1;
++			return NULL;
++		}
++		return static_call(udp_tunnel_gro_rcv)(sk, head, skb);
++	}
++	return call_gro_receive_sk(udp_sk(sk)->gro_receive, sk, head, skb);
++}
++
++#else
++
++static void udp_tunnel_gro_init(void) {}
++
++static struct sk_buff *udp_tunnel_gro_rcv(struct sock *sk,
++					  struct list_head *head,
++					  struct sk_buff *skb)
++{
++	return call_gro_receive_sk(udp_sk(sk)->gro_receive, sk, head, skb);
++}
++
+ #endif
+ 
+ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
+@@ -713,7 +844,7 @@ struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
+ 
+ 	skb_gro_pull(skb, sizeof(struct udphdr)); /* pull encapsulating udp header */
+ 	skb_gro_postpull_rcsum(skb, uh, sizeof(struct udphdr));
+-	pp = call_gro_receive_sk(udp_sk(sk)->gro_receive, sk, head, skb);
++	pp = udp_tunnel_gro_rcv(sk, head, skb);
+ 
+ out:
+ 	skb_gro_flush_final(skb, pp, flush);
+@@ -863,5 +994,7 @@ int __init udpv4_offload_init(void)
+ 			.gro_complete =	udp4_gro_complete,
+ 		},
+ 	};
++
++	udp_tunnel_gro_init();
+ 	return inet_add_offload(&net_hotdata.udpv4_offload, IPPROTO_UDP);
+ }
+-- 
+2.49.0
+
