@@ -24,4 +24,6 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 
 - [zstd](https://github.com/facebook/zstd/commits/dev/)
 
+- [firelzrd](https://github.com/firelzrd)
+
 - [Linux Kernel Mailing List Archive](https://lkml.org) / [Linux Kernel Mailing List Archive](https://lore.kernel.org/lkml/) / [Linux Kernel Mailing List Archive](https://patchwork.kernel.org)
