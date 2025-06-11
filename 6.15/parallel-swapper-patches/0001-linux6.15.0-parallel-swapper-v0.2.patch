@@ -1,0 +1,320 @@
+From 2940e7e02e6a64d5cac805244249b26b2f8a53ed Mon Sep 17 00:00:00 2001
+From: Masahito S <firelzrd@gmail.com>
+Date: Wed, 4 Jun 2025 20:22:13 +0900
+Subject: [PATCH] linux6.15.0-parallel-swapper-v0.2
+
+---
+ include/linux/swap.h |   5 +
+ mm/page_io.c         | 221 +++++++++++++++++++++++++++++++++++++++++++
+ mm/vmscan.c          |  20 ++++
+ 3 files changed, 246 insertions(+)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index db46b25a6..3c684a80a 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -682,5 +682,10 @@ static inline bool mem_cgroup_swap_full(struct folio *folio)
+ }
+ #endif
+ 
++extern int sysctl_parallel_swap;
++extern int sysctl_parallel_swap_factor;
++extern int  swapout_wq_init(void);
++extern void swapout_wq_destroy(void);
++
+ #endif /* __KERNEL__*/
+ #endif /* _LINUX_SWAP_H */
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 4bce19df5..5822ae92d 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -25,6 +25,9 @@
+ #include <linux/sched/task.h>
+ #include <linux/delayacct.h>
+ #include <linux/zswap.h>
++#include <linux/cpumask.h>
++#include <linux/kfifo.h>
++#include <linux/mempool.h>
+ #include "swap.h"
+ 
+ static void __end_swap_bio_write(struct bio *bio)
+@@ -233,6 +236,215 @@ static void swap_zeromap_folio_clear(struct folio *folio)
+ 	}
+ }
+ 
++int sysctl_parallel_swap = 1;
++int sysctl_parallel_swap_factor = 1;
++
++struct numa_swapout_info {
++	struct kfifo fifo;
++	struct mutex lock;
++	atomic_t writer_is_waiting;
++	atomic_t running_workers;
++	struct workqueue_struct *wq;
++	mempool_t *mempool;
++};
++
++static struct numa_swapout_info *numa_swapout_infos;
++#define SWAP_ASYNC_FIFO_SIZE 256
++
++int swapout_wq_init(void)
++{
++	int nid;
++	struct numa_swapout_info *nsi;
++
++	printk(KERN_INFO "Parallel Swapper 0.2 by Masahito Suzuki (forked from Kcompressd by Qun-Wei Lin from MediaTek)");
++
++	numa_swapout_infos = kcalloc(
++		nr_node_ids, sizeof(struct numa_swapout_info), GFP_KERNEL);
++	if (!numa_swapout_infos)
++		return -ENOMEM;
++
++	for_each_node(nid) {
++		nsi = &numa_swapout_infos[nid];
++
++		char wq_name[32];
++		snprintf(wq_name, 32, "swapout%d", nid);
++
++		int max_workers;
++		max_workers =
++			max(1, (int)cpumask_weight(cpumask_of_node(nid)) - 1);
++		nsi->wq = alloc_workqueue(wq_name,
++							WQ_UNBOUND | WQ_MEM_RECLAIM,
++							max_workers);
++		if (!nsi->wq) {
++			pr_err("Failed to create swapout workqueue for node %d\n", nid);
++			goto error;
++		}
++
++		if (kfifo_alloc(&nsi->fifo,
++				SWAP_ASYNC_FIFO_SIZE * sizeof(struct folio *), GFP_KERNEL)) {
++			pr_err("%s: Failed to kfifo_alloc\n", __func__);
++			goto error;
++		}
++
++		nsi->mempool = mempool_create_kmalloc_pool(
++			max_workers, sizeof(struct work_struct));
++		if (!nsi->mempool) {
++			pr_err("Failed to create swapout mempool for node %d\n", nid);
++			goto error_wq;
++		}
++
++		mutex_init(&nsi->lock);
++		atomic_set(&nsi->writer_is_waiting, 0);
++		atomic_set(&nsi->running_workers, 0);
++	}
++
++	return 0;
++
++error_wq:
++	destroy_workqueue(nsi->wq);
++error:
++	for_each_node(nid) {
++		if (nsi->wq)
++			destroy_workqueue(nsi->wq);
++	}
++	kfree(numa_swapout_infos);
++	return -ENOMEM;
++}
++
++void swapout_wq_destroy(void)
++{
++	int nid;
++	struct numa_swapout_info *nsi;
++
++	for_each_node(nid) {
++		nsi = &numa_swapout_infos[nid];
++		if (nsi->wq)
++			destroy_workqueue(nsi->wq);
++		if (nsi->mempool)
++			mempool_destroy(nsi->mempool);
++	}
++	kfree(numa_swapout_infos);
++}
++
++static inline void do_swapout(struct folio *folio)
++{
++	struct writeback_control wbc = {
++		.sync_mode = WB_SYNC_NONE,
++		.nr_to_write = SWAP_CLUSTER_MAX,
++		.range_start = 0,
++		.range_end = LLONG_MAX,
++		.for_reclaim = 1,
++	};
++
++	if (zswap_store(folio)) {
++		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
++		folio_unlock(folio);
++		return;
++	}
++	__swap_writepage(folio, &wbc);
++}
++
++static void swapout_worker(struct work_struct *work)
++{
++	struct folio *folio;
++	int nid = numa_node_id();
++	struct numa_swapout_info *nsi = &numa_swapout_infos[nid];
++
++	while (true) {
++		mutex_lock(&nsi->lock);
++		if (atomic_read(&nsi->writer_is_waiting)) {
++			mutex_unlock(&nsi->lock);
++			continue;
++		}
++		if (kfifo_is_empty(&nsi->fifo) ||
++				unlikely(!kfifo_out(&nsi->fifo, &folio, sizeof(folio))))
++			break;
++		mutex_unlock(&nsi->lock);
++
++		do_swapout(folio);
++	}
++
++	atomic_dec(&nsi->running_workers);
++	mutex_unlock(&nsi->lock);
++
++	mempool_free(work, nsi->mempool);
++}
++
++static bool swapout_sched_parallel(struct folio *folio)
++{
++	struct swap_info_struct *sis = swp_swap_info(folio->swap);
++	int nid = numa_node_id();
++	struct numa_swapout_info *nsi = &numa_swapout_infos[nid];
++	int max_workers, max_queued;
++	struct work_struct *work = NULL;
++	struct folio *alt_folio;
++
++	if (!current_is_kswapd())
++		return false;
++
++	if (!folio_test_anon(folio))
++		return false;
++	/*
++	 * This case needs to synchronously return AOP_WRITEPAGE_ACTIVATE
++	 */
++	if (!mem_cgroup_zswap_writeback_enabled(folio_memcg(folio)))
++		return false;
++
++	sis = swp_swap_info(folio->swap);
++	if (!zswap_is_enabled() && !data_race(sis->flags & SWP_SYNCHRONOUS_IO))
++		return false;
++
++	max_workers = clamp(sysctl_parallel_swap,
++		0, (int)cpumask_weight(cpumask_of_node(nid)) - 1);
++
++	if (!max_workers)
++		return false;
++
++	max_queued = min(SWAP_ASYNC_FIFO_SIZE,
++		max_workers * sysctl_parallel_swap_factor);
++
++	atomic_set(&nsi->writer_is_waiting, 1);
++	guard(mutex)(&nsi->lock);
++	atomic_set(&nsi->writer_is_waiting, 0);
++
++	if (atomic_read(&nsi->running_workers) < max_workers) {
++		work = mempool_alloc(nsi->mempool, GFP_ATOMIC);
++		if (unlikely(!work))
++			return false;
++	}
++
++	if (kfifo_len(&nsi->fifo) >= max_queued * sizeof(folio)) {
++
++		if (unlikely(kfifo_is_empty(&nsi->fifo) ||
++				!kfifo_out(&nsi->fifo, &alt_folio, sizeof(folio))))
++			goto fallback_clean;
++
++		do_swapout(alt_folio);
++
++		if (unlikely(!kfifo_in(&nsi->fifo, &folio, sizeof(folio))))
++			goto fallback_clean;
++
++		goto enqueue_success;
++	}
++
++	if (unlikely(!kfifo_in(&nsi->fifo, &folio, sizeof(folio))))
++		goto fallback_clean;
++enqueue_success:
++	if (work) {
++		INIT_WORK(work, swapout_worker);
++		queue_work(nsi->wq, work);
++		atomic_inc(&nsi->running_workers);
++	}
++
++	return true;
++
++fallback_clean:
++	if(work)
++		mempool_free(work, nsi->mempool);
++
++	return false;
++}
++
+ /*
+  * We may have stale swap cache pages in memory: notice
+  * them here and get rid of the unnecessary final write.
+@@ -275,6 +487,15 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
+ 		 */
+ 		swap_zeromap_folio_clear(folio);
+ 	}
++
++	/*
++	 * Compression within zswap and zram might block rmap, unmap
++	 * of both file and anon pages, try to do compression parallel
++	 * if possible
++	 */
++	if (swapout_sched_parallel(folio))
++		return 0;
++
+ 	if (zswap_store(folio)) {
+ 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
+ 		folio_unlock(folio);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 3783e45bf..19a569a7a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -7433,6 +7433,8 @@ void __meminit kswapd_run(int nid)
+ 		} else {
+ 			wake_up_process(pgdat->kswapd);
+ 		}
++
++    	swapout_wq_init();
+ 	}
+ 	pgdat_kswapd_unlock(pgdat);
+ }
+@@ -7451,6 +7453,8 @@ void __meminit kswapd_stop(int nid)
+ 	if (kswapd) {
+ 		kthread_stop(kswapd);
+ 		pgdat->kswapd = NULL;
++
++		swapout_wq_destroy();
+ 	}
+ 	pgdat_kswapd_unlock(pgdat);
+ }
+@@ -7465,6 +7469,22 @@ static const struct ctl_table vmscan_sysctl_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_TWO_HUNDRED,
+ 	},
++	{
++		.procname	= "parallel_swap",
++		.data		= &sysctl_parallel_swap,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler = proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++	},
++	{
++		.procname	= "parallel_swap_factor",
++		.data		= &sysctl_parallel_swap_factor,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler = proc_dointvec_minmax,
++		.extra1		= SYSCTL_ONE,
++	},
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.procname	= "zone_reclaim_mode",
+-- 
+2.49.0
+

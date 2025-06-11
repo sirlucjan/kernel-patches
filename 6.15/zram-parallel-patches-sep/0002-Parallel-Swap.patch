@@ -1,0 +1,260 @@
+From 8309d58031756d972806f9aeb04477c0c85d81b7 Mon Sep 17 00:00:00 2001
+From: Masahito S <firelzrd@gmail.com>
+Date: Mon, 2 Jun 2025 12:38:37 +0900
+Subject: [PATCH 2/2] Parallel Swap
+
+---
+ include/linux/mmzone.h |   8 +++
+ include/linux/swap.h   |   1 +
+ mm/page_io.c           | 136 +++++++++++++++++++++++++++++++++++++++++
+ mm/vmscan.c            |  14 +++++
+ 4 files changed, 159 insertions(+)
+
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 6ccec1bf2..5d577354f 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -23,6 +23,8 @@
+ #include <linux/page-flags.h>
+ #include <linux/local_lock.h>
+ #include <linux/zswap.h>
++#include <linux/cpumask.h>
++#include <linux/mempool.h>
+ #include <asm/page.h>
+ 
+ /* Free memory management - zoned buddy allocator.  */
+@@ -1398,6 +1400,9 @@ typedef struct pglist_data {
+ 
+ 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
+ 
++	struct workqueue_struct *swapout_wq;
++	atomic_t swapout_pending_works;
++
+ #ifdef CONFIG_COMPACTION
+ 	int kcompactd_max_order;
+ 	enum zone_type kcompactd_highest_zoneidx;
+@@ -1480,6 +1485,9 @@ typedef struct pglist_data {
+ #endif
+ } pg_data_t;
+ 
++extern int  swapout_wq_init(void);
++extern void swapout_wq_destroy(void);
++
+ #define node_present_pages(nid)	(NODE_DATA(nid)->node_present_pages)
+ #define node_spanned_pages(nid)	(NODE_DATA(nid)->node_spanned_pages)
+ 
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index db46b25a6..1eeaa6a37 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -425,6 +425,7 @@ extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
+ 						unsigned long *nr_scanned);
+ extern unsigned long shrink_all_memory(unsigned long nr_pages);
+ extern int vm_swappiness;
++extern int sysctl_parallel_swap;
+ long remove_mapping(struct address_space *mapping, struct folio *folio);
+ 
+ #ifdef CONFIG_NUMA
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 4bce19df5..924f322f5 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -233,6 +233,133 @@ static void swap_zeromap_folio_clear(struct folio *folio)
+ 	}
+ }
+ 
++struct swapout_work {
++	struct work_struct work;
++	struct folio *folio;
++};
++
++mempool_t **swapout_mempool;
++
++int swapout_wq_init(void)
++{
++	int nid;
++	pg_data_t *pgdat;
++
++	swapout_mempool =
++		kcalloc(nr_node_ids, sizeof(mempool_t *), GFP_KERNEL);
++	if (!swapout_mempool)
++		return -ENOMEM;
++
++	for_each_node(nid) {
++		pgdat = NODE_DATA(nid);
++
++		char wq_name[32];
++		snprintf(wq_name, 32, "swapout%d", nid);
++
++		int max_swapout_workers;
++		max_swapout_workers =
++			max(1, (int)cpumask_weight(cpumask_of_node(nid)) - 1);
++		pgdat->swapout_wq = alloc_workqueue(wq_name,
++							WQ_UNBOUND | WQ_MEM_RECLAIM,
++							max_swapout_workers);
++		if (!pgdat->swapout_wq) {
++			pr_err("Failed to create swapout workqueue for node %d\n", nid);
++			goto error;
++		}
++
++		swapout_mempool[nid] = mempool_create_kmalloc_pool(
++			max_swapout_workers, sizeof(struct swapout_work));
++		if (!swapout_mempool[nid]) {
++			pr_err("Failed to create swapout mempool for node %d\n", nid);
++			goto error_wq;
++		}
++	}
++
++	return 0;
++
++error_wq:
++	destroy_workqueue(pgdat->swapout_wq);
++error:
++	kfree(swapout_mempool);
++	return -ENOMEM;
++}
++
++void swapout_wq_destroy(void)
++{
++    int nid;
++    for_each_node(nid) {
++        if (swapout_mempool[nid])
++            mempool_destroy(swapout_mempool[nid]);
++    }
++    kfree(swapout_mempool);
++}
++
++static void swapout_worker(struct work_struct *work)
++{
++	struct swapout_work *swapout_work =
++		container_of(work, struct swapout_work, work);
++	struct folio *folio = swapout_work->folio;
++	struct writeback_control wbc = {
++		.sync_mode = WB_SYNC_NONE,
++	};
++
++	if (zswap_store(folio)) {
++		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
++		folio_unlock(folio);
++	} else {
++		__swap_writepage(folio, &wbc);
++	}
++
++	mempool_free(swapout_work, swapout_mempool[page_to_nid(&folio->page)]);
++
++	atomic_dec(&NODE_DATA(page_to_nid(&folio->page))->swapout_pending_works);
++}
++
++static bool swapout_sched_parallel(struct folio *folio)
++{
++	struct swap_info_struct *sis = swp_swap_info(folio->swap);
++	int nid = numa_node_id();
++	pg_data_t *pgdat = NODE_DATA(nid);
++	unsigned long current_pending;
++	int max_workers;
++	struct swapout_work *work;
++
++	if (!current_is_kswapd())
++		return false;
++
++	if (!folio_test_anon(folio))
++		return false;
++	/*
++	 * This case needs to synchronously return AOP_WRITEPAGE_ACTIVATE
++	 */
++	if (!mem_cgroup_zswap_writeback_enabled(folio_memcg(folio)))
++		return false;
++
++	sis = swp_swap_info(folio->swap);
++	if (!zswap_is_enabled() && !data_race(sis->flags & SWP_SYNCHRONOUS_IO))
++		return false;
++
++	current_pending = atomic_read(&pgdat->swapout_pending_works);
++
++	max_workers = clamp(sysctl_parallel_swap,
++		0, (int)cpumask_weight(cpumask_of_node(nid)) - 1);
++	if (current_pending >= max_workers)
++		return false;
++
++	work = mempool_alloc(swapout_mempool[nid], GFP_ATOMIC);
++	if (!work)
++		return false;
++
++	INIT_WORK(&work->work, swapout_worker);
++	work->folio = folio;
++
++	queue_work(pgdat->swapout_wq, &work->work);
++
++	atomic_inc(&pgdat->swapout_pending_works);
++
++	return true;
++}
++
+ /*
+  * We may have stale swap cache pages in memory: notice
+  * them here and get rid of the unnecessary final write.
+@@ -275,6 +402,15 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
+ 		 */
+ 		swap_zeromap_folio_clear(folio);
+ 	}
++
++	/*
++	 * Compression within zswap and zram might block rmap, unmap
++	 * of both file and anon pages, try to do compression parallel
++	 * if possible
++	 */
++	if (swapout_sched_parallel(folio))
++		return 0;
++
+ 	if (zswap_store(folio)) {
+ 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
+ 		folio_unlock(folio);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 3783e45bf..32ac3743e 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -183,6 +183,8 @@ struct scan_control {
+ 	struct reclaim_state reclaim_state;
+ };
+ 
++int sysctl_parallel_swap = 1;
++
+ #ifdef ARCH_HAS_PREFETCHW
+ #define prefetchw_prev_lru_folio(_folio, _base, _field)			\
+ 	do {								\
+@@ -7433,6 +7435,8 @@ void __meminit kswapd_run(int nid)
+ 		} else {
+ 			wake_up_process(pgdat->kswapd);
+ 		}
++
++    	swapout_wq_init();
+ 	}
+ 	pgdat_kswapd_unlock(pgdat);
+ }
+@@ -7451,6 +7455,8 @@ void __meminit kswapd_stop(int nid)
+ 	if (kswapd) {
+ 		kthread_stop(kswapd);
+ 		pgdat->kswapd = NULL;
++
++		swapout_wq_destroy();
+ 	}
+ 	pgdat_kswapd_unlock(pgdat);
+ }
+@@ -7465,6 +7471,14 @@ static const struct ctl_table vmscan_sysctl_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_TWO_HUNDRED,
+ 	},
++	{
++		.procname	= "parallel_swap",
++		.data		= &sysctl_parallel_swap,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler = proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++	},
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.procname	= "zone_reclaim_mode",
+-- 
+2.49.0
+
