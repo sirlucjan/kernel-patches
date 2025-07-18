@@ -1,6 +1,6 @@
 ## PATCHES
 
-#### Patches for [CachyOS Kernels](https://github.com/CachyOS/linux-cachyos)
+#### Patches for [CachyOS Kernels](https://github.com/CachyOS/linux-cachyos) and more.
 
 ###### Patches developed and offered only for the last, stable line (not EOL and not LTS). 
 ###### Active support is offered only for this kernel line. 
@@ -27,3 +27,5 @@ Here are patches reformatted (with `git format-patch` and/or `git diff`) and reb
 - [firelzrd](https://github.com/firelzrd)
 
 - [Linux Kernel Mailing List Archive](https://lkml.org) / [Linux Kernel Mailing List Archive](https://lore.kernel.org/lkml/) / [Linux Kernel Mailing List Archive](https://patchwork.kernel.org)
+
+### NOTES. The repository does not contain all patches from the above-mentioned sources - only those that I test myself or find interesting.
