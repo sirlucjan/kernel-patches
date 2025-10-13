@@ -1,0 +1,185 @@
+From 02488792c0bac9a18290a3f39244c638b7088104 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Sat, 20 Sep 2025 23:38:25 +0200
+Subject: [PATCH 30/30] sched_ext: Introduce scx_bpf_dsq_peek()
+
+BPF schedulers often need to inspect the first task in a DSQ without
+consuming it, for example to access its vruntime or other properties.
+
+At the moment, this can be done using BPF iterators, but this requires
+taking the DSQ lock, which can be very costly in overcommitted
+scenarios, due to high locking contention.
+
+To address this, introduce scx_bpf_dsq_peek(), a new kfunc that returns
+the first task in a user DSQ in a lockless way.
+
+For now, this kfunc can only be used with user DSQs to simplify locking.
+This is probably a reasonable compromise: once a task is queued to a
+built-in DSQ (e.g., SCX_DSQ_LOCAL), it is effectively considered
+dispatched, so peeking at its state is rarely needed.
+
+The scx_bpf_dsq_peek() API is implemented by caching the first task
+directly in the struct scx_dispatch_q, that can be accessed under RCU
+read lock protection, to ensure the task remains valid while accessing
+its properties.
+
+Results
+=======
+
+Benchmark:
+ - Measure schbench performance (rps), using a BPF schedulers with
+   per-CPU DSQs on a 72-core system (scx_bpf_dsq_peek() is used to
+   retrieve the task with the minimum vruntime across all the CPUs):
+
+   $ schbench -L -m 4 -M auto -t 200 -n 0
+
+Average rps over 10 runs:
+ - without scx_bpf_dsq_peek(): 1391770.37 rps
+ - with scx_bpf_dsq_peek():    2068638.81 rps (~+50% speedup)
+
+Cc: Ryan Newton <newton@meta.com>
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+---
+ include/linux/sched/ext.h                |  1 +
+ kernel/sched/ext.c                       | 42 ++++++++++++++++++++++++
+ tools/sched_ext/include/scx/common.bpf.h |  1 +
+ tools/sched_ext/include/scx/compat.bpf.h | 18 ++++++++++
+ 4 files changed, 62 insertions(+)
+
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index d82b7a9b0..7ad28933f 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -63,6 +63,7 @@ struct scx_dispatch_q {
+ 	u32			nr;
+ 	u32			seq;	/* used by BPF iter */
+ 	u64			id;
++	struct task_struct	*first_task;
+ 	struct rhash_head	hash_node;
+ 	struct llist_node	free_node;
+ 	struct rcu_head		rcu;
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 17db27ede..12b745678 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -899,6 +899,19 @@ static void refill_task_slice_dfl(struct scx_sched *sch, struct task_struct *p)
+ 	__scx_add_event(sch, SCX_EV_REFILL_SLICE_DFL, 1);
+ }
+ 
++static void update_first_task(struct scx_dispatch_q *dsq)
++{
++	struct task_struct *p;
++
++	if (dsq->id & SCX_DSQ_FLAG_BUILTIN)
++		return;
++
++	lockdep_assert_held(&dsq->lock);
++
++	p = nldsq_next_task(dsq, NULL, false);
++	rcu_assign_pointer(dsq->first_task, p);
++}
++
+ static void dispatch_enqueue(struct scx_sched *sch, struct scx_dispatch_q *dsq,
+ 			     struct task_struct *p, u64 enq_flags)
+ {
+@@ -961,6 +974,7 @@ static void dispatch_enqueue(struct scx_sched *sch, struct scx_dispatch_q *dsq,
+ 		} else {
+ 			list_add(&p->scx.dsq_list.node, &dsq->list);
+ 		}
++		update_first_task(dsq);
+ 	} else {
+ 		/* a FIFO DSQ shouldn't be using PRIQ enqueuing */
+ 		if (unlikely(!RB_EMPTY_ROOT(&dsq->priq)))
+@@ -1027,6 +1041,8 @@ static void task_unlink_from_dsq(struct task_struct *p,
+ 
+ 	list_del_init(&p->scx.dsq_list.node);
+ 	dsq_mod_nr(dsq, -1);
++
++	update_first_task(dsq);
+ }
+ 
+ static void dispatch_dequeue(struct rq *rq, struct task_struct *p)
+@@ -5762,6 +5778,31 @@ __bpf_kfunc bool scx_bpf_dsq_move_to_local(u64 dsq_id)
+ 	}
+ }
+ 
++/*
++ * Return the first task in a priority DSQ in a lockless way.
++ */
++__bpf_kfunc struct task_struct *scx_bpf_dsq_peek(u64 dsq_id)
++{
++	struct scx_sched *sch = rcu_dereference(scx_root);
++	struct scx_dispatch_q *dsq;
++
++	if (!scx_kf_allowed(sch, SCX_KF_DISPATCH))
++		return NULL;
++
++	if (unlikely((dsq_id & SCX_DSQ_FLAG_BUILTIN))) {
++		scx_error(sch, "invalid DSQ ID 0x%016llx (only user DSQs allowed)", dsq_id);
++		return NULL;
++	}
++
++	dsq = find_user_dsq(sch, dsq_id);
++	if (unlikely(!dsq)) {
++		scx_error(sch, "non-existent DSQ ID 0x%016llx", dsq_id);
++		return NULL;
++	}
++
++	return rcu_dereference(dsq->first_task);
++}
++
+ /**
+  * scx_bpf_dsq_move_set_slice - Override slice when moving between DSQs
+  * @it__iter: DSQ iterator in progress
+@@ -5862,6 +5903,7 @@ BTF_KFUNCS_START(scx_kfunc_ids_dispatch)
+ BTF_ID_FLAGS(func, scx_bpf_dispatch_nr_slots)
+ BTF_ID_FLAGS(func, scx_bpf_dispatch_cancel)
+ BTF_ID_FLAGS(func, scx_bpf_dsq_move_to_local)
++BTF_ID_FLAGS(func, scx_bpf_dsq_peek, KF_RCU_PROTECTED | KF_RET_NULL)
+ BTF_ID_FLAGS(func, scx_bpf_dsq_move_set_slice)
+ BTF_ID_FLAGS(func, scx_bpf_dsq_move_set_vtime)
+ BTF_ID_FLAGS(func, scx_bpf_dsq_move, KF_RCU)
+diff --git a/tools/sched_ext/include/scx/common.bpf.h b/tools/sched_ext/include/scx/common.bpf.h
+index 06e255103..b3b1c7ca2 100644
+--- a/tools/sched_ext/include/scx/common.bpf.h
++++ b/tools/sched_ext/include/scx/common.bpf.h
+@@ -67,6 +67,7 @@ void scx_bpf_dsq_insert_vtime(struct task_struct *p, u64 dsq_id, u64 slice, u64
+ u32 scx_bpf_dispatch_nr_slots(void) __ksym;
+ void scx_bpf_dispatch_cancel(void) __ksym;
+ bool scx_bpf_dsq_move_to_local(u64 dsq_id) __ksym __weak;
++struct task_struct *scx_bpf_dsq_peek(u64 dsq_id) __ksym __weak;
+ void scx_bpf_dsq_move_set_slice(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym __weak;
+ void scx_bpf_dsq_move_set_vtime(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym __weak;
+ bool scx_bpf_dsq_move(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
+diff --git a/tools/sched_ext/include/scx/compat.bpf.h b/tools/sched_ext/include/scx/compat.bpf.h
+index dd9144624..82970ce87 100644
+--- a/tools/sched_ext/include/scx/compat.bpf.h
++++ b/tools/sched_ext/include/scx/compat.bpf.h
+@@ -247,6 +247,24 @@ static inline struct task_struct *__COMPAT_scx_bpf_cpu_curr(int cpu)
+ 	return rq ? rq->curr : NULL;
+ }
+ 
++/*
++ * v6.18: Introduce lockless peek API for user DSQs.
++ *
++ * Preserve the following macro until v6.20.
++ */
++static inline struct task_struct *__COMPAT_scx_bpf_dsq_peek(u64 dsq_id)
++{
++	struct task_struct *p;
++
++	if (bpf_ksym_exists(scx_bpf_dsq_peek))
++		return scx_bpf_dsq_peek(dsq_id);
++
++	bpf_for_each(scx_dsq, p, dsq_id, 0)
++		return p;
++
++	return NULL;
++}
++
+ /*
+  * Define sched_ext_ops. This may be expanded to define multiple variants for
+  * backward compatibility. See compat.h::SCX_OPS_LOAD/ATTACH().
+-- 
+2.51.0
+
