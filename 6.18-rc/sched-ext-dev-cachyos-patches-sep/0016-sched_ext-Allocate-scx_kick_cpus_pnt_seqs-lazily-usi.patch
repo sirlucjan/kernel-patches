@@ -1,0 +1,195 @@
+From ed6f453bac7fcab41daab55397eb496d483b3c9c Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 8 Oct 2025 13:43:26 -1000
+Subject: [PATCH 16/32] sched_ext: Allocate scx_kick_cpus_pnt_seqs lazily using
+ kvzalloc()
+
+On systems with >4096 CPUs, scx_kick_cpus_pnt_seqs allocation fails during
+boot because it exceeds the 32,768 byte percpu allocator limit.
+
+Restructure to use DEFINE_PER_CPU() for the per-CPU pointers, with each CPU
+pointing to its own kvzalloc'd array. Move allocation from boot time to
+scx_enable() and free in scx_disable(), so the O(nr_cpu_ids^2) memory is only
+consumed when sched_ext is active.
+
+Use RCU to guard against racing with free. Arrays are freed via call_rcu()
+and kick_cpus_irq_workfn() uses rcu_dereference_bh() with a NULL check.
+
+While at it, rename to scx_kick_pseqs for brevity and update comments to
+clarify these are pick_task sequence numbers.
+
+v2: RCU protect scx_kick_seqs to manage kick_cpus_irq_workfn() racing
+    against disable as per Andrea.
+
+v3: Fix bugs notcied by Andrea.
+
+Reported-by: Phil Auld <pauld@redhat.com>
+Link: http://lkml.kernel.org/r/20251007133523.GA93086@pauld.westford.csb
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Andrea Righi <arighi@nvidia.com>
+---
+ kernel/sched/ext.c | 89 ++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 856c7f785..97e68404a 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -67,8 +67,19 @@ static unsigned long scx_watchdog_timestamp = INITIAL_JIFFIES;
+ 
+ static struct delayed_work scx_watchdog_work;
+ 
+-/* for %SCX_KICK_WAIT */
+-static unsigned long __percpu *scx_kick_cpus_pnt_seqs;
++/*
++ * For %SCX_KICK_WAIT: Each CPU has a pointer to an array of pick_task sequence
++ * numbers. The arrays are allocated with kvzalloc() as size can exceed percpu
++ * allocator limits on large machines. O(nr_cpu_ids^2) allocation, allocated
++ * lazily when enabling and freed when disabling to avoid waste when sched_ext
++ * isn't active.
++ */
++struct scx_kick_pseqs {
++	struct rcu_head		rcu;
++	unsigned long		seqs[];
++};
++
++static DEFINE_PER_CPU(struct scx_kick_pseqs __rcu *, scx_kick_pseqs);
+ 
+ /*
+  * Direct dispatch marker.
+@@ -3895,6 +3906,27 @@ static const char *scx_exit_reason(enum scx_exit_kind kind)
+ 	}
+ }
+ 
++static void free_kick_pseqs_rcu(struct rcu_head *rcu)
++{
++	struct scx_kick_pseqs *pseqs = container_of(rcu, struct scx_kick_pseqs, rcu);
++
++	kvfree(pseqs);
++}
++
++static void free_kick_pseqs(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct scx_kick_pseqs **pseqs = per_cpu_ptr(&scx_kick_pseqs, cpu);
++		struct scx_kick_pseqs *to_free;
++
++		to_free = rcu_replace_pointer(*pseqs, NULL, true);
++		if (to_free)
++			call_rcu(&to_free->rcu, free_kick_pseqs_rcu);
++	}
++}
++
+ static void scx_disable_workfn(struct kthread_work *work)
+ {
+ 	struct scx_sched *sch = container_of(work, struct scx_sched, disable_work);
+@@ -4029,6 +4061,7 @@ static void scx_disable_workfn(struct kthread_work *work)
+ 	free_percpu(scx_dsp_ctx);
+ 	scx_dsp_ctx = NULL;
+ 	scx_dsp_max_batch = 0;
++	free_kick_pseqs();
+ 
+ 	mutex_unlock(&scx_enable_mutex);
+ 
+@@ -4391,6 +4424,33 @@ static void scx_vexit(struct scx_sched *sch,
+ 	irq_work_queue(&sch->error_irq_work);
+ }
+ 
++static int alloc_kick_pseqs(void)
++{
++	int cpu;
++
++	/*
++	 * Allocate per-CPU arrays sized by nr_cpu_ids. Use kvzalloc as size
++	 * can exceed percpu allocator limits on large machines.
++	 */
++	for_each_possible_cpu(cpu) {
++		struct scx_kick_pseqs **pseqs = per_cpu_ptr(&scx_kick_pseqs, cpu);
++		struct scx_kick_pseqs *new_pseqs;
++
++		WARN_ON_ONCE(rcu_access_pointer(*pseqs));
++
++		new_pseqs = kvzalloc_node(struct_size(new_pseqs, seqs, nr_cpu_ids),
++					  GFP_KERNEL, cpu_to_node(cpu));
++		if (!new_pseqs) {
++			free_kick_pseqs();
++			return -ENOMEM;
++		}
++
++		rcu_assign_pointer(*pseqs, new_pseqs);
++	}
++
++	return 0;
++}
++
+ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops)
+ {
+ 	struct scx_sched *sch;
+@@ -4536,15 +4596,19 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ 	mutex_lock(&scx_enable_mutex);
+ 
++	ret = alloc_kick_pseqs();
++	if (ret)
++		goto err_unlock;
++
+ 	if (scx_enable_state() != SCX_DISABLED) {
+ 		ret = -EBUSY;
+-		goto err_unlock;
++		goto err_free_pseqs;
+ 	}
+ 
+ 	sch = scx_alloc_and_add_sched(ops);
+ 	if (IS_ERR(sch)) {
+ 		ret = PTR_ERR(sch);
+-		goto err_unlock;
++		goto err_free_pseqs;
+ 	}
+ 
+ 	/*
+@@ -4749,6 +4813,8 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ 	return 0;
+ 
++err_free_pseqs:
++	free_kick_pseqs();
+ err_unlock:
+ 	mutex_unlock(&scx_enable_mutex);
+ 	return ret;
+@@ -5130,10 +5196,18 @@ static void kick_cpus_irq_workfn(struct irq_work *irq_work)
+ {
+ 	struct rq *this_rq = this_rq();
+ 	struct scx_rq *this_scx = &this_rq->scx;
+-	unsigned long *pseqs = this_cpu_ptr(scx_kick_cpus_pnt_seqs);
++	struct scx_kick_pseqs __rcu *pseqs_pcpu = __this_cpu_read(scx_kick_pseqs);
+ 	bool should_wait = false;
++	unsigned long *pseqs;
+ 	s32 cpu;
+ 
++	if (unlikely(!pseqs_pcpu)) {
++		pr_warn_once("kick_cpus_irq_workfn() called with NULL scx_kick_pseqs");
++		return;
++	}
++
++	pseqs = rcu_dereference_bh(pseqs_pcpu)->seqs;
++
+ 	for_each_cpu(cpu, this_scx->cpus_to_kick) {
+ 		should_wait |= kick_one_cpu(cpu, this_rq, pseqs);
+ 		cpumask_clear_cpu(cpu, this_scx->cpus_to_kick);
+@@ -5256,11 +5330,6 @@ void __init init_sched_ext_class(void)
+ 
+ 	scx_idle_init_masks();
+ 
+-	scx_kick_cpus_pnt_seqs =
+-		__alloc_percpu(sizeof(scx_kick_cpus_pnt_seqs[0]) * nr_cpu_ids,
+-			       __alignof__(scx_kick_cpus_pnt_seqs[0]));
+-	BUG_ON(!scx_kick_cpus_pnt_seqs);
+-
+ 	for_each_possible_cpu(cpu) {
+ 		struct rq *rq = cpu_rq(cpu);
+ 		int  n = cpu_to_node(cpu);
+-- 
+2.51.0
+

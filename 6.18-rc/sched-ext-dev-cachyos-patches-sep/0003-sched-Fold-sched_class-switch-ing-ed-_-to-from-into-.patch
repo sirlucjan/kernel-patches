@@ -1,0 +1,378 @@
+From c68a07a654e65d5226dbcb267480fef1be7d7a61 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 6 Oct 2025 12:44:05 +0200
+Subject: [PATCH 03/32] sched: Fold sched_class::switch{ing,ed}_{to,from}()
+ into the change pattern
+
+Add {DE,EN}QUEUE_CLASS and fold the sched_class::switch* methods into
+the change pattern. This completes and makes the pattern more
+symmetric.
+
+This changes the order of callbacks slightly:
+
+				|
+				|  switching_from()
+  dequeue_task();		|  dequeue_task()
+  put_prev_task();		|  put_prev_task()
+				|  switched_from()
+				|
+  ... change task ...		|  ... change task ...
+				|
+  switching_to();		|  switching_to()
+  enqueue_task();		|  enqueue_task()
+  set_next_task();		|  set_next_task()
+  prev_class->switched_from()	|
+  switched_to()			|  switched_to()
+				|
+
+Notably, it moves the switched_from() callback right after the
+dequeue/put. Existing implementations don't appear to be affected by
+this change in location -- specifically the task isn't enqueued on the
+class in question in either location.
+
+Make (CLASS)^(SAVE|MOVE), because there is nothing to save-restore
+when changing scheduling classes.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/core.c      | 56 +++++++++++++++++++---------------------
+ kernel/sched/ext.c       | 26 ++++++++++++++-----
+ kernel/sched/idle.c      |  4 +--
+ kernel/sched/rt.c        |  2 +-
+ kernel/sched/sched.h     | 22 ++++++----------
+ kernel/sched/stop_task.c |  4 +--
+ kernel/sched/syscalls.c  |  9 +++++--
+ 7 files changed, 66 insertions(+), 57 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 9b1e863fe..716ad18d8 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2169,34 +2169,9 @@ inline int task_curr(const struct task_struct *p)
+ 	return cpu_curr(task_cpu(p)) == p;
+ }
+ 
+-/*
+- * ->switching_to() is called with the pi_lock and rq_lock held and must not
+- * mess with locking.
+- */
+-void check_class_changing(struct rq *rq, struct task_struct *p,
+-			  const struct sched_class *prev_class)
++void check_prio_changed(struct rq *rq, struct task_struct *p, int oldprio)
+ {
+-	if (prev_class != p->sched_class && p->sched_class->switching_to)
+-		p->sched_class->switching_to(rq, p);
+-}
+-
+-/*
+- * switched_from, switched_to and prio_changed must _NOT_ drop rq->lock,
+- * use the balance_callback list if you want balancing.
+- *
+- * this means any call to check_class_changed() must be followed by a call to
+- * balance_callback().
+- */
+-void check_class_changed(struct rq *rq, struct task_struct *p,
+-			 const struct sched_class *prev_class,
+-			 int oldprio)
+-{
+-	if (prev_class != p->sched_class) {
+-		if (prev_class->switched_from)
+-			prev_class->switched_from(rq, p);
+-
+-		p->sched_class->switched_to(rq, p);
+-	} else if (oldprio != p->prio || dl_task(p))
++	if (oldprio != p->prio || dl_task(p))
+ 		p->sched_class->prio_changed(rq, p, oldprio);
+ }
+ 
+@@ -7388,6 +7363,11 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
+ 	prev_class = p->sched_class;
+ 	next_class = __setscheduler_class(p->policy, prio);
+ 
++	if (prev_class != next_class) {
++		queue_flag |= DEQUEUE_CLASS;
++		queue_flag &= ~(DEQUEUE_SAVE | DEQUEUE_MOVE);
++	}
++
+ 	if (prev_class != next_class && p->se.sched_delayed)
+ 		dequeue_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
+ 
+@@ -7424,11 +7404,10 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
+ 
+ 		p->sched_class = next_class;
+ 		p->prio = prio;
+-
+-		check_class_changing(rq, p, prev_class);
+ 	}
+ 
+-	check_class_changed(rq, p, prev_class, oldprio);
++	if (!(queue_flag & DEQUEUE_CLASS))
++		check_prio_changed(rq, p, oldprio);
+ out_unlock:
+ 	/* Avoid rq from going away on us: */
+ 	preempt_disable();
+@@ -10864,6 +10843,14 @@ struct sched_change_ctx *sched_change_begin(struct task_struct *p, unsigned int
+ 
+ 	lockdep_assert_rq_held(rq);
+ 
++	if (flags & DEQUEUE_CLASS) {
++		if (WARN_ON_ONCE(flags & (DEQUEUE_SAVE | DEQUEUE_MOVE)))
++			flags &= ~(DEQUEUE_SAVE | DEQUEUE_MOVE);
++
++		if (p->sched_class->switching_from)
++			p->sched_class->switching_from(rq, p);
++	}
++
+ 	*ctx = (struct sched_change_ctx){
+ 		.p = p,
+ 		.flags = flags,
+@@ -10876,6 +10863,9 @@ struct sched_change_ctx *sched_change_begin(struct task_struct *p, unsigned int
+ 	if (ctx->running)
+ 		put_prev_task(rq, p);
+ 
++	if ((flags & DEQUEUE_CLASS) && p->sched_class->switched_from)
++		p->sched_class->switched_from(rq, p);
++
+ 	return ctx;
+ }
+ 
+@@ -10886,8 +10876,14 @@ void sched_change_end(struct sched_change_ctx *ctx)
+ 
+ 	lockdep_assert_rq_held(rq);
+ 
++	if ((ctx->flags & ENQUEUE_CLASS) && p->sched_class->switching_to)
++		p->sched_class->switching_to(rq, p);
++
+ 	if (ctx->queued)
+ 		enqueue_task(rq, p, ctx->flags | ENQUEUE_NOCLOCK);
+ 	if (ctx->running)
+ 		set_next_task(rq, p);
++
++	if ((ctx->flags & ENQUEUE_CLASS) && p->sched_class->switched_to)
++		p->sched_class->switched_to(rq, p);
+ }
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index aadd59c83..01da44235 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -3931,21 +3931,28 @@ static void scx_disable_workfn(struct kthread_work *work)
+ 
+ 	scx_task_iter_start(&sti);
+ 	while ((p = scx_task_iter_next_locked(&sti))) {
++		unsigned int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+ 		const struct sched_class *old_class = p->sched_class;
+ 		const struct sched_class *new_class =
+ 			__setscheduler_class(p->policy, p->prio);
+ 
+ 		update_rq_clock(task_rq(p));
+ 
++		if (old_class != new_class) {
++			queue_flags |= DEQUEUE_CLASS;
++			queue_flags &= ~(DEQUEUE_SAVE | DEQUEUE_MOVE);
++		}
++
+ 		if (old_class != new_class && p->se.sched_delayed)
+ 			dequeue_task(task_rq(p), p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
+ 
+-		scoped_guard (sched_change, p, DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK) {
++		scoped_guard (sched_change, p, queue_flags) {
+ 			p->sched_class = new_class;
+-			check_class_changing(task_rq(p), p, old_class);
+ 		}
+ 
+-		check_class_changed(task_rq(p), p, old_class, p->prio);
++		if (!(queue_flags & DEQUEUE_CLASS))
++			check_prio_changed(task_rq(p), p, p->prio);
++
+ 		scx_exit_task(p);
+ 	}
+ 	scx_task_iter_stop(&sti);
+@@ -4681,6 +4688,7 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 	percpu_down_write(&scx_fork_rwsem);
+ 	scx_task_iter_start(&sti);
+ 	while ((p = scx_task_iter_next_locked(&sti))) {
++		unsigned int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+ 		const struct sched_class *old_class = p->sched_class;
+ 		const struct sched_class *new_class =
+ 			__setscheduler_class(p->policy, p->prio);
+@@ -4690,16 +4698,22 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
+ 
+ 		update_rq_clock(task_rq(p));
+ 
++		if (old_class != new_class) {
++			queue_flags |= DEQUEUE_CLASS;
++			queue_flags &= ~(DEQUEUE_SAVE | DEQUEUE_MOVE);
++		}
++
+ 		if (old_class != new_class && p->se.sched_delayed)
+ 			dequeue_task(task_rq(p), p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
+ 
+-		scoped_guard (sched_change, p, DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK) {
++		scoped_guard (sched_change, p, queue_flags) {
+ 			p->scx.slice = SCX_SLICE_DFL;
+ 			p->sched_class = new_class;
+-			check_class_changing(task_rq(p), p, old_class);
+ 		}
+ 
+-		check_class_changed(task_rq(p), p, old_class, p->prio);
++		if (!(queue_flags & DEQUEUE_CLASS))
++			check_prio_changed(task_rq(p), p, p->prio);
++
+ 		put_task_struct(p);
+ 	}
+ 	scx_task_iter_stop(&sti);
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index c39b089d4..f02dceda0 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -498,7 +498,7 @@ static void task_tick_idle(struct rq *rq, struct task_struct *curr, int queued)
+ {
+ }
+ 
+-static void switched_to_idle(struct rq *rq, struct task_struct *p)
++static void switching_to_idle(struct rq *rq, struct task_struct *p)
+ {
+ 	BUG();
+ }
+@@ -536,6 +536,6 @@ DEFINE_SCHED_CLASS(idle) = {
+ 	.task_tick		= task_tick_idle,
+ 
+ 	.prio_changed		= prio_changed_idle,
+-	.switched_to		= switched_to_idle,
++	.switching_to		= switching_to_idle,
+ 	.update_curr		= update_curr_idle,
+ };
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 7936d4333..6b2e8112c 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -2589,8 +2589,8 @@ DEFINE_SCHED_CLASS(rt) = {
+ 
+ 	.get_rr_interval	= get_rr_interval_rt,
+ 
+-	.prio_changed		= prio_changed_rt,
+ 	.switched_to		= switched_to_rt,
++	.prio_changed		= prio_changed_rt,
+ 
+ 	.update_curr		= update_curr_rt,
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 611fcc7f7..0ddc8d2d9 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -20,7 +20,6 @@
+ #include <linux/sched/task_flags.h>
+ #include <linux/sched/task.h>
+ #include <linux/sched/topology.h>
+-
+ #include <linux/atomic.h>
+ #include <linux/bitmap.h>
+ #include <linux/bug.h>
+@@ -2369,6 +2368,7 @@ extern const u32		sched_prio_to_wmult[40];
+ 
+ #define DEQUEUE_MIGRATING	0x0010 /* Matches ENQUEUE_MIGRATING */
+ #define DEQUEUE_DELAYED		0x0020 /* Matches ENQUEUE_DELAYED */
++#define DEQUEUE_CLASS		0x0040 /* Matches ENQUEUE_CLASS */
+ 
+ #define DEQUEUE_SPECIAL		0x00010000
+ #define DEQUEUE_THROTTLE	0x00020000
+@@ -2380,6 +2380,7 @@ extern const u32		sched_prio_to_wmult[40];
+ 
+ #define ENQUEUE_MIGRATING	0x0010
+ #define ENQUEUE_DELAYED		0x0020
++#define ENQUEUE_CLASS		0x0040
+ 
+ #define ENQUEUE_HEAD		0x00010000
+ #define ENQUEUE_REPLENISH	0x00020000
+@@ -2443,14 +2444,11 @@ struct sched_class {
+ 	void (*task_fork)(struct task_struct *p);
+ 	void (*task_dead)(struct task_struct *p);
+ 
+-	/*
+-	 * The switched_from() call is allowed to drop rq->lock, therefore we
+-	 * cannot assume the switched_from/switched_to pair is serialized by
+-	 * rq->lock. They are however serialized by p->pi_lock.
+-	 */
+-	void (*switching_to) (struct rq *this_rq, struct task_struct *task);
+-	void (*switched_from)(struct rq *this_rq, struct task_struct *task);
+-	void (*switched_to)  (struct rq *this_rq, struct task_struct *task);
++	void (*switching_from)(struct rq *this_rq, struct task_struct *task);
++	void (*switched_from) (struct rq *this_rq, struct task_struct *task);
++	void (*switching_to)  (struct rq *this_rq, struct task_struct *task);
++	void (*switched_to)   (struct rq *this_rq, struct task_struct *task);
++
+ 	void (*reweight_task)(struct rq *this_rq, struct task_struct *task,
+ 			      const struct load_weight *lw);
+ 	void (*prio_changed) (struct rq *this_rq, struct task_struct *task,
+@@ -3879,11 +3877,7 @@ extern void set_load_weight(struct task_struct *p, bool update_load);
+ extern void enqueue_task(struct rq *rq, struct task_struct *p, int flags);
+ extern bool dequeue_task(struct rq *rq, struct task_struct *p, int flags);
+ 
+-extern void check_class_changing(struct rq *rq, struct task_struct *p,
+-				 const struct sched_class *prev_class);
+-extern void check_class_changed(struct rq *rq, struct task_struct *p,
+-				const struct sched_class *prev_class,
+-				int oldprio);
++extern void check_prio_changed(struct rq *rq, struct task_struct *p, int oldprio);
+ 
+ extern struct balance_callback *splice_balance_callbacks(struct rq *rq);
+ extern void balance_callbacks(struct rq *rq, struct balance_callback *head);
+diff --git a/kernel/sched/stop_task.c b/kernel/sched/stop_task.c
+index 2d4e279f0..fcc4c5424 100644
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@ -75,7 +75,7 @@ static void task_tick_stop(struct rq *rq, struct task_struct *curr, int queued)
+ {
+ }
+ 
+-static void switched_to_stop(struct rq *rq, struct task_struct *p)
++static void switching_to_stop(struct rq *rq, struct task_struct *p)
+ {
+ 	BUG(); /* its impossible to change to this class */
+ }
+@@ -112,6 +112,6 @@ DEFINE_SCHED_CLASS(stop) = {
+ 	.task_tick		= task_tick_stop,
+ 
+ 	.prio_changed		= prio_changed_stop,
+-	.switched_to		= switched_to_stop,
++	.switching_to		= switching_to_stop,
+ 	.update_curr		= update_curr_stop,
+ };
+diff --git a/kernel/sched/syscalls.c b/kernel/sched/syscalls.c
+index 09ffe9141..007d14403 100644
+--- a/kernel/sched/syscalls.c
++++ b/kernel/sched/syscalls.c
+@@ -684,6 +684,11 @@ int __sched_setscheduler(struct task_struct *p,
+ 	prev_class = p->sched_class;
+ 	next_class = __setscheduler_class(policy, newprio);
+ 
++	if (prev_class != next_class) {
++		queue_flags |= DEQUEUE_CLASS;
++		queue_flags &= ~(DEQUEUE_SAVE | DEQUEUE_MOVE);
++	}
++
+ 	if (prev_class != next_class && p->se.sched_delayed)
+ 		dequeue_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
+ 
+@@ -695,7 +700,6 @@ int __sched_setscheduler(struct task_struct *p,
+ 			p->prio = newprio;
+ 		}
+ 		__setscheduler_uclamp(p, attr);
+-		check_class_changing(rq, p, prev_class);
+ 
+ 		if (scope->queued) {
+ 			/*
+@@ -707,7 +711,8 @@ int __sched_setscheduler(struct task_struct *p,
+ 		}
+ 	}
+ 
+-	check_class_changed(rq, p, prev_class, oldprio);
++	if (!(queue_flags & DEQUEUE_CLASS))
++		check_prio_changed(rq, p, oldprio);
+ 
+ 	/* Avoid rq from going away on us: */
+ 	preempt_disable();
+-- 
+2.51.0
+
