@@ -1,0 +1,138 @@
+From 991728830a0461e60ac13165fd2c27e5828080a4 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Fri, 19 Dec 2025 23:43:14 +0100
+Subject: [PATCH 12/13] sched_ext: Fix ops.dequeue() semantics
+
+Properly implement ops.dequeue() to ensure every ops.enqueue() is
+balanced by a corresponding ops.dequeue() call, regardless of whether
+the task is on a BPF data structure or already dispatched to a DSQ.
+
+A task is considered enqueued when it is owned by the BPF scheduler.
+This ownership persists until the task is either dispatched (moved to a
+local DSQ for execution) or removed from the BPF scheduler, such as when
+it blocks waiting for an event or when its properties (for example, CPU
+affinity or priority) are updated.
+
+When the task enters the BPF scheduler ops.enqueue() is invoked, when it
+leaves BPF scheduler ownership, ops.dequeue() is invoked.
+
+This allows BPF schedulers to reliably track task ownership and maintain
+accurate accounting.
+
+Cc: Emil Tsalapatis <emil@etsalapatis.com>
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+---
+ Documentation/scheduler/sched-ext.rst | 22 ++++++++++++++++++++++
+ include/linux/sched/ext.h             |  1 +
+ kernel/sched/ext.c                    | 27 ++++++++++++++++++++++++++-
+ 3 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/scheduler/sched-ext.rst b/Documentation/scheduler/sched-ext.rst
+index 404fe6126..3ed4be53f 100644
+--- a/Documentation/scheduler/sched-ext.rst
++++ b/Documentation/scheduler/sched-ext.rst
+@@ -252,6 +252,26 @@ The following briefly shows how a waking task is scheduled and executed.
+ 
+    * Queue the task on the BPF side.
+ 
++   Once ``ops.enqueue()`` is called, the task is considered "enqueued" and
++   is owned by the BPF scheduler. Ownership is retained until the task is
++   either dispatched (moved to a local DSQ for execution) or dequeued
++   (removed from the scheduler due to a blocking event, or to modify a
++   property, like CPU affinity, priority, etc.). When the task leaves the
++   BPF scheduler ``ops.dequeue()`` is invoked.
++
++   **Important**: ``ops.dequeue()`` is called for *any* enqueued task,
++   regardless of whether the task is still on a BPF data structure, or it
++   is already dispatched to a DSQ (global, local, or user DSQ)
++
++   This guarantees that every ``ops.enqueue()`` will eventually be followed
++   by a ``ops.dequeue()``. This makes it reliable for BPF schedulers to
++   track task ownership and maintain accurate accounting, such as per-DSQ
++   queued runtime sums.
++
++   BPF schedulers can choose not to implement ``ops.dequeue()`` if they
++   don't need to track these transitions. The sched_ext core will safely
++   handle all dequeue operations regardless.
++
+ 3. When a CPU is ready to schedule, it first looks at its local DSQ. If
+    empty, it then looks at the global DSQ. If there still isn't a task to
+    run, ``ops.dispatch()`` is invoked which can use the following two
+@@ -319,6 +339,8 @@ by a sched_ext scheduler:
+                 /* Any usable CPU becomes available */
+ 
+                 ops.dispatch(); /* Task is moved to a local DSQ */
++
++                ops.dequeue(); /* Exiting BPF scheduler */
+             }
+             ops.running();      /* Task starts running on its assigned CPU */
+             while (task->scx.slice > 0 && task is runnable)
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index bcb962d5e..334c3692a 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -84,6 +84,7 @@ struct scx_dispatch_q {
+ /* scx_entity.flags */
+ enum scx_ent_flags {
+ 	SCX_TASK_QUEUED		= 1 << 0, /* on ext runqueue */
++	SCX_TASK_OPS_ENQUEUED	= 1 << 1, /* ops.enqueue() was called */
+ 	SCX_TASK_RESET_RUNNABLE_AT = 1 << 2, /* runnable_at should be reset */
+ 	SCX_TASK_DEQD_FOR_SLEEP	= 1 << 3, /* last dequeue was for SLEEP */
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 6978284f5..b1626e684 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -1392,6 +1392,9 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 	WARN_ON_ONCE(atomic_long_read(&p->scx.ops_state) != SCX_OPSS_NONE);
+ 	atomic_long_set(&p->scx.ops_state, SCX_OPSS_QUEUEING | qseq);
+ 
++	/* Mark that ops.enqueue() is being called for this task */
++	p->scx.flags |= SCX_TASK_OPS_ENQUEUED;
++
+ 	ddsp_taskp = this_cpu_ptr(&direct_dispatch_task);
+ 	WARN_ON_ONCE(*ddsp_taskp);
+ 	*ddsp_taskp = p;
+@@ -1528,6 +1531,21 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 
+ 	switch (opss & SCX_OPSS_STATE_MASK) {
+ 	case SCX_OPSS_NONE:
++		/*
++		 * Task is not currently being enqueued or queued on the BPF
++		 * scheduler. Check if ops.enqueue() was called for this task.
++		 */
++		if ((p->scx.flags & SCX_TASK_OPS_ENQUEUED) &&
++		    SCX_HAS_OP(sch, dequeue)) {
++			/*
++			 * ops.enqueue() was called and the task was dispatched.
++			 * Call ops.dequeue() to notify the BPF scheduler that
++			 * the task is leaving.
++			 */
++			SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq,
++					 p, deq_flags);
++			p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++		}
+ 		break;
+ 	case SCX_OPSS_QUEUEING:
+ 		/*
+@@ -1536,9 +1554,16 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 		 */
+ 		BUG();
+ 	case SCX_OPSS_QUEUED:
+-		if (SCX_HAS_OP(sch, dequeue))
++		/*
++		 * Task is owned by the BPF scheduler. Call ops.dequeue()
++		 * to notify the BPF scheduler that the task is being
++		 * removed.
++		 */
++		if (SCX_HAS_OP(sch, dequeue)) {
+ 			SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq,
+ 					 p, deq_flags);
++			p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++		}
+ 
+ 		if (atomic_long_try_cmpxchg(&p->scx.ops_state, &opss,
+ 					    SCX_OPSS_NONE))
+-- 
+2.52.0
+

@@ -1,0 +1,82 @@
+From dcccb166cb46d612f23fa3880d1649363e095c1d Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Sun, 21 Dec 2025 19:27:05 +0100
+Subject: [PATCH 11/13] sched_ext: Bypass buffer for same-CPU local DSQ
+ dispatch
+
+Add an optimized fast path in scx_dsq_insert_commit() that completely
+bypasses the dispatch buffer for same-CPU local DSQ dispatches.
+
+When ops.dispatch() is called and a task is being dispatched to a local
+DSQ on the same CPU it's already running on, we can dispatch it
+immediately without buffering because:
+ - we already hold the current CPU's rq lock,
+ - no cross-CPU locking is needed,
+ - the task cannot migrate while we hold the lock,
+ - no lock ordering issues arise.
+
+The fast path handles both SCX_DSQ_LOCAL and SCX_DSQ_LOCAL_ON | cpu when
+the target CPU matches the current CPU. This optimization is placed in
+scx_dsq_insert_commit(), allowing tasks to completely bypass the
+dispatch buffer.
+
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+---
+ kernel/sched/ext.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 7ac76c0c6..6978284f5 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -5731,6 +5731,47 @@ static void scx_dsq_insert_commit(struct scx_sched *sch, struct task_struct *p,
+ 		return;
+ 	}
+ 
++	/*
++	 * Fast path: if dispatching to a local DSQ (SCX_DSQ_LOCAL or
++	 * SCX_DSQ_LOCAL_ON) and the target CPU is the current CPU, bypass
++	 * the buffer entirely and dispatch immediately.
++	 */
++	if (dsq_id == SCX_DSQ_LOCAL ||
++	    (dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON) {
++		struct rq *rq = this_rq();
++		s32 cpu = cpu_of(rq);
++		bool same_cpu;
++
++		/* Check if target is current CPU */
++		if (dsq_id == SCX_DSQ_LOCAL) {
++			same_cpu = (task_cpu(p) == cpu);
++		} else {
++			s32 target_cpu = dsq_id & SCX_DSQ_LOCAL_CPU_MASK;
++			same_cpu = (target_cpu == cpu && task_cpu(p) == cpu);
++		}
++
++		if (same_cpu) {
++			unsigned long opss;
++
++			/*
++			 * Validate task state and claim it atomically,
++			 * this ensures the task is still queued and hasn't
++			 * been consumed by another CPU.
++			 */
++			opss = atomic_long_read(&p->scx.ops_state);
++
++			if ((opss & SCX_OPSS_STATE_MASK) == SCX_OPSS_QUEUED &&
++			    atomic_long_try_cmpxchg(&p->scx.ops_state, &opss,
++						    SCX_OPSS_DISPATCHING)) {
++				touch_core_sched_dispatch(rq, p);
++				BUG_ON(!(p->scx.flags & SCX_TASK_QUEUED));
++				dispatch_enqueue(sch, &rq->scx.local_dsq, p,
++						 enq_flags | SCX_ENQ_CLEAR_OPSS);
++				return;
++			}
++		}
++	}
++
+ 	if (unlikely(dspc->cursor >= scx_dsp_max_batch)) {
+ 		scx_error(sch, "dispatch buffer overflow");
+ 		return;
+-- 
+2.52.0
+
