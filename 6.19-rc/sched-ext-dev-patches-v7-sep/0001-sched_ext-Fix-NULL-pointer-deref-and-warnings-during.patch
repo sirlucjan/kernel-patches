@@ -1,0 +1,137 @@
+From fdb5182e8657f359c2e95e25b22f880558637106 Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Mon, 2 Feb 2026 15:52:19 +0100
+Subject: [PATCH 01/15] sched_ext: Fix NULL pointer deref and warnings during
+ scx teardown
+
+When a BPF scheduler is being disabled, scx_root can be set to NULL
+while tasks are still associated with the sched_ext class. If a task is
+subject to an affinity change, priority adjustment, or policy switch
+during this window, sched_class operations will dereference a NULL
+scx_root pointer, triggering a BUG like the following:
+
+  BUG: kernel NULL pointer dereference, address: 00000000000001c0
+  ...
+  RIP: 0010:set_cpus_allowed_scx+0x1a/0xa0
+  ...
+  Call Trace:
+   __set_cpus_allowed_ptr_locked+0x142/0x1c0
+   __sched_setaffinity+0x72/0x100
+   sched_setaffinity+0x281/0x360
+
+Similarly, tasks can be in various states, depending on the timing of
+concurrent operations. This causes spurious WARN_ON_ONCE() triggers in
+scx_disable_task() and invalid state transitions when tasks are switched
+to or from the sched_ext class:
+
+  WARNING: kernel/sched/ext.c:3118 at scx_disable_task+0x7c/0x180
+  ...
+  Call Trace:
+   sched_change_begin+0xf2/0x270
+   __sched_setscheduler+0x346/0xc70
+
+Fix by:
+
+ - Adding NULL checks at the beginning of sched_class operations
+   (set_cpus_allowed_scx, reweight_task_scx, switching_to_scx) to skip
+   BPF scheduler notifications when scx_root is NULL.
+
+ - Making the state assertion in scx_disable_task() conditional and only
+   warn during normal operation. Add early return if task is not in
+   SCX_TASK_ENABLED state to make the function idempotent.
+
+ - In switched_from_scx(), check task state before calling
+   scx_disable_task() to avoid calling it on tasks in a transitional
+   state.
+
+Fixes: d310fb4009689 ("sched_ext: Clean up scx_root usages")
+Cc: stable@vger.kernel.org # v6.16+
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+---
+ kernel/sched/ext.c | 42 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index afe28c04d..aae5c5141 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -2619,6 +2619,9 @@ static void set_cpus_allowed_scx(struct task_struct *p,
+ 
+ 	set_cpus_allowed_common(p, ac);
+ 
++	if (unlikely(!sch))
++		return;
++
+ 	/*
+ 	 * The effective cpumask is stored in @p->cpus_ptr which may temporarily
+ 	 * differ from the configured one in @p->cpus_mask. Always tell the bpf
+@@ -2920,7 +2923,18 @@ static void scx_disable_task(struct task_struct *p)
+ 	struct rq *rq = task_rq(p);
+ 
+ 	lockdep_assert_rq_held(rq);
+-	WARN_ON_ONCE(scx_get_task_state(p) != SCX_TASK_ENABLED);
++
++	/*
++	 * During disabling, tasks can be in various states due to
++	 * concurrent operations, only warn about unexpected state during
++	 * normal operation.
++	 */
++	if (likely(scx_enable_state() != SCX_DISABLING))
++		WARN_ON_ONCE(scx_get_task_state(p) != SCX_TASK_ENABLED);
++
++	/* If task is not enabled, skip disable */
++	if (scx_get_task_state(p) != SCX_TASK_ENABLED)
++		return;
+ 
+ 	if (SCX_HAS_OP(sch, disable))
+ 		SCX_CALL_OP_TASK(sch, SCX_KF_REST, disable, rq, p);
+@@ -3063,6 +3077,9 @@ static void reweight_task_scx(struct rq *rq, struct task_struct *p,
+ 
+ 	lockdep_assert_rq_held(task_rq(p));
+ 
++	if (unlikely(!sch))
++		return;
++
+ 	p->scx.weight = sched_weight_to_cgroup(scale_load_down(lw->weight));
+ 	if (SCX_HAS_OP(sch, set_weight))
+ 		SCX_CALL_OP_TASK(sch, SCX_KF_REST, set_weight, rq,
+@@ -3077,6 +3094,21 @@ static void switching_to_scx(struct rq *rq, struct task_struct *p)
+ {
+ 	struct scx_sched *sch = scx_root;
+ 
++	/*
++	 * We may race with a concurrent disable, skip enabling if scx_root
++	 * is NULL or the task is in a transitional state.
++	 */
++	if (unlikely(!sch || scx_enable_state() == SCX_DISABLING))
++		return;
++
++	/*
++	 * Task might not be properly initialized if it's being switched to
++	 * SCX after scx_init_task_enabled was set. Initialize to READY state
++	 * first if needed.
++	 */
++	if (scx_get_task_state(p) == SCX_TASK_NONE)
++		scx_set_task_state(p, SCX_TASK_READY);
++
+ 	scx_enable_task(p);
+ 
+ 	/*
+@@ -3090,7 +3122,13 @@ static void switching_to_scx(struct rq *rq, struct task_struct *p)
+ 
+ static void switched_from_scx(struct rq *rq, struct task_struct *p)
+ {
+-	scx_disable_task(p);
++	/*
++	 * Only disable if the task is actually enabled. During scheduler
++	 * disabling, tasks might already be in READY state if they've been
++	 * disabled by concurrent operations.
++	 */
++	if (scx_get_task_state(p) == SCX_TASK_ENABLED)
++		scx_disable_task(p);
+ }
+ 
+ static void wakeup_preempt_scx(struct rq *rq, struct task_struct *p,int wake_flags) {}
+-- 
+2.52.0
+
