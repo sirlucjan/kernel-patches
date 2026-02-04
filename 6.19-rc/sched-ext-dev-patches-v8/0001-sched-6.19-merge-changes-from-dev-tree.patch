@@ -1,0 +1,2580 @@
+From 961c3d0e467d23ae1ee4d1c4bba5e67e41cde026 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Wed, 4 Feb 2026 20:11:42 +0100
+Subject: [PATCH] sched-6.19: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ Documentation/scheduler/sched-ext.rst         |  74 ++++
+ include/linux/sched/ext.h                     |   1 +
+ kernel/sched/core.c                           |  11 +
+ kernel/sched/deadline.c                       |  91 ++--
+ kernel/sched/debug.c                          | 171 ++++++--
+ kernel/sched/ext.c                            | 387 +++++++++++++++++-
+ kernel/sched/ext_idle.c                       |   9 +-
+ kernel/sched/ext_internal.h                   |   7 +
+ kernel/sched/fair.c                           |  66 +--
+ kernel/sched/idle.c                           |  34 ++
+ kernel/sched/sched.h                          |  57 ++-
+ kernel/sched/topology.c                       |   5 +
+ .../sched_ext/include/scx/enum_defs.autogen.h |   1 +
+ .../sched_ext/include/scx/enums.autogen.bpf.h |   2 +
+ tools/sched_ext/include/scx/enums.autogen.h   |   1 +
+ tools/testing/selftests/sched_ext/Makefile    |   3 +
+ .../testing/selftests/sched_ext/dequeue.bpf.c | 238 +++++++++++
+ tools/testing/selftests/sched_ext/dequeue.c   | 201 +++++++++
+ .../selftests/sched_ext/rt_stall.bpf.c        |  23 ++
+ tools/testing/selftests/sched_ext/rt_stall.c  | 240 +++++++++++
+ tools/testing/selftests/sched_ext/total_bw.c  | 281 +++++++++++++
+ 21 files changed, 1750 insertions(+), 153 deletions(-)
+ create mode 100644 tools/testing/selftests/sched_ext/dequeue.bpf.c
+ create mode 100644 tools/testing/selftests/sched_ext/dequeue.c
+ create mode 100644 tools/testing/selftests/sched_ext/rt_stall.bpf.c
+ create mode 100644 tools/testing/selftests/sched_ext/rt_stall.c
+ create mode 100644 tools/testing/selftests/sched_ext/total_bw.c
+
+diff --git a/Documentation/scheduler/sched-ext.rst b/Documentation/scheduler/sched-ext.rst
+index 404fe6126..1457f2aef 100644
+--- a/Documentation/scheduler/sched-ext.rst
++++ b/Documentation/scheduler/sched-ext.rst
+@@ -252,6 +252,78 @@ The following briefly shows how a waking task is scheduled and executed.
+ 
+    * Queue the task on the BPF side.
+ 
++   **Task State Tracking and ops.dequeue() Semantics**
++
++   Once ``ops.select_cpu()`` or ``ops.enqueue()`` is called, the task may
++   enter the "BPF scheduler's custody" depending on where it's dispatched:
++
++   * **Direct dispatch to terminal DSQs** (``SCX_DSQ_LOCAL``,
++     ``SCX_DSQ_LOCAL_ON | cpu``, or ``SCX_DSQ_GLOBAL``): The BPF scheduler
++     is done with the task - it either goes straight to a CPU's local run
++     queue or to the global DSQ as a fallback. The task never enters (or
++     exits) BPF custody, and ``ops.dequeue()`` will not be called.
++
++   * **Dispatch to user-created DSQs** (custom DSQs): the task enters the
++     BPF scheduler's custody. When the task later leaves BPF custody
++     (dispatched to a terminal DSQ, picked by core-sched, or dequeued for
++     sleep/property changes), ``ops.dequeue()`` will be called exactly once.
++
++   * **Queued on BPF side**: The task is in BPF data structures and in BPF
++     custody, ``ops.dequeue()`` will be called when it leaves.
++
++   The key principle: **ops.dequeue() is called when a task leaves the BPF
++   scheduler's custody**.
++
++   This works also with the ``ops.select_cpu()`` direct dispatch
++   optimization: even though it skips ``ops.enqueue()`` invocation, if the
++   task is dispatched to a user-created DSQ, it enters BPF custody and will
++   get ``ops.dequeue()`` when it leaves. If dispatched to a terminal DSQ,
++   the BPF scheduler is done with it immediately. This provides the
++   performance benefit of avoiding the ``ops.enqueue()`` roundtrip while
++   maintaining correct state tracking.
++
++   The dequeue can happen for different reasons, distinguished by flags:
++
++   1. **Regular dispatch workflow**: when the task is dispatched from a
++      user-created DSQ to a terminal DSQ (leaving BPF custody for execution),
++      ``ops.dequeue()`` is triggered without any special flags.
++
++   2. **Core scheduling pick**: when ``CONFIG_SCHED_CORE`` is enabled and
++      core scheduling picks a task for execution while it's still in BPF
++      custody, ``ops.dequeue()`` is called with the
++      ``SCX_DEQ_CORE_SCHED_EXEC`` flag.
++
++   3. **Scheduling property change**: when a task property changes (via
++      operations like ``sched_setaffinity()``, ``sched_setscheduler()``,
++      priority changes, CPU migrations, etc.) while the task is still in
++      BPF custody, ``ops.dequeue()`` is called with the
++      ``SCX_DEQ_SCHED_CHANGE`` flag set in ``deq_flags``.
++
++   **Important**: Once a task has left BPF custody (dispatched to a
++   terminal DSQ), property changes will not trigger ``ops.dequeue()``,
++   since the task is no longer being managed by the BPF scheduler.
++
++   **Property Change Notifications for Running Tasks**:
++
++   For tasks that have left BPF custody (running or on terminal DSQs),
++   property changes can be intercepted through the dedicated callbacks:
++
++   * ``ops.set_cpumask()``: Called when a task's CPU affinity changes
++     (e.g., via ``sched_setaffinity()``). This callback is invoked for
++     all tasks regardless of their state or BPF custody.
++
++   * ``ops.set_weight()``: Called when a task's scheduling weight/priority
++     changes (e.g., via ``sched_setscheduler()`` or ``set_user_nice()``).
++     This callback is also invoked for all tasks.
++
++   These callbacks provide complete coverage for property changes,
++   complementing ``ops.dequeue()`` which only applies to tasks in BPF
++   custody.
++
++   BPF schedulers can choose not to implement ``ops.dequeue()`` if they
++   don't need to track these transitions. The sched_ext core will safely
++   handle all dequeue operations regardless.
++
+ 3. When a CPU is ready to schedule, it first looks at its local DSQ. If
+    empty, it then looks at the global DSQ. If there still isn't a task to
+    run, ``ops.dispatch()`` is invoked which can use the following two
+@@ -319,6 +391,8 @@ by a sched_ext scheduler:
+                 /* Any usable CPU becomes available */
+ 
+                 ops.dispatch(); /* Task is moved to a local DSQ */
++
++                ops.dequeue(); /* Exiting BPF scheduler */
+             }
+             ops.running();      /* Task starts running on its assigned CPU */
+             while (task->scx.slice > 0 && task is runnable)
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index bcb962d5e..0d003d284 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -84,6 +84,7 @@ struct scx_dispatch_q {
+ /* scx_entity.flags */
+ enum scx_ent_flags {
+ 	SCX_TASK_QUEUED		= 1 << 0, /* on ext runqueue */
++	SCX_TASK_OPS_ENQUEUED	= 1 << 1, /* under ext scheduler's custody */
+ 	SCX_TASK_RESET_RUNNABLE_AT = 1 << 2, /* runnable_at should be reset */
+ 	SCX_TASK_DEQD_FOR_SLEEP	= 1 << 3, /* last dequeue was for SLEEP */
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 045f83ad2..5c707ed54 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8276,6 +8276,11 @@ static void cpuset_cpu_inactive(unsigned int cpu)
+ 	}
+ }
+ 
++#ifdef CONFIG_SCHED_SMT
++DEFINE_STATIC_KEY_FALSE(sched_smt_present);
++EXPORT_SYMBOL_GPL(sched_smt_present);
++#endif
++
+ static inline void sched_smt_present_inc(int cpu)
+ {
+ #ifdef CONFIG_SCHED_SMT
+@@ -8477,6 +8482,9 @@ int sched_cpu_dying(unsigned int cpu)
+ 		dump_rq_tasks(rq, KERN_WARNING);
+ 	}
+ 	dl_server_stop(&rq->fair_server);
++#ifdef CONFIG_SCHED_CLASS_EXT
++	dl_server_stop(&rq->ext_server);
++#endif
+ 	rq_unlock_irqrestore(rq, &rf);
+ 
+ 	calc_load_migrate(rq);
+@@ -8680,6 +8688,9 @@ void __init sched_init(void)
+ 		hrtick_rq_init(rq);
+ 		atomic_set(&rq->nr_iowait, 0);
+ 		fair_server_init(rq);
++#ifdef CONFIG_SCHED_CLASS_EXT
++		ext_server_init(rq);
++#endif
+ 
+ #ifdef CONFIG_SCHED_CORE
+ 		rq->core = rq;
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 7bcde7114..ca94ec692 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1449,8 +1449,8 @@ static void update_curr_dl_se(struct rq *rq, struct sched_dl_entity *dl_se, s64
+ 		dl_se->dl_defer_idle = 0;
+ 
+ 	/*
+-	 * The fair server can consume its runtime while throttled (not queued/
+-	 * running as regular CFS).
++	 * The DL server can consume its runtime while throttled (not
++	 * queued / running as regular CFS).
+ 	 *
+ 	 * If the server consumes its entire runtime in this state. The server
+ 	 * is not required for the current period. Thus, reset the server by
+@@ -1535,10 +1535,10 @@ static void update_curr_dl_se(struct rq *rq, struct sched_dl_entity *dl_se, s64
+ 	}
+ 
+ 	/*
+-	 * The fair server (sole dl_server) does not account for real-time
+-	 * workload because it is running fair work.
++	 * The dl_server does not account for real-time workload because it
++	 * is running fair work.
+ 	 */
+-	if (dl_se == &rq->fair_server)
++	if (dl_se->dl_server)
+ 		return;
+ 
+ #ifdef CONFIG_RT_GROUP_SCHED
+@@ -1573,9 +1573,9 @@ static void update_curr_dl_se(struct rq *rq, struct sched_dl_entity *dl_se, s64
+  * In the non-defer mode, the idle time is not accounted, as the
+  * server provides a guarantee.
+  *
+- * If the dl_server is in defer mode, the idle time is also considered
+- * as time available for the fair server, avoiding a penalty for the
+- * rt scheduler that did not consumed that time.
++ * If the dl_server is in defer mode, the idle time is also considered as
++ * time available for the dl_server, avoiding a penalty for the rt
++ * scheduler that did not consumed that time.
+  */
+ void dl_server_update_idle(struct sched_dl_entity *dl_se, s64 delta_exec)
+ {
+@@ -1799,7 +1799,7 @@ void dl_server_start(struct sched_dl_entity *dl_se)
+ 	struct rq *rq = dl_se->rq;
+ 
+ 	dl_se->dl_defer_idle = 0;
+-	if (!dl_server(dl_se) || dl_se->dl_server_active)
++	if (!dl_server(dl_se) || dl_se->dl_server_active || !dl_se->dl_runtime)
+ 		return;
+ 
+ 	/*
+@@ -1860,6 +1860,18 @@ void sched_init_dl_servers(void)
+ 		dl_se->dl_server = 1;
+ 		dl_se->dl_defer = 1;
+ 		setup_new_dl_entity(dl_se);
++
++#ifdef CONFIG_SCHED_CLASS_EXT
++		dl_se = &rq->ext_server;
++
++		WARN_ON(dl_server(dl_se));
++
++		dl_server_apply_params(dl_se, runtime, period, 1);
++
++		dl_se->dl_server = 1;
++		dl_se->dl_defer = 1;
++		setup_new_dl_entity(dl_se);
++#endif
+ 	}
+ }
+ 
+@@ -1886,7 +1898,6 @@ int dl_server_apply_params(struct sched_dl_entity *dl_se, u64 runtime, u64 perio
+ 	int cpu = cpu_of(rq);
+ 	struct dl_bw *dl_b;
+ 	unsigned long cap;
+-	int retval = 0;
+ 	int cpus;
+ 
+ 	dl_b = dl_bw_of(cpu);
+@@ -1918,7 +1929,7 @@ int dl_server_apply_params(struct sched_dl_entity *dl_se, u64 runtime, u64 perio
+ 	dl_se->dl_bw = to_ratio(dl_se->dl_period, dl_se->dl_runtime);
+ 	dl_se->dl_density = to_ratio(dl_se->dl_deadline, dl_se->dl_runtime);
+ 
+-	return retval;
++	return 0;
+ }
+ 
+ /*
+@@ -3191,6 +3202,36 @@ void dl_add_task_root_domain(struct task_struct *p)
+ 	raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
+ }
+ 
++static void dl_server_add_bw(struct root_domain *rd, int cpu)
++{
++	struct sched_dl_entity *dl_se;
++
++	dl_se = &cpu_rq(cpu)->fair_server;
++	if (dl_server(dl_se) && cpu_active(cpu))
++		__dl_add(&rd->dl_bw, dl_se->dl_bw, dl_bw_cpus(cpu));
++
++#ifdef CONFIG_SCHED_CLASS_EXT
++	dl_se = &cpu_rq(cpu)->ext_server;
++	if (dl_server(dl_se) && cpu_active(cpu))
++		__dl_add(&rd->dl_bw, dl_se->dl_bw, dl_bw_cpus(cpu));
++#endif
++}
++
++static u64 dl_server_read_bw(int cpu)
++{
++	u64 dl_bw = 0;
++
++	if (cpu_rq(cpu)->fair_server.dl_server)
++		dl_bw += cpu_rq(cpu)->fair_server.dl_bw;
++
++#ifdef CONFIG_SCHED_CLASS_EXT
++	if (cpu_rq(cpu)->ext_server.dl_server)
++		dl_bw += cpu_rq(cpu)->ext_server.dl_bw;
++#endif
++
++	return dl_bw;
++}
++
+ void dl_clear_root_domain(struct root_domain *rd)
+ {
+ 	int i;
+@@ -3209,12 +3250,8 @@ void dl_clear_root_domain(struct root_domain *rd)
+ 	 * dl_servers are not tasks. Since dl_add_task_root_domain ignores
+ 	 * them, we need to account for them here explicitly.
+ 	 */
+-	for_each_cpu(i, rd->span) {
+-		struct sched_dl_entity *dl_se = &cpu_rq(i)->fair_server;
+-
+-		if (dl_server(dl_se) && cpu_active(i))
+-			__dl_add(&rd->dl_bw, dl_se->dl_bw, dl_bw_cpus(i));
+-	}
++	for_each_cpu(i, rd->span)
++		dl_server_add_bw(rd, i);
+ }
+ 
+ void dl_clear_root_domain_cpu(int cpu)
+@@ -3656,6 +3693,9 @@ static void __dl_clear_params(struct sched_dl_entity *dl_se)
+ 	dl_se->dl_non_contending	= 0;
+ 	dl_se->dl_overrun		= 0;
+ 	dl_se->dl_server		= 0;
++	dl_se->dl_defer			= 0;
++	dl_se->dl_defer_running		= 0;
++	dl_se->dl_defer_armed		= 0;
+ 
+ #ifdef CONFIG_RT_MUTEXES
+ 	dl_se->pi_se			= dl_se;
+@@ -3713,7 +3753,7 @@ static int dl_bw_manage(enum dl_bw_request req, int cpu, u64 dl_bw)
+ 	unsigned long flags, cap;
+ 	struct dl_bw *dl_b;
+ 	bool overflow = 0;
+-	u64 fair_server_bw = 0;
++	u64 dl_server_bw = 0;
+ 
+ 	rcu_read_lock_sched();
+ 	dl_b = dl_bw_of(cpu);
+@@ -3746,27 +3786,26 @@ static int dl_bw_manage(enum dl_bw_request req, int cpu, u64 dl_bw)
+ 		cap -= arch_scale_cpu_capacity(cpu);
+ 
+ 		/*
+-		 * cpu is going offline and NORMAL tasks will be moved away
+-		 * from it. We can thus discount dl_server bandwidth
+-		 * contribution as it won't need to be servicing tasks after
+-		 * the cpu is off.
++		 * cpu is going offline and NORMAL and EXT tasks will be
++		 * moved away from it. We can thus discount dl_server
++		 * bandwidth contribution as it won't need to be servicing
++		 * tasks after the cpu is off.
+ 		 */
+-		if (cpu_rq(cpu)->fair_server.dl_server)
+-			fair_server_bw = cpu_rq(cpu)->fair_server.dl_bw;
++		dl_server_bw = dl_server_read_bw(cpu);
+ 
+ 		/*
+ 		 * Not much to check if no DEADLINE bandwidth is present.
+ 		 * dl_servers we can discount, as tasks will be moved out the
+ 		 * offlined CPUs anyway.
+ 		 */
+-		if (dl_b->total_bw - fair_server_bw > 0) {
++		if (dl_b->total_bw - dl_server_bw > 0) {
+ 			/*
+ 			 * Leaving at least one CPU for DEADLINE tasks seems a
+ 			 * wise thing to do. As said above, cpu is not offline
+ 			 * yet, so account for that.
+ 			 */
+ 			if (dl_bw_cpus(cpu) - 1)
+-				overflow = __dl_overflow(dl_b, cap, fair_server_bw, 0);
++				overflow = __dl_overflow(dl_b, cap, dl_server_bw, 0);
+ 			else
+ 				overflow = 1;
+ 		}
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 41caa22e0..4493965d4 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -336,17 +336,19 @@ enum dl_param {
+ 	DL_PERIOD,
+ };
+ 
+-static unsigned long fair_server_period_max = (1UL << 22) * NSEC_PER_USEC; /* ~4 seconds */
+-static unsigned long fair_server_period_min = (100) * NSEC_PER_USEC;     /* 100 us */
++static unsigned long dl_server_period_max = (1UL << 22) * NSEC_PER_USEC; /* ~4 seconds */
++static unsigned long dl_server_period_min = (100) * NSEC_PER_USEC;     /* 100 us */
+ 
+-static ssize_t sched_fair_server_write(struct file *filp, const char __user *ubuf,
+-				       size_t cnt, loff_t *ppos, enum dl_param param)
++static ssize_t sched_server_write_common(struct file *filp, const char __user *ubuf,
++					 size_t cnt, loff_t *ppos, enum dl_param param,
++					 void *server)
+ {
+ 	long cpu = (long) ((struct seq_file *) filp->private_data)->private;
++	struct sched_dl_entity *dl_se = (struct sched_dl_entity *)server;
++	u64 old_runtime, runtime, period;
+ 	struct rq *rq = cpu_rq(cpu);
+-	u64 runtime, period;
++	int retval = 0;
+ 	size_t err;
+-	int retval;
+ 	u64 value;
+ 
+ 	err = kstrtoull_from_user(ubuf, cnt, 10, &value);
+@@ -354,8 +356,8 @@ static ssize_t sched_fair_server_write(struct file *filp, const char __user *ubu
+ 		return err;
+ 
+ 	scoped_guard (rq_lock_irqsave, rq) {
+-		runtime  = rq->fair_server.dl_runtime;
+-		period = rq->fair_server.dl_period;
++		old_runtime = runtime = dl_se->dl_runtime;
++		period = dl_se->dl_period;
+ 
+ 		switch (param) {
+ 		case DL_RUNTIME:
+@@ -371,60 +373,68 @@ static ssize_t sched_fair_server_write(struct file *filp, const char __user *ubu
+ 		}
+ 
+ 		if (runtime > period ||
+-		    period > fair_server_period_max ||
+-		    period < fair_server_period_min) {
++		    period > dl_server_period_max ||
++		    period < dl_server_period_min) {
+ 			return  -EINVAL;
+ 		}
+ 
+ 		update_rq_clock(rq);
+-		dl_server_stop(&rq->fair_server);
++		dl_server_stop(dl_se);
++		retval = dl_server_apply_params(dl_se, runtime, period, 0);
++		dl_server_start(dl_se);
+ 
+-		retval = dl_server_apply_params(&rq->fair_server, runtime, period, 0);
+-		if (retval)
+-			cnt = retval;
++		if (retval < 0)
++			return retval;
++	}
+ 
+-		if (!runtime)
+-			printk_deferred("Fair server disabled in CPU %d, system may crash due to starvation.\n",
+-					cpu_of(rq));
+-
+-		if (rq->cfs.h_nr_queued)
+-			dl_server_start(&rq->fair_server);
++	if (!!old_runtime ^ !!runtime) {
++		pr_info("%s server %sabled on CPU %d%s.\n",
++			server == &rq->fair_server ? "Fair" : "Ext",
++			runtime ? "en" : "dis",
++			cpu_of(rq),
++			runtime ? "" : ", system may malfunction due to starvation");
+ 	}
+ 
+ 	*ppos += cnt;
+ 	return cnt;
+ }
+ 
+-static size_t sched_fair_server_show(struct seq_file *m, void *v, enum dl_param param)
++static size_t sched_server_show_common(struct seq_file *m, void *v, enum dl_param param,
++				       void *server)
+ {
+-	unsigned long cpu = (unsigned long) m->private;
+-	struct rq *rq = cpu_rq(cpu);
++	struct sched_dl_entity *dl_se = (struct sched_dl_entity *)server;
+ 	u64 value;
+ 
+ 	switch (param) {
+ 	case DL_RUNTIME:
+-		value = rq->fair_server.dl_runtime;
++		value = dl_se->dl_runtime;
+ 		break;
+ 	case DL_PERIOD:
+-		value = rq->fair_server.dl_period;
++		value = dl_se->dl_period;
+ 		break;
+ 	}
+ 
+ 	seq_printf(m, "%llu\n", value);
+ 	return 0;
+-
+ }
+ 
+ static ssize_t
+ sched_fair_server_runtime_write(struct file *filp, const char __user *ubuf,
+ 				size_t cnt, loff_t *ppos)
+ {
+-	return sched_fair_server_write(filp, ubuf, cnt, ppos, DL_RUNTIME);
++	long cpu = (long) ((struct seq_file *) filp->private_data)->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_write_common(filp, ubuf, cnt, ppos, DL_RUNTIME,
++					&rq->fair_server);
+ }
+ 
+ static int sched_fair_server_runtime_show(struct seq_file *m, void *v)
+ {
+-	return sched_fair_server_show(m, v, DL_RUNTIME);
++	unsigned long cpu = (unsigned long) m->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_show_common(m, v, DL_RUNTIME, &rq->fair_server);
+ }
+ 
+ static int sched_fair_server_runtime_open(struct inode *inode, struct file *filp)
+@@ -440,16 +450,57 @@ static const struct file_operations fair_server_runtime_fops = {
+ 	.release	= single_release,
+ };
+ 
++#ifdef CONFIG_SCHED_CLASS_EXT
++static ssize_t
++sched_ext_server_runtime_write(struct file *filp, const char __user *ubuf,
++			       size_t cnt, loff_t *ppos)
++{
++	long cpu = (long) ((struct seq_file *) filp->private_data)->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_write_common(filp, ubuf, cnt, ppos, DL_RUNTIME,
++					&rq->ext_server);
++}
++
++static int sched_ext_server_runtime_show(struct seq_file *m, void *v)
++{
++	unsigned long cpu = (unsigned long) m->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_show_common(m, v, DL_RUNTIME, &rq->ext_server);
++}
++
++static int sched_ext_server_runtime_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, sched_ext_server_runtime_show, inode->i_private);
++}
++
++static const struct file_operations ext_server_runtime_fops = {
++	.open		= sched_ext_server_runtime_open,
++	.write		= sched_ext_server_runtime_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++#endif /* CONFIG_SCHED_CLASS_EXT */
++
+ static ssize_t
+ sched_fair_server_period_write(struct file *filp, const char __user *ubuf,
+ 			       size_t cnt, loff_t *ppos)
+ {
+-	return sched_fair_server_write(filp, ubuf, cnt, ppos, DL_PERIOD);
++	long cpu = (long) ((struct seq_file *) filp->private_data)->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_write_common(filp, ubuf, cnt, ppos, DL_PERIOD,
++					&rq->fair_server);
+ }
+ 
+ static int sched_fair_server_period_show(struct seq_file *m, void *v)
+ {
+-	return sched_fair_server_show(m, v, DL_PERIOD);
++	unsigned long cpu = (unsigned long) m->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_show_common(m, v, DL_PERIOD, &rq->fair_server);
+ }
+ 
+ static int sched_fair_server_period_open(struct inode *inode, struct file *filp)
+@@ -465,6 +516,40 @@ static const struct file_operations fair_server_period_fops = {
+ 	.release	= single_release,
+ };
+ 
++#ifdef CONFIG_SCHED_CLASS_EXT
++static ssize_t
++sched_ext_server_period_write(struct file *filp, const char __user *ubuf,
++			      size_t cnt, loff_t *ppos)
++{
++	long cpu = (long) ((struct seq_file *) filp->private_data)->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_write_common(filp, ubuf, cnt, ppos, DL_PERIOD,
++					&rq->ext_server);
++}
++
++static int sched_ext_server_period_show(struct seq_file *m, void *v)
++{
++	unsigned long cpu = (unsigned long) m->private;
++	struct rq *rq = cpu_rq(cpu);
++
++	return sched_server_show_common(m, v, DL_PERIOD, &rq->ext_server);
++}
++
++static int sched_ext_server_period_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, sched_ext_server_period_show, inode->i_private);
++}
++
++static const struct file_operations ext_server_period_fops = {
++	.open		= sched_ext_server_period_open,
++	.write		= sched_ext_server_period_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++#endif /* CONFIG_SCHED_CLASS_EXT */
++
+ static struct dentry *debugfs_sched;
+ 
+ static void debugfs_fair_server_init(void)
+@@ -488,6 +573,29 @@ static void debugfs_fair_server_init(void)
+ 	}
+ }
+ 
++#ifdef CONFIG_SCHED_CLASS_EXT
++static void debugfs_ext_server_init(void)
++{
++	struct dentry *d_ext;
++	unsigned long cpu;
++
++	d_ext = debugfs_create_dir("ext_server", debugfs_sched);
++	if (!d_ext)
++		return;
++
++	for_each_possible_cpu(cpu) {
++		struct dentry *d_cpu;
++		char buf[32];
++
++		snprintf(buf, sizeof(buf), "cpu%lu", cpu);
++		d_cpu = debugfs_create_dir(buf, d_ext);
++
++		debugfs_create_file("runtime", 0644, d_cpu, (void *) cpu, &ext_server_runtime_fops);
++		debugfs_create_file("period", 0644, d_cpu, (void *) cpu, &ext_server_period_fops);
++	}
++}
++#endif /* CONFIG_SCHED_CLASS_EXT */
++
+ static __init int sched_init_debug(void)
+ {
+ 	struct dentry __maybe_unused *numa;
+@@ -526,6 +634,9 @@ static __init int sched_init_debug(void)
+ 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
+ 
+ 	debugfs_fair_server_init();
++#ifdef CONFIG_SCHED_CLASS_EXT
++	debugfs_ext_server_init();
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index afe28c04d..4df53358f 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -924,6 +924,26 @@ static void touch_core_sched(struct rq *rq, struct task_struct *p)
+ #endif
+ }
+ 
++/**
++ * is_terminal_dsq - Check if a DSQ is terminal for ops.dequeue() purposes
++ * @dsq_id: DSQ ID to check
++ *
++ * Returns true if @dsq_id is a terminal DSQ where the BPF scheduler is
++ * considered "done" with the task. Terminal DSQs include:
++ *  - Local DSQs (SCX_DSQ_LOCAL or SCX_DSQ_LOCAL_ON): per-CPU queues where
++ *    tasks go directly to execution
++ *  - Global DSQ (SCX_DSQ_GLOBAL): the built-in fallback queue
++ *
++ * Tasks dispatched to terminal DSQs exit BPF scheduler custody and do not
++ * trigger ops.dequeue() when they are later consumed.
++ */
++static inline bool is_terminal_dsq(u64 dsq_id)
++{
++	return dsq_id == SCX_DSQ_LOCAL ||
++	       (dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON ||
++	       dsq_id == SCX_DSQ_GLOBAL;
++}
++
+ /**
+  * touch_core_sched_dispatch - Update core-sched timestamp on dispatch
+  * @rq: rq to read clock from, must be locked
+@@ -958,6 +978,8 @@ static void update_curr_scx(struct rq *rq)
+ 		if (!curr->scx.slice)
+ 			touch_core_sched(rq, curr);
+ 	}
++
++	dl_server_update(&rq->ext_server, delta_exec);
+ }
+ 
+ static bool scx_dsq_priq_less(struct rb_node *node_a,
+@@ -1274,6 +1296,26 @@ static void mark_direct_dispatch(struct scx_sched *sch,
+ 
+ 	p->scx.ddsp_dsq_id = dsq_id;
+ 	p->scx.ddsp_enq_flags = enq_flags;
++
++	/*
++	 * Mark the task as entering BPF scheduler's custody if it's being
++	 * dispatched to a non-terminal DSQ (i.e., custom user DSQs). This
++	 * handles the case where ops.select_cpu() directly dispatches - even
++	 * though ops.enqueue() won't be called, the task enters BPF custody
++	 * if dispatched to a user DSQ and should get ops.dequeue() when it
++	 * leaves.
++	 *
++	 * For terminal DSQs (local DSQs and SCX_DSQ_GLOBAL), clear the flag
++	 * since the BPF scheduler is done with the task. This also clears
++	 * any flag that was set by do_enqueue_task() before we knew the
++	 * dispatch destination.
++	 */
++	if (SCX_HAS_OP(sch, dequeue)) {
++		if (!is_terminal_dsq(dsq_id))
++			p->scx.flags |= SCX_TASK_OPS_ENQUEUED;
++		else
++			p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++	}
+ }
+ 
+ static void direct_dispatch(struct scx_sched *sch, struct task_struct *p,
+@@ -1287,6 +1329,41 @@ static void direct_dispatch(struct scx_sched *sch, struct task_struct *p,
+ 
+ 	p->scx.ddsp_enq_flags |= enq_flags;
+ 
++	/*
++	 * The task is about to be dispatched, handle ops.dequeue() based
++	 * on where the task is going.
++	 *
++	 * Key principle: ops.dequeue() is called when a task leaves the
++	 * BPF scheduler's custody. A task is in BPF custody if it's on a
++	 * user-created DSQ or in BPF data structures. Once dispatched to a
++	 * terminal DSQ (local DSQ or SCX_DSQ_GLOBAL), the BPF scheduler is
++	 * done with it.
++	 *
++	 * Direct dispatch to terminal DSQs: task never enters (or exits)
++	 * BPF scheduler's custody. If it was in custody, call ops.dequeue()
++	 * to notify the BPF scheduler. Clear the flag so future property
++	 * changes also won't trigger ops.dequeue().
++	 *
++	 * Direct dispatch to user DSQs: task enters BPF scheduler's custody.
++	 * Mark the task as in BPF custody so that when it's later dispatched
++	 * to a terminal DSQ or dequeued for property changes, ops.dequeue()
++	 * will be called.
++	 *
++	 * This also handles the ops.select_cpu() direct dispatch: the
++	 * shortcut skips ops.enqueue() but the task still enters BPF custody
++	 * if dispatched to a user DSQ, and thus needs ops.dequeue() when it
++	 * leaves.
++	 */
++	if (SCX_HAS_OP(sch, dequeue)) {
++		if (!is_terminal_dsq(dsq->id)) {
++			p->scx.flags |= SCX_TASK_OPS_ENQUEUED;
++		} else {
++			if (p->scx.flags & SCX_TASK_OPS_ENQUEUED)
++				SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq, p, 0);
++			p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++		}
++	}
++
+ 	/*
+ 	 * We are in the enqueue path with @rq locked and pinned, and thus can't
+ 	 * double lock a remote rq and enqueue to its local DSQ. For
+@@ -1391,6 +1468,21 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 	WARN_ON_ONCE(atomic_long_read(&p->scx.ops_state) != SCX_OPSS_NONE);
+ 	atomic_long_set(&p->scx.ops_state, SCX_OPSS_QUEUEING | qseq);
+ 
++	/*
++	 * Mark that ops.enqueue() is being called for this task. This
++	 * indicates the task is entering the BPF scheduler's data
++	 * structures (QUEUED state).
++	 *
++	 * However, if the task was already marked as in BPF custody by
++	 * mark_direct_dispatch() (ops.select_cpu() direct dispatch to
++	 * non-local DSQ), don't clear that - keep the flag set so
++	 * ops.dequeue() will be called when appropriate.
++	 *
++	 * Only track this flag if ops.dequeue() is implemented.
++	 */
++	if (SCX_HAS_OP(sch, dequeue))
++		p->scx.flags |= SCX_TASK_OPS_ENQUEUED;
++
+ 	ddsp_taskp = this_cpu_ptr(&direct_dispatch_task);
+ 	WARN_ON_ONCE(*ddsp_taskp);
+ 	*ddsp_taskp = p;
+@@ -1501,6 +1593,10 @@ static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags
+ 	if (enq_flags & SCX_ENQ_WAKEUP)
+ 		touch_core_sched(rq, p);
+ 
++	/* Start dl_server if this is the first task being enqueued */
++	if (rq->scx.nr_running == 1)
++		dl_server_start(&rq->ext_server);
++
+ 	do_enqueue_task(rq, p, enq_flags, sticky_cpu);
+ out:
+ 	rq->scx.flags &= ~SCX_RQ_IN_WAKEUP;
+@@ -1523,6 +1619,30 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 
+ 	switch (opss & SCX_OPSS_STATE_MASK) {
+ 	case SCX_OPSS_NONE:
++		/*
++		 * Task is not in BPF data structures (either dispatched to
++		 * a DSQ or running). Only call ops.dequeue() if the task
++		 * is still in BPF scheduler's custody
++		 * (%SCX_TASK_OPS_ENQUEUED is set).
++		 *
++		 * If the task has already been dispatched to a local DSQ
++		 * (left BPF custody), the flag will be clear and we skip
++		 * ops.dequeue()
++		 *
++		 * If this is a property change (not sleep/core-sched) and
++		 * the task is still in BPF custody, set the
++		 * %SCX_DEQ_SCHED_CHANGE flag.
++		 */
++		if (SCX_HAS_OP(sch, dequeue) &&
++		    p->scx.flags & SCX_TASK_OPS_ENQUEUED) {
++			u64 flags = deq_flags;
++
++			if (!(deq_flags & (DEQUEUE_SLEEP | SCX_DEQ_CORE_SCHED_EXEC)))
++				flags |= SCX_DEQ_SCHED_CHANGE;
++
++			SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq, p, flags);
++			p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++		}
+ 		break;
+ 	case SCX_OPSS_QUEUEING:
+ 		/*
+@@ -1531,9 +1651,24 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 		 */
+ 		BUG();
+ 	case SCX_OPSS_QUEUED:
+-		if (SCX_HAS_OP(sch, dequeue))
+-			SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq,
+-					 p, deq_flags);
++		/*
++		 * Task is still on the BPF scheduler (not dispatched yet).
++		 * Call ops.dequeue() to notify. Add %SCX_DEQ_SCHED_CHANGE
++		 * only for property changes, not for core-sched picks or
++		 * sleep.
++		 *
++		 * Clear the flag after calling ops.dequeue(): the task is
++		 * leaving BPF scheduler's custody.
++		 */
++		if (SCX_HAS_OP(sch, dequeue)) {
++			u64 flags = deq_flags;
++
++			if (!(deq_flags & (DEQUEUE_SLEEP | SCX_DEQ_CORE_SCHED_EXEC)))
++				flags |= SCX_DEQ_SCHED_CHANGE;
++
++			SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq, p, flags);
++			p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++		}
+ 
+ 		if (atomic_long_try_cmpxchg(&p->scx.ops_state, &opss,
+ 					    SCX_OPSS_NONE))
+@@ -1630,6 +1765,7 @@ static void move_local_task_to_local_dsq(struct task_struct *p, u64 enq_flags,
+ 					 struct scx_dispatch_q *src_dsq,
+ 					 struct rq *dst_rq)
+ {
++	struct scx_sched *sch = scx_root;
+ 	struct scx_dispatch_q *dst_dsq = &dst_rq->scx.local_dsq;
+ 
+ 	/* @dsq is locked and @p is on @dst_rq */
+@@ -1638,6 +1774,15 @@ static void move_local_task_to_local_dsq(struct task_struct *p, u64 enq_flags,
+ 
+ 	WARN_ON_ONCE(p->scx.holding_cpu >= 0);
+ 
++	/*
++	 * Task is moving from a non-local DSQ to a local DSQ. Call
++	 * ops.dequeue() if the task was in BPF custody.
++	 */
++	if (SCX_HAS_OP(sch, dequeue) && (p->scx.flags & SCX_TASK_OPS_ENQUEUED)) {
++		SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, dst_rq, p, 0);
++		p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++	}
++
+ 	if (enq_flags & (SCX_ENQ_HEAD | SCX_ENQ_PREEMPT))
+ 		list_add(&p->scx.dsq_list.node, &dst_dsq->list);
+ 	else
+@@ -1828,8 +1973,9 @@ static bool consume_remote_task(struct rq *this_rq, struct task_struct *p,
+  * will change. As @p's task_rq is locked, this function doesn't need to use the
+  * holding_cpu mechanism.
+  *
+- * On return, @src_dsq is unlocked and only @p's new task_rq, which is the
+- * return value, is locked.
++ * On success, @src_dsq is unlocked and only @p's new task_rq, which is the
++ * return value, is locked. On failure (affinity change invalidated the move),
++ * returns NULL with @src_dsq unlocked and task remaining in @src_dsq.
+  */
+ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
+ 					 struct task_struct *p, u64 enq_flags,
+@@ -1845,9 +1991,13 @@ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
+ 	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+ 		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
+ 		if (src_rq != dst_rq &&
+-		    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
+-			dst_dsq = find_global_dsq(sch, p);
+-			dst_rq = src_rq;
++		    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, false))) {
++			/*
++			 * Task affinity changed after dispatch decision:
++			 * drop the dispatch, caller will handle returning
++			 * the task to its original DSQ.
++			 */
++			return NULL;
+ 		}
+ 	} else {
+ 		/* no need to migrate if destination is a non-local DSQ */
+@@ -1974,9 +2124,15 @@ static void dispatch_to_local_dsq(struct scx_sched *sch, struct rq *rq,
+ 	}
+ 
+ 	if (src_rq != dst_rq &&
+-	    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
+-		dispatch_enqueue(sch, find_global_dsq(sch, p), p,
+-				 enq_flags | SCX_ENQ_CLEAR_OPSS);
++	    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, false))) {
++		/*
++		 * Task affinity changed after dispatch decision: drop the
++		 * dispatch, task remains in its current state and will be
++		 * dispatched again in a future cycle.
++		 */
++		atomic_long_set_release(&p->scx.ops_state, SCX_OPSS_QUEUED |
++					(atomic_long_read(&p->scx.ops_state) &
++					 SCX_OPSS_QSEQ_MASK));
+ 		return;
+ 	}
+ 
+@@ -2022,8 +2178,13 @@ static void dispatch_to_local_dsq(struct scx_sched *sch, struct rq *rq,
+ 			locked_rq = dst_rq;
+ 		}
+ 
+-		/* if the destination CPU is idle, wake it up */
+-		if (sched_class_above(p->sched_class, dst_rq->curr->sched_class))
++		/*
++		 * If the destination CPU is idle/in-balance, wake it up.
++		 * Skip resched if already in balance - CPU is already looking
++		 * for tasks and will pick this up immediately.
++		 */
++		if (!(dst_rq->scx.flags & SCX_RQ_IN_BALANCE) &&
++		    sched_class_above(p->sched_class, dst_rq->curr->sched_class))
+ 			resched_curr(dst_rq);
+ 	}
+ 
+@@ -2107,6 +2268,27 @@ static void finish_dispatch(struct scx_sched *sch, struct rq *rq,
+ 
+ 	BUG_ON(!(p->scx.flags & SCX_TASK_QUEUED));
+ 
++	/*
++	 * Handle ops.dequeue() based on destination DSQ.
++	 *
++	 * Dispatch to terminal DSQs (local DSQs and SCX_DSQ_GLOBAL): the BPF
++	 * scheduler is done with the task. Call ops.dequeue() if it was in
++	 * BPF custody, then clear the %SCX_TASK_OPS_ENQUEUED flag.
++	 *
++	 * Dispatch to user DSQs: task is in BPF scheduler's custody.
++	 * Mark it so ops.dequeue() will be called when it leaves.
++	 */
++	if (SCX_HAS_OP(sch, dequeue)) {
++		if (!is_terminal_dsq(dsq_id)) {
++			p->scx.flags |= SCX_TASK_OPS_ENQUEUED;
++		} else {
++			if (p->scx.flags & SCX_TASK_OPS_ENQUEUED)
++				SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq, p, 0);
++
++			p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++		}
++	}
++
+ 	dsq = find_dsq_for_dispatch(sch, this_rq(), dsq_id, p);
+ 
+ 	if (dsq->id == SCX_DSQ_LOCAL)
+@@ -2512,6 +2694,33 @@ static struct task_struct *pick_task_scx(struct rq *rq, struct rq_flags *rf)
+ 	return do_pick_task_scx(rq, rf, false);
+ }
+ 
++/*
++ * Select the next task to run from the ext scheduling class.
++ *
++ * Use do_pick_task_scx() directly with @force_scx enabled, since the
++ * dl_server must always select a sched_ext task.
++ */
++static struct task_struct *
++ext_server_pick_task(struct sched_dl_entity *dl_se, struct rq_flags *rf)
++{
++	if (!scx_enabled())
++		return NULL;
++
++	return do_pick_task_scx(dl_se->rq, rf, true);
++}
++
++/*
++ * Initialize the ext server deadline entity.
++ */
++void ext_server_init(struct rq *rq)
++{
++	struct sched_dl_entity *dl_se = &rq->ext_server;
++
++	init_dl_entity(dl_se);
++
++	dl_server_init(dl_se, rq, ext_server_pick_task);
++}
++
+ #ifdef CONFIG_SCHED_CORE
+ /**
+  * scx_prio_less - Task ordering for core-sched
+@@ -2616,9 +2825,30 @@ static void set_cpus_allowed_scx(struct task_struct *p,
+ 				 struct affinity_context *ac)
+ {
+ 	struct scx_sched *sch = scx_root;
++	struct rq *rq = task_rq(p);
++
++	lockdep_assert_rq_held(rq);
+ 
+ 	set_cpus_allowed_common(p, ac);
+ 
++	if (unlikely(!sch))
++		return;
++
++	/*
++	 * Affinity changes invalidate any pending dispatch decisions made
++	 * with the old affinity. Increment the runqueue's ops_qseq and
++	 * update the task's qseq to invalidate in-flight dispatches.
++	 */
++	if (p->scx.flags & SCX_TASK_QUEUED) {
++		unsigned long opss;
++
++		rq->scx.ops_qseq++;
++		opss = atomic_long_read(&p->scx.ops_state);
++		atomic_long_set(&p->scx.ops_state,
++				(opss & SCX_OPSS_STATE_MASK) |
++				(rq->scx.ops_qseq << SCX_OPSS_QSEQ_SHIFT));
++	}
++
+ 	/*
+ 	 * The effective cpumask is stored in @p->cpus_ptr which may temporarily
+ 	 * differ from the configured one in @p->cpus_mask. Always tell the bpf
+@@ -2894,6 +3124,14 @@ static void scx_enable_task(struct task_struct *p)
+ 
+ 	lockdep_assert_rq_held(rq);
+ 
++	/*
++	 * Clear enqueue/dequeue tracking flags when enabling the task.
++	 * This ensures a clean state when the task enters SCX. Only needed
++	 * if ops.dequeue() is implemented.
++	 */
++	if (SCX_HAS_OP(sch, dequeue))
++		p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
++
+ 	/*
+ 	 * Set the weight before calling ops.enable() so that the scheduler
+ 	 * doesn't see a stale value if they inspect the task struct.
+@@ -2920,11 +3158,29 @@ static void scx_disable_task(struct task_struct *p)
+ 	struct rq *rq = task_rq(p);
+ 
+ 	lockdep_assert_rq_held(rq);
+-	WARN_ON_ONCE(scx_get_task_state(p) != SCX_TASK_ENABLED);
++
++	/*
++	 * During disabling, tasks can be in various states due to
++	 * concurrent operations, only warn about unexpected state during
++	 * normal operation.
++	 */
++	if (likely(scx_enable_state() != SCX_DISABLING))
++		WARN_ON_ONCE(scx_get_task_state(p) != SCX_TASK_ENABLED);
++
++	/* If task is not enabled, skip disable */
++	if (scx_get_task_state(p) != SCX_TASK_ENABLED)
++		return;
+ 
+ 	if (SCX_HAS_OP(sch, disable))
+ 		SCX_CALL_OP_TASK(sch, SCX_KF_REST, disable, rq, p);
+ 	scx_set_task_state(p, SCX_TASK_READY);
++
++	/*
++	 * Clear enqueue/dequeue tracking flags when disabling the task.
++	 * Only needed if ops.dequeue() is implemented.
++	 */
++	if (SCX_HAS_OP(sch, dequeue))
++		p->scx.flags &= ~SCX_TASK_OPS_ENQUEUED;
+ }
+ 
+ static void scx_exit_task(struct task_struct *p)
+@@ -3063,6 +3319,9 @@ static void reweight_task_scx(struct rq *rq, struct task_struct *p,
+ 
+ 	lockdep_assert_rq_held(task_rq(p));
+ 
++	if (unlikely(!sch))
++		return;
++
+ 	p->scx.weight = sched_weight_to_cgroup(scale_load_down(lw->weight));
+ 	if (SCX_HAS_OP(sch, set_weight))
+ 		SCX_CALL_OP_TASK(sch, SCX_KF_REST, set_weight, rq,
+@@ -3077,6 +3336,37 @@ static void switching_to_scx(struct rq *rq, struct task_struct *p)
+ {
+ 	struct scx_sched *sch = scx_root;
+ 
++	/*
++	 * We may race with a concurrent disable, skip enabling if scx_root
++	 * is NULL or the task is in a transitional state.
++	 */
++	if (unlikely(!sch || scx_enable_state() == SCX_DISABLING))
++		return;
++
++	/*
++	 * Task might not be properly initialized if it's being switched to
++	 * SCX after scx_init_task_enabled was set. Initialize to READY state
++	 * first if needed. Valid transitions: NONE -> INIT -> READY -> ENABLED
++	 */
++	switch (scx_get_task_state(p)) {
++	case SCX_TASK_NONE:
++		scx_set_task_state(p, SCX_TASK_INIT);
++		fallthrough;
++	case SCX_TASK_INIT:
++		scx_set_task_state(p, SCX_TASK_READY);
++		break;
++	case SCX_TASK_READY:
++		/* Already ready, proceed to enable */
++		break;
++	case SCX_TASK_ENABLED:
++		/* Already enabled, nothing to do */
++		return;
++	default:
++		WARN_ONCE(1, "sched_ext: Unexpected task state %d for %s[%d]",
++			  scx_get_task_state(p), p->comm, p->pid);
++		return;
++	}
++
+ 	scx_enable_task(p);
+ 
+ 	/*
+@@ -3090,7 +3380,13 @@ static void switching_to_scx(struct rq *rq, struct task_struct *p)
+ 
+ static void switched_from_scx(struct rq *rq, struct task_struct *p)
+ {
+-	scx_disable_task(p);
++	/*
++	 * Only disable if the task is actually enabled. During scheduler
++	 * disabling, tasks might already be in READY state if they've been
++	 * disabled by concurrent operations.
++	 */
++	if (scx_get_task_state(p) == SCX_TASK_ENABLED)
++		scx_disable_task(p);
+ }
+ 
+ static void wakeup_preempt_scx(struct rq *rq, struct task_struct *p,int wake_flags) {}
+@@ -5699,6 +5995,54 @@ static void scx_dsq_insert_commit(struct scx_sched *sch, struct task_struct *p,
+ 		return;
+ 	}
+ 
++	/*
++	 * Fast path: Skip dispatch buffer for same-CPU local DSQ dispatches.
++	 * This eliminates buffering overhead when the BPF scheduler dispatches
++	 * tasks to the local DSQ of the current CPU from ops.dispatch().
++	 */
++	if (dsq_id == SCX_DSQ_LOCAL && dspc->rq == this_rq()) {
++		struct rq *rq = dspc->rq;
++		unsigned long opss, qseq;
++
++		qseq = atomic_long_read(&p->scx.ops_state) & SCX_OPSS_QSEQ_MASK;
++
++		/*
++		 * Fast validation and claim: try to transition from QUEUED to
++		 * DISPATCHING if qseq matches.
++		 */
++retry_fast:
++		opss = atomic_long_read(&p->scx.ops_state);
++
++		switch (opss & SCX_OPSS_STATE_MASK) {
++		case SCX_OPSS_DISPATCHING:
++		case SCX_OPSS_NONE:
++			/* Someone else got to it or task is gone */
++			return;
++		case SCX_OPSS_QUEUED:
++			if ((opss & SCX_OPSS_QSEQ_MASK) != qseq)
++				return;
++			if (likely(atomic_long_try_cmpxchg(&p->scx.ops_state,
++							   &opss,
++							   SCX_OPSS_DISPATCHING)))
++				break;
++			goto retry_fast;
++		case SCX_OPSS_QUEUEING:
++			wait_ops_state(p, opss);
++			goto retry_fast;
++		}
++
++		/* Successfully claimed, now dispatch directly */
++		if (!(p->scx.flags & SCX_TASK_QUEUED))
++			return;
++
++		touch_core_sched_dispatch(rq, p);
++
++		dispatch_enqueue(sch, &rq->scx.local_dsq, p,
++				 enq_flags | SCX_ENQ_CLEAR_OPSS);
++		dspc->nr_tasks++;
++		return;
++	}
++
+ 	if (unlikely(dspc->cursor >= scx_dsp_max_batch)) {
+ 		scx_error(sch, "dispatch buffer overflow");
+ 		return;
+@@ -5959,14 +6303,21 @@ static bool scx_dsq_move(struct bpf_iter_scx_dsq_kern *kit,
+ 
+ 	/* execute move */
+ 	locked_rq = move_task_between_dsqs(sch, p, enq_flags, src_dsq, dst_dsq);
+-	dispatched = true;
++	if (locked_rq) {
++		dispatched = true;
++	} else {
++		/* Move failed: task stays in src_dsq */
++		raw_spin_unlock(&src_dsq->lock);
++		locked_rq = in_balance ? this_rq : NULL;
++	}
+ out:
+ 	if (in_balance) {
+ 		if (this_rq != locked_rq) {
+-			raw_spin_rq_unlock(locked_rq);
++			if (locked_rq)
++				raw_spin_rq_unlock(locked_rq);
+ 			raw_spin_rq_lock(this_rq);
+ 		}
+-	} else {
++	} else if (locked_rq) {
+ 		raw_spin_rq_unlock_irqrestore(locked_rq, flags);
+ 	}
+ 
+diff --git a/kernel/sched/ext_idle.c b/kernel/sched/ext_idle.c
+index 3d9d404d5..22561c06a 100644
+--- a/kernel/sched/ext_idle.c
++++ b/kernel/sched/ext_idle.c
+@@ -558,6 +558,8 @@ s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
+ 	 * partially idle @prev_cpu.
+ 	 */
+ 	if (sched_smt_active()) {
++		bool has_idle_cores = test_idle_cores(prev_cpu);
++
+ 		/*
+ 		 * Keep using @prev_cpu if it's part of a fully idle core.
+ 		 */
+@@ -570,11 +572,16 @@ s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
+ 
+ 		/*
+ 		 * Search for any fully idle core in the same LLC domain.
++		 *
++		 * Skip this step if we already known this LLC has no fully
++		 * idle cores.
+ 		 */
+-		if (llc_cpus) {
++		if (llc_cpus && has_idle_cores) {
+ 			cpu = pick_idle_cpu_in_node(llc_cpus, node, SCX_PICK_IDLE_CORE);
+ 			if (cpu >= 0)
+ 				goto out_unlock;
++
++			set_idle_cores(prev_cpu, false);
+ 		}
+ 
+ 		/*
+diff --git a/kernel/sched/ext_internal.h b/kernel/sched/ext_internal.h
+index 386c677e4..befa9a5d6 100644
+--- a/kernel/sched/ext_internal.h
++++ b/kernel/sched/ext_internal.h
+@@ -982,6 +982,13 @@ enum scx_deq_flags {
+ 	 * it hasn't been dispatched yet. Dequeue from the BPF side.
+ 	 */
+ 	SCX_DEQ_CORE_SCHED_EXEC	= 1LLU << 32,
++
++	/*
++	 * The task is being dequeued due to a property change (e.g.,
++	 * sched_setaffinity(), sched_setscheduler(), set_user_nice(),
++	 * etc.).
++	 */
++	SCX_DEQ_SCHED_CHANGE	= 1LLU << 33,
+ };
+ 
+ enum scx_pick_idle_cpu_flags {
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3eaeceda7..0843a38bf 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2064,8 +2064,6 @@ numa_type numa_classify(unsigned int imbalance_pct,
+ }
+ 
+ #ifdef CONFIG_SCHED_SMT
+-/* Forward declarations of select_idle_sibling helpers */
+-static inline bool test_idle_cores(int cpu);
+ static inline int numa_idle_core(int idle_core, int cpu)
+ {
+ 	if (!static_branch_likely(&sched_smt_present) ||
+@@ -7499,62 +7497,10 @@ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
+ }
+ 
+ #ifdef CONFIG_SCHED_SMT
+-DEFINE_STATIC_KEY_FALSE(sched_smt_present);
+-EXPORT_SYMBOL_GPL(sched_smt_present);
+-
+-static inline void set_idle_cores(int cpu, int val)
+-{
+-	struct sched_domain_shared *sds;
+-
+-	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
+-	if (sds)
+-		WRITE_ONCE(sds->has_idle_cores, val);
+-}
+-
+-static inline bool test_idle_cores(int cpu)
+-{
+-	struct sched_domain_shared *sds;
+-
+-	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
+-	if (sds)
+-		return READ_ONCE(sds->has_idle_cores);
+-
+-	return false;
+-}
+-
+-/*
+- * Scans the local SMT mask to see if the entire core is idle, and records this
+- * information in sd_llc_shared->has_idle_cores.
+- *
+- * Since SMT siblings share all cache levels, inspecting this limited remote
+- * state should be fairly cheap.
+- */
+-void __update_idle_core(struct rq *rq)
+-{
+-	int core = cpu_of(rq);
+-	int cpu;
+-
+-	rcu_read_lock();
+-	if (test_idle_cores(core))
+-		goto unlock;
+-
+-	for_each_cpu(cpu, cpu_smt_mask(core)) {
+-		if (cpu == core)
+-			continue;
+-
+-		if (!available_idle_cpu(cpu))
+-			goto unlock;
+-	}
+-
+-	set_idle_cores(core, 1);
+-unlock:
+-	rcu_read_unlock();
+-}
+-
+ /*
+  * Scan the entire LLC domain for idle cores; this dynamically switches off if
+  * there are no idle cores left in the system; tracked through
+- * sd_llc->shared->has_idle_cores and enabled through update_idle_core() above.
++ * sd_llc->shared->has_idle_cores and enabled through update_idle_core().
+  */
+ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
+ {
+@@ -7608,16 +7554,6 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
+ }
+ 
+ #else /* !CONFIG_SCHED_SMT: */
+-
+-static inline void set_idle_cores(int cpu, int val)
+-{
+-}
+-
+-static inline bool test_idle_cores(int cpu)
+-{
+-	return false;
+-}
+-
+ static inline int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
+ {
+ 	return __select_idle_cpu(core, p);
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index abf8f15d6..8b5519255 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -454,6 +454,37 @@ static void wakeup_preempt_idle(struct rq *rq, struct task_struct *p, int flags)
+ 	resched_curr(rq);
+ }
+ 
++#ifdef CONFIG_SCHED_SMT
++/*
++ * Scans the local SMT mask to see if the entire core is idle, and records this
++ * information in sd_llc_shared->has_idle_cores.
++ *
++ * Since SMT siblings share all cache levels, inspecting this limited remote
++ * state should be fairly cheap.
++ */
++void __update_idle_core(struct rq *rq)
++{
++	int core = cpu_of(rq);
++	int cpu;
++
++	rcu_read_lock();
++	if (test_idle_cores(core))
++		goto unlock;
++
++	for_each_cpu(cpu, cpu_smt_mask(core)) {
++		if (cpu == core)
++			continue;
++
++		if (!available_idle_cpu(cpu))
++			goto unlock;
++	}
++
++	set_idle_cores(core, 1);
++unlock:
++	rcu_read_unlock();
++}
++#endif /* !CONFIG_SCHED_SMT: */
++
+ static void update_curr_idle(struct rq *rq);
+ 
+ static void put_prev_task_idle(struct rq *rq, struct task_struct *prev, struct task_struct *next)
+@@ -536,6 +567,9 @@ static void update_curr_idle(struct rq *rq)
+ 	se->exec_start = now;
+ 
+ 	dl_server_update_idle(&rq->fair_server, delta_exec);
++#ifdef CONFIG_SCHED_CLASS_EXT
++	dl_server_update_idle(&rq->ext_server, delta_exec);
++#endif
+ }
+ 
+ /*
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 93fce4bbf..db75a9c07 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -414,6 +414,7 @@ extern void dl_server_init(struct sched_dl_entity *dl_se, struct rq *rq,
+ extern void sched_init_dl_servers(void);
+ 
+ extern void fair_server_init(struct rq *rq);
++extern void ext_server_init(struct rq *rq);
+ extern void __dl_server_attach_root(struct sched_dl_entity *dl_se, struct rq *rq);
+ extern int dl_server_apply_params(struct sched_dl_entity *dl_se,
+ 		    u64 runtime, u64 period, bool init);
+@@ -1151,6 +1152,7 @@ struct rq {
+ 	struct dl_rq		dl;
+ #ifdef CONFIG_SCHED_CLASS_EXT
+ 	struct scx_rq		scx;
++	struct sched_dl_entity	ext_server;
+ #endif
+ 
+ 	struct sched_dl_entity	fair_server;
+@@ -1613,19 +1615,6 @@ do {						\
+ 	flags = _raw_spin_rq_lock_irqsave(rq);	\
+ } while (0)
+ 
+-#ifdef CONFIG_SCHED_SMT
+-extern void __update_idle_core(struct rq *rq);
+-
+-static inline void update_idle_core(struct rq *rq)
+-{
+-	if (static_branch_unlikely(&sched_smt_present))
+-		__update_idle_core(rq);
+-}
+-
+-#else /* !CONFIG_SCHED_SMT: */
+-static inline void update_idle_core(struct rq *rq) { }
+-#endif /* !CONFIG_SCHED_SMT */
+-
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 
+ static inline struct task_struct *task_of(struct sched_entity *se)
+@@ -2108,6 +2097,48 @@ DECLARE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
+ extern struct static_key_false sched_asym_cpucapacity;
+ extern struct static_key_false sched_cluster_active;
+ 
++#ifdef CONFIG_SCHED_SMT
++static inline void set_idle_cores(int cpu, int val)
++{
++	struct sched_domain_shared *sds;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (sds)
++		WRITE_ONCE(sds->has_idle_cores, val);
++}
++
++static inline bool test_idle_cores(int cpu)
++{
++	struct sched_domain_shared *sds;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (sds)
++		return READ_ONCE(sds->has_idle_cores);
++
++	return false;
++}
++
++extern void __update_idle_core(struct rq *rq);
++
++static inline void update_idle_core(struct rq *rq)
++{
++	if (static_branch_unlikely(&sched_smt_present))
++		__update_idle_core(rq);
++}
++
++#else /* !CONFIG_SCHED_SMT: */
++static inline void set_idle_cores(int cpu, int val)
++{
++}
++
++static inline bool test_idle_cores(int cpu)
++{
++	return false;
++}
++
++static inline void update_idle_core(struct rq *rq) { }
++#endif /* CONFIG_SCHED_SMT */
++
+ static __always_inline bool sched_asym_cpucap_active(void)
+ {
+ 	return static_branch_unlikely(&sched_asym_cpucapacity);
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index cf643a5dd..ac268da91 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -508,6 +508,11 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
+ 	if (rq->fair_server.dl_server)
+ 		__dl_server_attach_root(&rq->fair_server, rq);
+ 
++#ifdef CONFIG_SCHED_CLASS_EXT
++	if (rq->ext_server.dl_server)
++		__dl_server_attach_root(&rq->ext_server, rq);
++#endif
++
+ 	rq_unlock_irqrestore(rq, &rf);
+ 
+ 	if (old_rd)
+diff --git a/tools/sched_ext/include/scx/enum_defs.autogen.h b/tools/sched_ext/include/scx/enum_defs.autogen.h
+index c2c33df92..dcc945304 100644
+--- a/tools/sched_ext/include/scx/enum_defs.autogen.h
++++ b/tools/sched_ext/include/scx/enum_defs.autogen.h
+@@ -21,6 +21,7 @@
+ #define HAVE_SCX_CPU_PREEMPT_UNKNOWN
+ #define HAVE_SCX_DEQ_SLEEP
+ #define HAVE_SCX_DEQ_CORE_SCHED_EXEC
++#define HAVE_SCX_DEQ_SCHED_CHANGE
+ #define HAVE_SCX_DSQ_FLAG_BUILTIN
+ #define HAVE_SCX_DSQ_FLAG_LOCAL_ON
+ #define HAVE_SCX_DSQ_INVALID
+diff --git a/tools/sched_ext/include/scx/enums.autogen.bpf.h b/tools/sched_ext/include/scx/enums.autogen.bpf.h
+index 2f8002bcc..5da50f937 100644
+--- a/tools/sched_ext/include/scx/enums.autogen.bpf.h
++++ b/tools/sched_ext/include/scx/enums.autogen.bpf.h
+@@ -127,3 +127,5 @@ const volatile u64 __SCX_ENQ_CLEAR_OPSS __weak;
+ const volatile u64 __SCX_ENQ_DSQ_PRIQ __weak;
+ #define SCX_ENQ_DSQ_PRIQ __SCX_ENQ_DSQ_PRIQ
+ 
++const volatile u64 __SCX_DEQ_SCHED_CHANGE __weak;
++#define SCX_DEQ_SCHED_CHANGE __SCX_DEQ_SCHED_CHANGE
+diff --git a/tools/sched_ext/include/scx/enums.autogen.h b/tools/sched_ext/include/scx/enums.autogen.h
+index fedec9385..fc9a7a4d9 100644
+--- a/tools/sched_ext/include/scx/enums.autogen.h
++++ b/tools/sched_ext/include/scx/enums.autogen.h
+@@ -46,4 +46,5 @@
+ 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_LAST); \
+ 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_CLEAR_OPSS); \
+ 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_DSQ_PRIQ); \
++	SCX_ENUM_SET(skel, scx_deq_flags, SCX_DEQ_SCHED_CHANGE); \
+ } while (0)
+diff --git a/tools/testing/selftests/sched_ext/Makefile b/tools/testing/selftests/sched_ext/Makefile
+index 5fe45f9c5..2815a875b 100644
+--- a/tools/testing/selftests/sched_ext/Makefile
++++ b/tools/testing/selftests/sched_ext/Makefile
+@@ -161,6 +161,7 @@ all_test_bpfprogs := $(foreach prog,$(wildcard *.bpf.c),$(INCLUDE_DIR)/$(patsubs
+ 
+ auto-test-targets :=			\
+ 	create_dsq			\
++	dequeue				\
+ 	enq_last_no_enq_fails		\
+ 	ddsp_bogus_dsq_fail		\
+ 	ddsp_vtimelocal_fail		\
+@@ -183,7 +184,9 @@ auto-test-targets :=			\
+ 	select_cpu_dispatch_bad_dsq	\
+ 	select_cpu_dispatch_dbl_dsp	\
+ 	select_cpu_vtime		\
++	rt_stall			\
+ 	test_example			\
++	total_bw			\
+ 
+ testcase-targets := $(addsuffix .o,$(addprefix $(SCXOBJ_DIR)/,$(auto-test-targets)))
+ 
+diff --git a/tools/testing/selftests/sched_ext/dequeue.bpf.c b/tools/testing/selftests/sched_ext/dequeue.bpf.c
+new file mode 100644
+index 000000000..092956bec
+--- /dev/null
++++ b/tools/testing/selftests/sched_ext/dequeue.bpf.c
+@@ -0,0 +1,238 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * A scheduler that validates ops.dequeue() is called correctly:
++ * - for tasks on BPF data structures (not yet dispatched)
++ * - for tasks dispatched to non-local DSQs (global or user DSQs)
++ * - That every ops.enqueue() is followed by ops.dequeue() except for tasks
++ *   directly dispatched to local DSQs, which bypass the BPF scheduler
++ *   entirely
++ *
++ * Copyright (c) 2026 NVIDIA Corporation.
++ */
++
++#include <scx/common.bpf.h>
++
++#define SHARED_DSQ	0
++
++char _license[] SEC("license") = "GPL";
++
++UEI_DEFINE(uei);
++
++/*
++ * Counters to track the lifecycle of tasks:
++ * - enqueue_cnt: Number of times ops.enqueue() was called
++ * - dequeue_cnt: Number of times ops.dequeue() was called (any type)
++ * - dispatch_dequeue_cnt: Number of regular dispatch dequeues (no flag)
++ * - change_dequeue_cnt: Number of property change dequeues (%SCX_DEQ_SCHED_CHANGE)
++ */
++u64 enqueue_cnt, dequeue_cnt, dispatch_dequeue_cnt, change_dequeue_cnt;
++
++/*
++ * Test scenarios:
++ * - 0: Dispatch to local DSQ (bypasses BPF scheduler, no dequeue callbacks)
++ * - 1: Dispatch to shared DSQ (enters BPF scheduler, dequeue callbacks expected)
++ */
++u32 test_scenario;
++
++/*
++ * Per-task state to track lifecycle and validate workflow semantics.
++ * State transitions:
++ *   NONE -> ENQUEUED (on enqueue)
++ *   ENQUEUED -> DISPATCHED (on dispatch dequeue)
++ *   DISPATCHED -> NONE (on property change dequeue or re-enqueue)
++ *   ENQUEUED -> NONE (on property change dequeue before dispatch)
++ */
++enum task_state {
++	TASK_NONE = 0,      /* Task is outside scheduler control */
++	TASK_ENQUEUED,      /* ops.enqueue() called, waiting for dequeue */
++	TASK_DISPATCHED,    /* Dispatch dequeue received, can get property change or re-enqueue */
++};
++
++struct task_ctx {
++	enum task_state state; /* Current state in the workflow */
++	u64 enqueue_seq;       /* Sequence number for debugging */
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
++	__type(value, struct task_ctx);
++} task_ctx_stor SEC(".maps");
++
++static struct task_ctx *try_lookup_task_ctx(struct task_struct *p)
++{
++	return bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
++}
++
++s32 BPF_STRUCT_OPS(dequeue_select_cpu, struct task_struct *p,
++		   s32 prev_cpu, u64 wake_flags)
++{
++	/* Always bounce to ops.enqueue() */
++	return prev_cpu;
++}
++
++void BPF_STRUCT_OPS(dequeue_enqueue, struct task_struct *p, u64 enq_flags)
++{
++	struct task_ctx *tctx;
++
++	tctx = try_lookup_task_ctx(p);
++	if (!tctx)
++		return;
++
++	switch (test_scenario) {
++	case 0:
++		/*
++		 * Scenario 0: Direct dispatch to the local DSQ.
++		 *
++		 * Task bypasses BPF scheduler entirely - no enqueue
++		 * tracking, no dequeue callbacks. Don't increment counters
++		 * or validate state since the task never enters BPF
++		 * scheduler management.
++		 */
++		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
++		break;
++
++	case 1:
++		/*
++		 * Scenario 1: Dispatch to shared DSQ.
++		 *
++		 * Task enters BPF scheduler management - track
++		 * enqueue/dequeue lifecycle and validate state
++		 * transitions.
++		 */
++		__sync_fetch_and_add(&enqueue_cnt, 1);
++
++		/*
++		 * Validate state transition: enqueue is only valid from
++		 * NONE or DISPATCHED states. Getting enqueue while in
++		 * ENQUEUED state indicates a missing dequeue.
++		 */
++		if (tctx->state == TASK_ENQUEUED)
++			scx_bpf_error("%d (%s): enqueue while in ENQUEUED state seq=%llu",
++				      p->pid, p->comm, tctx->enqueue_seq);
++
++		/* Transition to ENQUEUED state */
++		tctx->state = TASK_ENQUEUED;
++		tctx->enqueue_seq++;
++
++		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
++		break;
++	}
++}
++
++void BPF_STRUCT_OPS(dequeue_dequeue, struct task_struct *p, u64 deq_flags)
++{
++	struct task_ctx *tctx;
++
++	__sync_fetch_and_add(&dequeue_cnt, 1);
++
++	tctx = try_lookup_task_ctx(p);
++	if (!tctx)
++		return;
++
++	/*
++	 * For scenario 0 (local DSQ), ops.dequeue() should never be called
++	 * because tasks bypass the BPF scheduler entirely. If we get here,
++	 * it's a kernel bug. We don't track enqueues for scenario 0, so
++	 * tctx->enqueue_seq will be 0.
++	 */
++	if (test_scenario == 0) {
++		scx_bpf_error("%d (%s): dequeue called for local DSQ scenario - kernel bug!",
++			      p->pid, p->comm);
++		return;
++	}
++
++	/*
++	 * Validate state: dequeue should only happen from ENQUEUED or
++	 * DISPATCHED states. Getting dequeue from NONE indicates a bug.
++	 */
++	if (tctx->state == TASK_NONE) {
++		scx_bpf_error("%d (%s): dequeue from NONE state seq=%llu",
++			      p->pid, p->comm, tctx->enqueue_seq);
++		return;
++	}
++
++	if (deq_flags & SCX_DEQ_SCHED_CHANGE) {
++		/*
++		 * Property change interrupting the workflow. Valid from
++		 * both ENQUEUED and DISPATCHED states. Transitions task
++		 * back to NONE state.
++		 */
++		__sync_fetch_and_add(&change_dequeue_cnt, 1);
++
++		/* Validate state transition */
++		if (tctx->state != TASK_ENQUEUED && tctx->state != TASK_DISPATCHED)
++			scx_bpf_error("%d (%s): invalid property change dequeue state=%d seq=%llu",
++				      p->pid, p->comm, tctx->state, tctx->enqueue_seq);
++
++		/* Transition back to NONE: task outside scheduler control */
++		tctx->state = TASK_NONE;
++	} else {
++		/*
++		 * Regular dispatch dequeue: normal workflow step. Valid
++		 * only from ENQUEUED state (after enqueue, before dispatch
++		 * dequeue). Transitions to DISPATCHED state.
++		 */
++		__sync_fetch_and_add(&dispatch_dequeue_cnt, 1);
++
++		/* Dispatch dequeue should not have %SCX_DEQ_SCHED_CHANGE flag */
++		if (deq_flags & SCX_DEQ_SCHED_CHANGE)
++			scx_bpf_error("%d (%s): SCX_DEQ_SCHED_CHANGE in dispatch dequeue seq=%llu",
++				      p->pid, p->comm, tctx->enqueue_seq);
++
++		/* Must be in ENQUEUED state */
++		if (tctx->state != TASK_ENQUEUED)
++			scx_bpf_error("%d (%s): dispatch dequeue from state %d seq=%llu",
++				      p->pid, p->comm, tctx->state, tctx->enqueue_seq);
++
++		/* Transition to DISPATCHED: normal cycle completed dispatch */
++		tctx->state = TASK_DISPATCHED;
++	}
++}
++
++void BPF_STRUCT_OPS(dequeue_dispatch, s32 cpu, struct task_struct *prev)
++{
++	scx_bpf_dsq_move_to_local(SHARED_DSQ);
++}
++
++s32 BPF_STRUCT_OPS(dequeue_init_task, struct task_struct *p,
++		   struct scx_init_task_args *args)
++{
++	struct task_ctx *tctx;
++
++	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0,
++				   BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (!tctx)
++		return -ENOMEM;
++
++	return 0;
++}
++
++s32 BPF_STRUCT_OPS_SLEEPABLE(dequeue_init)
++{
++	s32 ret;
++
++	ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++void BPF_STRUCT_OPS(dequeue_exit, struct scx_exit_info *ei)
++{
++	UEI_RECORD(uei, ei);
++}
++
++SEC(".struct_ops.link")
++struct sched_ext_ops dequeue_ops = {
++	.select_cpu		= (void *)dequeue_select_cpu,
++	.enqueue		= (void *)dequeue_enqueue,
++	.dequeue		= (void *)dequeue_dequeue,
++	.dispatch		= (void *)dequeue_dispatch,
++	.init_task		= (void *)dequeue_init_task,
++	.init			= (void *)dequeue_init,
++	.exit			= (void *)dequeue_exit,
++	.name			= "dequeue_test",
++};
+diff --git a/tools/testing/selftests/sched_ext/dequeue.c b/tools/testing/selftests/sched_ext/dequeue.c
+new file mode 100644
+index 000000000..805970834
+--- /dev/null
++++ b/tools/testing/selftests/sched_ext/dequeue.c
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2025 NVIDIA Corporation.
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <unistd.h>
++#include <signal.h>
++#include <bpf/bpf.h>
++#include <scx/common.h>
++#include <sys/wait.h>
++#include <sched.h>
++#include <pthread.h>
++#include "scx_test.h"
++#include "dequeue.bpf.skel.h"
++
++#define NUM_WORKERS 8
++
++/*
++ * Worker function that creates enqueue/dequeue events. It alternates
++ * between CPU work, sleeping, and affinity changes to trigger dequeues.
++ */
++static void worker_fn(int id)
++{
++	cpu_set_t cpuset;
++	int i;
++	volatile int sum = 0;
++
++	for (i = 0; i < 1000; i++) {
++		int j;
++
++		/* Do some work to trigger scheduling events */
++		for (j = 0; j < 10000; j++)
++			sum += j;
++
++		/* Change affinity to trigger dequeue */
++		if (i % 10 == 0) {
++			CPU_ZERO(&cpuset);
++			/* Rotate through the first 4 CPUs */
++			CPU_SET(i % 4, &cpuset);
++			sched_setaffinity(0, sizeof(cpuset), &cpuset);
++		}
++
++		/* Do additional work */
++		for (j = 0; j < 10000; j++)
++			sum += j;
++
++		/* Sleep to trigger dequeue */
++		usleep(1000 + (id * 100));
++	}
++
++	exit(0);
++}
++
++static enum scx_test_status run_scenario(struct dequeue *skel, u32 scenario,
++					 const char *scenario_name)
++{
++	struct bpf_link *link;
++	pid_t pids[NUM_WORKERS];
++	int i, status;
++	u64 enq_start, deq_start, dispatch_deq_start, change_deq_start;
++	u64 enq_delta, deq_delta, dispatch_deq_delta, change_deq_delta;
++
++	/* Set the test scenario */
++	skel->bss->test_scenario = scenario;
++
++	/* Record starting counts */
++	enq_start = skel->bss->enqueue_cnt;
++	deq_start = skel->bss->dequeue_cnt;
++	dispatch_deq_start = skel->bss->dispatch_dequeue_cnt;
++	change_deq_start = skel->bss->change_dequeue_cnt;
++
++	link = bpf_map__attach_struct_ops(skel->maps.dequeue_ops);
++	SCX_FAIL_IF(!link, "Failed to attach struct_ops for scenario %s", scenario_name);
++
++	/* Fork worker processes to generate enqueue/dequeue events */
++	for (i = 0; i < NUM_WORKERS; i++) {
++		pids[i] = fork();
++		SCX_FAIL_IF(pids[i] < 0, "Failed to fork worker %d", i);
++
++		if (pids[i] == 0) {
++			worker_fn(i);
++			/* Should not reach here */
++			exit(1);
++		}
++	}
++
++	/* Wait for all workers to complete */
++	for (i = 0; i < NUM_WORKERS; i++) {
++		SCX_FAIL_IF(waitpid(pids[i], &status, 0) != pids[i],
++			    "Failed to wait for worker %d", i);
++		SCX_FAIL_IF(status != 0, "Worker %d exited with status %d", i, status);
++	}
++
++	bpf_link__destroy(link);
++
++	SCX_EQ(skel->data->uei.kind, EXIT_KIND(SCX_EXIT_UNREG));
++
++	/* Calculate deltas */
++	enq_delta = skel->bss->enqueue_cnt - enq_start;
++	deq_delta = skel->bss->dequeue_cnt - deq_start;
++	dispatch_deq_delta = skel->bss->dispatch_dequeue_cnt - dispatch_deq_start;
++	change_deq_delta = skel->bss->change_dequeue_cnt - change_deq_start;
++
++	printf("%s:\n", scenario_name);
++	printf("  enqueues: %lu\n", (unsigned long)enq_delta);
++	printf("  dequeues: %lu (dispatch: %lu, property_change: %lu)\n",
++	       (unsigned long)deq_delta,
++	       (unsigned long)dispatch_deq_delta,
++	       (unsigned long)change_deq_delta);
++
++	/*
++	 * Validate enqueue/dequeue lifecycle tracking.
++	 *
++	 * For scenario 0 (Local DSQ), both enqueues and dequeues should be
++	 * 0 because tasks bypass the BPF scheduler entirely: they never
++	 * enter BPF scheduler's custody. For scenario 1 (ser DSQ) , we
++	 * expect both enqueues and dequeues.
++	 *
++	 * The BPF code does strict state machine validation with
++	 * scx_bpf_error() to ensure the workflow semantics are correct. If
++	 * we reach here without errors, the semantics are validated
++	 * correctly.
++	 */
++	if (scenario == 0) {
++		/* Local DSQ: tasks bypass BPF scheduler completely */
++		SCX_EQ(enq_delta, 0);
++		SCX_EQ(deq_delta, 0);
++		SCX_EQ(dispatch_deq_delta, 0);
++		SCX_EQ(change_deq_delta, 0);
++	} else {
++		/* Non-local DSQ: tasks enter BPF scheduler's custody */
++		SCX_GT(enq_delta, 0);
++		SCX_GT(deq_delta, 0);
++		/* Validate 1:1 enqueue/dequeue pairing */
++		SCX_EQ(enq_delta, deq_delta);
++	}
++
++	return SCX_TEST_PASS;
++}
++
++static enum scx_test_status setup(void **ctx)
++{
++	struct dequeue *skel;
++
++	skel = dequeue__open();
++	SCX_FAIL_IF(!skel, "Failed to open skel");
++	SCX_ENUM_INIT(skel);
++	SCX_FAIL_IF(dequeue__load(skel), "Failed to load skel");
++
++	*ctx = skel;
++
++	return SCX_TEST_PASS;
++}
++
++static enum scx_test_status run(void *ctx)
++{
++	struct dequeue *skel = ctx;
++	enum scx_test_status status;
++
++	status = run_scenario(skel, 0, "Local DSQ (direct dispatch)");
++	if (status != SCX_TEST_PASS)
++		return status;
++
++	status = run_scenario(skel, 1, "User DSQ");
++	if (status != SCX_TEST_PASS)
++		return status;
++
++	printf("\n=== Summary ===\n");
++	printf("Total enqueues: %lu\n", (unsigned long)skel->bss->enqueue_cnt);
++	printf("Total dequeues: %lu\n", (unsigned long)skel->bss->dequeue_cnt);
++	printf("  Dispatch dequeues: %lu (no flag, normal workflow)\n",
++	       (unsigned long)skel->bss->dispatch_dequeue_cnt);
++	printf("  Property change dequeues: %lu (SCX_DEQ_SCHED_CHANGE flag)\n",
++	       (unsigned long)skel->bss->change_dequeue_cnt);
++	printf("\nAll scenarios passed - no state machine violations detected\n");
++	printf("-> Validated: Local DSQ dispatch bypasses BPF scheduler (no dequeue callbacks)\n");
++	printf("-> Validated: Non-local DSQ dispatch triggers dequeue callbacks\n");
++	printf("-> Validated: Dispatch dequeues have no flags (normal workflow)\n");
++	printf("-> Validated: Async dequeues have SCX_DEQ_SCHED_CHANGE flag (interruptions)\n");
++	printf("-> Validated: No duplicate enqueues or invalid state transitions\n");
++
++	return SCX_TEST_PASS;
++}
++
++static void cleanup(void *ctx)
++{
++	struct dequeue *skel = ctx;
++
++	dequeue__destroy(skel);
++}
++
++struct scx_test dequeue_test = {
++	.name = "dequeue",
++	.description = "Verify ops.dequeue() semantics for local and non-local DSQ dispatch",
++	.setup = setup,
++	.run = run,
++	.cleanup = cleanup,
++};
++
++REGISTER_SCX_TEST(&dequeue_test)
+diff --git a/tools/testing/selftests/sched_ext/rt_stall.bpf.c b/tools/testing/selftests/sched_ext/rt_stall.bpf.c
+new file mode 100644
+index 000000000..80086779d
+--- /dev/null
++++ b/tools/testing/selftests/sched_ext/rt_stall.bpf.c
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * A scheduler that verified if RT tasks can stall SCHED_EXT tasks.
++ *
++ * Copyright (c) 2025 NVIDIA Corporation.
++ */
++
++#include <scx/common.bpf.h>
++
++char _license[] SEC("license") = "GPL";
++
++UEI_DEFINE(uei);
++
++void BPF_STRUCT_OPS(rt_stall_exit, struct scx_exit_info *ei)
++{
++	UEI_RECORD(uei, ei);
++}
++
++SEC(".struct_ops.link")
++struct sched_ext_ops rt_stall_ops = {
++	.exit			= (void *)rt_stall_exit,
++	.name			= "rt_stall",
++};
+diff --git a/tools/testing/selftests/sched_ext/rt_stall.c b/tools/testing/selftests/sched_ext/rt_stall.c
+new file mode 100644
+index 000000000..015200f80
+--- /dev/null
++++ b/tools/testing/selftests/sched_ext/rt_stall.c
+@@ -0,0 +1,240 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2025 NVIDIA Corporation.
++ */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sched.h>
++#include <sys/prctl.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <time.h>
++#include <linux/sched.h>
++#include <signal.h>
++#include <bpf/bpf.h>
++#include <scx/common.h>
++#include <unistd.h>
++#include "rt_stall.bpf.skel.h"
++#include "scx_test.h"
++#include "../kselftest.h"
++
++#define CORE_ID		0	/* CPU to pin tasks to */
++#define RUN_TIME        5	/* How long to run the test in seconds */
++
++/* Simple busy-wait function for test tasks */
++static void process_func(void)
++{
++	while (1) {
++		/* Busy wait */
++		for (volatile unsigned long i = 0; i < 10000000UL; i++)
++			;
++	}
++}
++
++/* Set CPU affinity to a specific core */
++static void set_affinity(int cpu)
++{
++	cpu_set_t mask;
++
++	CPU_ZERO(&mask);
++	CPU_SET(cpu, &mask);
++	if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
++		perror("sched_setaffinity");
++		exit(EXIT_FAILURE);
++	}
++}
++
++/* Set task scheduling policy and priority */
++static void set_sched(int policy, int priority)
++{
++	struct sched_param param;
++
++	param.sched_priority = priority;
++	if (sched_setscheduler(0, policy, &param) != 0) {
++		perror("sched_setscheduler");
++		exit(EXIT_FAILURE);
++	}
++}
++
++/* Get process runtime from /proc/<pid>/stat */
++static float get_process_runtime(int pid)
++{
++	char path[256];
++	FILE *file;
++	long utime, stime;
++	int fields;
++
++	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
++	file = fopen(path, "r");
++	if (file == NULL) {
++		perror("Failed to open stat file");
++		return -1;
++	}
++
++	/* Skip the first 13 fields and read the 14th and 15th */
++	fields = fscanf(file,
++			"%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
++			&utime, &stime);
++	fclose(file);
++
++	if (fields != 2) {
++		fprintf(stderr, "Failed to read stat file\n");
++		return -1;
++	}
++
++	/* Calculate the total time spent in the process */
++	long total_time = utime + stime;
++	long ticks_per_second = sysconf(_SC_CLK_TCK);
++	float runtime_seconds = total_time * 1.0 / ticks_per_second;
++
++	return runtime_seconds;
++}
++
++static enum scx_test_status setup(void **ctx)
++{
++	struct rt_stall *skel;
++
++	skel = rt_stall__open();
++	SCX_FAIL_IF(!skel, "Failed to open");
++	SCX_ENUM_INIT(skel);
++	SCX_FAIL_IF(rt_stall__load(skel), "Failed to load skel");
++
++	*ctx = skel;
++
++	return SCX_TEST_PASS;
++}
++
++static bool sched_stress_test(bool is_ext)
++{
++	/*
++	 * We're expecting the EXT task to get around 5% of CPU time when
++	 * competing with the RT task (small 1% fluctuations are expected).
++	 *
++	 * However, the EXT task should get at least 4% of the CPU to prove
++	 * that the EXT deadline server is working correctly. A percentage
++	 * less than 4% indicates a bug where RT tasks can potentially
++	 * stall SCHED_EXT tasks, causing the test to fail.
++	 */
++	const float expected_min_ratio = 0.04; /* 4% */
++	const char *class_str = is_ext ? "EXT" : "FAIR";
++
++	float ext_runtime, rt_runtime, actual_ratio;
++	int ext_pid, rt_pid;
++
++	ksft_print_header();
++	ksft_set_plan(1);
++
++	/* Create and set up a EXT task */
++	ext_pid = fork();
++	if (ext_pid == 0) {
++		set_affinity(CORE_ID);
++		process_func();
++		exit(0);
++	} else if (ext_pid < 0) {
++		perror("fork task");
++		ksft_exit_fail();
++	}
++
++	/* Create an RT task */
++	rt_pid = fork();
++	if (rt_pid == 0) {
++		set_affinity(CORE_ID);
++		set_sched(SCHED_FIFO, 50);
++		process_func();
++		exit(0);
++	} else if (rt_pid < 0) {
++		perror("fork for RT task");
++		ksft_exit_fail();
++	}
++
++	/* Let the processes run for the specified time */
++	sleep(RUN_TIME);
++
++	/* Get runtime for the EXT task */
++	ext_runtime = get_process_runtime(ext_pid);
++	if (ext_runtime == -1)
++		ksft_exit_fail_msg("Error getting runtime for %s task (PID %d)\n",
++				   class_str, ext_pid);
++	ksft_print_msg("Runtime of %s task (PID %d) is %f seconds\n",
++		       class_str, ext_pid, ext_runtime);
++
++	/* Get runtime for the RT task */
++	rt_runtime = get_process_runtime(rt_pid);
++	if (rt_runtime == -1)
++		ksft_exit_fail_msg("Error getting runtime for RT task (PID %d)\n", rt_pid);
++	ksft_print_msg("Runtime of RT task (PID %d) is %f seconds\n", rt_pid, rt_runtime);
++
++	/* Kill the processes */
++	kill(ext_pid, SIGKILL);
++	kill(rt_pid, SIGKILL);
++	waitpid(ext_pid, NULL, 0);
++	waitpid(rt_pid, NULL, 0);
++
++	/* Verify that the scx task got enough runtime */
++	actual_ratio = ext_runtime / (ext_runtime + rt_runtime);
++	ksft_print_msg("%s task got %.2f%% of total runtime\n",
++		       class_str, actual_ratio * 100);
++
++	if (actual_ratio >= expected_min_ratio) {
++		ksft_test_result_pass("PASS: %s task got more than %.2f%% of runtime\n",
++				      class_str, expected_min_ratio * 100);
++		return true;
++	}
++	ksft_test_result_fail("FAIL: %s task got less than %.2f%% of runtime\n",
++			      class_str, expected_min_ratio * 100);
++	return false;
++}
++
++static enum scx_test_status run(void *ctx)
++{
++	struct rt_stall *skel = ctx;
++	struct bpf_link *link = NULL;
++	bool res;
++	int i;
++
++	/*
++	 * Test if the dl_server is working both with and without the
++	 * sched_ext scheduler attached.
++	 *
++	 * This ensures all the scenarios are covered:
++	 *   - fair_server stop -> ext_server start
++	 *   - ext_server stop -> fair_server stop
++	 */
++	for (i = 0; i < 4; i++) {
++		bool is_ext = i % 2;
++
++		if (is_ext) {
++			memset(&skel->data->uei, 0, sizeof(skel->data->uei));
++			link = bpf_map__attach_struct_ops(skel->maps.rt_stall_ops);
++			SCX_FAIL_IF(!link, "Failed to attach scheduler");
++		}
++		res = sched_stress_test(is_ext);
++		if (is_ext) {
++			SCX_EQ(skel->data->uei.kind, EXIT_KIND(SCX_EXIT_NONE));
++			bpf_link__destroy(link);
++		}
++
++		if (!res)
++			ksft_exit_fail();
++	}
++
++	return SCX_TEST_PASS;
++}
++
++static void cleanup(void *ctx)
++{
++	struct rt_stall *skel = ctx;
++
++	rt_stall__destroy(skel);
++}
++
++struct scx_test rt_stall = {
++	.name = "rt_stall",
++	.description = "Verify that RT tasks cannot stall SCHED_EXT tasks",
++	.setup = setup,
++	.run = run,
++	.cleanup = cleanup,
++};
++REGISTER_SCX_TEST(&rt_stall)
+diff --git a/tools/testing/selftests/sched_ext/total_bw.c b/tools/testing/selftests/sched_ext/total_bw.c
+new file mode 100644
+index 000000000..5b0a619ba
+--- /dev/null
++++ b/tools/testing/selftests/sched_ext/total_bw.c
+@@ -0,0 +1,281 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Test to verify that total_bw value remains consistent across all CPUs
++ * in different BPF program states.
++ *
++ * Copyright (C) 2025 NVIDIA Corporation.
++ */
++#include <bpf/bpf.h>
++#include <errno.h>
++#include <pthread.h>
++#include <scx/common.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include "minimal.bpf.skel.h"
++#include "scx_test.h"
++
++#define MAX_CPUS 512
++#define STRESS_DURATION_SEC 5
++
++struct total_bw_ctx {
++	struct minimal *skel;
++	long baseline_bw[MAX_CPUS];
++	int nr_cpus;
++};
++
++static void *cpu_stress_thread(void *arg)
++{
++	volatile int i;
++	time_t end_time = time(NULL) + STRESS_DURATION_SEC;
++
++	while (time(NULL) < end_time)
++		for (i = 0; i < 1000000; i++)
++			;
++
++	return NULL;
++}
++
++/*
++ * The first enqueue on a CPU causes the DL server to start, for that
++ * reason run stressor threads in the hopes it schedules on all CPUs.
++ */
++static int run_cpu_stress(int nr_cpus)
++{
++	pthread_t *threads;
++	int i, ret = 0;
++
++	threads = calloc(nr_cpus, sizeof(pthread_t));
++	if (!threads)
++		return -ENOMEM;
++
++	/* Create threads to run on each CPU */
++	for (i = 0; i < nr_cpus; i++) {
++		if (pthread_create(&threads[i], NULL, cpu_stress_thread, NULL)) {
++			ret = -errno;
++			fprintf(stderr, "Failed to create thread %d: %s\n", i, strerror(-ret));
++			break;
++		}
++	}
++
++	/* Wait for all threads to complete */
++	for (i = 0; i < nr_cpus; i++) {
++		if (threads[i])
++			pthread_join(threads[i], NULL);
++	}
++
++	free(threads);
++	return ret;
++}
++
++static int read_total_bw_values(long *bw_values, int max_cpus)
++{
++	FILE *fp;
++	char line[256];
++	int cpu_count = 0;
++
++	fp = fopen("/sys/kernel/debug/sched/debug", "r");
++	if (!fp) {
++		SCX_ERR("Failed to open debug file");
++		return -1;
++	}
++
++	while (fgets(line, sizeof(line), fp)) {
++		char *bw_str = strstr(line, "total_bw");
++
++		if (bw_str) {
++			bw_str = strchr(bw_str, ':');
++			if (bw_str) {
++				/* Only store up to max_cpus values */
++				if (cpu_count < max_cpus)
++					bw_values[cpu_count] = atol(bw_str + 1);
++				cpu_count++;
++			}
++		}
++	}
++
++	fclose(fp);
++	return cpu_count;
++}
++
++static bool verify_total_bw_consistency(long *bw_values, int count)
++{
++	int i;
++	long first_value;
++
++	if (count <= 0)
++		return false;
++
++	first_value = bw_values[0];
++
++	for (i = 1; i < count; i++) {
++		if (bw_values[i] != first_value) {
++			SCX_ERR("Inconsistent total_bw: CPU0=%ld, CPU%d=%ld",
++				first_value, i, bw_values[i]);
++			return false;
++		}
++	}
++
++	return true;
++}
++
++static int fetch_verify_total_bw(long *bw_values, int nr_cpus)
++{
++	int attempts = 0;
++	int max_attempts = 10;
++	int count;
++
++	/*
++	 * The first enqueue on a CPU causes the DL server to start, for that
++	 * reason run stressor threads in the hopes it schedules on all CPUs.
++	 */
++	if (run_cpu_stress(nr_cpus) < 0) {
++		SCX_ERR("Failed to run CPU stress");
++		return -1;
++	}
++
++	/* Try multiple times to get stable values */
++	while (attempts < max_attempts) {
++		count = read_total_bw_values(bw_values, nr_cpus);
++		fprintf(stderr, "Read %d total_bw values (testing %d CPUs)\n", count, nr_cpus);
++		/* If system has more CPUs than we're testing, that's OK */
++		if (count < nr_cpus) {
++			SCX_ERR("Expected at least %d CPUs, got %d", nr_cpus, count);
++			attempts++;
++			sleep(1);
++			continue;
++		}
++
++		/* Only verify the CPUs we're testing */
++		if (verify_total_bw_consistency(bw_values, nr_cpus)) {
++			fprintf(stderr, "Values are consistent: %ld\n", bw_values[0]);
++			return 0;
++		}
++
++		attempts++;
++		sleep(1);
++	}
++
++	return -1;
++}
++
++static enum scx_test_status setup(void **ctx)
++{
++	struct total_bw_ctx *test_ctx;
++
++	if (access("/sys/kernel/debug/sched/debug", R_OK) != 0) {
++		fprintf(stderr, "Skipping test: debugfs sched/debug not accessible\n");
++		return SCX_TEST_SKIP;
++	}
++
++	test_ctx = calloc(1, sizeof(*test_ctx));
++	if (!test_ctx)
++		return SCX_TEST_FAIL;
++
++	test_ctx->nr_cpus = sysconf(_SC_NPROCESSORS_ONLN);
++	if (test_ctx->nr_cpus <= 0) {
++		free(test_ctx);
++		return SCX_TEST_FAIL;
++	}
++
++	/* If system has more CPUs than MAX_CPUS, just test the first MAX_CPUS */
++	if (test_ctx->nr_cpus > MAX_CPUS)
++		test_ctx->nr_cpus = MAX_CPUS;
++
++	/* Test scenario 1: BPF program not loaded */
++	/* Read and verify baseline total_bw before loading BPF program */
++	fprintf(stderr, "BPF prog initially not loaded, reading total_bw values\n");
++	if (fetch_verify_total_bw(test_ctx->baseline_bw, test_ctx->nr_cpus) < 0) {
++		SCX_ERR("Failed to get stable baseline values");
++		free(test_ctx);
++		return SCX_TEST_FAIL;
++	}
++
++	/* Load the BPF skeleton */
++	test_ctx->skel = minimal__open();
++	if (!test_ctx->skel) {
++		free(test_ctx);
++		return SCX_TEST_FAIL;
++	}
++
++	SCX_ENUM_INIT(test_ctx->skel);
++	if (minimal__load(test_ctx->skel)) {
++		minimal__destroy(test_ctx->skel);
++		free(test_ctx);
++		return SCX_TEST_FAIL;
++	}
++
++	*ctx = test_ctx;
++	return SCX_TEST_PASS;
++}
++
++static enum scx_test_status run(void *ctx)
++{
++	struct total_bw_ctx *test_ctx = ctx;
++	struct bpf_link *link;
++	long loaded_bw[MAX_CPUS];
++	long unloaded_bw[MAX_CPUS];
++	int i;
++
++	/* Test scenario 2: BPF program loaded */
++	link = bpf_map__attach_struct_ops(test_ctx->skel->maps.minimal_ops);
++	if (!link) {
++		SCX_ERR("Failed to attach scheduler");
++		return SCX_TEST_FAIL;
++	}
++
++	fprintf(stderr, "BPF program loaded, reading total_bw values\n");
++	if (fetch_verify_total_bw(loaded_bw, test_ctx->nr_cpus) < 0) {
++		SCX_ERR("Failed to get stable values with BPF loaded");
++		bpf_link__destroy(link);
++		return SCX_TEST_FAIL;
++	}
++	bpf_link__destroy(link);
++
++	/* Test scenario 3: BPF program unloaded */
++	fprintf(stderr, "BPF program unloaded, reading total_bw values\n");
++	if (fetch_verify_total_bw(unloaded_bw, test_ctx->nr_cpus) < 0) {
++		SCX_ERR("Failed to get stable values after BPF unload");
++		return SCX_TEST_FAIL;
++	}
++
++	/* Verify all three scenarios have the same total_bw values */
++	for (i = 0; i < test_ctx->nr_cpus; i++) {
++		if (test_ctx->baseline_bw[i] != loaded_bw[i]) {
++			SCX_ERR("CPU%d: baseline_bw=%ld != loaded_bw=%ld",
++				i, test_ctx->baseline_bw[i], loaded_bw[i]);
++			return SCX_TEST_FAIL;
++		}
++
++		if (test_ctx->baseline_bw[i] != unloaded_bw[i]) {
++			SCX_ERR("CPU%d: baseline_bw=%ld != unloaded_bw=%ld",
++				i, test_ctx->baseline_bw[i], unloaded_bw[i]);
++			return SCX_TEST_FAIL;
++		}
++	}
++
++	fprintf(stderr, "All total_bw values are consistent across all scenarios\n");
++	return SCX_TEST_PASS;
++}
++
++static void cleanup(void *ctx)
++{
++	struct total_bw_ctx *test_ctx = ctx;
++
++	if (test_ctx) {
++		if (test_ctx->skel)
++			minimal__destroy(test_ctx->skel);
++		free(test_ctx);
++	}
++}
++
++struct scx_test total_bw = {
++	.name = "total_bw",
++	.description = "Verify total_bw consistency across BPF program states",
++	.setup = setup,
++	.run = run,
++	.cleanup = cleanup,
++};
++REGISTER_SCX_TEST(&total_bw)
+-- 
+2.52.0
+
