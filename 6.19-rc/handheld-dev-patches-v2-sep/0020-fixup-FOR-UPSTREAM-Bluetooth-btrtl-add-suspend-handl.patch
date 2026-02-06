@@ -1,0 +1,281 @@
+From 94d2f6820fdc8f0ec2950cd1c9c8aaead9cbe33e Mon Sep 17 00:00:00 2001
+From: Robert Beckett <bob.beckett@collabora.com>
+Date: Tue, 18 Feb 2025 19:24:07 +0000
+Subject: [PATCH 020/108] fixup! [FOR-UPSTREAM] Bluetooth: btrtl: add suspend
+ handling to ignore BT_DIS
+
+Turns out 5/7 call chains that can lead to the close flushing the
+request work come from another work item, most of which don't set any
+state that we can gate the enabling on.
+
+Given the number of possible paths that this can end up with a guranteed
+lock inversion issue, it seems more prudent to rely on the same
+guarantees that made the original btrtl code not need to lock, which
+was to only do requests at start of day before registering with the
+HCI subsystem so that no lock taking is ever required.
+
+This commit simplifies the design considerably, and avoids any chance
+of the lock inversion happing.
+
+Signed-off-by: Robert Beckett <bob.beckett@collabora.com>
+---
+ drivers/bluetooth/btrtl.c | 107 +++++++++-----------------------------
+ drivers/bluetooth/btrtl.h |  13 -----
+ drivers/bluetooth/btusb.c |  16 ------
+ 3 files changed, 24 insertions(+), 112 deletions(-)
+
+diff --git a/drivers/bluetooth/btrtl.c b/drivers/bluetooth/btrtl.c
+index 1ecf85f2e..85991c259 100644
+--- a/drivers/bluetooth/btrtl.c
++++ b/drivers/bluetooth/btrtl.c
+@@ -453,18 +453,6 @@ static int btrtl_vendor_read_reg16(struct hci_dev *hdev,
+ 	return 0;
+ }
+ 
+-static int btrtl_vendor_read_reg16_unlocked(struct hci_dev *hdev,
+-					    struct rtl_vendor_cmd *cmd, u8 *rp)
+-{
+-	int ret;
+-
+-	hci_req_sync_lock(hdev);
+-	ret = btrtl_vendor_read_reg16(hdev, cmd, rp);
+-	hci_req_sync_unlock(hdev);
+-
+-	return ret;
+-}
+-
+ static int btrtl_vendor_write_reg16(struct hci_dev *hdev,
+ 				    struct rtl_vendor_cmd *cmd, const u8 * const rp)
+ {
+@@ -493,18 +481,6 @@ static int btrtl_vendor_write_reg16(struct hci_dev *hdev,
+ 	return 0;
+ }
+ 
+-static int btrtl_vendor_write_reg16_unlocked(struct hci_dev *hdev,
+-					    struct rtl_vendor_cmd *cmd, u8 *rp)
+-{
+-	int ret;
+-
+-	hci_req_sync_lock(hdev);
+-	ret = btrtl_vendor_write_reg16(hdev, cmd, rp);
+-	hci_req_sync_unlock(hdev);
+-
+-	return ret;
+-}
+-
+ static void *rtl_iov_pull_data(struct rtl_iovec *iov, u32 len)
+ {
+ 	void *data = iov->data;
+@@ -1363,33 +1339,49 @@ static const struct dmi_system_id btrtl_can_ignore_bt_dis_table[] = {
+ 	{}
+ };
+ 
+-static bool btrtl_fw_can_ignore_bt_dis(struct hci_dev *hdev)
++static void btrtl_handle_fw_can_ignore_bt_dis(struct hci_dev *hdev)
+ {
+ 	struct sk_buff *skb;
+ 	struct hci_rp_read_local_version *rp;
+-	bool ret = false;
++	bool can_ignore = false;
++	u16 ignore_mask;
++	u8 buf[2];
++	int ret;
+ 
+ 	if (!dmi_check_system(btrtl_can_ignore_bt_dis_table))
+-		return false;
++		return;
+ 
+ 	skb = btrtl_read_local_version(hdev);
+ 	if (IS_ERR(skb))
+-		return false;
++		return;
+ 
+ 	rp = (struct hci_rp_read_local_version *)skb->data;
+ 	if (le16_to_cpu(rp->hci_rev) == 0x98d7 &&
+ 	    le16_to_cpu(rp->lmp_subver) == 0x081e)
+-		ret = true;
++		can_ignore = true;
+ 
+ 	kfree_skb(skb);
++	if (!can_ignore)
++		return;
+ 
+-	return ret;
++	ret = btrtl_vendor_read_reg16(hdev, RTL_IGNORE_MASK, buf);
++	if (ret) {
++		rtl_dev_warn(hdev, "failed to read ignore mask, will not wake on bluetooth");
++		return;
++	}
++
++	ignore_mask = get_unaligned_le16(buf);
++	ignore_mask |= RTL_IGNORE_BT_DIS;
++	put_unaligned_le16(ignore_mask, buf);
++
++	ret = btrtl_vendor_write_reg16(hdev, RTL_IGNORE_MASK, buf);
++	if (ret)
++		rtl_dev_warn(hdev, "failed to write ignore mask, will not wake on bluetooth");
+ }
+ 
+ void btrtl_set_quirks(struct hci_dev *hdev, struct btrtl_device_info *btrtl_dev)
+ {
+-	if (btrtl_fw_can_ignore_bt_dis(hdev))
+-		btrealtek_set_flag(hdev, REALTEK_CAN_IGNORE_BT_DIS);
++	btrtl_handle_fw_can_ignore_bt_dis(hdev);
+ 
+ 	/* Enable controller to do both LE scan and BR/EDR inquiry
+ 	 * simultaneously.
+@@ -1603,57 +1595,6 @@ int btrtl_get_uart_settings(struct hci_dev *hdev,
+ }
+ EXPORT_SYMBOL_GPL(btrtl_get_uart_settings);
+ 
+-int btrtl_early_suspend(struct hci_dev *hdev)
+-{
+-	int ret = 0;
+-	u16 ignore_mask;
+-	u8 buf[2];
+-
+-	if (!btrealtek_test_flag(hdev, REALTEK_CAN_IGNORE_BT_DIS))
+-		return -EOPNOTSUPP;
+-
+-	if (hci_dev_test_flag(hdev, HCI_POWERING_DOWN))
+-		return 0;
+-
+-	ret = btrtl_vendor_read_reg16_unlocked(hdev, RTL_IGNORE_MASK, buf);
+-	if (ret)
+-		return ret;
+-
+-	ignore_mask = get_unaligned_le16(buf);
+-	ignore_mask |= RTL_IGNORE_BT_DIS;
+-	put_unaligned_le16(ignore_mask, buf);
+-
+-	ret = btrtl_vendor_write_reg16_unlocked(hdev, RTL_IGNORE_MASK, buf);
+-
+-	return ret;
+-}
+-EXPORT_SYMBOL_GPL(btrtl_early_suspend);
+-
+-int btrtl_late_resume(struct hci_dev *hdev)
+-{
+-	int ret = 0;
+-	u16 ignore_mask;
+-	u8 buf[2];
+-
+-	if (!btrealtek_test_flag(hdev, REALTEK_CAN_IGNORE_BT_DIS))
+-		return -EOPNOTSUPP;
+-
+-	if (hci_dev_test_flag(hdev, HCI_POWERING_DOWN))
+-		return 0;
+-
+-	ret = btrtl_vendor_read_reg16_unlocked(hdev, RTL_IGNORE_MASK, buf);
+-	if (ret)
+-		return ret;
+-
+-	ignore_mask = get_unaligned_le16(buf);
+-	ignore_mask &= ~RTL_IGNORE_BT_DIS;
+-	put_unaligned_le16(ignore_mask, buf);
+-
+-	ret = btrtl_vendor_write_reg16_unlocked(hdev, RTL_IGNORE_MASK, buf);
+-
+-	return ret;
+-}
+-EXPORT_SYMBOL_GPL(btrtl_late_resume);
+ 
+ MODULE_AUTHOR("Daniel Drake <drake@endlessm.com>");
+ MODULE_DESCRIPTION("Bluetooth support for Realtek devices ver " VERSION);
+diff --git a/drivers/bluetooth/btrtl.h b/drivers/bluetooth/btrtl.h
+index 61be34ccb..a2d9d34f9 100644
+--- a/drivers/bluetooth/btrtl.h
++++ b/drivers/bluetooth/btrtl.h
+@@ -105,7 +105,6 @@ struct rtl_vendor_cmd {
+ 
+ enum {
+ 	REALTEK_ALT6_CONTINUOUS_TX_CHIP,
+-	REALTEK_CAN_IGNORE_BT_DIS,
+ 
+ 	__REALTEK_NUM_FLAGS,
+ };
+@@ -149,8 +148,6 @@ int btrtl_get_uart_settings(struct hci_dev *hdev,
+ 			    unsigned int *controller_baudrate,
+ 			    u32 *device_baudrate, bool *flow_control);
+ void btrtl_set_driver_name(struct hci_dev *hdev, const char *driver_name);
+-int btrtl_early_suspend(struct hci_dev *hdev);
+-int btrtl_late_resume(struct hci_dev *hdev);
+ 
+ #else
+ 
+@@ -198,14 +195,4 @@ static inline void btrtl_set_driver_name(struct hci_dev *hdev, const char *drive
+ {
+ }
+ 
+-static inline int btrtl_early_suspend(struct hci_dev *hdev, pm_message_t message)
+-{
+-	return -EOPNOTSUPP;
+-}
+-
+-static inline int btrtl_late_resume(struct hci_dev *hdev)
+-{
+-	return -EOPNOTSUPP;
+-}
+-
+ #endif
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index 77c96a6d4..ded09e94d 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -963,11 +963,9 @@ struct btusb_data {
+ 
+ 	int (*setup_on_usb)(struct hci_dev *hdev);
+ 
+-	int (*early_suspend)(struct hci_dev *hdev);
+ 	int (*suspend)(struct hci_dev *hdev);
+ 	int (*resume)(struct hci_dev *hdev);
+ 	int (*disconnect)(struct hci_dev *hdev);
+-	int (*late_resume)(struct hci_dev *hdev);
+ 
+ 	int oob_wake_irq;   /* irq for out-of-band wake-on-bt */
+ 
+@@ -4302,8 +4300,6 @@ static int btusb_probe(struct usb_interface *intf,
+ 		hdev->shutdown = btrtl_shutdown_realtek;
+ 		hdev->reset = btusb_rtl_reset;
+ 		hdev->hw_error = btusb_rtl_hw_error;
+-		data->early_suspend = btrtl_early_suspend;
+-		data->late_resume = btrtl_late_resume;
+ 
+ 		/* Realtek devices need to set remote wakeup on auto-suspend */
+ 		set_bit(BTUSB_WAKEUP_AUTOSUSPEND, &data->flags);
+@@ -4470,8 +4466,6 @@ static void btusb_disconnect(struct usb_interface *intf)
+ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
+ {
+ 	struct btusb_data *data = usb_get_intfdata(intf);
+-	struct hci_dev *hdev = data->hdev;
+-	int ret = 0;
+ 
+ 	BT_DBG("intf %p", intf);
+ 
+@@ -4484,11 +4478,6 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
+ 	if (data->suspend_count++)
+ 		return 0;
+ 
+-	if (data->early_suspend)
+-		ret = data->early_suspend(hdev);
+-	if (ret && ret != -EOPNOTSUPP)
+-		return ret;
+-
+ 	spin_lock_irq(&data->txlock);
+ 	if (!(PMSG_IS_AUTO(message) && data->tx_in_flight)) {
+ 		set_bit(BTUSB_SUSPENDING, &data->flags);
+@@ -4616,11 +4605,6 @@ static int btusb_resume(struct usb_interface *intf)
+ 	spin_unlock_irq(&data->txlock);
+ 	schedule_work(&data->work);
+ 
+-	if (data->late_resume)
+-		err = data->late_resume(hdev);
+-	if (err && err != -EOPNOTSUPP)
+-		goto done;
+-
+ 	return 0;
+ 
+ failed:
+-- 
+2.52.0
+
