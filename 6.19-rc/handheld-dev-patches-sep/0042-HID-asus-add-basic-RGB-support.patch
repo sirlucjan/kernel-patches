@@ -1,0 +1,311 @@
+From 43d51f4b2da13aadf81669b67031e6fe96c13e36 Mon Sep 17 00:00:00 2001
+From: Antheas Kapenekakis <lkml@antheas.dev>
+Date: Tue, 25 Mar 2025 19:45:58 +0100
+Subject: [PATCH 042/112] HID: asus: add basic RGB support
+
+Adds basic RGB support to hid-asus through multi-index. The interface
+works quite well, but has not gone through much stability testing.
+Applied on demand, if userspace does not touch the RGB sysfs, not
+even initialization is done. Ensuring compatibility with existing
+userspace programs.
+
+Signed-off-by: Antheas Kapenekakis <lkml@antheas.dev>
+---
+ drivers/hid/Kconfig    |   1 +
+ drivers/hid/hid-asus.c | 175 +++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 159 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index 920a64b66..80005c022 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -189,6 +189,7 @@ config HID_APPLETB_KBD
+ config HID_ASUS
+ 	tristate "Asus"
+ 	depends on USB_HID
++	depends on LEDS_CLASS_MULTICOLOR
+ 	depends on LEDS_CLASS
+ 	depends on ASUS_WMI || ASUS_WMI=n
+ 	select POWER_SUPPLY
+diff --git a/drivers/hid/hid-asus.c b/drivers/hid/hid-asus.c
+index de64451e3..799cf43d2 100644
+--- a/drivers/hid/hid-asus.c
++++ b/drivers/hid/hid-asus.c
+@@ -23,6 +23,7 @@
+ /*
+  */
+ 
++#include <linux/array_size.h>
+ #include <linux/dmi.h>
+ #include <linux/hid.h>
+ #include <linux/module.h>
+@@ -30,6 +31,7 @@
+ #include <linux/input/mt.h>
+ #include <linux/usb.h> /* For to_usb_interface for T100 touchpad intf check */
+ #include <linux/power_supply.h>
++#include <linux/led-class-multicolor.h>
+ #include <linux/leds.h>
+ 
+ #include "hid-ids.h"
+@@ -52,6 +54,7 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
+ #define FEATURE_KBD_REPORT_SIZE 64
+ #define FEATURE_KBD_LED_REPORT_ID1 0x5d
+ #define FEATURE_KBD_LED_REPORT_ID2 0x5e
++#define FEATURE_KBD_LED_REPORT_SIZE 7
+ 
+ #define ROG_ALLY_REPORT_SIZE 64
+ #define ROG_ALLY_X_MIN_MCU 313
+@@ -92,6 +95,7 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
+ #define QUIRK_ROG_ALLY_XPAD		BIT(13)
+ #define QUIRK_SKIP_REPORT_FIXUP		BIT(14)
+ #define QUIRK_ROG_NKEY_LEGACY		BIT(15)
++#define QUIRK_ROG_NKEY_RGB		BIT(16)
+ 
+ #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
+ 						 QUIRK_NO_INIT_REPORTS | \
+@@ -104,9 +108,15 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
+ 
+ struct asus_kbd_leds {
+ 	struct asus_hid_listener listener;
++	struct led_classdev_mc mc_led;
++	struct mc_subled subled_info[3];
+ 	struct hid_device *hdev;
+ 	struct work_struct work;
+ 	unsigned int brightness;
++	u8 rgb_colors[3];
++	bool rgb_init;
++	bool rgb_set;
++	bool rgb_registered;
+ 	spinlock_t lock;
+ 	bool removed;
+ };
+@@ -506,11 +516,8 @@ static void asus_schedule_work(struct asus_kbd_leds *led)
+ 	spin_unlock_irqrestore(&led->lock, flags);
+ }
+ 
+-static void asus_kbd_backlight_set(struct asus_hid_listener *listener,
+-				   int brightness)
++static void do_asus_kbd_backlight_set(struct asus_kbd_leds *led, int brightness)
+ {
+-	struct asus_kbd_leds *led = container_of(listener, struct asus_kbd_leds,
+-						 listener);
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&led->lock, flags);
+@@ -520,9 +527,56 @@ static void asus_kbd_backlight_set(struct asus_hid_listener *listener,
+ 	asus_schedule_work(led);
+ }
+ 
+-static void asus_kbd_backlight_work(struct work_struct *work)
++static void asus_kbd_listener_set(struct asus_hid_listener *listener,
++				   int brightness)
++{
++	struct asus_kbd_leds *led = container_of(listener, struct asus_kbd_leds,
++						 listener);
++	do_asus_kbd_backlight_set(led, brightness);
++	if (led->rgb_registered) {
++		led->mc_led.led_cdev.brightness = brightness;
++		led_classdev_notify_brightness_hw_changed(&led->mc_led.led_cdev,
++							  brightness);
++	}
++}
++
++static void asus_kbd_brightness_set(struct led_classdev *led_cdev,
++				    enum led_brightness brightness)
++{
++	struct led_classdev_mc *mc_cdev = lcdev_to_mccdev(led_cdev);
++	struct asus_kbd_leds *led = container_of(mc_cdev, struct asus_kbd_leds,
++						 mc_led);
++	unsigned long flags;
++
++	spin_lock_irqsave(&led->lock, flags);
++	led->rgb_colors[0] = mc_cdev->subled_info[0].intensity;
++	led->rgb_colors[1] = mc_cdev->subled_info[1].intensity;
++	led->rgb_colors[2] = mc_cdev->subled_info[2].intensity;
++	led->rgb_set = true;
++	spin_unlock_irqrestore(&led->lock, flags);
++
++	do_asus_kbd_backlight_set(led, brightness);
++}
++
++static enum led_brightness asus_kbd_brightness_get(struct led_classdev *led_cdev)
++{
++	struct led_classdev_mc *mc_led;
++	struct asus_kbd_leds *led;
++	enum led_brightness brightness;
++	unsigned long flags;
++
++	mc_led = lcdev_to_mccdev(led_cdev);
++	led = container_of(mc_led, struct asus_kbd_leds, mc_led);
++
++	spin_lock_irqsave(&led->lock, flags);
++	brightness = led->brightness;
++	spin_unlock_irqrestore(&led->lock, flags);
++
++	return brightness;
++}
++
++static void asus_kbd_backlight_work(struct asus_kbd_leds *led)
+ {
+-	struct asus_kbd_leds *led = container_of(work, struct asus_kbd_leds, work);
+ 	u8 buf[] = { FEATURE_KBD_REPORT_ID, 0xba, 0xc5, 0xc4, 0x00 };
+ 	int ret;
+ 	unsigned long flags;
+@@ -627,12 +681,71 @@ static void validate_mcu_fw_version(struct hid_device *hdev, int idProduct)
+ 	}
+ }
+ 
++static void asus_kbd_rgb_work(struct asus_kbd_leds *led)
++{
++	u8 rgb_buf[][FEATURE_KBD_LED_REPORT_SIZE] = {
++		{ FEATURE_KBD_LED_REPORT_ID1, 0xB3 }, /* set mode */
++		{ FEATURE_KBD_LED_REPORT_ID1, 0xB5 }, /* apply mode */
++		{ FEATURE_KBD_LED_REPORT_ID1, 0xB4 }, /* save to mem */
++	};
++	unsigned long flags;
++	uint8_t colors[3];
++	bool rgb_init, rgb_set;
++	int ret;
++
++	spin_lock_irqsave(&led->lock, flags);
++	rgb_init = led->rgb_init;
++	rgb_set = led->rgb_set;
++	led->rgb_set = false;
++	colors[0] = led->rgb_colors[0];
++	colors[1] = led->rgb_colors[1];
++	colors[2] = led->rgb_colors[2];
++	spin_unlock_irqrestore(&led->lock, flags);
++
++	if (!rgb_set)
++		return;
++
++	if (rgb_init) {
++		ret = asus_kbd_init(led->hdev, FEATURE_KBD_LED_REPORT_ID1);
++		if (ret < 0) {
++			hid_err(led->hdev, "Asus failed to init RGB: %d\n", ret);
++			return;
++		}
++		spin_lock_irqsave(&led->lock, flags);
++		led->rgb_init = false;
++		spin_unlock_irqrestore(&led->lock, flags);
++	}
++
++	/* Protocol is: 54b3 zone (0=all) mode (0=solid) RGB */
++	rgb_buf[0][4] = colors[0];
++	rgb_buf[0][5] = colors[1];
++	rgb_buf[0][6] = colors[2];
++
++	for (size_t i = 0; i < ARRAY_SIZE(rgb_buf); i++) {
++		ret = asus_kbd_set_report(led->hdev, rgb_buf[i], sizeof(rgb_buf[i]));
++		if (ret < 0) {
++			hid_err(led->hdev, "Asus failed to set RGB: %d\n", ret);
++			return;
++		}
++	}
++}
++
++static void asus_kbd_work(struct work_struct *work)
++{
++	struct asus_kbd_leds *led = container_of(work, struct asus_kbd_leds,
++						 work);
++	asus_kbd_backlight_work(led);
++	asus_kbd_rgb_work(led);
++}
++
+ static int asus_kbd_register_leds(struct hid_device *hdev)
+ {
+ 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+ 	struct usb_interface *intf;
+ 	struct usb_device *udev;
+ 	unsigned char kbd_func;
++	struct asus_kbd_leds *leds;
++	bool rgb_init = true;
+ 	int ret;
+ 
+ 	ret = asus_kbd_init(hdev, FEATURE_KBD_REPORT_ID);
+@@ -647,6 +760,7 @@ static int asus_kbd_register_leds(struct hid_device *hdev)
+ 		ret = asus_kbd_init(hdev, FEATURE_KBD_LED_REPORT_ID1);
+ 		if (ret < 0)
+ 			return ret;
++		rgb_init = false;
+ 	}
+ 
+ 	/* Get keyboard functions */
+@@ -677,20 +791,47 @@ static int asus_kbd_register_leds(struct hid_device *hdev)
+ 	if (!drvdata->kbd_backlight)
+ 		return -ENOMEM;
+ 
+-	drvdata->kbd_backlight->removed = false;
+-	drvdata->kbd_backlight->brightness = 0;
+-	drvdata->kbd_backlight->hdev = hdev;
+-	drvdata->kbd_backlight->listener.brightness_set = asus_kbd_backlight_set;
+-	INIT_WORK(&drvdata->kbd_backlight->work, asus_kbd_backlight_work);
++	leds = drvdata->kbd_backlight;
++	leds->removed = false;
++	leds->brightness = ASUS_EV_MAX_BRIGHTNESS;
++	leds->hdev = hdev;
++	leds->listener.brightness_set = asus_kbd_listener_set;
++
++	leds->rgb_colors[0] = 0;
++	leds->rgb_colors[1] = 0;
++	leds->rgb_colors[2] = 0;
++	leds->rgb_init = rgb_init;
++	leds->rgb_set = false;
++	leds->mc_led.led_cdev.name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
++					"asus-%s:rgb:peripheral",
++					strlen(hdev->uniq) ?
++					hdev->uniq : dev_name(&hdev->dev));
++	leds->mc_led.led_cdev.flags = LED_BRIGHT_HW_CHANGED;
++	leds->mc_led.led_cdev.max_brightness = ASUS_EV_MAX_BRIGHTNESS;
++	leds->mc_led.led_cdev.brightness_set = asus_kbd_brightness_set;
++	leds->mc_led.led_cdev.brightness_get = asus_kbd_brightness_get;
++	leds->mc_led.subled_info = leds->subled_info;
++	leds->mc_led.num_colors = ARRAY_SIZE(leds->subled_info);
++	leds->subled_info[0].color_index = LED_COLOR_ID_RED;
++	leds->subled_info[1].color_index = LED_COLOR_ID_GREEN;
++	leds->subled_info[2].color_index = LED_COLOR_ID_BLUE;
++
++	INIT_WORK(&drvdata->kbd_backlight->work, asus_kbd_work);
+ 	spin_lock_init(&drvdata->kbd_backlight->lock);
+ 
+ 	ret = asus_hid_register_listener(&drvdata->kbd_backlight->listener);
+-	if (ret < 0) {
+-		/* No need to have this still around */
+-		devm_kfree(&hdev->dev, drvdata->kbd_backlight);
++	/* Asus-wmi might not be accessible so this is not fatal. */
++	if (!ret)
++		hid_warn(hdev, "Asus-wmi brightness listener not registered\n");
++
++	if (drvdata->quirks & QUIRK_ROG_NKEY_RGB) {
++		ret = devm_led_classdev_multicolor_register(&hdev->dev, &leds->mc_led);
++		if (!ret)
++			leds->rgb_registered = true;
++		return ret;
+ 	}
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ /*
+@@ -1393,7 +1534,7 @@ static const struct hid_device_id asus_devices[] = {
+ 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ROG_NKEY_LEGACY },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+ 	    USB_DEVICE_ID_ASUSTEK_ROG_Z13_LIGHTBAR),
+-	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
++	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ROG_NKEY_RGB },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+ 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY),
+ 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ROG_ALLY_XPAD},
+@@ -1422,7 +1563,7 @@ static const struct hid_device_id asus_devices[] = {
+ 	 */
+ 	{ HID_DEVICE(BUS_USB, HID_GROUP_GENERIC,
+ 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_ROG_Z13_FOLIO),
+-	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
++	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_ROG_NKEY_RGB },
+ 	{ HID_DEVICE(BUS_USB, HID_GROUP_GENERIC,
+ 		USB_VENDOR_ID_ASUSTEK, USB_DEVICE_ID_ASUSTEK_T101HA_KEYBOARD) },
+ 	{ }
+-- 
+2.52.0
+
