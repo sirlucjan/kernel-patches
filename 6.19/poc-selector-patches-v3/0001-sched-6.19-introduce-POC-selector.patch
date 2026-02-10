@@ -1,0 +1,1565 @@
+From cea92e259a81985af133a2dfa3bcb8eacf7a6c53 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Tue, 10 Feb 2026 09:28:04 +0100
+Subject: [PATCH] sched-6.19: introduce POC selector
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ include/linux/sched/topology.h |   27 +-
+ init/Kconfig                   |   26 +
+ kernel/sched/fair.c            |   46 +-
+ kernel/sched/idle.c            |    6 +
+ kernel/sched/poc_selector.c    | 1115 ++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h           |   98 +++
+ kernel/sched/topology.c        |  125 ++++
+ 7 files changed, 1440 insertions(+), 3 deletions(-)
+ create mode 100644 kernel/sched/poc_selector.c
+
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 45c0022b9..a29aa5c2d 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -66,8 +66,31 @@ struct sched_group;
+ struct sched_domain_shared {
+ 	atomic_t	ref;
+ 	atomic_t	nr_busy_cpus;
+-	int		has_idle_cores;
+-	int		nr_idle_scan;
++	int			has_idle_cores;
++	int			nr_idle_scan;
++#ifdef CONFIG_SCHED_POC_SELECTOR
++	/*
++	 * POC Selector: per-LLC atomic64 idle masks (cake inspired)
++	 *
++	 * Supports up to 64 CPUs per LLC (single word).
++	 * LLCs with 65+ CPUs fall through to CFS standard path.
++	 *
++	 * Cacheline-aligned: LOCK-prefixed writes to these bitmaps on
++	 * every idle transition must not invalidate the cache line
++	 * containing nr_busy_cpus / has_idle_cores / nr_idle_scan.
++	 */
++	atomic64_t	poc_idle_cpus  ____cacheline_aligned;
++	atomic64_t	poc_idle_cores;		/* physical core idle mask */
++	int			poc_cpu_base;		/* smallest CPU ID in this LLC */
++	u8			poc_affinity_shift;	/* bit shift for cpumask alignment */
++	u8			poc_cluster_shift;	/* log2(cluster_size) in POC bit space */
++	bool		poc_fast_eligible;	/* true when LLC CPU count <= 64 */
++	bool		poc_cluster_valid;	/* true when shift-based cluster mask works */
++	u64			poc_cluster_mask[64];	/* pre-computed cluster masks */
++#ifdef CONFIG_SCHED_SMT
++	u64			poc_smt_siblings[64];	/* pre-computed SMT sibling masks */
++#endif /* CONFIG_SCHED_SMT */
++#endif /* CONFIG_SCHED_POC_SELECTOR */
+ };
+ 
+ struct sched_domain {
+diff --git a/init/Kconfig b/init/Kconfig
+index fa79feb8f..4a6c7a0e2 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1442,6 +1442,32 @@ config SCHED_AUTOGROUP
+ 	  desktop applications.  Task group autogeneration is currently based
+ 	  upon task session.
+ 
++config SCHED_POC_SELECTOR
++	bool "Piece-Of-Cake Fast Idle CPU Selector"
++	depends on SMP
++	default y
++	help
++	  Idle CPU selector using cached bitmasks inspired by the scx_cake BPF
++	  scheduler. Reduces select_idle_cpu overhead by using bitmap scanning.
++
++	  This optimization does not affect scheduler fairness - it only
++	  speeds up the process of finding an idle CPU for task wakeup.
++
++	  If unsure, say Y.
++
++config SCHED_POC_SELECTOR_DEBUG
++	bool "POC Selector debug counters"
++	depends on SCHED_POC_SELECTOR && SYSFS
++	default n
++	help
++	  Expose per-level hit counters and per-CPU selection counters
++	  via sysfs (/sys/kernel/poc_selector/).
++
++	  Counters: hit, fallthrough, sticky, l2_hit, llc_hit, per-CPU selected.
++	  SMT search count can be derived as (hit - sticky - l2_hit - llc_hit).
++
++	  If unsure, say N.
++
+ config RELAY
+ 	bool "Kernel->user space relay support (formerly relayfs)"
+ 	select IRQ_WORK
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3eaeceda7..4bd2367d1 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7373,6 +7373,10 @@ static int wake_affine(struct sched_domain *sd, struct task_struct *p,
+ 	return target;
+ }
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++#include "poc_selector.c"
++#endif
++
+ static struct sched_group *
+ sched_balance_find_dst_group(struct sched_domain *sd, struct task_struct *p, int this_cpu);
+ 
+@@ -7393,6 +7397,14 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
+ 	if (group->group_weight == 1)
+ 		return cpumask_first(sched_group_span(group));
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++	/* POC fast path: O(1) idle CPU lookup for LLC-internal groups */
++	i = poc_find_idle_cpu_in_group(
++		this_cpu, sched_group_span(group), p->cpus_ptr);
++	if (i >= 0)
++		return i;
++#endif
++
+ 	/* Traverse only the allowed CPUs */
+ 	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
+ 		struct rq *rq = cpu_rq(i);
+@@ -7869,9 +7881,38 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if (!sd)
+ 		return target;
+ 
+-	if (sched_smt_active()) {
++	if (sched_smt_active())
+ 		has_idle_core = test_idle_cores(target);
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++	{
++		struct sched_domain_shared *sd_share;
++
++		sd_share = rcu_dereference(per_cpu(sd_llc_shared, target));
++		if (sd_share &&
++		    static_branch_likely(&sched_poc_enabled) &&
++		    !sched_asym_cpucap_active()) {
++			int poc_cpu;
++
++			prefetch(&sd_share->poc_idle_cpus);
++
++			if (unlikely(!sd_share->poc_fast_eligible))
++				goto idle_cpu_fallbacks;
++
++			poc_cpu = select_idle_cpu_poc(has_idle_core, target,
++							  sd_share, p->cpus_ptr);
++			if (poc_cpu >= 0) {
++				POC_DBG_INC_HIT();
++				POC_DBG_INC_SELECTED(poc_cpu);
++				return poc_cpu;
++			}
++			POC_DBG_INC_FALLTHROUGH();
++			goto idle_cpu_fallbacks;
++		}
++	}
++#endif
++
++	if (sched_smt_active()) {
+ 		if (!has_idle_core && cpus_share_cache(prev, target)) {
+ 			i = select_idle_smt(p, sd, prev);
+ 			if ((unsigned int)i < nr_cpumask_bits)
+@@ -7883,6 +7924,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++idle_cpu_fallbacks:
++#endif
+ 	/*
+ 	 * For cluster machines which have lower sharing cache like L2 or
+ 	 * LLC Tag, we tend to find an idle CPU in the target's cluster
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index abf8f15d6..847e50d65 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -277,6 +277,9 @@ static void do_idle(void)
+ 	__current_set_polling();
+ 	tick_nohz_idle_enter();
+ 
++	/* POC Selector: mark CPU as idle */
++	set_cpu_idle_state(cpu, 1);
++
+ 	while (!need_resched()) {
+ 
+ 		/*
+@@ -334,6 +337,9 @@ static void do_idle(void)
+ 		arch_cpu_idle_exit();
+ 	}
+ 
++	/* POC Selector: mark CPU as busy */
++	set_cpu_idle_state(cpu, 0);
++
+ 	/*
+ 	 * Since we fell out of the loop above, we know TIF_NEED_RESCHED must
+ 	 * be set, propagate it into PREEMPT_NEED_RESCHED.
+diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
+new file mode 100644
+index 000000000..6995589b9
+--- /dev/null
++++ b/kernel/sched/poc_selector.c
+@@ -0,0 +1,1115 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Piece-Of-Cake (POC) CPU Selector
++ *
++ * Fast idle CPU selector inspired by RitzDaCat's scx_cake scheduler
++ * "Piece of Cake" - making idle CPU search a piece of cake!
++ *
++ * Uses per-LLC atomic64_t bitmask for O(1) idle CPU lookup.
++ * Supports up to 64 CPUs per LLC (single 64-bit word).
++ * Includes affinity-aware filtering via cpumask intersection.
++ *
++ * When the fast path is not eligible (LLC exceeds 64 CPUs),
++ * returns -1 to let CFS standard select_idle_cpu handle it.
++ *
++ * Copyright (C) 2026 Masahito Suzuki
++ *
++ * Acknowledgements:
++ *   This work is heavily inspired by RitzDaCat's scx_cake scheduler.
++ *
++ *   Special thanks to the algorithm inventors whose research enabled
++ *   the O(1) techniques used in this implementation:
++ *
++ *     - Prashant Pandey, Michael A. Bender, Rob Johnson
++ *       ("A Fast x86 Implementation of Select")
++ *
++ *     - Daniel Lemire
++ *       ("Fast Random Integer Generation in an Interval")
++ */
++
++#ifdef CONFIG_SCHED_POC_SELECTOR
++
++/**************************************************************
++ * Version and configuration macros:
++ */
++
++#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
++#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
++
++#define SCHED_POC_SELECTOR_VERSION  "1.9.2"
++
++/*
++ * IF_SMT - conditionally include code only when SMT is enabled.
++ * On non-SMT systems, cpu_smt_mask() returns only self, so SMT
++ * sibling searches are useless.  Skip them entirely at compile time.
++ */
++#ifdef CONFIG_SCHED_SMT
++#define IF_SMT(code) code
++#else
++#define IF_SMT(code)
++#endif /* CONFIG_SCHED_SMT */
++
++/**************************************************************
++ * Static keys:
++ */
++
++/*
++ * Runtime control: sched_poc_selector (sysctl kernel.sched_poc_selector)
++ * Static key: enabled by default, toggled via sysctl.
++ * When disabled, all POC paths are NOPed out at zero cost.
++ */
++DEFINE_STATIC_KEY_TRUE(sched_poc_enabled);
++
++/*
++ * L2 cluster search control: sched_poc_l2_cluster_search
++ * (sysctl kernel.sched_poc_l2_cluster_search)
++ *
++ * When enabled (default), Level 2 and Level 5 search within L2 (cluster)
++ * domain before falling back to LLC-wide search.  Disable to skip
++ * cluster-local search for A/B performance comparison.
++ */
++DEFINE_STATIC_KEY_TRUE(sched_poc_l2_cluster_search);
++
++/*
++ * sched_poc_aligned: true when all LLCs have poc_cpu_base aligned to 64
++ *
++ * When true, cpumask-to-POC conversion is a simple word load (zero shift).
++ * When false (e.g., Threadripper CCDs at CPU 8, 16, ...), bit shifting
++ * is needed to align cpumask bits with POC's LLC-relative positions.
++ * Defaults to true; disabled at boot if any LLC has non-aligned base.
++ */
++DEFINE_STATIC_KEY_TRUE(sched_poc_aligned);
++
++/**************************************************************
++ * Per-CPU variables:
++ */
++
++/*
++ * Per-CPU round-robin counter for idle CPU selection.
++ * Combined with CPU ID via golden ratio hash to ensure:
++ * - No atomic contention (per-CPU)
++ * - No thundering herd (different CPUs produce different seeds)
++ * - Good distribution (golden ratio multiplication)
++ */
++#define POC_HASH_MULT 0x9E3779B9U  /* golden ratio * 2^32 */
++static DEFINE_PER_CPU(u32, poc_rr_counter);
++
++/**************************************************************
++ * Debug counters:
++ *
++ * hit / fallthrough / selected are counted at the call site (fair.c).
++ * sticky / l2_hit / llc_hit are counted inside the DEFINE_SELECT_IDLE_CPU_POC macro.
++ */
++
++#ifdef CONFIG_SCHED_POC_SELECTOR_DEBUG
++static DEFINE_PER_CPU(u32, poc_dbg_hit);
++static DEFINE_PER_CPU(u32, poc_dbg_fallthrough);
++static DEFINE_PER_CPU(u32, poc_dbg_sticky);
++static DEFINE_PER_CPU(u32, poc_dbg_l2_hit);
++static DEFINE_PER_CPU(u32, poc_dbg_llc_hit);
++#ifdef CONFIG_SCHED_SMT
++static DEFINE_PER_CPU(u32, poc_dbg_smt_tgt);
++static DEFINE_PER_CPU(u32, poc_dbg_l2_smt);
++#endif /* CONFIG_SCHED_SMT */
++static DEFINE_PER_CPU(atomic_t, poc_dbg_selected);
++
++#define POC_DBG_INC_HIT()          __this_cpu_inc(poc_dbg_hit)
++#define POC_DBG_INC_FALLTHROUGH()  __this_cpu_inc(poc_dbg_fallthrough)
++#define POC_DBG_INC_STICKY()      __this_cpu_inc(poc_dbg_sticky)
++#define POC_DBG_INC_L2_HIT()      __this_cpu_inc(poc_dbg_l2_hit)
++#define POC_DBG_INC_LLC_HIT()     __this_cpu_inc(poc_dbg_llc_hit)
++#ifdef CONFIG_SCHED_SMT
++#define POC_DBG_INC_SMT_TGT()     __this_cpu_inc(poc_dbg_smt_tgt)
++#define POC_DBG_INC_L2_SMT()      __this_cpu_inc(poc_dbg_l2_smt)
++#else
++#define POC_DBG_INC_SMT_TGT()     do {} while (0)
++#define POC_DBG_INC_L2_SMT()      do {} while (0)
++#endif /* CONFIG_SCHED_SMT */
++#define POC_DBG_INC_SELECTED(cpu)  atomic_inc(&per_cpu(poc_dbg_selected, cpu))
++#else
++#define POC_DBG_INC_HIT()          do {} while (0)
++#define POC_DBG_INC_FALLTHROUGH()  do {} while (0)
++#define POC_DBG_INC_STICKY()      do {} while (0)
++#define POC_DBG_INC_L2_HIT()      do {} while (0)
++#define POC_DBG_INC_LLC_HIT()     do {} while (0)
++#define POC_DBG_INC_SMT_TGT()     do {} while (0)
++#define POC_DBG_INC_L2_SMT()      do {} while (0)
++#define POC_DBG_INC_SELECTED(cpu)  do {} while (0)
++#endif /* CONFIG_SCHED_POC_SELECTOR_DEBUG */
++
++/**************************************************************
++ * Bit manipulation primitives:
++ */
++
++/*
++ * POC_CTZ64 — Portable Count Trailing Zeros (64-bit)
++ *
++ * Three-tier architecture detection:
++ *
++ *   Tier 1: Native hardware CTZ with well-defined zero semantics
++ *     x86-64 + BMI1 (__BMI__): TZCNT — returns 64 for input 0
++ *     ARM64:                   RBIT + CLZ
++ *     RISC-V Zbb:              CTZ instruction
++ *
++ *   Tier 2: x86-64 without BMI1 (Bulldozer, pre-Haswell, etc.)
++ *     BSF is fast (~3 cyc) but UNDEFINED for input 0.
++ *     On AMD Bulldozer: BSF(0) leaves dest register unchanged (stale value).
++ *     On Intel pre-Haswell: BSF(0) is architecturally undefined.
++ *     Wrap with explicit zero check to guarantee returning 64.
++ *
++ *   Tier 3: De Bruijn fallback (BPF, unknown architectures)
++ *     Software multiply + 64-entry table lookup, branchless O(1).
++ */
++
++/*
++ * POC_CTZ64 is defined in sched.h for use by load balancer functions.
++ * Here we only define POC_CTZ64_NAME for sysfs hardware info display.
++ */
++#if defined(__x86_64__) && defined(__BMI__)
++#define POC_CTZ64_NAME "HW (TZCNT)"
++#elif defined(__aarch64__)
++#define POC_CTZ64_NAME "HW (RBIT+CLZ)"
++#elif defined(__riscv) && defined(__riscv_zbb)
++#define POC_CTZ64_NAME "HW (ctz)"
++#elif defined(__x86_64__)
++#define POC_CTZ64_NAME "HW (BSF)"
++#else
++#define POC_CTZ64_NAME "SW (De Bruijn)"
++#endif
++
++/*
++ * POC_PTSELECT — Select position of the j-th set bit in a 64-bit word
++ *
++ * Based on the algorithm described in:
++ *   P. Pandey, M. A. Bender, R. Johnson,
++ *   "A Fast x86 Implementation of Select", arXiv:1706.00990, 2017.
++ *
++ * Returns the bit position (0-indexed) of the j-th set bit in v.
++ * Undefined behavior if j >= popcount(v).
++ *
++ *   Tier 1 (x86-64 + BMI2, excluding AMD Zen 1/2 slow microcode PDEP):
++ *     PDEP + TZCNT — 4 instructions total.
++ *     PDEP deposits the j-th source bit at the j-th mask position.
++ *
++ *   Tier 2 (fallback): Iterative bit-clear — O(j) iterations
++ *     Clears the lowest set bit j times, then CTZ on remainder.
++ */
++
++#if defined(__x86_64__) && defined(__BMI2__) && \
++    !defined(__znver1) && !defined(__znver2)
++static __always_inline int poc_ptselect(u64 v, int j)
++{
++	u64 deposited;
++
++	asm("pdep %2, %1, %0" : "=r"(deposited) : "r"(1ULL << j), "rm"(v));
++	return POC_CTZ64(deposited);
++}
++#define POC_PTSELECT(v, j) poc_ptselect(v, j)
++#define POC_PTSELECT_NAME "HW (PDEP)"
++
++/*
++ * Tier 2 (fallback): Iterative bit-clear — O(j) iterations.
++ *   Clears the lowest set bit j times, then returns its position via CTZ.
++ */
++#else
++static __always_inline int poc_ptselect_sw(u64 v, int j)
++{
++	int k;
++
++	for (k = 0; k < j; k++)
++		v &= v - 1;	/* clear lowest set bit */
++	return POC_CTZ64(v);
++}
++#define POC_PTSELECT(v, j) poc_ptselect_sw(v, j)
++#define POC_PTSELECT_NAME "SW (loop)"
++
++#endif /* POC_PTSELECT */
++
++/*
++ * Map seed in [0, 2^32) to [0, range) without division — Lemire's fastrange
++ *
++ * Based on the algorithm described in:
++ *   D. Lemire, "Fast Random Integer Generation in an Interval",
++ *   ACM Trans. Model. Comput. Simul. 29, 1, Article 3, 2019.
++ */
++#define POC_FASTRANGE(seed, range) ((u32)(((u64)(seed) * (u32)(range)) >> 32))
++
++/**************************************************************
++ * Core idle state management:
++ */
++
++/*
++ * is_idle_core_poc - Check if all SMT siblings of a CPU are idle
++ * @cpu: CPU number to check
++ * @sd_share: sched_domain_shared containing poc_idle_cpus
++ *
++ * Returns: true if ALL SMT siblings are idle, false otherwise
++ */
++static bool is_idle_core_poc(int cpu, struct sched_domain_shared *sd_share)
++{
++	int base = sd_share->poc_cpu_base;
++	u64 cpus = (u64)atomic64_read(&sd_share->poc_idle_cpus);
++	int sibling;
++
++	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
++		int bit = sibling - base;
++
++		if ((unsigned int)bit >= 64)
++			return false;
++
++		if (!(cpus & (1ULL << bit)))
++			return false;
++	}
++	return true;
++}
++
++/*
++ * __set_cpu_idle_state - Update per-LLC idle masks when CPU goes idle/busy
++ * @cpu: CPU number
++ * @state: 0=busy, 1=idle
++ *
++ * Updates the per-LLC atomic64 idle CPU and core masks using lock-free
++ * atomic64_or/atomic64_andnot operations.  Each CPU only modifies its
++ * own bit, so no additional locking is required.
++ *
++ * CPUs outside the supported range (> 64 per LLC) are silently skipped;
++ * the fast path will not be used for those LLCs anyway.
++ *
++ * Caller (inline wrapper in sched.h) ensures sched_poc_enabled is on
++ * and sched_asym_cpucap_active() is false before calling here.
++ */
++void __set_cpu_idle_state(int cpu, int state)
++{
++	scoped_guard(rcu) {
++		struct sched_domain_shared *sd_share =
++			rcu_dereference(per_cpu(sd_llc_shared, cpu));
++		if (!sd_share || !sd_share->poc_fast_eligible)
++			break;
++
++		int bit = cpu - sd_share->poc_cpu_base;
++
++		if ((unsigned int)bit >= 64)
++			break;
++
++		/* Update logical CPU idle mask */
++		if (state > 0)
++			atomic64_or(1ULL << bit, &sd_share->poc_idle_cpus);
++		else
++			atomic64_andnot(1ULL << bit, &sd_share->poc_idle_cpus);
++
++		/*
++		 * Ensure the CPU mask update is visible before
++		 * reading it back in is_idle_core_poc().
++		 *
++		 * On x86, the preceding LOCK'd atomic64_or/andnot
++		 * already provides full ordering, so this compiles
++		 * to a mere compiler barrier (~0 cyc).  On ARM64
++		 * it emits dmb ish.
++		 */
++		smp_mb__after_atomic();
++
++		/*
++		 * Update physical core idle mask (SMT systems only).
++		 *
++		 * On non-SMT, cpu_smt_mask(cpu) = {cpu} only, so
++		 * poc_idle_cores would be an exact copy of
++		 * poc_idle_cpus.  Skip the redundant LOCK'd atomic.
++		 */
++		if (sched_smt_active()) {
++			int core = cpumask_first(cpu_smt_mask(cpu));
++			int core_bit = core - sd_share->poc_cpu_base;
++
++			if ((unsigned int)core_bit < 64) {
++				if (state > 0 && is_idle_core_poc(cpu, sd_share))
++					atomic64_or(1ULL << core_bit,
++						    &sd_share->poc_idle_cores);
++				else
++					atomic64_andnot(1ULL << core_bit,
++							&sd_share->poc_idle_cores);
++			}
++		}
++	}
++}
++
++/**************************************************************
++ * Idle CPU selection helpers:
++ */
++
++/*
++ * poc_select_rr - Round-robin idle CPU selection from a single-word mask
++ * @mask: idle bitmask (snapshot)
++ * @base: poc_cpu_base (smallest CPU ID in this LLC)
++ * @seed: per-CPU round-robin seed
++ *
++ * Selects uniformly among set bits via FASTRANGE + PTSELECT.
++ * Caller must ensure at least one bit is set in mask.
++ * Returns: selected CPU number.
++ */
++static __always_inline int poc_select_rr(u64 mask, int base, unsigned int seed)
++{
++	int total = hweight64(mask);
++	int pick = POC_FASTRANGE(seed, total);
++
++	return POC_PTSELECT(mask, pick) + base;
++}
++
++/*
++ * poc_cluster_search - Search for an idle CPU within the target's L2 cluster
++ * @mask: snapshot of idle bitmask (cores or cpus, caller decides)
++ * @sd_share: per-LLC shared data containing cluster geometry
++ * @tgt_bit: target CPU's POC-relative bit position
++ * @base: poc_cpu_base (smallest CPU ID in this LLC)
++ *
++ * Uses pre-computed cluster mask for O(1) lookup via CTZ.
++ * Returns: idle CPU number if found within cluster, -1 otherwise.
++ */
++static __always_inline int poc_cluster_search(u64 mask,
++					      struct sched_domain_shared *sd_share,
++					      int tgt_bit, int base)
++{
++	u64 cls_mask, cls_idle;
++
++	if ((unsigned int)tgt_bit >= 64)
++		return -1;
++
++	cls_mask = sd_share->poc_cluster_mask[tgt_bit];
++	cls_idle = mask & cls_mask;
++
++	if (cls_idle)
++		return base + POC_CTZ64(cls_idle);
++
++	return -1;
++}
++
++#ifdef CONFIG_SCHED_SMT
++/*
++ * poc_find_idle_smt_sibling - Find an idle SMT sibling of target CPU
++ * @target: CPU to find sibling for
++ * @cpu_mask: snapshot of idle CPU bitmask
++ * @base: base CPU number for this LLC
++ * @smt_siblings: pre-computed SMT sibling masks
++ *
++ * Uses pre-computed SMT sibling mask for O(1) lookup via CTZ.
++ * Returns: idle sibling CPU number if found, -1 otherwise
++ */
++static __always_inline int poc_find_idle_smt_sibling(int target,
++				u64 cpu_mask, int base, const u64 *smt_siblings)
++{
++	int tgt_bit = target - base;
++	u64 sib_mask, idle_sibs;
++
++	if ((unsigned int)tgt_bit >= 64)
++		return -1;
++
++	sib_mask = smt_siblings[tgt_bit];
++	idle_sibs = cpu_mask & sib_mask;
++
++	if (idle_sibs)
++		return base + POC_CTZ64(idle_sibs);
++
++	return -1;
++}
++#endif /* CONFIG_SCHED_SMT */
++
++/**************************************************************
++ * Fast path dispatcher:
++ */
++
++/*
++ * select_idle_cpu_poc - Fast idle CPU selector (cake-inspired atomic64 path)
++ * @has_idle_core: true if there are idle physical cores
++ * @target: preferred target CPU
++ * @sd_share: per-LLC shared data (caller provides; never NULL)
++ * @allowed: task's cpumask (p->cpus_ptr) for affinity filtering
++ *
++ * Three-phase idle CPU selection using per-LLC atomic64_t mask:
++ *
++ * Phase 1: Early return
++ *   Level 0: Saturation check -- no idle CPUs = return -1
++ *   Level 1: Target sticky    -- target itself is idle (best locality)
++ *
++ * Phase 2: Core search (no SMT contention, physical core exclusive)
++ *   Level 2: L2 domain -- idle core within cluster
++ *   Level 3: L3 domain -- idle core across LLC
++ *
++ * Phase 3: CPU search (all cores busy, SMT fallback)
++ *   Level 4: L1 domain -- target's SMT sibling (L1+L2 shared)
++ *   Level 5: L2 domain -- SMT within cluster (L2 shared)
++ *   Level 6: L3 domain -- any idle CPU via RR
++ *
++ * All masks are filtered by @allowed (affinity) before search.
++ *
++ * Returns: idle CPU number if found, -1 otherwise
++ */
++static __always_inline int select_idle_cpu_poc(bool has_idle_core,
++				int target,
++				struct sched_domain_shared *sd_share,
++				const struct cpumask *allowed)
++{
++	int base = sd_share->poc_cpu_base;
++	int tgt_bit = target - base;
++	u64 affinity;
++	u64 cpu_mask;
++
++	/* Convert affinity mask to POC-relative u64 */
++	affinity = poc_cpumask_to_u64(allowed, sd_share);
++
++	/* Level 0: Snapshot & affinity filter & saturation check */
++	cpu_mask = (u64)atomic64_read(&sd_share->poc_idle_cpus) & affinity;
++	if (!cpu_mask)
++		return -1;
++
++	/* Level 1: Target sticky -- maximize cache locality */
++	if ((unsigned int)tgt_bit < 64 && (cpu_mask & (1ULL << tgt_bit))) {
++		POC_DBG_INC_STICKY();
++		return target;
++	}
++
++	if ((unsigned int)tgt_bit < 64) {
++		prefetch(&sd_share->poc_cluster_mask[tgt_bit]);
++		IF_SMT(prefetch(&sd_share->poc_smt_siblings[tgt_bit]);)
++	}
++
++	/* === Phase 2 & 3: Core search then CPU search === */
++	{
++		unsigned int seed;
++		seed = __this_cpu_inc_return(poc_rr_counter) * POC_HASH_MULT;
++
++		if (has_idle_core && sched_smt_active()) {
++			/* === Phase 2: Core search (no SMT contention) === */
++			u64 core_mask;
++			int cpu;
++
++			core_mask = (u64)atomic64_read(&sd_share->poc_idle_cores) & affinity;
++
++			if (core_mask) {
++				/* Level 2: idle core in L2 cluster (L2 domain) */
++				if (static_branch_likely(&sched_poc_l2_cluster_search)
++				    && static_branch_unlikely(&sched_cluster_active)
++				    && sd_share->poc_cluster_valid) {
++					cpu = poc_cluster_search(core_mask, sd_share,
++							tgt_bit, base);
++					if (cpu >= 0) {
++						POC_DBG_INC_L2_HIT();
++						return cpu;
++					}
++				}
++
++				/* Level 3: idle core across LLC (L3 domain) */
++				POC_DBG_INC_LLC_HIT();
++				return poc_select_rr(core_mask, base, seed);
++			}
++
++			/* === Phase 3: CPU search (all cores busy) === */
++
++			/* Level 4: target's SMT sibling (L1 domain) */
++			IF_SMT(
++			{
++				int smt_tgt = poc_find_idle_smt_sibling(
++					target, cpu_mask, base,
++					sd_share->poc_smt_siblings);
++				if (smt_tgt >= 0) {
++					POC_DBG_INC_SMT_TGT();
++					return smt_tgt;
++				}
++			}
++			)
++
++			/* Level 5: SMT within cluster (L2 domain) */
++			if (static_branch_likely(&sched_poc_l2_cluster_search)
++			    && static_branch_unlikely(&sched_cluster_active)
++			    && sd_share->poc_cluster_valid) {
++				cpu = poc_cluster_search(cpu_mask, sd_share,
++						tgt_bit, base);
++				if (cpu >= 0) {
++					POC_DBG_INC_L2_SMT();
++					return cpu;
++				}
++			}
++
++			/* Level 6: any idle CPU via RR (L3 domain) */
++			return poc_select_rr(cpu_mask, base, seed);
++		}
++
++		/* Non-SMT path: Phase 2 only (no SMT siblings) */
++		/* Level 2: idle CPU within L2 cluster (L2 domain) */
++		if (static_branch_likely(&sched_poc_l2_cluster_search)
++		    && static_branch_unlikely(&sched_cluster_active)
++		    && sd_share->poc_cluster_valid) {
++			int cpu = poc_cluster_search(cpu_mask, sd_share,
++					tgt_bit, base);
++			if (cpu >= 0) {
++				POC_DBG_INC_L2_HIT();
++				return cpu;
++			}
++		}
++
++		/* Level 3: idle CPU across entire LLC (L3 domain) */
++		POC_DBG_INC_LLC_HIT();
++		return poc_select_rr(cpu_mask, base, seed);
++	}
++}
++
++/**************************************************************
++ * Load balancer helpers:
++ *
++ * These functions provide POC acceleration for load balancer paths:
++ * - poc_find_idle_cpu_in_group: O(1) idle CPU lookup for sched_balance_find_dst_group_cpu
++ * - poc_lb_idle_cpus: O(1) idle CPU counting for update_sg_lb_stats
++ */
++
++/*
++ * poc_find_idle_cpu_in_group - Find idle CPU in group using POC bitmap
++ * @this_cpu: current CPU for LLC lookup
++ * @group_span: cpumask of the scheduling group
++ * @allowed: task's allowed cpumask (p->cpus_ptr)
++ *
++ * Returns: idle CPU number, or -1 if none found or POC not applicable
++ *
++ * Used by sched_balance_find_dst_group_cpu() for O(1) idle CPU lookup
++ * when the group is entirely within the LLC.
++ */
++static __always_inline int poc_find_idle_cpu_in_group(int this_cpu,
++						      const struct cpumask *group_span,
++						      const struct cpumask *allowed)
++{
++	struct sched_domain *sd_llc_local;
++	struct sched_domain_shared *sd_share;
++	int base;
++	u64 group_mask, affinity, idle_mask;
++
++	if (!static_branch_likely(&sched_poc_enabled) ||
++	    unlikely(!sched_core_disabled()))
++		return -1;
++
++	sd_llc_local = rcu_dereference(per_cpu(sd_llc, this_cpu));
++	sd_share = rcu_dereference(per_cpu(sd_llc_shared, this_cpu));
++
++	if (!sd_llc_local || !sd_share || !sd_share->poc_fast_eligible)
++		return -1;
++
++	/* Prefetch poc_idle_cpus (separate cacheline) while
++	 * cpumask_subset scans the group/LLC spans below. */
++	prefetch(&sd_share->poc_idle_cpus);
++
++	/* Check if group is entirely within LLC */
++	if (!cpumask_subset(group_span, sched_domain_span(sd_llc_local)))
++		return -1;
++
++	base = sd_share->poc_cpu_base;
++
++	/* Convert group span and affinity to POC-relative u64 */
++	group_mask = poc_cpumask_to_u64(group_span, sd_share);
++	affinity = poc_cpumask_to_u64(allowed, sd_share);
++
++	/* Filter idle CPUs by group and affinity */
++	idle_mask = (u64)atomic64_read(&sd_share->poc_idle_cpus);
++	idle_mask &= group_mask & affinity;
++
++	if (idle_mask)
++		return base + POC_CTZ64(idle_mask);
++
++	return -1;
++}
++
++/*
++ * poc_lb_prepare_idle_check - Prepare POC idle mask for load balancer stats
++ * @dst_cpu: destination CPU for LLC lookup
++ * @group_span: cpumask of the scheduling group
++ * @env_cpus: cpumask of CPUs in load balance environment
++ * @out_idle_mask: output idle mask (POC-relative bits)
++ * @out_base: output POC base CPU number
++ *
++ * Returns: idle CPU count via popcount, or -1 if POC not applicable
++ *
++ * Used by update_sg_lb_stats() to pre-calculate idle CPU count and
++ * prepare the bitmap for O(1) idle checks in the loop.
++ */
++static __always_inline int poc_lb_prepare_idle_check(int dst_cpu,
++						     const struct cpumask *group_span,
++						     const struct cpumask *env_cpus,
++						     u64 *out_idle_mask,
++						     int *out_base)
++{
++	struct sched_domain *sd_llc_local;
++	struct sched_domain_shared *sd_share;
++	u64 group_mask, env_mask, idle_mask;
++
++	if (!static_branch_likely(&sched_poc_enabled))
++		return -1;
++
++	sd_llc_local = rcu_dereference(per_cpu(sd_llc, dst_cpu));
++	sd_share = rcu_dereference(per_cpu(sd_llc_shared, dst_cpu));
++
++	if (!sd_llc_local || !sd_share || !sd_share->poc_fast_eligible)
++		return -1;
++
++	/* Prefetch poc_idle_cpus (separate cacheline) while
++	 * cpumask_subset scans the group/LLC spans below. */
++	prefetch(&sd_share->poc_idle_cpus);
++
++	/* Check if group is entirely within LLC */
++	if (!cpumask_subset(group_span, sched_domain_span(sd_llc_local)))
++		return -1;
++
++	*out_base = sd_share->poc_cpu_base;
++	group_mask = poc_cpumask_to_u64(group_span, sd_share);
++	env_mask = poc_cpumask_to_u64(env_cpus, sd_share);
++	idle_mask = (u64)atomic64_read(&sd_share->poc_idle_cpus);
++	idle_mask &= group_mask & env_mask;
++
++	*out_idle_mask = idle_mask;
++	return hweight64(idle_mask);
++}
++
++/*
++ * poc_lb_is_cpu_idle - Check if CPU is idle using pre-calculated POC mask
++ * @cpu: CPU to check
++ * @idle_mask: POC idle mask from poc_lb_prepare_idle_check
++ * @base: POC base from poc_lb_prepare_idle_check
++ *
++ * Returns: true if CPU is marked idle in POC bitmap
++ */
++static __always_inline bool poc_lb_is_cpu_idle(int cpu, u64 idle_mask, int base)
++{
++	int bit = cpu - base;
++
++	return (unsigned int)bit < 64 && (idle_mask & (1ULL << bit));
++}
++
++/**************************************************************
++ * Sysctl interface and initialization:
++ */
++
++#ifdef CONFIG_SYSCTL
++/*
++ * poc_resync_idle_state - Resync POC idle bitmaps after re-enable
++ *
++ * When POC is re-enabled via sysctl after a period of being disabled,
++ * the idle bitmaps may be stale.  Walk all online CPUs and push the
++ * current idle state into poc_idle_cpus / poc_idle_cores.
++ *
++ * Must be called AFTER static_branch_enable() so that concurrent
++ * idle transitions are also updating the bitmap.
++ * Caller must hold cpus_read_lock().
++ */
++static void poc_resync_idle_state(void)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu)
++		__set_cpu_idle_state(cpu, idle_cpu(cpu));
++}
++
++static int sched_poc_sysctl_handler(const struct ctl_table *table, int write,
++				    void *buffer, size_t *lenp, loff_t *ppos)
++{
++	unsigned int val = static_branch_likely(&sched_poc_enabled) ? 1 : 0;
++	struct ctl_table tmp = {
++		.data    = &val,
++		.maxlen  = sizeof(val),
++		.extra1  = SYSCTL_ZERO,
++		.extra2  = SYSCTL_ONE,
++	};
++	int ret = proc_douintvec_minmax(&tmp, write, buffer, lenp, ppos);
++
++	if (!ret && write) {
++		cpus_read_lock();
++		if (val) {
++			static_branch_enable_cpuslocked(&sched_poc_enabled);
++			poc_resync_idle_state();
++		} else {
++			static_branch_disable_cpuslocked(&sched_poc_enabled);
++		}
++		cpus_read_unlock();
++	}
++	return ret;
++}
++
++static int sched_poc_l2_cluster_sysctl_handler(const struct ctl_table *table, int write,
++				       void *buffer, size_t *lenp, loff_t *ppos)
++{
++	unsigned int val = static_branch_likely(&sched_poc_l2_cluster_search) ? 1 : 0;
++	struct ctl_table tmp = {
++		.data    = &val,
++		.maxlen  = sizeof(val),
++		.extra1  = SYSCTL_ZERO,
++		.extra2  = SYSCTL_ONE,
++	};
++	int ret = proc_douintvec_minmax(&tmp, write, buffer, lenp, ppos);
++
++	if (!ret && write) {
++		if (val)
++			static_branch_enable(&sched_poc_l2_cluster_search);
++		else
++			static_branch_disable(&sched_poc_l2_cluster_search);
++	}
++	return ret;
++}
++
++static struct ctl_table sched_poc_sysctls[] = {
++	{
++		.procname	= "sched_poc_selector",
++		.data		= NULL,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= sched_poc_sysctl_handler,
++	},
++	{
++		.procname	= "sched_poc_l2_cluster_search",
++		.data		= NULL,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= sched_poc_l2_cluster_sysctl_handler,
++	},
++};
++
++static int __init sched_poc_sysctl_init(void)
++{
++	printk(KERN_INFO "%s %s by %s [CTZ: %s, PTSelect: %s]\n",
++		SCHED_POC_SELECTOR_PROGNAME, SCHED_POC_SELECTOR_VERSION,
++		SCHED_POC_SELECTOR_AUTHOR, POC_CTZ64_NAME, POC_PTSELECT_NAME);
++
++	register_sysctl_init("kernel", sched_poc_sysctls);
++	return 0;
++}
++late_initcall(sched_poc_sysctl_init);
++
++#endif /* CONFIG_SYSCTL */
++
++/*
++ * Initialize per-CPU RR counters with CPU ID in upper bits.
++ * This ensures different CPUs produce different seeds without
++ * needing to call smp_processor_id() at runtime.
++ */
++static int __init sched_poc_rr_init(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		per_cpu(poc_rr_counter, cpu) = (u32)cpu << 24;
++	return 0;
++}
++early_initcall(sched_poc_rr_init);
++
++/**************************************************************
++ * Status: sysfs interface (always available)
++ *
++ * Exported at /sys/kernel/poc_selector/status/ for runtime status queries.
++ * Reports whether POC is actually active (combining all conditions).
++ */
++
++#ifdef CONFIG_SYSFS
++
++/* Root kobject shared with debug section */
++static struct kobject *kobj_poc_root;
++
++static bool poc_check_all_llc_eligible(void)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		struct sched_domain_shared *sd_share;
++
++		rcu_read_lock();
++		sd_share = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++		if (sd_share && !sd_share->poc_fast_eligible) {
++			rcu_read_unlock();
++			return false;
++		}
++		rcu_read_unlock();
++	}
++	return true;
++}
++
++static ssize_t active_show(struct kobject *kobj,
++			   struct kobj_attribute *attr, char *buf)
++{
++	bool active = static_branch_likely(&sched_poc_enabled) &&
++		      !sched_asym_cpucap_active() &&
++		      poc_check_all_llc_eligible();
++	return sysfs_emit(buf, "%d\n", active ? 1 : 0);
++}
++
++static ssize_t symmetric_cpucap_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", sched_asym_cpucap_active() ? 0 : 1);
++}
++
++static ssize_t all_llc_eligible_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", poc_check_all_llc_eligible() ? 1 : 0);
++}
++
++static ssize_t version_show(struct kobject *kobj,
++			    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n", SCHED_POC_SELECTOR_VERSION);
++}
++
++static struct kobj_attribute poc_status_active_attr = __ATTR_RO(active);
++static struct kobj_attribute poc_status_asym_attr = __ATTR_RO(symmetric_cpucap);
++static struct kobj_attribute poc_status_eligible_attr = __ATTR_RO(all_llc_eligible);
++static struct kobj_attribute poc_status_version_attr = __ATTR_RO(version);
++
++static struct attribute *poc_status_attrs[] = {
++	&poc_status_active_attr.attr,
++	&poc_status_asym_attr.attr,
++	&poc_status_eligible_attr.attr,
++	&poc_status_version_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group poc_status_group = {
++	.name = "status",
++	.attrs = poc_status_attrs,
++};
++
++/* --- hw_accel: expose which hardware acceleration is in use --- */
++
++#define DEFINE_POC_HW_ATTR(fname, namestr) \
++static ssize_t poc_hw_##fname##_show(struct kobject *kobj, \
++		struct kobj_attribute *attr, char *buf) \
++{ \
++	return sysfs_emit(buf, "%s\n", namestr); \
++} \
++static struct kobj_attribute poc_hw_attr_##fname = { \
++	.attr = { .name = #fname, .mode = 0444 }, \
++	.show = poc_hw_##fname##_show, \
++}
++
++DEFINE_POC_HW_ATTR(ctz, POC_CTZ64_NAME);
++DEFINE_POC_HW_ATTR(ptselect, POC_PTSELECT_NAME);
++
++/* popcnt: x86 uses runtime alternatives, detect via boot_cpu_has */
++static ssize_t poc_hw_popcnt_show(struct kobject *kobj,
++				  struct kobj_attribute *attr, char *buf)
++{
++#if defined(__x86_64__)
++	return sysfs_emit(buf, "%s\n",
++		boot_cpu_has(X86_FEATURE_POPCNT) ? "HW (POPCNT)" : "SW");
++#elif defined(__aarch64__)
++	return sysfs_emit(buf, "HW (CNT)\n");
++#elif defined(__riscv) && defined(__riscv_zbb)
++	return sysfs_emit(buf, "HW (cpop)\n");
++#else
++	return sysfs_emit(buf, "SW\n");
++#endif
++}
++
++static struct kobj_attribute poc_hw_attr_popcnt = {
++	.attr = { .name = "popcnt", .mode = 0444 },
++	.show = poc_hw_popcnt_show,
++};
++
++static struct attribute *poc_hw_attrs[] = {
++	&poc_hw_attr_popcnt.attr,
++	&poc_hw_attr_ctz.attr,
++	&poc_hw_attr_ptselect.attr,
++	NULL,
++};
++
++static const struct attribute_group poc_hw_group = {
++	.name = "hw_accel",
++	.attrs = poc_hw_attrs,
++};
++
++static int __init sched_poc_status_init(void)
++{
++	int ret;
++
++	kobj_poc_root = kobject_create_and_add("poc_selector", kernel_kobj);
++	if (!kobj_poc_root)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(kobj_poc_root, &poc_status_group);
++	if (ret)
++		goto err_status;
++
++	ret = sysfs_create_group(kobj_poc_root, &poc_hw_group);
++	if (ret)
++		goto err_hw;
++
++	return 0;
++
++err_hw:
++	sysfs_remove_group(kobj_poc_root, &poc_status_group);
++err_status:
++	kobject_put(kobj_poc_root);
++	kobj_poc_root = NULL;
++	return ret;
++}
++late_initcall(sched_poc_status_init);
++
++#endif /* CONFIG_SYSFS */
++
++/**************************************************************
++ * Debug: sysfs interface
++ *
++ * Exported at /sys/kernel/poc_selector/ so non-root users can read
++ * counters.  Uses kobject + kobj_attribute (no debugfs dependency).
++ */
++
++#ifdef CONFIG_SCHED_POC_SELECTOR_DEBUG
++
++static u64 poc_dbg_sum_percpu(u32 __percpu *var)
++{
++	u64 sum = 0;
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		sum += per_cpu(*var, cpu);
++	return sum;
++}
++
++/*
++ * Aggregate counter attributes (read-only).
++ * We avoid __ATTR_RO() because "fallthrough" clashes with the
++ * compiler keyword macro; token-pasting (##) prevents expansion.
++ */
++#define DEFINE_POC_DBG_ATTR(ctr) \
++static ssize_t poc_dbg_##ctr##_show(struct kobject *kobj, \
++		struct kobj_attribute *attr, char *buf) \
++{ \
++	return sysfs_emit(buf, "%llu\n", \
++			  poc_dbg_sum_percpu(&poc_dbg_##ctr)); \
++} \
++static struct kobj_attribute poc_attr_##ctr = { \
++	.attr = { .name = #ctr, .mode = 0444 }, \
++	.show = poc_dbg_##ctr##_show, \
++}
++
++DEFINE_POC_DBG_ATTR(hit);
++DEFINE_POC_DBG_ATTR(fallthrough);
++DEFINE_POC_DBG_ATTR(sticky);
++DEFINE_POC_DBG_ATTR(l2_hit);
++DEFINE_POC_DBG_ATTR(llc_hit);
++#ifdef CONFIG_SCHED_SMT
++DEFINE_POC_DBG_ATTR(smt_tgt);
++DEFINE_POC_DBG_ATTR(l2_smt);
++#endif /* CONFIG_SCHED_SMT */
++
++/* Per-CPU selected counter — dynamically allocated per CPU */
++struct poc_selected_attr {
++	struct kobj_attribute kattr;
++	int cpu;
++};
++
++static ssize_t poc_selected_show(struct kobject *kobj,
++				 struct kobj_attribute *attr, char *buf)
++{
++	struct poc_selected_attr *sa =
++		container_of(attr, struct poc_selected_attr, kattr);
++	return sysfs_emit(buf, "%d\n",
++			  atomic_read(&per_cpu(poc_dbg_selected, sa->cpu)));
++}
++
++/* Reset all counters (write-only, root-only) */
++static ssize_t poc_dbg_reset_store(struct kobject *kobj,
++				   struct kobj_attribute *attr,
++				   const char *buf, size_t count)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		per_cpu(poc_dbg_hit, cpu) = 0;
++		per_cpu(poc_dbg_fallthrough, cpu) = 0;
++		per_cpu(poc_dbg_sticky, cpu) = 0;
++		per_cpu(poc_dbg_l2_hit, cpu) = 0;
++		per_cpu(poc_dbg_llc_hit, cpu) = 0;
++#ifdef CONFIG_SCHED_SMT
++		per_cpu(poc_dbg_smt_tgt, cpu) = 0;
++		per_cpu(poc_dbg_l2_smt, cpu) = 0;
++#endif /* CONFIG_SCHED_SMT */
++		atomic_set(&per_cpu(poc_dbg_selected, cpu), 0);
++	}
++	return count;
++}
++
++static struct kobj_attribute poc_attr_reset = {
++	.attr  = { .name = "reset", .mode = 0200 },
++	.store = poc_dbg_reset_store,
++};
++
++/* Attribute groups for batch registration */
++static struct attribute *poc_counter_attrs[] = {
++	&poc_attr_hit.attr,
++	&poc_attr_fallthrough.attr,
++	&poc_attr_sticky.attr,
++	&poc_attr_l2_hit.attr,
++	&poc_attr_llc_hit.attr,
++#ifdef CONFIG_SCHED_SMT
++	&poc_attr_smt_tgt.attr,
++	&poc_attr_l2_smt.attr,
++#endif /* CONFIG_SCHED_SMT */
++	&poc_attr_reset.attr,
++	NULL,
++};
++
++static const struct attribute_group poc_counter_group = {
++	.attrs = poc_counter_attrs,
++};
++
++static int __init sched_poc_debug_init(void)
++{
++	struct kobject *kobj_poc, *kobj_counters, *kobj_cpu;
++	int cpu, ret;
++	bool created_here = false;
++
++	/* Reuse root kobject from status init, or create if not present */
++	kobj_poc = kobj_poc_root;
++	if (!kobj_poc) {
++		kobj_poc = kobject_create_and_add("poc_selector", kernel_kobj);
++		if (!kobj_poc)
++			return -ENOMEM;
++		created_here = true;
++	}
++
++	kobj_counters = kobject_create_and_add("counters", kobj_poc);
++	if (!kobj_counters)
++		goto err_poc;
++
++	ret = sysfs_create_group(kobj_counters, &poc_counter_group);
++	if (ret)
++		goto err_counters;
++
++	kobj_cpu = kobject_create_and_add("cpu", kobj_counters);
++	if (kobj_cpu) {
++		for_each_possible_cpu(cpu) {
++			struct poc_selected_attr *sa;
++
++			sa = kzalloc(sizeof(*sa), GFP_KERNEL);
++			if (!sa)
++				continue;
++			sa->cpu = cpu;
++			sa->kattr.attr.name = kasprintf(GFP_KERNEL, "cpu%d", cpu);
++			if (!sa->kattr.attr.name) {
++				kfree(sa);
++				continue;
++			}
++			sa->kattr.attr.mode = 0444;
++			sa->kattr.show = poc_selected_show;
++			sysfs_attr_init(&sa->kattr.attr);
++			ret = sysfs_create_file(kobj_cpu, &sa->kattr.attr);
++			if (ret) {
++				kfree(sa->kattr.attr.name);
++				kfree(sa);
++			}
++		}
++	}
++
++	return 0;
++
++err_counters:
++	kobject_put(kobj_counters);
++err_poc:
++	if (created_here)
++		kobject_put(kobj_poc);
++	return ret;
++}
++late_initcall(sched_poc_debug_init);
++
++#endif /* CONFIG_SCHED_POC_SELECTOR_DEBUG */
++#endif /* CONFIG_SCHED_POC_SELECTOR */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index bd350e408..b43ebd9c1 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -3299,6 +3299,104 @@ extern void nohz_run_idle_balance(int cpu);
+ static inline void nohz_run_idle_balance(int cpu) { }
+ #endif
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++extern struct static_key_true sched_poc_enabled;
++extern struct static_key_true sched_poc_aligned;
++extern void __set_cpu_idle_state(int cpu, int state);
++static __always_inline void set_cpu_idle_state(int cpu, int state)
++{
++	if (static_branch_likely(&sched_poc_enabled) &&
++	    !sched_asym_cpucap_active())
++		__set_cpu_idle_state(cpu, state);
++}
++
++/*
++ * POC_CTZ64 - Count trailing zeros (find first set bit)
++ *
++ * Architecture-optimized CTZ for POC idle CPU selection.
++ * Returns 64 for input 0 (important for BSF-based implementations).
++ */
++#if defined(__x86_64__) && defined(__BMI__)
++/* Tier 1: x86-64 with BMI1 - TZCNT is zero-safe */
++#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
++
++#elif defined(__aarch64__)
++/* Tier 1: ARM64 - RBIT+CLZ is zero-safe */
++#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
++
++#elif defined(__riscv) && defined(__riscv_zbb)
++/* Tier 1: RISC-V with Zbb - CTZ is zero-safe */
++#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
++
++#elif defined(__x86_64__)
++/* Tier 2: x86-64 without BMI1 - BSF needs zero check */
++static __always_inline int poc_ctz64_bsf(u64 v)
++{
++	if (unlikely(!v))
++		return 64;
++	return (int)__builtin_ctzll(v);
++}
++#define POC_CTZ64(v) poc_ctz64_bsf(v)
++
++#else
++/* Tier 3: De Bruijn fallback for other architectures */
++#define POC_DEBRUIJN_CTZ64_CONST 0x03F79D71B4CA8B09ULL
++static const u8 poc_debruijn_ctz64_tab[64] = {
++	 0,  1, 56,  2, 57, 49, 28,  3,
++	61, 58, 42, 50, 38, 29, 17,  4,
++	62, 47, 59, 36, 45, 43, 51, 22,
++	53, 39, 33, 30, 24, 18, 12,  5,
++	63, 55, 48, 27, 60, 41, 37, 16,
++	46, 35, 44, 21, 52, 32, 23, 11,
++	54, 26, 40, 15, 34, 20, 31, 10,
++	25, 14, 19,  9, 13,  8,  7,  6,
++};
++static __always_inline int poc_debruijn_ctz64(u64 v)
++{
++	u64 lsb;
++	u32 idx;
++
++	if (unlikely(!v))
++		return 64;
++	lsb = v & (-(s64)v);
++	idx = (u32)((lsb * POC_DEBRUIJN_CTZ64_CONST) >> 58);
++	return (int)poc_debruijn_ctz64_tab[idx & 63];
++}
++#define POC_CTZ64(v) poc_debruijn_ctz64(v)
++
++#endif /* POC_CTZ64 */
++
++/*
++ * POC helper: convert cpumask region to POC-relative u64
++ *
++ * Extracts the 64-bit region of @mask corresponding to this LLC's
++ * CPU range and shifts it to align with POC's bit positions.
++ *
++ * Used by load balancer functions that need to intersect cpumasks
++ * with POC idle bitmaps.
++ */
++static __always_inline u64 poc_cpumask_to_u64(const struct cpumask *mask,
++					      struct sched_domain_shared *sd_share)
++{
++	int base = sd_share->poc_cpu_base;
++	int base_word = base >> 6;
++
++	if (static_branch_likely(&sched_poc_aligned)) {
++		/* Fast path: no shift needed (base is 64-aligned) */
++		return cpumask_bits(mask)[base_word];
++	} else {
++		/* Slow path: shift required (e.g., Threadripper) */
++		int shift = sd_share->poc_affinity_shift;
++		u64 lo = cpumask_bits(mask)[base_word];
++		u64 hi = cpumask_bits(mask)[base_word + 1];
++		return (lo >> shift) | (hi << (64 - shift));
++	}
++}
++
++#else
++static inline void set_cpu_idle_state(int cpu, int state) { }
++#endif
++
+ #include "stats.h"
+ 
+ #if defined(CONFIG_SCHED_CORE) && defined(CONFIG_SCHEDSTATS)
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index cf643a5dd..484d487d0 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1730,6 +1730,131 @@ sd_init(struct sched_domain_topology_level *tl,
+ 		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
+ 		atomic_inc(&sd->shared->ref);
+ 		atomic_set(&sd->shared->nr_busy_cpus, sd_weight);
++
++#ifdef CONFIG_SCHED_POC_SELECTOR
++		int range = cpumask_last(sd_span) - sd_id + 1;
++
++		sd->shared->poc_cpu_base = sd_id;
++		sd->shared->poc_affinity_shift = sd_id & 63;
++
++		if (range <= 64) {
++			sd->shared->poc_fast_eligible = true;
++			/*
++			 * Disable aligned optimization if this LLC's base CPU
++			 * is not 64-aligned (e.g., Threadripper CCDs).
++			 */
++			if (sd_id & 63)
++				static_branch_disable(&sched_poc_aligned);
++		} else {
++			sd->shared->poc_fast_eligible = false;
++		}
++		atomic64_set(&sd->shared->poc_idle_cpus, 0);
++		atomic64_set(&sd->shared->poc_idle_cores, 0);
++
++#ifdef CONFIG_SCHED_SMT
++		/*
++		 * Pre-compute SMT sibling masks for Level 4.
++		 * Each entry contains a bitmask of SMT siblings (excluding self)
++		 * for O(1) lookup via CTZ during wakeup.
++		 */
++		memset(sd->shared->poc_smt_siblings, 0,
++		       sizeof(sd->shared->poc_smt_siblings));
++		if (sd->shared->poc_fast_eligible) {
++			int cpu_iter;
++
++			for_each_cpu(cpu_iter, sd_span) {
++				int bit = cpu_iter - sd_id;
++				int sibling;
++				u64 mask = 0;
++
++				for_each_cpu(sibling, cpu_smt_mask(cpu_iter)) {
++					int sib_bit;
++
++					if (sibling == cpu_iter)
++						continue;
++					sib_bit = sibling - sd_id;
++					if (sib_bit >= 0 && sib_bit < 64)
++						mask |= 1ULL << sib_bit;
++				}
++				if (bit >= 0 && bit < 64)
++					sd->shared->poc_smt_siblings[bit] = mask;
++			}
++		}
++#endif /* CONFIG_SCHED_SMT */
++
++		memset(sd->shared->poc_cluster_mask, 0,
++		       sizeof(sd->shared->poc_cluster_mask));
++
++		sd->shared->poc_cluster_valid = false;
++		sd->shared->poc_cluster_shift = 0;
++
++#ifdef CONFIG_SCHED_CLUSTER
++		/*
++		 * Detect cluster (L2-sharing) topology for Level 1.5
++		 * cluster-local search in POC selector.
++		 *
++		 * Uses cpu_clustergroup_mask() which returns the L2
++		 * cache sharing mask on x86.  Validates that all
++		 * clusters are uniform (same size, power-of-2, and
++		 * naturally aligned in POC bit space).
++		 */
++		if (sd->shared->poc_fast_eligible) {
++			const struct cpumask *cls_mask =
++				cpu_clustergroup_mask(sd_id);
++			int cls_size = cpumask_weight(cls_mask);
++			int smt_size = cpumask_weight(cpu_smt_mask(sd_id));
++
++			if (cls_size > smt_size &&
++			    is_power_of_2(cls_size)) {
++				bool valid = true;
++				int cpu_iter;
++
++				for_each_cpu(cpu_iter, sd_span) {
++					const struct cpumask *m =
++						cpu_clustergroup_mask(cpu_iter);
++					int first = cpumask_first(m);
++					int rel = first - sd_id;
++
++					if (cpumask_weight(m) != cls_size ||
++					    (rel & (cls_size - 1)) != 0) {
++						valid = false;
++						break;
++					}
++				}
++				if (valid) {
++					sd->shared->poc_cluster_shift =
++						ilog2(cls_size);
++					sd->shared->poc_cluster_valid = true;
++
++					/*
++					 * Pre-compute cluster masks for O(1) lookup.
++					 * Each entry contains a bitmask of cluster
++					 * members (excluding self) for fast search.
++					 */
++					for_each_cpu(cpu_iter, sd_span) {
++						const struct cpumask *m =
++							cpu_clustergroup_mask(cpu_iter);
++						int bit = cpu_iter - sd_id;
++						int member;
++						u64 cmask = 0;
++
++						for_each_cpu(member, m) {
++							int mbit;
++
++							if (member == cpu_iter)
++								continue;
++							mbit = member - sd_id;
++							if (mbit >= 0 && mbit < 64)
++								cmask |= 1ULL << mbit;
++						}
++						if (bit >= 0 && bit < 64)
++							sd->shared->poc_cluster_mask[bit] = cmask;
++					}
++				}
++			}
++		}
++#endif /* CONFIG_SCHED_CLUSTER */
++#endif /* CONFIG_SCHED_POC_SELECTOR */
+ 	}
+ 
+ 	sd->private = sdd;
+-- 
+2.53.0
+
