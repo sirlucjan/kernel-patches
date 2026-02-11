@@ -1,0 +1,219 @@
+From 221d0ba6242b09da8d7567501d6fa48ab022ecdc Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Thu, 5 Feb 2026 10:49:37 +0100
+Subject: [PATCH 11/14] sched_ext: Invalidate dispatch decisions on CPU
+ affinity changes
+
+A BPF scheduler may rely on p->cpus_ptr from ops.dispatch() to select a
+target CPU. However, task affinity can change between the dispatch
+decision and its finalization in finish_dispatch(). When this happens,
+the scheduler may attempt to dispatch a task to a CPU that is no longer
+allowed, resulting in fatal errors such as:
+
+ EXIT: runtime error (SCX_DSQ_LOCAL[_ON] target CPU 10 not allowed for stress-ng-race-[13565])
+
+This race exists because ops.dispatch() runs without holding the task's
+run queue lock, allowing a concurrent set_cpus_allowed() to update
+p->cpus_ptr while the BPF scheduler is still using it. The dispatch is
+then finalized using stale affinity information.
+
+Example timeline:
+
+  CPU0                                      CPU1
+  ----                                      ----
+                                            task_rq_lock(p)
+  if (cpumask_test_cpu(cpu, p->cpus_ptr))
+                                            set_cpus_allowed_scx(p, new_mask)
+                                            task_rq_unlock(p)
+      scx_bpf_dsq_insert(p,
+              SCX_DSQ_LOCAL_ON | cpu, 0)
+
+Fix this by shooting down in-flight dispatches from dequeue_task_scx():
+When a QUEUED task is dequeued, increment the runqueue's ops_qseq and
+mark the associated queueing instance with %SCX_OPSS_QSEQ_INVALID before
+transitioning it to NONE.
+
+%SCX_OPSS_QSEQ_INVALID makes such invalidated instances explicit and
+helps catch BPF scheduler synchronization bugs.
+
+Any racing finish_dispatch() that observes an invalid or mismatched qseq
+simply drops the dispatch, since the task is already, or will be,
+re-enqueued. If dispatch_to_local_dsq() or move_task_between_dsqs()
+still encounter an affinity failure, drop the dispatch and requeue the
+task as QUEUED with the current qseq, instead of falling back to the
+global DSQ.
+
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+---
+ kernel/sched/ext.c          | 77 +++++++++++++++++++++++++++++--------
+ kernel/sched/ext_internal.h |  2 +
+ 2 files changed, 64 insertions(+), 15 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index de11638ad..6418d8270 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -1618,6 +1618,16 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 		 */
+ 		BUG();
+ 	case SCX_OPSS_QUEUED:
++		/*
++		 * Shoot down any in-flight dispatches for this task. The task
++		 * is leaving the runqueue, so any dispatch decision made while
++		 * it was queued is stale (e.g. affinity may be changing).
++		 * Incrementing ops_qseq ensures re-enqueued tasks get a new qseq.
++		 * Marking with SCX_OPSS_QSEQ_INVALID ensures any racing
++		 * finish_dispatch() sees an invalid instance and drops.
++		 */
++		rq->scx.ops_qseq++;
++
+ 		/*
+ 		 * Task is still on the BPF scheduler (not dispatched yet).
+ 		 * Call ops.dequeue() to notify it is leaving BPF custody.
+@@ -1625,9 +1635,15 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 		WARN_ON_ONCE(!(p->scx.flags & SCX_TASK_IN_BPF));
+ 		call_task_dequeue(sch, rq, p, deq_flags);
+ 
++		/*
++		 * Mark this queueing instance invalid so any racing
++		 * finish_dispatch() drops. Then transition to NONE.
++		 */
+ 		if (atomic_long_try_cmpxchg(&p->scx.ops_state, &opss,
+-					    SCX_OPSS_NONE))
++					    SCX_OPSS_QUEUED | SCX_OPSS_QSEQ_INVALID)) {
++			atomic_long_set_release(&p->scx.ops_state, SCX_OPSS_NONE);
+ 			break;
++		}
+ 		fallthrough;
+ 	case SCX_OPSS_DISPATCHING:
+ 		/*
+@@ -1929,8 +1945,9 @@ static bool consume_remote_task(struct rq *this_rq, struct task_struct *p,
+  * will change. As @p's task_rq is locked, this function doesn't need to use the
+  * holding_cpu mechanism.
+  *
+- * On return, @src_dsq is unlocked and only @p's new task_rq, which is the
+- * return value, is locked.
++ * On success, @src_dsq is unlocked and only @p's new task_rq, which is the
++ * return value, is locked. On failure (affinity change invalidated the move),
++ * returns NULL with @src_dsq unlocked and task remaining in @src_dsq.
+  */
+ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
+ 					 struct task_struct *p, u64 enq_flags,
+@@ -1946,9 +1963,9 @@ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
+ 	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+ 		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
+ 		if (src_rq != dst_rq &&
+-		    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
+-			dst_dsq = find_global_dsq(sch, p);
+-			dst_rq = src_rq;
++		    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, false))) {
++			/* Affinity changed after dispatch; drop the move, task stays on src_dsq */
++			return NULL;
+ 		}
+ 	} else {
+ 		/* no need to migrate if destination is a non-local DSQ */
+@@ -2075,9 +2092,24 @@ static void dispatch_to_local_dsq(struct scx_sched *sch, struct rq *rq,
+ 	}
+ 
+ 	if (src_rq != dst_rq &&
+-	    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
+-		dispatch_enqueue(sch, rq, find_global_dsq(sch, p), p,
+-				 enq_flags | SCX_ENQ_CLEAR_OPSS);
++	    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, false))) {
++		/*
++		 * Affinity changed after dispatch decision. Drop the dispatch;
++		 * the task will be re-enqueued by set_cpus_allowed_scx().
++		 * Release the task back to QUEUED so dequeue (if waiting) can
++		 * proceed, using current qseq from the task's rq.
++		 */
++		if (src_rq != rq) {
++			raw_spin_rq_unlock(rq);
++			raw_spin_rq_lock(src_rq);
++		}
++		atomic_long_set_release(&p->scx.ops_state,
++				       SCX_OPSS_QUEUED |
++				       (src_rq->scx.ops_qseq << SCX_OPSS_QSEQ_SHIFT));
++		if (src_rq != rq) {
++			raw_spin_rq_unlock(src_rq);
++			raw_spin_rq_lock(rq);
++		}
+ 		return;
+ 	}
+ 
+@@ -2177,10 +2209,12 @@ static void finish_dispatch(struct scx_sched *sch, struct rq *rq,
+ 	touch_core_sched_dispatch(rq, p);
+ retry:
+ 	/*
+-	 * No need for _acquire here. @p is accessed only after a successful
+-	 * try_cmpxchg to DISPATCHING.
++	 * Use load_acquire to pair with set_release in enqueue_task_scx and
++	 * dequeue_task_scx. We must see the current ops_state (e.g. NONE after
++	 * dequeue, or new qseq after re-enqueue following affinity change)
++	 * so that we drop stale dispatches and don't dispatch to invalid CPUs.
+ 	 */
+-	opss = atomic_long_read(&p->scx.ops_state);
++	opss = atomic_long_read_acquire(&p->scx.ops_state);
+ 
+ 	switch (opss & SCX_OPSS_STATE_MASK) {
+ 	case SCX_OPSS_DISPATCHING:
+@@ -2188,6 +2222,12 @@ static void finish_dispatch(struct scx_sched *sch, struct rq *rq,
+ 		/* someone else already got to it */
+ 		return;
+ 	case SCX_OPSS_QUEUED:
++		/*
++		 * This queueing instance was invalidated (e.g. by dequeue).
++		 * Drop; helps catch BPF scheduler sync bugs.
++		 */
++		if ((opss & SCX_OPSS_QSEQ_MASK) == SCX_OPSS_QSEQ_INVALID)
++			return;
+ 		/*
+ 		 * If qseq doesn't match, @p has gone through at least one
+ 		 * dispatch/dequeue and re-enqueue cycle between
+@@ -2756,6 +2796,9 @@ static void set_cpus_allowed_scx(struct task_struct *p,
+ 				 struct affinity_context *ac)
+ {
+ 	struct scx_sched *sch = scx_root;
++	struct rq *rq = task_rq(p);
++
++	lockdep_assert_rq_held(rq);
+ 
+ 	set_cpus_allowed_common(p, ac);
+ 
+@@ -6160,14 +6203,18 @@ static bool scx_dsq_move(struct bpf_iter_scx_dsq_kern *kit,
+ 
+ 	/* execute move */
+ 	locked_rq = move_task_between_dsqs(sch, p, enq_flags, src_dsq, dst_dsq);
+-	dispatched = true;
++	if (locked_rq)
++		dispatched = true;
++	else
++		raw_spin_unlock(&src_dsq->lock);
+ out:
+ 	if (in_balance) {
+ 		if (this_rq != locked_rq) {
+-			raw_spin_rq_unlock(locked_rq);
++			if (locked_rq)
++				raw_spin_rq_unlock(locked_rq);
+ 			raw_spin_rq_lock(this_rq);
+ 		}
+-	} else {
++	} else if (locked_rq) {
+ 		raw_spin_rq_unlock_irqrestore(locked_rq, flags);
+ 	}
+ 
+diff --git a/kernel/sched/ext_internal.h b/kernel/sched/ext_internal.h
+index befa9a5d6..179464881 100644
+--- a/kernel/sched/ext_internal.h
++++ b/kernel/sched/ext_internal.h
+@@ -1085,6 +1085,8 @@ enum scx_ops_state {
+ /* Use macros to ensure that the type is unsigned long for the masks */
+ #define SCX_OPSS_STATE_MASK	((1LU << SCX_OPSS_QSEQ_SHIFT) - 1)
+ #define SCX_OPSS_QSEQ_MASK	(~SCX_OPSS_STATE_MASK)
++/* Invalid qseq: marks a queueing instance as invalidated (e.g. by dequeue) */
++#define SCX_OPSS_QSEQ_INVALID	SCX_OPSS_QSEQ_MASK
+ 
+ DECLARE_PER_CPU(struct rq *, scx_locked_rq_state);
+ 
+-- 
+2.53.0
+
