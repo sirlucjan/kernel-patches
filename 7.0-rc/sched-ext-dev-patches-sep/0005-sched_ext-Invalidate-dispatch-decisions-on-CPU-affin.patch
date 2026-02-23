@@ -1,0 +1,140 @@
+From 04f55963d19a11f2285923af11ecc523e5030e7b Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Thu, 5 Feb 2026 10:49:37 +0100
+Subject: [PATCH 5/8] sched_ext: Invalidate dispatch decisions on CPU affinity
+ changes
+
+A BPF scheduler may rely on p->cpus_ptr from ops.dispatch() to select a
+target CPU. However, task affinity can change between the dispatch
+decision and its finalization in finish_dispatch(). When this happens,
+the scheduler may attempt to dispatch a task to a CPU that is no longer
+allowed, resulting in fatal errors such as:
+
+ EXIT: runtime error (SCX_DSQ_LOCAL[_ON] target CPU 10 not allowed for stress-ng-race-[13565])
+
+This race exists because ops.dispatch() runs without holding the task's
+run queue lock, allowing a concurrent set_cpus_allowed() to update
+p->cpus_ptr while the BPF scheduler is still using it. The dispatch is
+then finalized using stale affinity information.
+
+Example timeline:
+
+  CPU0                                      CPU1
+  ----                                      ----
+                                            task_rq_lock(p)
+  if (cpumask_test_cpu(cpu, p->cpus_ptr))
+                                            set_cpus_allowed_scx(p, new_mask)
+                                            task_rq_unlock(p)
+      scx_bpf_dsq_insert(p,
+              SCX_DSQ_LOCAL_ON | cpu, 0)
+
+Fix this by shooting down in-flight dispatches from the dequeue path:
+when a QUEUED task is dequeued, increment the runqueue's ops_qseq
+before transitioning the task's ops_state to NONE. Any racing
+finish_dispatch() that observes a mismatched qseq simply drops the
+dispatch, since the task is already, or will be, re-enqueued.
+
+Moreover, if dispatch_to_local_dsq() or move_task_between_dsqs() still
+encounter an affinity failure, drop the dispatch and requeue the task as
+QUEUED with the current qseq, instead of falling back to the global DSQ.
+
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+---
+ kernel/sched/ext.c | 53 ++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 44 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 0803e55e7..e126b14b3 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -1638,6 +1638,13 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 		 */
+ 		BUG();
+ 	case SCX_OPSS_QUEUED:
++		/*
++		 * Invalidate any in-flight dispatches for this task. The
++		 * task is leaving the runqueue, so any dispatch decision
++		 * made while it was queued is stale.
++		 */
++		rq->scx.ops_qseq++;
++
+ 		/*
+ 		 * Task is in BPF scheduler's custody (not dispatched yet).
+ 		 * Call ops.dequeue() unless this is an SCX-initiated
+@@ -1957,8 +1964,10 @@ static bool consume_remote_task(struct rq *this_rq, struct task_struct *p,
+  * will change. As @p's task_rq is locked, this function doesn't need to use the
+  * holding_cpu mechanism.
+  *
+- * On return, @src_dsq is unlocked and only @p's new task_rq, which is the
+- * return value, is locked.
++ * On success, @src_dsq is unlocked and only @p's new task_rq, which is the
++ * return value, is locked. On failure (affinity change invalidated the
++ * move), returns NULL with @src_dsq still locked and task remaining in
++ * @src_dsq.
+  */
+ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
+ 					 struct task_struct *p, u64 enq_flags,
+@@ -1974,9 +1983,12 @@ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
+ 	if (dst_dsq->id == SCX_DSQ_LOCAL) {
+ 		dst_rq = container_of(dst_dsq, struct rq, scx.local_dsq);
+ 		if (src_rq != dst_rq &&
+-		    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
+-			dst_dsq = find_global_dsq(sch, p);
+-			dst_rq = src_rq;
++		    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, false))) {
++			/*
++			 * Affinity changed after dispatch: abort the move,
++			 * task stays on src_dsq.
++			 */
++			return NULL;
+ 		}
+ 	} else {
+ 		/* no need to migrate if destination is a non-local DSQ */
+@@ -2103,9 +2115,27 @@ static void dispatch_to_local_dsq(struct scx_sched *sch, struct rq *rq,
+ 	}
+ 
+ 	if (src_rq != dst_rq &&
+-	    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
+-		dispatch_enqueue(sch, rq, find_global_dsq(sch, p), p,
+-				 enq_flags | SCX_ENQ_CLEAR_OPSS);
++	    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, false))) {
++		/*
++		 * Affinity changed after dispatch decision and the task
++		 * can't run anymore on the destination rq.
++		 *
++		 * Drop the dispatch, the task will be re-enqueued by
++		 * set_cpus_allowed_scx(). Set the task back to QUEUED so
++		 * dequeue (if waiting) can proceed, using current qseq
++		 * from the task's rq.
++		 */
++		if (src_rq != rq) {
++			raw_spin_rq_unlock(rq);
++			raw_spin_rq_lock(src_rq);
++		}
++		atomic_long_set_release(&p->scx.ops_state,
++			       SCX_OPSS_QUEUED |
++			       (src_rq->scx.ops_qseq << SCX_OPSS_QSEQ_SHIFT));
++		if (src_rq != rq) {
++			raw_spin_rq_unlock(src_rq);
++			raw_spin_rq_lock(rq);
++		}
+ 		return;
+ 	}
+ 
+@@ -6174,7 +6204,12 @@ static bool scx_dsq_move(struct bpf_iter_scx_dsq_kern *kit,
+ 
+ 	/* execute move */
+ 	locked_rq = move_task_between_dsqs(sch, p, enq_flags, src_dsq, dst_dsq);
+-	dispatched = true;
++	if (locked_rq) {
++		dispatched = true;
++	} else {
++		raw_spin_unlock(&src_dsq->lock);
++		locked_rq = src_rq;
++	}
+ out:
+ 	if (in_balance) {
+ 		if (this_rq != locked_rq) {
+-- 
+2.53.0
+
