@@ -1,0 +1,425 @@
+From d7861160c99836b7a4538cff130c70729a20fd6d Mon Sep 17 00:00:00 2001
+From: Andrea Righi <arighi@nvidia.com>
+Date: Wed, 18 Feb 2026 09:32:17 +0100
+Subject: [PATCH 08/47] sched_ext: Fix ops.dequeue() semantics
+
+Currently, ops.dequeue() is only invoked when the sched_ext core knows
+that a task resides in BPF-managed data structures, which causes it to
+miss scheduling property change events. In addition, ops.dequeue()
+callbacks are completely skipped when tasks are dispatched to non-local
+DSQs from ops.select_cpu(). As a result, BPF schedulers cannot reliably
+track task state.
+
+Fix this by guaranteeing that each task entering the BPF scheduler's
+custody triggers exactly one ops.dequeue() call when it leaves that
+custody, whether the exit is due to a dispatch (regular or via a core
+scheduling pick) or to a scheduling property change (e.g.
+sched_setaffinity(), sched_setscheduler(), set_user_nice(), NUMA
+balancing, etc.).
+
+BPF scheduler custody concept: a task is considered to be in the BPF
+scheduler's custody when the scheduler is responsible for managing its
+lifecycle. This includes tasks dispatched to user-created DSQs or stored
+in the BPF scheduler's internal data structures from ops.enqueue().
+Custody ends when the task is dispatched to a terminal DSQ (such as the
+local DSQ or %SCX_DSQ_GLOBAL), selected by core scheduling, or removed
+due to a property change.
+
+Tasks directly dispatched to terminal DSQs bypass the BPF scheduler
+entirely and are never in its custody. Terminal DSQs include:
+ - Local DSQs (%SCX_DSQ_LOCAL or %SCX_DSQ_LOCAL_ON): per-CPU queues
+   where tasks go directly to execution.
+ - Global DSQ (%SCX_DSQ_GLOBAL): the built-in fallback queue where the
+   BPF scheduler is considered "done" with the task.
+
+As a result, ops.dequeue() is not invoked for tasks directly dispatched
+to terminal DSQs.
+
+To identify dequeues triggered by scheduling property changes, introduce
+the new ops.dequeue() flag %SCX_DEQ_SCHED_CHANGE: when this flag is set,
+the dequeue was caused by a scheduling property change.
+
+New ops.dequeue() semantics:
+ - ops.dequeue() is invoked exactly once when the task leaves the BPF
+   scheduler's custody, in one of the following cases:
+   a) regular dispatch: a task dispatched to a user DSQ or stored in
+      internal BPF data structures is moved to a terminal DSQ
+      (ops.dequeue() called without any special flags set),
+   b) core scheduling dispatch: core-sched picks task before dispatch
+      (ops.dequeue() called with %SCX_DEQ_CORE_SCHED_EXEC flag set),
+   c) property change: task properties modified before dispatch,
+      (ops.dequeue() called with %SCX_DEQ_SCHED_CHANGE flag set).
+
+This allows BPF schedulers to:
+ - reliably track task ownership and lifecycle,
+ - maintain accurate accounting of managed tasks,
+ - update internal state when tasks change properties.
+
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Emil Tsalapatis <emil@etsalapatis.com>
+Cc: Kuba Piecuch <jpiecuch@google.com>
+Signed-off-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ Documentation/scheduler/sched-ext.rst         |  78 +++++++++++--
+ include/linux/sched/ext.h                     |   1 +
+ kernel/sched/ext.c                            | 110 ++++++++++++++++--
+ kernel/sched/ext_internal.h                   |   7 ++
+ .../sched_ext/include/scx/enum_defs.autogen.h |   1 +
+ .../sched_ext/include/scx/enums.autogen.bpf.h |   2 +
+ tools/sched_ext/include/scx/enums.autogen.h   |   1 +
+ 7 files changed, 184 insertions(+), 16 deletions(-)
+
+diff --git a/Documentation/scheduler/sched-ext.rst b/Documentation/scheduler/sched-ext.rst
+index 9e2882d93..7cb77fd2e 100644
+--- a/Documentation/scheduler/sched-ext.rst
++++ b/Documentation/scheduler/sched-ext.rst
+@@ -228,16 +228,23 @@ The following briefly shows how a waking task is scheduled and executed.
+    scheduler can wake up any cpu using the ``scx_bpf_kick_cpu()`` helper,
+    using ``ops.select_cpu()`` judiciously can be simpler and more efficient.
+ 
+-   A task can be immediately inserted into a DSQ from ``ops.select_cpu()``
+-   by calling ``scx_bpf_dsq_insert()``. If the task is inserted into
+-   ``SCX_DSQ_LOCAL`` from ``ops.select_cpu()``, it will be inserted into the
+-   local DSQ of whichever CPU is returned from ``ops.select_cpu()``.
+-   Additionally, inserting directly from ``ops.select_cpu()`` will cause the
+-   ``ops.enqueue()`` callback to be skipped.
+-
+    Note that the scheduler core will ignore an invalid CPU selection, for
+    example, if it's outside the allowed cpumask of the task.
+ 
++   A task can be immediately inserted into a DSQ from ``ops.select_cpu()``
++   by calling ``scx_bpf_dsq_insert()`` or ``scx_bpf_dsq_insert_vtime()``.
++
++   If the task is inserted into ``SCX_DSQ_LOCAL`` from
++   ``ops.select_cpu()``, it will be added to the local DSQ of whichever CPU
++   is returned from ``ops.select_cpu()``. Additionally, inserting directly
++   from ``ops.select_cpu()`` will cause the ``ops.enqueue()`` callback to
++   be skipped.
++
++   Any other attempt to store a task in BPF-internal data structures from
++   ``ops.select_cpu()`` does not prevent ``ops.enqueue()`` from being
++   invoked. This is discouraged, as it can introduce racy behavior or
++   inconsistent state.
++
+ 2. Once the target CPU is selected, ``ops.enqueue()`` is invoked (unless the
+    task was inserted directly from ``ops.select_cpu()``). ``ops.enqueue()``
+    can make one of the following decisions:
+@@ -251,6 +258,61 @@ The following briefly shows how a waking task is scheduled and executed.
+ 
+    * Queue the task on the BPF side.
+ 
++   **Task State Tracking and ops.dequeue() Semantics**
++
++   A task is in the "BPF scheduler's custody" when the BPF scheduler is
++   responsible for managing its lifecycle. A task enters custody when it is
++   dispatched to a user DSQ or stored in the BPF scheduler's internal data
++   structures. Custody is entered only from ``ops.enqueue()`` for those
++   operations. The only exception is dispatching to a user DSQ from
++   ``ops.select_cpu()``: although the task is not yet technically in BPF
++   scheduler custody at that point, the dispatch has the same semantic
++   effect as dispatching from ``ops.enqueue()`` for custody-related
++   purposes.
++
++   Once ``ops.enqueue()`` is called, the task may or may not enter custody
++   depending on what the scheduler does:
++
++   * **Directly dispatched to terminal DSQs** (``SCX_DSQ_LOCAL``,
++     ``SCX_DSQ_LOCAL_ON | cpu``, or ``SCX_DSQ_GLOBAL``): the BPF scheduler
++     is done with the task - it either goes straight to a CPU's local run
++     queue or to the global DSQ as a fallback. The task never enters (or
++     exits) BPF custody, and ``ops.dequeue()`` will not be called.
++
++   * **Dispatch to user-created DSQs** (custom DSQs): the task enters the
++     BPF scheduler's custody. When the task later leaves BPF custody
++     (dispatched to a terminal DSQ, picked by core-sched, or dequeued for
++     sleep/property changes), ``ops.dequeue()`` will be called exactly
++     once.
++
++   * **Stored in BPF data structures** (e.g., internal BPF queues): the
++     task is in BPF custody. ``ops.dequeue()`` will be called when it
++     leaves (e.g., when ``ops.dispatch()`` moves it to a terminal DSQ, or
++     on property change / sleep).
++
++   When a task leaves BPF scheduler custody, ``ops.dequeue()`` is invoked.
++   The dequeue can happen for different reasons, distinguished by flags:
++
++   1. **Regular dispatch**: when a task in BPF custody is dispatched to a
++      terminal DSQ from ``ops.dispatch()`` (leaving BPF custody for
++      execution), ``ops.dequeue()`` is triggered without any special flags.
++
++   2. **Core scheduling pick**: when ``CONFIG_SCHED_CORE`` is enabled and
++      core scheduling picks a task for execution while it's still in BPF
++      custody, ``ops.dequeue()`` is called with the
++      ``SCX_DEQ_CORE_SCHED_EXEC`` flag.
++
++   3. **Scheduling property change**: when a task property changes (via
++      operations like ``sched_setaffinity()``, ``sched_setscheduler()``,
++      priority changes, CPU migrations, etc.) while the task is still in
++      BPF custody, ``ops.dequeue()`` is called with the
++      ``SCX_DEQ_SCHED_CHANGE`` flag set in ``deq_flags``.
++
++   **Important**: Once a task has left BPF custody (e.g., after being
++   dispatched to a terminal DSQ), property changes will not trigger
++   ``ops.dequeue()``, since the task is no longer managed by the BPF
++   scheduler.
++
+ 3. When a CPU is ready to schedule, it first looks at its local DSQ. If
+    empty, it then looks at the global DSQ. If there still isn't a task to
+    run, ``ops.dispatch()`` is invoked which can use the following two
+@@ -318,6 +380,8 @@ by a sched_ext scheduler:
+                 /* Any usable CPU becomes available */
+ 
+                 ops.dispatch(); /* Task is moved to a local DSQ */
++
++                ops.dequeue(); /* Exiting BPF scheduler */
+             }
+             ops.running();      /* Task starts running on its assigned CPU */
+             while (task->scx.slice > 0 && task is runnable)
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index bcb962d5e..4601e5ecb 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -84,6 +84,7 @@ struct scx_dispatch_q {
+ /* scx_entity.flags */
+ enum scx_ent_flags {
+ 	SCX_TASK_QUEUED		= 1 << 0, /* on ext runqueue */
++	SCX_TASK_IN_CUSTODY	= 1 << 1, /* in custody, needs ops.dequeue() when leaving */
+ 	SCX_TASK_RESET_RUNNABLE_AT = 1 << 2, /* runnable_at should be reset */
+ 	SCX_TASK_DEQD_FOR_SLEEP	= 1 << 3, /* last dequeue was for SLEEP */
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 044bb2168..d5e688b9a 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -986,12 +986,45 @@ static void refill_task_slice_dfl(struct scx_sched *sch, struct task_struct *p)
+ 	__scx_add_event(sch, SCX_EV_REFILL_SLICE_DFL, 1);
+ }
+ 
++/*
++ * Return true if @p is moving due to an internal SCX migration, false
++ * otherwise.
++ */
++static inline bool task_scx_migrating(struct task_struct *p)
++{
++	/*
++	 * We only need to check sticky_cpu: it is set to the destination
++	 * CPU in move_remote_task_to_local_dsq() before deactivate_task()
++	 * and cleared when the task is enqueued on the destination, so it
++	 * is only non-negative during an internal SCX migration.
++	 */
++	return p->scx.sticky_cpu >= 0;
++}
++
++/*
++ * Call ops.dequeue() if the task is in BPF custody and not migrating.
++ * Clears %SCX_TASK_IN_CUSTODY when the callback is invoked.
++ */
++static void call_task_dequeue(struct scx_sched *sch, struct rq *rq,
++			      struct task_struct *p, u64 deq_flags)
++{
++	if (!(p->scx.flags & SCX_TASK_IN_CUSTODY) || task_scx_migrating(p))
++		return;
++
++	if (SCX_HAS_OP(sch, dequeue))
++		SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq, p, deq_flags);
++
++	p->scx.flags &= ~SCX_TASK_IN_CUSTODY;
++}
++
+ static void local_dsq_post_enq(struct scx_dispatch_q *dsq, struct task_struct *p,
+ 			       u64 enq_flags)
+ {
+ 	struct rq *rq = container_of(dsq, struct rq, scx.local_dsq);
+ 	bool preempt = false;
+ 
++	call_task_dequeue(scx_root, rq, p, 0);
++
+ 	/*
+ 	 * If @rq is in balance, the CPU is already vacant and looking for the
+ 	 * next task to run. No need to preempt or trigger resched after moving
+@@ -1115,17 +1148,34 @@ static void dispatch_enqueue(struct scx_sched *sch, struct rq *rq,
+ 	p->scx.ddsp_dsq_id = SCX_DSQ_INVALID;
+ 	p->scx.ddsp_enq_flags = 0;
+ 
++	/*
++	 * Update custody and call ops.dequeue() before clearing ops_state:
++	 * once ops_state is cleared, waiters in ops_dequeue() can proceed
++	 * and dequeue_task_scx() will RMW p->scx.flags. If we clear
++	 * ops_state first, both sides would modify p->scx.flags
++	 * concurrently in a non-atomic way.
++	 */
++	if (is_local) {
++		local_dsq_post_enq(dsq, p, enq_flags);
++	} else {
++		/*
++		 * Task on global/bypass DSQ: leave custody, task on
++		 * non-terminal DSQ: enter custody.
++		 */
++		if (dsq->id == SCX_DSQ_GLOBAL || dsq->id == SCX_DSQ_BYPASS)
++			call_task_dequeue(sch, rq, p, 0);
++		else
++			p->scx.flags |= SCX_TASK_IN_CUSTODY;
++
++		raw_spin_unlock(&dsq->lock);
++	}
++
+ 	/*
+ 	 * We're transitioning out of QUEUEING or DISPATCHING. store_release to
+ 	 * match waiters' load_acquire.
+ 	 */
+ 	if (enq_flags & SCX_ENQ_CLEAR_OPSS)
+ 		atomic_long_set_release(&p->scx.ops_state, SCX_OPSS_NONE);
+-
+-	if (is_local)
+-		local_dsq_post_enq(dsq, p, enq_flags);
+-	else
+-		raw_spin_unlock(&dsq->lock);
+ }
+ 
+ static void task_unlink_from_dsq(struct task_struct *p,
+@@ -1405,6 +1455,12 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 	if (p->scx.ddsp_dsq_id != SCX_DSQ_INVALID)
+ 		goto direct;
+ 
++	/*
++	 * Task is now in BPF scheduler's custody. Set %SCX_TASK_IN_CUSTODY
++	 * so ops.dequeue() is called when it leaves custody.
++	 */
++	p->scx.flags |= SCX_TASK_IN_CUSTODY;
++
+ 	/*
+ 	 * If not directly dispatched, QUEUEING isn't clear yet and dispatch or
+ 	 * dequeue may be waiting. The store_release matches their load_acquire.
+@@ -1522,6 +1578,14 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ {
+ 	struct scx_sched *sch = scx_root;
+ 	unsigned long opss;
++	u64 op_deq_flags = deq_flags;
++
++	/*
++	 * Set %SCX_DEQ_SCHED_CHANGE when the dequeue is due to a property
++	 * change (not sleep or core-sched pick).
++	 */
++	if (!(op_deq_flags & (DEQUEUE_SLEEP | SCX_DEQ_CORE_SCHED_EXEC)))
++		op_deq_flags |= SCX_DEQ_SCHED_CHANGE;
+ 
+ 	/* dequeue is always temporary, don't reset runnable_at */
+ 	clr_task_runnable(p, false);
+@@ -1539,10 +1603,8 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 		 */
+ 		BUG();
+ 	case SCX_OPSS_QUEUED:
+-		if (SCX_HAS_OP(sch, dequeue))
+-			SCX_CALL_OP_TASK(sch, SCX_KF_REST, dequeue, rq,
+-					 p, deq_flags);
+-
++		/* A queued task must always be in BPF scheduler's custody */
++		WARN_ON_ONCE(!(p->scx.flags & SCX_TASK_IN_CUSTODY));
+ 		if (atomic_long_try_cmpxchg(&p->scx.ops_state, &opss,
+ 					    SCX_OPSS_NONE))
+ 			break;
+@@ -1565,6 +1627,22 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
+ 		BUG_ON(atomic_long_read(&p->scx.ops_state) != SCX_OPSS_NONE);
+ 		break;
+ 	}
++
++	/*
++	 * Call ops.dequeue() if the task is still in BPF custody.
++	 *
++	 * The code that clears ops_state to %SCX_OPSS_NONE does not always
++	 * clear %SCX_TASK_IN_CUSTODY: in dispatch_to_local_dsq(), when
++	 * we're moving a task that was in %SCX_OPSS_DISPATCHING to a
++	 * remote CPU's local DSQ, we only set ops_state to %SCX_OPSS_NONE
++	 * so that a concurrent dequeue can proceed, but we clear
++	 * %SCX_TASK_IN_CUSTODY only when we later enqueue or move the
++	 * task. So we can see NONE + IN_CUSTODY here and we must handle
++	 * it. Similarly, after waiting on %SCX_OPSS_DISPATCHING we see
++	 * NONE but the task may still have %SCX_TASK_IN_CUSTODY set until
++	 * it is enqueued on the destination.
++	 */
++	call_task_dequeue(sch, rq, p, op_deq_flags);
+ }
+ 
+ static bool dequeue_task_scx(struct rq *rq, struct task_struct *p, int deq_flags)
+@@ -2935,6 +3013,13 @@ static void scx_enable_task(struct task_struct *p)
+ 
+ 	lockdep_assert_rq_held(rq);
+ 
++	/*
++	 * Verify the task is not in BPF scheduler's custody. If flag
++	 * transitions are consistent, the flag should always be clear
++	 * here.
++	 */
++	WARN_ON_ONCE(p->scx.flags & SCX_TASK_IN_CUSTODY);
++
+ 	/*
+ 	 * Set the weight before calling ops.enable() so that the scheduler
+ 	 * doesn't see a stale value if they inspect the task struct.
+@@ -2966,6 +3051,13 @@ static void scx_disable_task(struct task_struct *p)
+ 	if (SCX_HAS_OP(sch, disable))
+ 		SCX_CALL_OP_TASK(sch, SCX_KF_REST, disable, rq, p);
+ 	scx_set_task_state(p, SCX_TASK_READY);
++
++	/*
++	 * Verify the task is not in BPF scheduler's custody. If flag
++	 * transitions are consistent, the flag should always be clear
++	 * here.
++	 */
++	WARN_ON_ONCE(p->scx.flags & SCX_TASK_IN_CUSTODY);
+ }
+ 
+ static void scx_exit_task(struct task_struct *p)
+diff --git a/kernel/sched/ext_internal.h b/kernel/sched/ext_internal.h
+index 386c677e4..befa9a5d6 100644
+--- a/kernel/sched/ext_internal.h
++++ b/kernel/sched/ext_internal.h
+@@ -982,6 +982,13 @@ enum scx_deq_flags {
+ 	 * it hasn't been dispatched yet. Dequeue from the BPF side.
+ 	 */
+ 	SCX_DEQ_CORE_SCHED_EXEC	= 1LLU << 32,
++
++	/*
++	 * The task is being dequeued due to a property change (e.g.,
++	 * sched_setaffinity(), sched_setscheduler(), set_user_nice(),
++	 * etc.).
++	 */
++	SCX_DEQ_SCHED_CHANGE	= 1LLU << 33,
+ };
+ 
+ enum scx_pick_idle_cpu_flags {
+diff --git a/tools/sched_ext/include/scx/enum_defs.autogen.h b/tools/sched_ext/include/scx/enum_defs.autogen.h
+index c2c33df92..dcc945304 100644
+--- a/tools/sched_ext/include/scx/enum_defs.autogen.h
++++ b/tools/sched_ext/include/scx/enum_defs.autogen.h
+@@ -21,6 +21,7 @@
+ #define HAVE_SCX_CPU_PREEMPT_UNKNOWN
+ #define HAVE_SCX_DEQ_SLEEP
+ #define HAVE_SCX_DEQ_CORE_SCHED_EXEC
++#define HAVE_SCX_DEQ_SCHED_CHANGE
+ #define HAVE_SCX_DSQ_FLAG_BUILTIN
+ #define HAVE_SCX_DSQ_FLAG_LOCAL_ON
+ #define HAVE_SCX_DSQ_INVALID
+diff --git a/tools/sched_ext/include/scx/enums.autogen.bpf.h b/tools/sched_ext/include/scx/enums.autogen.bpf.h
+index 2f8002bcc..5da50f937 100644
+--- a/tools/sched_ext/include/scx/enums.autogen.bpf.h
++++ b/tools/sched_ext/include/scx/enums.autogen.bpf.h
+@@ -127,3 +127,5 @@ const volatile u64 __SCX_ENQ_CLEAR_OPSS __weak;
+ const volatile u64 __SCX_ENQ_DSQ_PRIQ __weak;
+ #define SCX_ENQ_DSQ_PRIQ __SCX_ENQ_DSQ_PRIQ
+ 
++const volatile u64 __SCX_DEQ_SCHED_CHANGE __weak;
++#define SCX_DEQ_SCHED_CHANGE __SCX_DEQ_SCHED_CHANGE
+diff --git a/tools/sched_ext/include/scx/enums.autogen.h b/tools/sched_ext/include/scx/enums.autogen.h
+index fedec9385..fc9a7a4d9 100644
+--- a/tools/sched_ext/include/scx/enums.autogen.h
++++ b/tools/sched_ext/include/scx/enums.autogen.h
+@@ -46,4 +46,5 @@
+ 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_LAST); \
+ 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_CLEAR_OPSS); \
+ 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_DSQ_PRIQ); \
++	SCX_ENUM_SET(skel, scx_deq_flags, SCX_DEQ_SCHED_CHANGE); \
+ } while (0)
+-- 
+2.53.0
+

@@ -1,0 +1,154 @@
+From a9b7b7177022af613ce4b1690f94d7d60ea1e9a6 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 24 Feb 2026 18:59:42 -1000
+Subject: [PATCH 23/47] sched_ext: Enforce scheduling authority in dispatch and
+ select_cpu operations
+
+Add checks to enforce scheduling authority boundaries when multiple
+schedulers are present:
+
+1. In scx_dsq_insert_preamble() and the dispatch retry path, ignore attempts
+   to insert tasks that the scheduler doesn't own, counting them via
+   SCX_EV_INSERT_NOT_OWNED. As BPF schedulers are allowed to ignore
+   dequeues, such attempts can occur legitimately during sub-scheduler
+   enabling when tasks move between schedulers. The counter helps distinguish
+   normal cases from scheduler bugs.
+
+2. For scx_bpf_dsq_insert_vtime() and scx_bpf_select_cpu_and(), error out
+   when sub-schedulers are attached. These functions lack the aux__prog
+   parameter needed to identify the calling scheduler, so they cannot be used
+   safely with multiple schedulers. BPF programs should use the arg-wrapped
+   versions (__scx_bpf_dsq_insert_vtime() and __scx_bpf_select_cpu_and())
+   instead.
+
+These checks ensure that with multiple concurrent schedulers, scheduler
+identity can be properly determined and unauthorized task operations are
+prevented or tracked.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/sched/ext.c          | 26 ++++++++++++++++++++++++++
+ kernel/sched/ext_idle.c     | 11 +++++++++++
+ kernel/sched/ext_internal.h | 12 ++++++++++++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 30dd65b33..56ac2d565 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -2321,6 +2321,12 @@ static void finish_dispatch(struct scx_sched *sch, struct rq *rq,
+ 		if ((opss & SCX_OPSS_QSEQ_MASK) != qseq_at_dispatch)
+ 			return;
+ 
++		/* see SCX_EV_INSERT_NOT_OWNED definition */
++		if (unlikely(!scx_task_on_sched(sch, p))) {
++			__scx_add_event(sch, SCX_EV_INSERT_NOT_OWNED, 1);
++			return;
++		}
++
+ 		/*
+ 		 * While we know @p is accessible, we don't yet have a claim on
+ 		 * it - the BPF scheduler is allowed to dispatch tasks
+@@ -4011,6 +4017,7 @@ static ssize_t scx_attr_events_show(struct kobject *kobj,
+ 	at += scx_attr_event_show(buf, at, &events, SCX_EV_BYPASS_DURATION);
+ 	at += scx_attr_event_show(buf, at, &events, SCX_EV_BYPASS_DISPATCH);
+ 	at += scx_attr_event_show(buf, at, &events, SCX_EV_BYPASS_ACTIVATE);
++	at += scx_attr_event_show(buf, at, &events, SCX_EV_INSERT_NOT_OWNED);
+ 	return at;
+ }
+ SCX_ATTR(events);
+@@ -5131,6 +5138,7 @@ static void scx_dump_state(struct scx_exit_info *ei, size_t dump_len)
+ 	scx_dump_event(s, &events, SCX_EV_BYPASS_DURATION);
+ 	scx_dump_event(s, &events, SCX_EV_BYPASS_DISPATCH);
+ 	scx_dump_event(s, &events, SCX_EV_BYPASS_ACTIVATE);
++	scx_dump_event(s, &events, SCX_EV_INSERT_NOT_OWNED);
+ 
+ 	if (seq_buf_has_overflowed(&s) && dump_len >= sizeof(trunc_marker))
+ 		memcpy(ei->dump + dump_len - sizeof(trunc_marker),
+@@ -6409,6 +6417,12 @@ static bool scx_dsq_insert_preamble(struct scx_sched *sch, struct task_struct *p
+ 		return false;
+ 	}
+ 
++	/* see SCX_EV_INSERT_NOT_OWNED definition */
++	if (unlikely(!scx_task_on_sched(sch, p))) {
++		__scx_add_event(sch, SCX_EV_INSERT_NOT_OWNED, 1);
++		return false;
++	}
++
+ 	return true;
+ }
+ 
+@@ -6601,6 +6615,17 @@ __bpf_kfunc void scx_bpf_dsq_insert_vtime(struct task_struct *p, u64 dsq_id,
+ 	if (unlikely(!sch))
+ 		return;
+ 
++#ifdef CONFIG_EXT_SUB_SCHED
++	/*
++	 * Disallow if any sub-scheds are attached. There is no way to tell
++	 * which scheduler called us, just error out @p's scheduler.
++	 */
++	if (unlikely(!list_empty(&sch->children))) {
++		scx_error(scx_task_sched(p), "__scx_bpf_dsq_insert_vtime() must be used");
++		return;
++	}
++#endif
++
+ 	scx_dsq_insert_vtime(sch, p, dsq_id, slice, vtime, enq_flags);
+ }
+ 
+@@ -7933,6 +7958,7 @@ static void scx_read_events(struct scx_sched *sch, struct scx_event_stats *event
+ 		scx_agg_event(events, e_cpu, SCX_EV_BYPASS_DURATION);
+ 		scx_agg_event(events, e_cpu, SCX_EV_BYPASS_DISPATCH);
+ 		scx_agg_event(events, e_cpu, SCX_EV_BYPASS_ACTIVATE);
++		scx_agg_event(events, e_cpu, SCX_EV_INSERT_NOT_OWNED);
+ 	}
+ }
+ 
+diff --git a/kernel/sched/ext_idle.c b/kernel/sched/ext_idle.c
+index 34487a83d..321efd7b1 100644
+--- a/kernel/sched/ext_idle.c
++++ b/kernel/sched/ext_idle.c
+@@ -1061,6 +1061,17 @@ __bpf_kfunc s32 scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu, u64
+ 	if (unlikely(!sch))
+ 		return -ENODEV;
+ 
++#ifdef CONFIG_EXT_SUB_SCHED
++	/*
++	 * Disallow if any sub-scheds are attached. There is no way to tell
++	 * which scheduler called us, just error out @p's scheduler.
++	 */
++	if (unlikely(!list_empty(&sch->children))) {
++		scx_error(scx_task_sched(p), "__scx_bpf_select_cpu_and() must be used");
++		return -EINVAL;
++	}
++#endif
++
+ 	return select_cpu_from_kfunc(sch, p, prev_cpu, wake_flags,
+ 				     cpus_allowed, flags);
+ }
+diff --git a/kernel/sched/ext_internal.h b/kernel/sched/ext_internal.h
+index 679325e8c..3b17180ba 100644
+--- a/kernel/sched/ext_internal.h
++++ b/kernel/sched/ext_internal.h
+@@ -911,6 +911,18 @@ struct scx_event_stats {
+ 	 * The number of times the bypassing mode has been activated.
+ 	 */
+ 	s64		SCX_EV_BYPASS_ACTIVATE;
++
++	/*
++	 * The number of times the scheduler attempted to insert a task that it
++	 * doesn't own into a DSQ. Such attempts are ignored.
++	 *
++	 * As BPF schedulers are allowed to ignore dequeues, it's difficult to
++	 * tell whether such an attempt is from a scheduler malfunction or an
++	 * ignored dequeue around sub-sched enabling. If this count keeps going
++	 * up regardless of sub-sched enabling, it likely indicates a bug in the
++	 * scheduler.
++	 */
++	s64		SCX_EV_INSERT_NOT_OWNED;
+ };
+ 
+ struct scx_sched_pcpu {
+-- 
+2.53.0
+
