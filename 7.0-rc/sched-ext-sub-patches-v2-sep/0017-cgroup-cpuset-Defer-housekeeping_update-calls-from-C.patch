@@ -1,0 +1,132 @@
+From e0993f95339666877e97b01dc405dc3b94568de0 Mon Sep 17 00:00:00 2001
+From: Waiman Long <longman@redhat.com>
+Date: Sat, 21 Feb 2026 13:54:17 -0500
+Subject: [PATCH 17/69] cgroup/cpuset: Defer housekeeping_update() calls from
+ CPU hotplug to workqueue
+
+The cpuset_handle_hotplug() may need to invoke housekeeping_update(),
+for instance, when an isolated partition is invalidated because its
+last active CPU has been put offline.
+
+As we are going to enable dynamic update to the nozh_full housekeeping
+cpumask (HK_TYPE_KERNEL_NOISE) soon with the help of CPU hotplug,
+allowing the CPU hotplug path to call into housekeeping_update() directly
+from update_isolation_cpumasks() will likely cause deadlock. So we
+have to defer any call to housekeeping_update() after the CPU hotplug
+operation has finished. This is now done via the workqueue where
+the update_hk_sched_domains() function will be invoked via the
+hk_sd_workfn().
+
+An concurrent cpuset control file write may have executed the required
+update_hk_sched_domains() function before the work function is called. So
+the work function call may become a no-op when it is invoked.
+
+Signed-off-by: Waiman Long <longman@redhat.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/cgroup/cpuset.c                        | 31 ++++++++++++++++---
+ .../selftests/cgroup/test_cpuset_prs.sh       | 11 ++++++-
+ 2 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index 898a83764..adb363443 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -1322,6 +1322,16 @@ static void update_hk_sched_domains(void)
+ 		rebuild_sched_domains_locked();
+ }
+ 
++/*
++ * Work function to invoke update_hk_sched_domains()
++ */
++static void hk_sd_workfn(struct work_struct *work)
++{
++	cpuset_full_lock();
++	update_hk_sched_domains();
++	cpuset_full_unlock();
++}
++
+ /**
+  * rm_siblings_excl_cpus - Remove exclusive CPUs that are used by sibling cpusets
+  * @parent: Parent cpuset containing all siblings
+@@ -3794,6 +3804,7 @@ static void cpuset_hotplug_update_tasks(struct cpuset *cs, struct tmpmasks *tmp)
+  */
+ static void cpuset_handle_hotplug(void)
+ {
++	static DECLARE_WORK(hk_sd_work, hk_sd_workfn);
+ 	static cpumask_t new_cpus;
+ 	static nodemask_t new_mems;
+ 	bool cpus_updated, mems_updated;
+@@ -3876,11 +3887,21 @@ static void cpuset_handle_hotplug(void)
+ 	}
+ 
+ 
+-	if (update_housekeeping || force_sd_rebuild) {
+-		mutex_lock(&cpuset_mutex);
+-		update_hk_sched_domains();
+-		mutex_unlock(&cpuset_mutex);
+-	}
++	/*
++	 * Queue a work to call housekeeping_update() & rebuild_sched_domains()
++	 * There will be a slight delay before the HK_TYPE_DOMAIN housekeeping
++	 * cpumask can correctly reflect what is in isolated_cpus.
++	 *
++	 * We rely on WORK_STRUCT_PENDING_BIT to not requeue a work item that
++	 * is still pending. Before the pending bit is cleared, the work data
++	 * is copied out and work item dequeued. So it is possible to queue
++	 * the work again before the hk_sd_workfn() is invoked to process the
++	 * previously queued work. Since hk_sd_workfn() doesn't use the work
++	 * item at all, this is not a problem.
++	 */
++	if (update_housekeeping || force_sd_rebuild)
++		queue_work(system_unbound_wq, &hk_sd_work);
++
+ 	free_tmpmasks(ptmp);
+ }
+ 
+diff --git a/tools/testing/selftests/cgroup/test_cpuset_prs.sh b/tools/testing/selftests/cgroup/test_cpuset_prs.sh
+index ef16f5610..a56f4153c 100755
+--- a/tools/testing/selftests/cgroup/test_cpuset_prs.sh
++++ b/tools/testing/selftests/cgroup/test_cpuset_prs.sh
+@@ -245,6 +245,9 @@ TEST_MATRIX=(
+ 	"  C2-3:P1  C3:P1   .      .     O3=0    .      .      .     0 A1:2|A2: A1:P1|A2:P1"
+ 	"  C2-3:P1  C3:P1   .      .    T:O2=0   .      .      .     0 A1:3|A2:3 A1:P1|A2:P-1"
+ 	"  C2-3:P1  C3:P1   .      .      .    T:O3=0   .      .     0 A1:2|A2:2 A1:P1|A2:P-1"
++	"  C2-3:P1  C3:P2   .      .    T:O2=0   .      .      .     0 A1:3|A2:3 A1:P1|A2:P-2"
++	"  C1-3:P1  C3:P2   .      .      .    T:O3=0   .      .     0 A1:1-2|A2:1-2 A1:P1|A2:P-2 3|"
++	"  C1-3:P1  C3:P2   .      .      .    T:O3=0  O3=1    .     0 A1:1-2|A2:3 A1:P1|A2:P2  3"
+ 	"$SETUP_A123_PARTITIONS    .     O1=0    .      .      .     0 A1:|A2:2|A3:3 A1:P1|A2:P1|A3:P1"
+ 	"$SETUP_A123_PARTITIONS    .     O2=0    .      .      .     0 A1:1|A2:|A3:3 A1:P1|A2:P1|A3:P1"
+ 	"$SETUP_A123_PARTITIONS    .     O3=0    .      .      .     0 A1:1|A2:2|A3: A1:P1|A2:P1|A3:P1"
+@@ -761,7 +764,7 @@ check_cgroup_states()
+ # only CPUs in isolated partitions as well as those that are isolated at
+ # boot time.
+ #
+-# $1 - expected isolated cpu list(s) <isolcpus1>{,<isolcpus2>}
++# $1 - expected isolated cpu list(s) <isolcpus1>{|<isolcpus2>}
+ # <isolcpus1> - expected sched/domains value
+ # <isolcpus2> - cpuset.cpus.isolated value = <isolcpus1> if not defined
+ #
+@@ -770,6 +773,7 @@ check_isolcpus()
+ 	EXPECTED_ISOLCPUS=$1
+ 	ISCPUS=${CGROUP2}/cpuset.cpus.isolated
+ 	ISOLCPUS=$(cat $ISCPUS)
++	HKICPUS=$(cat /sys/devices/system/cpu/isolated)
+ 	LASTISOLCPU=
+ 	SCHED_DOMAINS=/sys/kernel/debug/sched/domains
+ 	if [[ $EXPECTED_ISOLCPUS = . ]]
+@@ -807,6 +811,11 @@ check_isolcpus()
+ 	ISOLCPUS=
+ 	EXPECTED_ISOLCPUS=$EXPECTED_SDOMAIN
+ 
++	#
++	# The inverse of HK_TYPE_DOMAIN cpumask in $HKICPUS should match $ISOLCPUS
++	#
++	[[ "$ISOLCPUS" != "$HKICPUS" ]] && return 1
++
+ 	#
+ 	# Use the sched domain in debugfs to check isolated CPUs, if available
+ 	#
+-- 
+2.53.0
+

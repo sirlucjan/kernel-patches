@@ -1,0 +1,270 @@
+From 1b6558e1edc7f8490ee97df49c49accc6e05366c Mon Sep 17 00:00:00 2001
+From: Waiman Long <longman@redhat.com>
+Date: Sat, 21 Feb 2026 13:54:18 -0500
+Subject: [PATCH 18/69] cgroup/cpuset: Call housekeeping_update() without
+ holding cpus_read_lock
+
+The current cpuset partition code is able to dynamically update
+the sched domains of a running system and the corresponding
+HK_TYPE_DOMAIN housekeeping cpumask to perform what is essentially the
+"isolcpus=domain,..." boot command line feature at run time.
+
+The housekeeping cpumask update requires flushing a number of different
+workqueues which may not be safe with cpus_read_lock() held as the
+workqueue flushing code may acquire cpus_read_lock() or acquiring locks
+which have locking dependency with cpus_read_lock() down the chain. Below
+is an example of such circular locking problem.
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  6.18.0-test+ #2 Tainted: G S
+  ------------------------------------------------------
+  test_cpuset_prs/10971 is trying to acquire lock:
+  ffff888112ba4958 ((wq_completion)sync_wq){+.+.}-{0:0}, at: touch_wq_lockdep_map+0x7a/0x180
+
+  but task is already holding lock:
+  ffffffffae47f450 (cpuset_mutex){+.+.}-{4:4}, at: cpuset_partition_write+0x85/0x130
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+  -> #4 (cpuset_mutex){+.+.}-{4:4}:
+  -> #3 (cpu_hotplug_lock){++++}-{0:0}:
+  -> #2 (rtnl_mutex){+.+.}-{4:4}:
+  -> #1 ((work_completion)(&arg.work)){+.+.}-{0:0}:
+  -> #0 ((wq_completion)sync_wq){+.+.}-{0:0}:
+
+  Chain exists of:
+    (wq_completion)sync_wq --> cpu_hotplug_lock --> cpuset_mutex
+
+  5 locks held by test_cpuset_prs/10971:
+   #0: ffff88816810e440 (sb_writers#7){.+.+}-{0:0}, at: ksys_write+0xf9/0x1d0
+   #1: ffff8891ab620890 (&of->mutex#2){+.+.}-{4:4}, at: kernfs_fop_write_iter+0x260/0x5f0
+   #2: ffff8890a78b83e8 (kn->active#187){.+.+}-{0:0}, at: kernfs_fop_write_iter+0x2b6/0x5f0
+   #3: ffffffffadf32900 (cpu_hotplug_lock){++++}-{0:0}, at: cpuset_partition_write+0x77/0x130
+   #4: ffffffffae47f450 (cpuset_mutex){+.+.}-{4:4}, at: cpuset_partition_write+0x85/0x130
+
+  Call Trace:
+   <TASK>
+     :
+   touch_wq_lockdep_map+0x93/0x180
+   __flush_workqueue+0x111/0x10b0
+   housekeeping_update+0x12d/0x2d0
+   update_parent_effective_cpumask+0x595/0x2440
+   update_prstate+0x89d/0xce0
+   cpuset_partition_write+0xc5/0x130
+   cgroup_file_write+0x1a5/0x680
+   kernfs_fop_write_iter+0x3df/0x5f0
+   vfs_write+0x525/0xfd0
+   ksys_write+0xf9/0x1d0
+   do_syscall_64+0x95/0x520
+   entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+To avoid such a circular locking dependency problem, we have to
+call housekeeping_update() without holding the cpus_read_lock() and
+cpuset_mutex. The current set of wq's flushed by housekeeping_update()
+may not have work functions that call cpus_read_lock() directly,
+but we are likely to extend the list of wq's that are flushed in the
+future. Moreover, the current set of work functions may hold locks that
+may have cpu_hotplug_lock down the dependency chain.
+
+So housekeeping_update() is now called after releasing cpus_read_lock
+and cpuset_mutex at the end of a cpuset operation. These two locks are
+then re-acquired later before calling rebuild_sched_domains_locked().
+
+To enable mutual exclusion between the housekeeping_update() call and
+other cpuset control file write actions, a new top level cpuset_top_mutex
+is introduced. This new mutex will be acquired first to allow sharing
+variables used by both code paths. However, cpuset update from CPU
+hotplug can still happen in parallel with the housekeeping_update()
+call, though that should be rare in production environment.
+
+As cpus_read_lock() is now no longer held when
+tmigr_isolated_exclude_cpumask() is called, it needs to acquire it
+directly.
+
+The lockdep_is_cpuset_held() is also updated to return true if either
+cpuset_top_mutex or cpuset_mutex is held.
+
+Fixes: 03ff73510169 ("cpuset: Update HK_TYPE_DOMAIN cpumask from cpuset")
+Signed-off-by: Waiman Long <longman@redhat.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+---
+ kernel/cgroup/cpuset.c        | 47 +++++++++++++++++++++++++++++++----
+ kernel/sched/isolation.c      |  4 +--
+ kernel/time/timer_migration.c |  4 +--
+ 3 files changed, 44 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index adb363443..052a226a7 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -65,14 +65,28 @@ static const char * const perr_strings[] = {
+  * CPUSET Locking Convention
+  * -------------------------
+  *
+- * Below are the three global locks guarding cpuset structures in lock
++ * Below are the four global/local locks guarding cpuset structures in lock
+  * acquisition order:
++ *  - cpuset_top_mutex
+  *  - cpu_hotplug_lock (cpus_read_lock/cpus_write_lock)
+  *  - cpuset_mutex
+  *  - callback_lock (raw spinlock)
+  *
+- * A task must hold all the three locks to modify externally visible or
+- * used fields of cpusets, though some of the internally used cpuset fields
++ * As cpuset will now indirectly flush a number of different workqueues in
++ * housekeeping_update() to update housekeeping cpumasks when the set of
++ * isolated CPUs is going to be changed, it may be vulnerable to deadlock
++ * if we hold cpus_read_lock while calling into housekeeping_update().
++ *
++ * The first cpuset_top_mutex will be held except when calling into
++ * cpuset_handle_hotplug() from the CPU hotplug code where cpus_write_lock
++ * and cpuset_mutex will be held instead. The main purpose of this mutex
++ * is to prevent regular cpuset control file write actions from interfering
++ * with the call to housekeeping_update(), though CPU hotplug operation can
++ * still happen in parallel. This mutex also provides protection for some
++ * internal variables.
++ *
++ * A task must hold all the remaining three locks to modify externally visible
++ * or used fields of cpusets, though some of the internally used cpuset fields
+  * and internal variables can be modified without holding callback_lock. If only
+  * reliable read access of the externally used fields are needed, a task can
+  * hold either cpuset_mutex or callback_lock which are exposed to other
+@@ -100,6 +114,7 @@ static const char * const perr_strings[] = {
+  * cpumasks and nodemasks.
+  */
+ 
++static DEFINE_MUTEX(cpuset_top_mutex);
+ static DEFINE_MUTEX(cpuset_mutex);
+ 
+ /*
+@@ -111,6 +126,8 @@ static DEFINE_MUTEX(cpuset_mutex);
+  *
+  * CSCB: Readable by holding either cpuset_mutex or callback_lock. Writable
+  *	 by holding both cpuset_mutex and callback_lock.
++ *
++ * T:	 Read/write-able by holding the cpuset_top_mutex.
+  */
+ 
+ /*
+@@ -134,6 +151,11 @@ static cpumask_var_t	isolated_cpus;		/* CSCB */
+  */
+ static bool		update_housekeeping;	/* RWCS */
+ 
++/*
++ * Copy of isolated_cpus to be passed to housekeeping_update()
++ */
++static cpumask_var_t	isolated_hk_cpus;	/* T */
++
+ /*
+  * A flag to force sched domain rebuild at the end of an operation.
+  * It can be set in
+@@ -297,6 +319,7 @@ void lockdep_assert_cpuset_lock_held(void)
+  */
+ void cpuset_full_lock(void)
+ {
++	mutex_lock(&cpuset_top_mutex);
+ 	cpus_read_lock();
+ 	mutex_lock(&cpuset_mutex);
+ }
+@@ -305,12 +328,14 @@ void cpuset_full_unlock(void)
+ {
+ 	mutex_unlock(&cpuset_mutex);
+ 	cpus_read_unlock();
++	mutex_unlock(&cpuset_top_mutex);
+ }
+ 
+ #ifdef CONFIG_LOCKDEP
+ bool lockdep_is_cpuset_held(void)
+ {
+-	return lockdep_is_held(&cpuset_mutex);
++	return lockdep_is_held(&cpuset_mutex) ||
++	       lockdep_is_held(&cpuset_top_mutex);
+ }
+ #endif
+ 
+@@ -1313,9 +1338,20 @@ static void update_hk_sched_domains(void)
+ {
+ 	if (update_housekeeping) {
+ 		/* Updating HK cpumasks implies rebuild sched domains */
+-		WARN_ON_ONCE(housekeeping_update(isolated_cpus));
+ 		update_housekeeping = false;
+ 		force_sd_rebuild = true;
++		cpumask_copy(isolated_hk_cpus, isolated_cpus);
++
++		/*
++		 * housekeeping_update() is now called without holding
++		 * cpus_read_lock and cpuset_mutex. Only cpuset_top_mutex
++		 * is still being held for mutual exclusion.
++		 */
++		mutex_unlock(&cpuset_mutex);
++		cpus_read_unlock();
++		WARN_ON_ONCE(housekeeping_update(isolated_hk_cpus));
++		cpus_read_lock();
++		mutex_lock(&cpuset_mutex);
+ 	}
+ 	/* force_sd_rebuild will be cleared in rebuild_sched_domains_locked() */
+ 	if (force_sd_rebuild)
+@@ -3633,6 +3669,7 @@ int __init cpuset_init(void)
+ 	BUG_ON(!alloc_cpumask_var(&top_cpuset.exclusive_cpus, GFP_KERNEL));
+ 	BUG_ON(!zalloc_cpumask_var(&subpartitions_cpus, GFP_KERNEL));
+ 	BUG_ON(!zalloc_cpumask_var(&isolated_cpus, GFP_KERNEL));
++	BUG_ON(!zalloc_cpumask_var(&isolated_hk_cpus, GFP_KERNEL));
+ 
+ 	cpumask_setall(top_cpuset.cpus_allowed);
+ 	nodes_setall(top_cpuset.mems_allowed);
+diff --git a/kernel/sched/isolation.c b/kernel/sched/isolation.c
+index 3b725d39c..ef152d401 100644
+--- a/kernel/sched/isolation.c
++++ b/kernel/sched/isolation.c
+@@ -123,8 +123,6 @@ int housekeeping_update(struct cpumask *isol_mask)
+ 	struct cpumask *trial, *old = NULL;
+ 	int err;
+ 
+-	lockdep_assert_cpus_held();
+-
+ 	trial = kmalloc(cpumask_size(), GFP_KERNEL);
+ 	if (!trial)
+ 		return -ENOMEM;
+@@ -136,7 +134,7 @@ int housekeeping_update(struct cpumask *isol_mask)
+ 	}
+ 
+ 	if (!housekeeping.flags)
+-		static_branch_enable_cpuslocked(&housekeeping_overridden);
++		static_branch_enable(&housekeeping_overridden);
+ 
+ 	if (housekeeping.flags & HK_FLAG_DOMAIN)
+ 		old = housekeeping_cpumask_dereference(HK_TYPE_DOMAIN);
+diff --git a/kernel/time/timer_migration.c b/kernel/time/timer_migration.c
+index c1ed0d5e8..155eeaea4 100644
+--- a/kernel/time/timer_migration.c
++++ b/kernel/time/timer_migration.c
+@@ -1559,8 +1559,6 @@ int tmigr_isolated_exclude_cpumask(struct cpumask *exclude_cpumask)
+ 	cpumask_var_t cpumask __free(free_cpumask_var) = CPUMASK_VAR_NULL;
+ 	int cpu;
+ 
+-	lockdep_assert_cpus_held();
+-
+ 	if (!works)
+ 		return -ENOMEM;
+ 	if (!alloc_cpumask_var(&cpumask, GFP_KERNEL))
+@@ -1570,6 +1568,7 @@ int tmigr_isolated_exclude_cpumask(struct cpumask *exclude_cpumask)
+ 	 * First set previously isolated CPUs as available (unisolate).
+ 	 * This cpumask contains only CPUs that switched to available now.
+ 	 */
++	guard(cpus_read_lock)();
+ 	cpumask_andnot(cpumask, cpu_online_mask, exclude_cpumask);
+ 	cpumask_andnot(cpumask, cpumask, tmigr_available_cpumask);
+ 
+@@ -1626,7 +1625,6 @@ static int __init tmigr_init_isolation(void)
+ 	cpumask_andnot(cpumask, cpu_possible_mask, housekeeping_cpumask(HK_TYPE_DOMAIN));
+ 
+ 	/* Protect against RCU torture hotplug testing */
+-	guard(cpus_read_lock)();
+ 	return tmigr_isolated_exclude_cpumask(cpumask);
+ }
+ late_initcall(tmigr_init_isolation);
+-- 
+2.53.0
+
