@@ -1,0 +1,472 @@
+From cbf5219f4e33eb8722224df3bbfc20ff06478ce7 Mon Sep 17 00:00:00 2001
+From: Robert Beckett <bob.beckett@collabora.com>
+Date: Thu, 21 Aug 2025 19:03:06 +0100
+Subject: [PATCH 111/112] leds: rgb: add leds-valve driver
+
+Add initial support for Valve LED strip
+
+Signed-off-by: Robert Beckett <bob.beckett@collabora.com>
+(cherry picked from commit 50e3efc58b078a31c357ed91231ec15f7541e2f7)
+Signed-off-by: John Schoenick <johns@valvesoftware.com>
+---
+ drivers/leds/rgb/Kconfig      |   9 +
+ drivers/leds/rgb/Makefile     |   1 +
+ drivers/leds/rgb/leds-valve.c | 419 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 429 insertions(+)
+ create mode 100644 drivers/leds/rgb/leds-valve.c
+
+diff --git a/drivers/leds/rgb/Kconfig b/drivers/leds/rgb/Kconfig
+index 222d943d8..2f33a69ab 100644
+--- a/drivers/leds/rgb/Kconfig
++++ b/drivers/leds/rgb/Kconfig
+@@ -75,4 +75,13 @@ config LEDS_MT6370_RGB
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called "leds-mt6370-rgb".
+ 
++config LEDS_VALVE
++	tristate "LED Support for Valve Freemont"
++	help
++	  Say Y here to enable support for Valve Freemont LED strip device.
++	  It is a strip LED controller with 17 RGB LEDs.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called "leds-valve".
++
+ endif # LEDS_CLASS_MULTICOLOR
+diff --git a/drivers/leds/rgb/Makefile b/drivers/leds/rgb/Makefile
+index a501fd27f..bad9c5170 100644
+--- a/drivers/leds/rgb/Makefile
++++ b/drivers/leds/rgb/Makefile
+@@ -6,3 +6,4 @@ obj-$(CONFIG_LEDS_NCP5623)		+= leds-ncp5623.o
+ obj-$(CONFIG_LEDS_PWM_MULTICOLOR)	+= leds-pwm-multicolor.o
+ obj-$(CONFIG_LEDS_QCOM_LPG)		+= leds-qcom-lpg.o
+ obj-$(CONFIG_LEDS_MT6370_RGB)		+= leds-mt6370-rgb.o
++obj-$(CONFIG_LEDS_VALVE)		+= leds-valve.o
+diff --git a/drivers/leds/rgb/leds-valve.c b/drivers/leds/rgb/leds-valve.c
+new file mode 100644
+index 000000000..bab9dbad1
+--- /dev/null
++++ b/drivers/leds/rgb/leds-valve.c
+@@ -0,0 +1,419 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++/*
++ * Valve LEDs driver
++ *
++ * Copyright (C) 2025 Valve Corporation
++ *
++ */
++
++#include <linux/device.h>
++#include <linux/dmi.h>
++#include <linux/io.h>
++#include <linux/ioport.h>
++#include <linux/kstrtox.h>
++#include <linux/led-class-multicolor.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++
++#define DRVNAME "valve-leds"
++
++#define VALVE_NUM_LEDS 17
++#define VALVE_NUM_COMPONENTS 3
++#define VALVE_BRIGHTNESS_DEFAULT 255
++#define VALVE_BRIGHTNESS_MAX 255
++#define VALVE_INTENSITY_DEFAULT 255
++
++#define VALVE_PORT_BASE          0xe39
++#define VALVE_PORT_STRIDE        3
++#define VALVE_PORT_MODE          (0xe6c - VALVE_PORT_BASE)
++#define VALVE_PORT_DELAY         (0xe6e - VALVE_PORT_BASE)
++#define VALVE_PORT_BREATH_OFFSET (0xe6f - VALVE_PORT_BASE)
++#define VALVE_PORT_BREATH_LEVEL  (0xe70 - VALVE_PORT_BASE)
++#define VALVE_PORT_PATROL_NUM    (0xe71 - VALVE_PORT_BASE)
++#define VALVE_PORT_COLOR_SHIFT   (0xe75 - VALVE_PORT_BASE)
++#define VALVE_NR_PORTS           (VALVE_PORT_COLOR_SHIFT + 1)
++
++#define VALVE_LED_PORT(n) (n * VALVE_PORT_STRIDE)
++
++static bool test_interface;
++module_param(test_interface, bool, 0644);
++MODULE_PARM_DESC(test_interface, "Just test the interface, don't write LEDs");
++
++static int test_reg_write(void *ctx, unsigned int reg, unsigned int val)
++{
++	pr_info(DRVNAME " %s(): 0x%03x=0x%x\n", __func__, VALVE_PORT_BASE + reg, val);
++	return 0;
++}
++
++static int test_raw_write(void *ctx, const void *data, size_t count)
++{
++	int i;
++	const u8 *bytes = data;
++
++	pr_info(DRVNAME " %s(): 0x%03x: ", __func__, VALVE_PORT_BASE + bytes[0]);
++	for (i = 1; i < count; i++)
++		pr_cont("%02x ", bytes[i]);
++	pr_cont("\n");
++
++	return 0;
++}
++
++static int test_reg_read(void *ctx, unsigned int reg, unsigned int *val)
++{
++	*val = 0;
++	pr_info(DRVNAME " %s(): 0x%03x\n", __func__, VALVE_PORT_BASE + reg);
++	return 0;
++}
++
++static int test_raw_read(void *ctx, const void *reg_buf, size_t reg_size, void *val_buf, size_t val_size)
++{
++	int i;
++	const u8 *regs = reg_buf;
++
++	pr_info(DRVNAME " %s(): ", __func__);
++	for (i = 0; i < reg_size; i++)
++		pr_cont("%03x ", VALVE_PORT_BASE + regs[i]);
++	pr_cont("\n");
++
++	return 0;
++}
++
++static const struct regmap_bus test_bus = {
++	.reg_write = test_reg_write,
++	.write = test_raw_write,
++	.reg_read = test_reg_read,
++	.read = test_raw_read,
++};
++
++struct valve_leds {
++	struct platform_device *pdev;
++	struct regmap *regmap;
++	struct valve_led {
++		struct led_classdev_mc mcdev;
++		struct mc_subled rgb[VALVE_NUM_COMPONENTS];
++		int index;
++	} leds[VALVE_NUM_LEDS];
++
++	// cached so we can restore state on `enabled` toggle
++	int effect_index;
++};
++
++static struct platform_device *pdev;
++
++// Index that corresponds to off and normal states for `enabled` cycling
++#define VALVE_INDEX_DISABLED 4
++#define VALVE_INDEX_NORMAL   3
++static const char *const effect_names[] = {
++	"patrol",
++	"breath",
++	"factory",
++	"normal",
++	"off",
++	"rainbow",
++	"demo",
++	"manual",
++};
++
++static ssize_t enabled_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct valve_leds *leds = dev_get_drvdata(dev->parent);
++	unsigned int mode;
++	ssize_t len = 0;
++	int ret;
++
++	ret = regmap_read(leds->regmap, VALVE_PORT_MODE, &mode);
++	if (ret)
++		return ret;
++
++	len = sysfs_emit(buf, "%d\n", (mode != VALVE_INDEX_DISABLED));
++
++	return len;
++}
++
++static ssize_t enabled_store(struct device *dev, struct device_attribute *attr,
++	const char *buf, size_t count)
++{
++	struct valve_leds *leds = dev_get_drvdata(dev->parent);
++	int mode, enabled, ret;
++
++	enabled = __sysfs_match_string(effect_names, ARRAY_SIZE(effect_names), buf);
++	if (enabled < 0)
++		return enabled;
++
++	mode = enabled ? leds->effect_index : VALVE_INDEX_DISABLED;
++	ret = regmap_write(leds->regmap, VALVE_PORT_MODE, mode);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static ssize_t effect_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct valve_leds *leds = dev_get_drvdata(dev->parent);
++	unsigned int mode;
++	ssize_t len = 0;
++	int ret;
++
++	ret = regmap_read(leds->regmap, VALVE_PORT_MODE, &mode);
++	if (ret)
++		return ret;
++
++	if (mode >= 0 && mode < ARRAY_SIZE(effect_names))
++		len = sysfs_emit(buf, "%s\n", effect_names[mode]);
++
++	return len;
++}
++
++static ssize_t effect_store(struct device *dev, struct device_attribute *attr,
++	const char *buf, size_t count)
++{
++	struct valve_leds *leds = dev_get_drvdata(dev->parent);
++	int mode, ret;
++
++	mode = __sysfs_match_string(effect_names, ARRAY_SIZE(effect_names), buf);
++	if (mode < 0)
++		return mode;
++
++	ret = regmap_write(leds->regmap, VALVE_PORT_MODE, mode);
++	if (ret)
++		return ret;
++
++	// cache last enabled mode for enabled node to restore
++	if (mode != VALVE_INDEX_DISABLED)
++		leds->effect_index = mode;
++
++	return count;
++}
++
++static ssize_t effect_index_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	ssize_t len = 0;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(effect_names); i++)
++		len += sysfs_emit_at(buf, len, "%s ", effect_names[i]);
++
++	buf[len - 1] = '\n';
++
++	return len;
++}
++
++static DEVICE_ATTR_RW(enabled);
++static DEVICE_ATTR_RW(effect);
++static DEVICE_ATTR_RO(effect_index);
++
++static ssize_t byte_reg_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct valve_leds *leds = dev_get_drvdata(dev->parent);
++	struct dev_ext_attribute *ext = container_of(attr, typeof(*ext), attr);
++	unsigned int port = (long)ext->var;
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(leds->regmap, port, &val);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "0x%02x\n", val);
++}
++
++static ssize_t byte_reg_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
++{
++	struct valve_leds *leds = dev_get_drvdata(dev->parent);
++	struct dev_ext_attribute *ext = container_of(attr, typeof(*ext), attr);
++	unsigned int port = (long)ext->var;
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(leds->regmap, port, val);
++	if (ret)
++		return ret;
++
++	return size;
++}
++
++#define VALVE_LEDS_BYTE_ATTR(_name, _mode, _port) \
++	struct dev_ext_attribute dev_attr_##_name = \
++		{ __ATTR(_name, _mode, byte_reg_show, byte_reg_store), ((void *)_port) }
++
++VALVE_LEDS_BYTE_ATTR(delay, 0644, VALVE_PORT_DELAY);
++VALVE_LEDS_BYTE_ATTR(breath_offset, 0644, VALVE_PORT_BREATH_OFFSET);
++VALVE_LEDS_BYTE_ATTR(breath_level, 0644, VALVE_PORT_BREATH_LEVEL);
++VALVE_LEDS_BYTE_ATTR(patrol_num, 0644, VALVE_PORT_PATROL_NUM);
++VALVE_LEDS_BYTE_ATTR(color_shift, 0644, VALVE_PORT_COLOR_SHIFT);
++
++static struct attribute *valve_leds_attrs[] = {
++	&dev_attr_effect.attr,
++	&dev_attr_effect_index.attr,
++	&dev_attr_enabled.attr,
++	&dev_attr_delay.attr.attr,
++	&dev_attr_breath_offset.attr.attr,
++	&dev_attr_breath_level.attr.attr,
++	&dev_attr_patrol_num.attr.attr,
++	&dev_attr_color_shift.attr.attr,
++	NULL,
++};
++static const struct attribute_group valve_leds_attr_group = {
++	.attrs = valve_leds_attrs,
++};
++
++
++static int valve_leds_set_brightness(struct led_classdev *led_cdev, enum led_brightness brightness)
++{
++	struct valve_leds *leds = dev_get_drvdata(led_cdev->dev->parent);
++	struct led_classdev_mc *mcdev = lcdev_to_mccdev(led_cdev);
++	struct valve_led *led = container_of(mcdev, typeof(*led), mcdev);
++	char rgb[3];
++	int ret;
++
++	led_mc_calc_color_components(mcdev, brightness);
++
++	rgb[0] = led->rgb[0].brightness;
++	rgb[1] = led->rgb[1].brightness;
++	rgb[2] = led->rgb[2].brightness;
++
++	ret = regmap_bulk_write(leds->regmap, VALVE_LED_PORT(led->index), rgb, 3);
++	return ret;
++}
++
++
++static const struct dmi_system_id valve_leds_dmi_table[] = {
++	{
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "OEM"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "F7F"),
++		},
++	},
++	{
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Valve"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Fremont"),
++		},
++	},
++	{}
++};
++
++static int valve_leds_probe(struct platform_device *pdev)
++{
++	struct valve_leds *vleds;
++	int i, c;
++	int ret;
++	void __iomem *ports;
++
++	static const struct regmap_config cfg = {
++		.name = DRVNAME,
++		.reg_bits = 8,
++		.val_bits = 8,
++		.io_port = true,
++	};
++
++	if (!test_interface && !dmi_check_system(valve_leds_dmi_table))
++		return -ENODEV;
++
++	vleds = devm_kzalloc(&pdev->dev, sizeof(*vleds), GFP_KERNEL);
++	if (!vleds)
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, vleds);
++
++	if (test_interface) {
++		vleds->regmap = devm_regmap_init(&pdev->dev, &test_bus, NULL, &cfg);
++	} else {
++		if (!devm_request_region(&pdev->dev, VALVE_PORT_BASE, VALVE_NR_PORTS, DRVNAME))
++			return -EBUSY;
++
++		ports = devm_ioport_map(&pdev->dev, VALVE_PORT_BASE, VALVE_NR_PORTS);
++		if (!ports)
++			return -ENOMEM;
++
++		vleds->regmap = devm_regmap_init_mmio(&pdev->dev, ports, &cfg);
++	}
++
++	if (IS_ERR(vleds->regmap))
++		return PTR_ERR(vleds->regmap);
++
++	// Read current state at load time
++	// Cached for `enabled` node but also serves as a self-test
++	ret = regmap_read(vleds->regmap, VALVE_PORT_MODE, &vleds->effect_index);
++	if (ret) {
++		pr_err("%s(): Failed to read led state: %ld\n", __func__, PTR_ERR(pdev));
++		return ret;
++	}
++
++	vleds->pdev = pdev;
++	for (i = 0; i < VALVE_NUM_LEDS; i++) {
++		for (c = 0; c < VALVE_NUM_COMPONENTS; c++) {
++			vleds->leds[i].rgb[c].color_index = LED_COLOR_ID_RED + c;
++			vleds->leds[i].rgb[c].brightness = VALVE_BRIGHTNESS_DEFAULT;
++			vleds->leds[i].rgb[c].intensity = VALVE_INTENSITY_DEFAULT;
++			vleds->leds[i].rgb[c].channel = c;
++		}
++
++		vleds->leds[i].index = i;
++		vleds->leds[i].mcdev.led_cdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "%s[%d]", DRVNAME, i);
++		vleds->leds[i].mcdev.led_cdev.brightness = VALVE_BRIGHTNESS_DEFAULT;
++		vleds->leds[i].mcdev.led_cdev.max_brightness = VALVE_BRIGHTNESS_MAX;
++		vleds->leds[i].mcdev.num_colors = VALVE_NUM_COMPONENTS;
++		vleds->leds[i].mcdev.subled_info = vleds->leds[i].rgb;
++		vleds->leds[i].mcdev.led_cdev.brightness_set_blocking = valve_leds_set_brightness;
++
++		ret = devm_led_classdev_multicolor_register(&pdev->dev, &vleds->leds[i].mcdev);
++		if (ret)
++			return ret;
++
++		ret = devm_device_add_group(vleds->leds[i].mcdev.led_cdev.dev, &valve_leds_attr_group);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static struct platform_driver valve_leds_driver = {
++	.probe = valve_leds_probe,
++	.driver = {
++		.name = DRVNAME,
++	},
++};
++
++static int __init valve_leds_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&valve_leds_driver);
++	if (ret < 0) {
++		pr_err("%s(): Failed to register driver: %d\n", __func__, ret);
++		return ret;
++	}
++
++	pdev = platform_device_register_simple(DRVNAME, -1, NULL, 0);
++	if (IS_ERR(pdev)) {
++		pr_err("%s(): Failed to register device: %ld\n", __func__, PTR_ERR(pdev));
++		platform_driver_unregister(&valve_leds_driver);
++		return PTR_ERR(pdev);
++	}
++
++	return 0;
++}
++
++static void __exit valve_leds_exit(void)
++{
++	platform_device_unregister(pdev);
++	platform_driver_unregister(&valve_leds_driver);
++}
++
++module_init(valve_leds_init);
++module_exit(valve_leds_exit);
++
++MODULE_DEVICE_TABLE(dmi, valve_leds_dmi_table);
++MODULE_AUTHOR("Robert Beckett <bob.beckett@collabora.com>");
++MODULE_DESCRIPTION("Valve LEDs driver");
++MODULE_LICENSE("GPL");
+-- 
+2.53.0
+
