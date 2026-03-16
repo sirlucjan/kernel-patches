@@ -1,0 +1,447 @@
+From 9e8df1d945abb914ea29a8d931bd9c3987171d81 Mon Sep 17 00:00:00 2001
+From: Yakov Till <yakov.till@gmail.com>
+Date: Sun, 14 Dec 2025 13:46:32 +0100
+Subject: [PATCH 16/17] ALSA: hda: aw88399: implement complete startup sequence
+ in library
+
+The library's aw88399_dev_start_internal() was incomplete compared to
+the vendor driver in aw88399.c. This caused robustness issues and
+'pa stop check fail' errors in dmesg.
+
+Changes:
+- Fix I2S TX enable to use correct register (I2SCTRL3_REG, not I2SCFG1)
+- Add PLL lock check with mode1/mode2 fallback (aw_dev_check_syspll)
+- Add full system status check with noise gate awareness (aw_dev_check_sysst)
+- Add DSP watchdog status check (aw_dev_dsp_check)
+- Add interrupt status clear function (aw_dev_clear_int_status)
+- Rewrite start sequence to match vendor driver:
+  1. Power on
+  2. PLL lock check
+  3. Amp power on
+  4. System status check
+  5. DSP check (if enabled)
+  6. I2S TX enable
+  7. Unmute
+  8. Clear interrupts
+- Add proper error handling with cleanup on failure
+
+The startup sequence now matches the original aw88399_dev_start() from
+the vendor's ASoC driver, providing the same robustness and error
+recovery behavior.
+
+Signed-off-by: Yakov Till <yakov.till@gmail.com>
+---
+ sound/soc/codecs/aw88399-lib.c | 291 ++++++++++++++++++++++++++++++---
+ 1 file changed, 265 insertions(+), 26 deletions(-)
+
+diff --git a/sound/soc/codecs/aw88399-lib.c b/sound/soc/codecs/aw88399-lib.c
+index 68acb7e6f..9753c3d13 100644
+--- a/sound/soc/codecs/aw88399-lib.c
++++ b/sound/soc/codecs/aw88399-lib.c
+@@ -25,36 +25,44 @@
+  * Additional bit field definitions not in shared header
+  * (internal to library implementation)
+  */
+-#define AW88399_I2STXEN_START_BIT	9
++
++/* I2S TX enable - NOTE: uses I2SCTRL3_REG, not I2SCFG1_REG */
++#define AW88399_I2STXEN_START_BIT	0
+ #define AW88399_I2STXEN_MASK		(~(1 << AW88399_I2STXEN_START_BIT))
+ #define AW88399_I2STXEN_ENABLE_VALUE	(1 << AW88399_I2STXEN_START_BIT)
+ #define AW88399_I2STXEN_DISABLE_VALUE	(0 << AW88399_I2STXEN_START_BIT)
+ 
++/* Power down control */
+ #define AW88399_PWDN_START_BIT		0
+ #define AW88399_PWDN_MASK		(~(1 << AW88399_PWDN_START_BIT))
+ #define AW88399_PWDN_POWER_DOWN_VALUE	(1 << AW88399_PWDN_START_BIT)
+ #define AW88399_PWDN_WORKING_VALUE	(0 << AW88399_PWDN_START_BIT)
+ 
++/* Amplifier power down */
+ #define AW88399_AMPPD_START_BIT		1
+ #define AW88399_AMPPD_MASK		(~(1 << AW88399_AMPPD_START_BIT))
+ #define AW88399_AMPPD_POWER_DOWN_VALUE	(1 << AW88399_AMPPD_START_BIT)
+ #define AW88399_AMPPD_WORKING_VALUE	(0 << AW88399_AMPPD_START_BIT)
+ 
++/* DSP bypass */
+ #define AW88399_DSPBY_START_BIT		2
+ #define AW88399_DSPBY_MASK		(~(1 << AW88399_DSPBY_START_BIT))
+ #define AW88399_DSPBY_BYPASS_VALUE	(1 << AW88399_DSPBY_START_BIT)
+ #define AW88399_DSPBY_WORKING_VALUE	(0 << AW88399_DSPBY_START_BIT)
+ 
++/* Memory clock select */
+ #define AW88399_MEM_CLKSEL_START_BIT	3
+ #define AW88399_MEM_CLKSEL_MASK		(~(1 << AW88399_MEM_CLKSEL_START_BIT))
+ #define AW88399_MEM_CLKSEL_OSCCLK_VALUE	(0 << AW88399_MEM_CLKSEL_START_BIT)
+ #define AW88399_MEM_CLKSEL_DAPHCLK_VALUE (1 << AW88399_MEM_CLKSEL_START_BIT)
+ 
++/* Hardware mute */
+ #define AW88399_HMUTE_START_BIT		8
+ #define AW88399_HMUTE_MASK		(~(1 << AW88399_HMUTE_START_BIT))
+ #define AW88399_HMUTE_ENABLE_VALUE	(1 << AW88399_HMUTE_START_BIT)
+ #define AW88399_HMUTE_DISABLE_VALUE	(0 << AW88399_HMUTE_START_BIT)
+ 
++/* PLL status bits */
+ #define AW88399_PLLS_START_BIT		0
+ #define AW88399_PLLS_LOCKED_VALUE	(1 << AW88399_PLLS_START_BIT)
+ #define AW88399_CLKS_START_BIT		4
+@@ -63,9 +71,20 @@
+ #define AW88399_BIT_PLL_CHECK \
+ 	(AW88399_CLKS_STABLE_VALUE | AW88399_PLLS_LOCKED_VALUE)
+ 
++/* System status check masks */
++#define AW88399_SWS_START_BIT		8
++#define AW88399_SWS_VALUE		(1 << AW88399_SWS_START_BIT)
+ #define AW88399_BIT_SYSST_NOSWS_CHECK \
+ 	(AW88399_CLKS_STABLE_VALUE | AW88399_PLLS_LOCKED_VALUE)
++#define AW88399_BIT_SYSST_SWS_CHECK \
++	(AW88399_SWS_VALUE | AW88399_CLKS_STABLE_VALUE | AW88399_PLLS_LOCKED_VALUE)
++#define AW88399_BIT_SYSST_CHECK_MASK	(~0x01FF)
+ 
++/* Noise gate enable bit for sysst check mode selection */
++#define AW88399_NOISE_GATE_EN_START_BIT	13
++#define AW88399_NOISE_GATE_EN_MASK	(~(1 << AW88399_NOISE_GATE_EN_START_BIT))
++
++/* System interrupt bits */
+ #define AW88399_PLLI_START_BIT		0
+ #define AW88399_CLKI_START_BIT		4
+ #define AW88399_NOCLKI_START_BIT	5
+@@ -74,14 +93,26 @@
+ 	 (1 << AW88399_CLKI_START_BIT) | \
+ 	 (1 << AW88399_NOCLKI_START_BIT))
+ 
++/* CCO MUX for PLL mode switching */
++#define AW88399_CCO_MUX_START_BIT	14
++#define AW88399_CCO_MUX_MASK		(~(3 << AW88399_CCO_MUX_START_BIT))
++#define AW88399_CCO_MUX_BYPASS_VALUE	(0 << AW88399_CCO_MUX_START_BIT)
++#define AW88399_CCO_MUX_DIVIDED_VALUE	(1 << AW88399_CCO_MUX_START_BIT)
++
++/* DSP watchdog for status check */
++#define AW88399_WDT_CNT_MASK		(~0xFF)
++
++/* Volume control */
+ #define AW88399_VOLUME_STEP_DB		64
+ #define AW88399_VOL_DEFAULT_VALUE	0
+ #define AW88399_MUTE_VOL		1023
+ #define AW88399_VOL_START_BIT		0
+ #define AW88399_VOL_MASK		(~0x3FF)
+ 
++/* Retry and timing constants */
+ #define AW88399_START_RETRIES		5
+ #define AW88399_DEV_SYSST_CHECK_MAX	10
++#define AW88399_DEV_DSP_CHECK_MAX	10
+ #define AW88399_DEV_DEFAULT_CH		0
+ 
+ /**
+@@ -154,15 +185,15 @@ static void aw_dev_dsp_enable(struct aw_device *aw_dev, bool dsp)
+ 
+ static void aw_dev_i2s_tx_enable(struct aw_device *aw_dev, bool flag)
+ {
++	/* NOTE: Uses I2SCTRL3_REG (not I2SCFG1) per vendor driver */
+ 	if (flag)
+-		regmap_update_bits(aw_dev->regmap, AW88399_I2SCFG1_REG,
++		regmap_update_bits(aw_dev->regmap, AW88399_I2SCTRL3_REG,
+ 				   ~AW88399_I2STXEN_MASK, AW88399_I2STXEN_ENABLE_VALUE);
+ 	else
+-		regmap_update_bits(aw_dev->regmap, AW88399_I2SCFG1_REG,
++		regmap_update_bits(aw_dev->regmap, AW88399_I2SCTRL3_REG,
+ 				   ~AW88399_I2STXEN_MASK, AW88399_I2STXEN_DISABLE_VALUE);
+ }
+ 
+-
+ static int aw_dev_get_int_status(struct aw_device *aw_dev, u16 *int_status)
+ {
+ 	unsigned int val;
+@@ -176,6 +207,17 @@ static int aw_dev_get_int_status(struct aw_device *aw_dev, u16 *int_status)
+ 	return 0;
+ }
+ 
++static void aw_dev_clear_int_status(struct aw_device *aw_dev)
++{
++	u16 int_status = 0;
++
++	/* Read int status to clear, then verify */
++	aw_dev_get_int_status(aw_dev, &int_status);
++	aw_dev_get_int_status(aw_dev, &int_status);
++	if (int_status)
++		dev_dbg(aw_dev->dev, "int status not cleared: 0x%04x", int_status);
++}
++
+ static int aw_dev_check_sysint(struct aw_device *aw_dev)
+ {
+ 	u16 reg_val = 0;
+@@ -193,29 +235,187 @@ static int aw_dev_check_sysint(struct aw_device *aw_dev)
+ 	return 0;
+ }
+ 
+-static int aw_dev_sysst_check(struct aw_device *aw_dev)
++/* PLL lock check - mode 1 (direct IIS check) */
++static int aw_dev_get_iis_status(struct aw_device *aw_dev)
++{
++	unsigned int reg_val;
++	int ret;
++
++	ret = regmap_read(aw_dev->regmap, AW88399_SYSST_REG, &reg_val);
++	if (ret)
++		return ret;
++
++	if ((reg_val & AW88399_BIT_PLL_CHECK) != AW88399_BIT_PLL_CHECK) {
++		dev_dbg(aw_dev->dev, "pll check fail, reg_val:0x%04x", reg_val);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int aw_dev_check_mode1_pll(struct aw_device *aw_dev)
+ {
+-	unsigned int check_val = AW88399_BIT_SYSST_NOSWS_CHECK;
+-	unsigned int val;
+ 	int ret, i;
+ 
+ 	for (i = 0; i < AW88399_DEV_SYSST_CHECK_MAX; i++) {
+-		ret = regmap_read(aw_dev->regmap, AW88399_SYSST_REG, &val);
+-		if (ret)
+-			return ret;
+-
+-		if ((val & check_val) == check_val) {
+-			dev_dbg(aw_dev->dev, "sysst check pass, val=0x%x", val);
++		ret = aw_dev_get_iis_status(aw_dev);
++		if (!ret)
+ 			return 0;
+-		}
+-		usleep_range(AW88399_2000_US, AW88399_2000_US + 100);
++		usleep_range(AW88399_2000_US, AW88399_2000_US + 10);
+ 	}
+ 
+-	dev_err(aw_dev->dev, "sysst check failed, val=0x%x", val);
++	dev_err(aw_dev->dev, "mode1 iis signal check failed");
+ 	return -EPERM;
+ }
+ 
+-/* Device start implementation */
++/* PLL lock check - mode 2 (with CCO MUX switch) */
++static int aw_dev_check_mode2_pll(struct aw_device *aw_dev)
++{
++	unsigned int reg_val;
++	int ret, i;
++
++	ret = regmap_read(aw_dev->regmap, AW88399_PLLCTRL2_REG, &reg_val);
++	if (ret)
++		return ret;
++
++	reg_val &= (~AW88399_CCO_MUX_MASK);
++	if (reg_val == AW88399_CCO_MUX_DIVIDED_VALUE) {
++		dev_dbg(aw_dev->dev, "CCO_MUX already in divided mode");
++		return -EPERM;
++	}
++
++	/* Switch to mode2 (divided) */
++	ret = regmap_update_bits(aw_dev->regmap, AW88399_PLLCTRL2_REG,
++				 ~AW88399_CCO_MUX_MASK, AW88399_CCO_MUX_DIVIDED_VALUE);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < AW88399_DEV_SYSST_CHECK_MAX; i++) {
++		ret = aw_dev_get_iis_status(aw_dev);
++		if (!ret)
++			break;
++		usleep_range(AW88399_2000_US, AW88399_2000_US + 10);
++	}
++
++	/* Switch back to mode1 (bypass) */
++	regmap_update_bits(aw_dev->regmap, AW88399_PLLCTRL2_REG,
++			   ~AW88399_CCO_MUX_MASK, AW88399_CCO_MUX_BYPASS_VALUE);
++
++	if (!ret) {
++		usleep_range(AW88399_2000_US, AW88399_2000_US + 10);
++		for (i = 0; i < AW88399_DEV_SYSST_CHECK_MAX; i++) {
++			ret = aw_dev_get_iis_status(aw_dev);
++			if (!ret)
++				break;
++			usleep_range(AW88399_2000_US, AW88399_2000_US + 10);
++		}
++	}
++
++	if (ret)
++		dev_err(aw_dev->dev, "mode2 pll check failed");
++
++	return ret;
++}
++
++static int aw_dev_check_syspll(struct aw_device *aw_dev)
++{
++	int ret;
++
++	ret = aw_dev_check_mode1_pll(aw_dev);
++	if (ret) {
++		dev_dbg(aw_dev->dev, "mode1 pll failed, trying mode2");
++		ret = aw_dev_check_mode2_pll(aw_dev);
++		if (ret) {
++			dev_err(aw_dev->dev, "both pll modes failed");
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++/* Full system status check with noise gate awareness */
++static int aw_dev_check_sysst(struct aw_device *aw_dev)
++{
++	unsigned int check_val;
++	unsigned int reg_val;
++	int ret, i;
++
++	/* Determine check mode based on noise gate setting */
++	ret = regmap_read(aw_dev->regmap, AW88399_PWMCTRL3_REG, &reg_val);
++	if (ret)
++		return ret;
++
++	if (reg_val & (~AW88399_NOISE_GATE_EN_MASK))
++		check_val = AW88399_BIT_SYSST_NOSWS_CHECK;
++	else
++		check_val = AW88399_BIT_SYSST_SWS_CHECK;
++
++	for (i = 0; i < AW88399_DEV_SYSST_CHECK_MAX; i++) {
++		ret = regmap_read(aw_dev->regmap, AW88399_SYSST_REG, &reg_val);
++		if (ret)
++			return ret;
++
++		if ((reg_val & (~AW88399_BIT_SYSST_CHECK_MASK) & check_val) == check_val) {
++			dev_dbg(aw_dev->dev, "sysst check pass, val=0x%x", reg_val);
++			return 0;
++		}
++		dev_dbg(aw_dev->dev, "sysst check fail cnt=%d, val=0x%04x, check=0x%x",
++			i, reg_val, check_val);
++		usleep_range(AW88399_2000_US, AW88399_2000_US + 10);
++	}
++
++	dev_err(aw_dev->dev, "sysst check failed, val=0x%x", reg_val);
++	return -EPERM;
++}
++
++/* DSP status check */
++static int aw_dev_get_dsp_status(struct aw_device *aw_dev)
++{
++	unsigned int reg_val;
++	int ret;
++
++	ret = regmap_read(aw_dev->regmap, AW88399_WDT_REG, &reg_val);
++	if (ret)
++		return ret;
++
++	if (!(reg_val & (~AW88399_WDT_CNT_MASK)))
++		return -EPERM;
++
++	return 0;
++}
++
++static int aw_dev_dsp_check(struct aw_device *aw_dev)
++{
++	int ret, i;
++
++	if (aw_dev->dsp_cfg == AW88395_DEV_DSP_BYPASS) {
++		dev_dbg(aw_dev->dev, "dsp bypass mode");
++		return 0;
++	}
++
++	/* Toggle DSP to start watchdog */
++	aw_dev_dsp_enable(aw_dev, false);
++	aw_dev_dsp_enable(aw_dev, true);
++	usleep_range(AW88399_1000_US, AW88399_1000_US + 10);
++
++	for (i = 0; i < AW88399_DEV_DSP_CHECK_MAX; i++) {
++		ret = aw_dev_get_dsp_status(aw_dev);
++		if (!ret) {
++			dev_dbg(aw_dev->dev, "dsp status check pass");
++			return 0;
++		}
++		usleep_range(AW88399_2000_US, AW88399_2000_US + 10);
++	}
++
++	dev_err(aw_dev->dev, "dsp status check failed");
++	return -EPERM;
++}
++
++/*
++ * Complete device start implementation
++ * Follows vendor driver sequence from aw88399.c:aw88399_dev_start()
++ */
+ static int aw88399_dev_start_internal(struct aw88399_dev *aw88399_dev)
+ {
+ 	struct aw_device *aw_dev = aw88399_dev->aw_pa;
+@@ -226,23 +426,62 @@ static int aw88399_dev_start_internal(struct aw88399_dev *aw88399_dev)
+ 		return 0;
+ 	}
+ 
+-	/* Power on sequence */
++	/* Step 1: Power on */
+ 	aw_dev_pwd(aw_dev, false);
+-	usleep_range(AW88399_2000_US, AW88399_2000_US + 100);
++	usleep_range(AW88399_2000_US, AW88399_2000_US + 10);
+ 
+-	ret = aw_dev_sysst_check(aw_dev);
+-	if (ret)
+-		return ret;
++	/* Step 2: Check PLL lock */
++	ret = aw_dev_check_syspll(aw_dev);
++	if (ret) {
++		dev_err(aw_dev->dev, "pll check failed, cannot start");
++		goto pll_check_fail;
++	}
+ 
++	/* Step 3: Amp power on */
+ 	aw_dev_amppd(aw_dev, false);
+-	aw_dev_dsp_enable(aw_dev, true);
+-	aw88399_lib_dev_mute(aw_dev, false);
++	usleep_range(AW88399_1000_US, AW88399_1000_US + 50);
++
++	/* Step 4: Check system status */
++	ret = aw_dev_check_sysst(aw_dev);
++	if (ret) {
++		dev_err(aw_dev->dev, "sysst check failed");
++		goto sysst_check_fail;
++	}
++
++	/* Step 5: DSP check (if DSP is enabled) */
++	if (aw_dev->dsp_cfg == AW88395_DEV_DSP_WORK) {
++		aw_dev_dsp_enable(aw_dev, false);
++		ret = aw_dev_dsp_check(aw_dev);
++		if (ret) {
++			dev_err(aw_dev->dev, "dsp status check failed");
++			goto dsp_check_fail;
++		}
++	} else {
++		dev_dbg(aw_dev->dev, "starting with dsp bypass");
++	}
++
++	/* Step 6: Enable I2S TX feedback */
+ 	aw_dev_i2s_tx_enable(aw_dev, true);
+ 
+-	aw_dev->status = AW88399_DEV_PW_ON;
++	/* Step 7: Unmute */
++	aw88399_lib_dev_mute(aw_dev, false);
+ 
+-	dev_dbg(aw_dev->dev, "device started");
++	/* Step 8: Clear interrupts */
++	aw_dev_clear_int_status(aw_dev);
++
++	aw_dev->status = AW88399_DEV_PW_ON;
++	dev_dbg(aw_dev->dev, "device started successfully");
+ 	return 0;
++
++dsp_check_fail:
++	aw_dev_dsp_enable(aw_dev, false);
++sysst_check_fail:
++	aw_dev_clear_int_status(aw_dev);
++	aw_dev_amppd(aw_dev, true);
++pll_check_fail:
++	aw_dev_pwd(aw_dev, true);
++	aw_dev->status = AW88399_DEV_PW_OFF;
++	return ret;
+ }
+ 
+ /**
+-- 
+2.53.0
+
