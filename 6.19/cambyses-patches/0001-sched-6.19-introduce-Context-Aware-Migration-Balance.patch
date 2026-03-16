@@ -1,0 +1,1430 @@
+From 2d1489fb3c7a1cab582c4996ed69a0de7d4f36ab Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Mon, 16 Mar 2026 09:08:55 +0100
+Subject: [PATCH] sched-6.19: introduce Context-Aware Migration Balancer
+ Yielding Scored Entity Selection
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ init/Kconfig                       |  35 ++
+ kernel/sched/Makefile              |  19 +
+ kernel/sched/cambyses.c            | 579 +++++++++++++++++++++++++++++
+ kernel/sched/cambyses.h            |  99 +++++
+ kernel/sched/cambyses_simd_avx2.c  | 259 +++++++++++++
+ kernel/sched/cambyses_simd_ssse3.c | 105 ++++++
+ kernel/sched/cambyses_sort.c       | 209 +++++++++++
+ kernel/sched/fair.c                |  19 +
+ 8 files changed, 1324 insertions(+)
+ create mode 100644 kernel/sched/cambyses.c
+ create mode 100644 kernel/sched/cambyses.h
+ create mode 100644 kernel/sched/cambyses_simd_avx2.c
+ create mode 100644 kernel/sched/cambyses_simd_ssse3.c
+ create mode 100644 kernel/sched/cambyses_sort.c
+
+diff --git a/init/Kconfig b/init/Kconfig
+index fa79feb8f..4789f4a06 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1430,6 +1430,41 @@ config CHECKPOINT_RESTORE
+ 
+ 	  If unsure, say N here.
+ 
++config SCHED_CAMBYSES
++	bool "Cambyses scored migration selection for CFS load balancer"
++	depends on SMP
++	default y
++	help
++	  Context-Aware Migration Balancer Yielding Scored Entity Selection.
++
++	  Replaces the default FIFO task selection in detach_tasks() with
++	  a scoring function that evaluates cache coldness, load contribution,
++	  affinity breadth, and wakee stability to select the most suitable
++	  migration candidates.
++
++	  When disabled at runtime (sysctl kernel.sched_cambyses=0),
++	  all Cambyses paths are NOPed out via static key at zero cost.
++
++	  If unsure, say Y here.
++
++config SCHED_CAMBYSES_SIMD
++	bool "SIMD acceleration for Cambyses batch scoring"
++	depends on SCHED_CAMBYSES
++	depends on X86_64
++	default y
++	help
++	  Uses SIMD instructions (AVX2/SSSE3 on x86_64) for batch scoring
++	  of migration candidates when the candidate count exceeds 8.
++
++	  SSSE3 processes 4 candidates per xmm register, AVX2 processes
++	  8 candidates per ymm register, using PMADDUBSW for integer
++	  multiply-accumulate of feature vectors.
++
++	  Requires kernel_fpu_begin/end (XSAVE/XRSTOR).  Falls back to
++	  scalar scoring when SIMD is not beneficial or CPU lacks support.
++
++	  If unsure, say Y here.
++
+ config SCHED_AUTOGROUP
+ 	bool "Automatic process group scheduling"
+ 	select CGROUPS
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index 8ae86371d..3ce826bea 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -37,3 +37,22 @@ obj-y += core.o
+ obj-y += fair.o
+ obj-y += build_policy.o
+ obj-y += build_utility.o
++# Cambyses: cambyses.c is #included from fair.c (needs access to static functions).
++# Sort networks are in a separate TU to prevent auto-vectorization contamination.
++obj-$(CONFIG_SCHED_CAMBYSES) += cambyses_sort.o
++
++# Cambyses SIMD: Separate TUs with ISA-specific flags.
++# FPU_KILL_FLAGS must be removed first (kernel builds with -mno-sse etc.),
++# then ISA flags added.  Following Nap's pattern (drivers/cpuidle/governors/nap/).
++ifdef CONFIG_SCHED_CAMBYSES_SIMD
++obj-y += cambyses_simd_ssse3.o cambyses_simd_avx2.o
++
++CAMBYSES_FPU_KILL_FLAGS := -mno-sse -mno-sse2 -mno-mmx -mno-avx -mno-3dnow \
++                           -mno-sse4a -msoft-float -mno-80387 -mno-fp-ret-in-387
++
++CFLAGS_REMOVE_cambyses_simd_ssse3.o += $(CAMBYSES_FPU_KILL_FLAGS)
++CFLAGS_REMOVE_cambyses_simd_avx2.o  += $(CAMBYSES_FPU_KILL_FLAGS)
++
++CFLAGS_cambyses_simd_ssse3.o += $(CC_FLAGS_FPU) -mssse3
++CFLAGS_cambyses_simd_avx2.o  += $(CC_FLAGS_FPU) -mavx -mavx2
++endif
+diff --git a/kernel/sched/cambyses.c b/kernel/sched/cambyses.c
+new file mode 100644
+index 000000000..77df9dc5a
+--- /dev/null
++++ b/kernel/sched/cambyses.c
+@@ -0,0 +1,579 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Cambyses — Context-Aware Migration Balancer Yielding Scored Entity Selection
++ *
++ * Scored migration selection for CFS load balancer.
++ * Replaces FIFO selection with a multi-feature scoring function that evaluates
++ * cache coldness, load contribution, voluntary switch ratio, and wakee stability.
++ */
++
++/*
++ * This file is #included from fair.c (not compiled separately)
++ * to access static functions: can_migrate_task(), detach_task(),
++ * task_h_load(), task_util_est(), task_fits_cpu(), etc.
++ */
++
++/**************************************************************
++ * Version Information:
++ */
++
++#define CAMBYSES_PROGNAME "Cambyses Migration Selector"
++#define CAMBYSES_AUTHOR   "Masahito Suzuki"
++
++#define CAMBYSES_VERSION  "0.1.1"
++
++/* Runtime toggle — NOP-patched when disabled */
++DEFINE_STATIC_KEY_TRUE(sched_cambyses);
++
++/* Default weights: w1=3 (load contribution dominant), w0=w2=w3=1 */
++u8 sysctl_cambyses_w0 = 1;
++u8 sysctl_cambyses_w1 = 2;
++u8 sysctl_cambyses_w2 = 1;
++u8 sysctl_cambyses_w3 = 1;
++
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++DEFINE_STATIC_KEY_FALSE(cambyses_has_avx2);
++DEFINE_STATIC_KEY_FALSE(cambyses_has_ssse3);
++#endif
++
++/*
++ * log2p1_u64_u8fp2 — fixed-point log2(v+1) with 2-bit mantissa
++ *
++ * Returns (exponent << 2) | mantissa, giving 4× finer granularity than
++ * fls64().  Based on BORE scheduler's log2p1_u64_u32fp().
++ *
++ * Result fits in u8 for all practical scheduler values (max ~163 for
++ * nanosecond-scale deltas).
++ */
++static inline u8 log2p1_u64_u8fp2(u64 v)
++{
++	int clz, exponent;
++	u8 mantissa;
++
++	if (unlikely(!v))
++		return 0;
++	clz = __builtin_clzll(v);
++	exponent = 64 - clz;
++	mantissa = (u8)((v << clz) << 1 >> 62);
++	return (u8)(exponent << 2 | mantissa);
++}
++
++/*
++ * vol_switch_ratio_u6 — voluntary context switch ratio, 0–64
++ *
++ * Approximates (nvcsw / (nvcsw + nivcsw)) × 64 without division, using
++ * log2 subtraction: log2(a/b) = log2(a) - log2(b).
++ *
++ * Both nvcsw and total are converted to pseudo-log2 via log2p1_u64_u8fp2
++ * (CLZ + 2 shifts each), then subtracted.  The +1 offsets in log2p1 cancel.
++ * Result is offset by +64 and clamped to [0, 64].
++ *
++ * Higher value = more I/O-bound = transient cache footprint = cheaper to migrate.
++ */
++static inline u8 vol_switch_ratio_u6(struct task_struct *p)
++{
++	unsigned long total = p->nvcsw + p->nivcsw;
++
++	if (unlikely(!total))
++		return 0;
++	return (u8)clamp_t(int,
++		(int)log2p1_u64_u8fp2(p->nvcsw)
++		- (int)log2p1_u64_u8fp2(total) + 64,
++		0, 64);
++}
++
++/*
++ * score_task_cambyses — compute migration suitability score for a task
++ *
++ * Features (u8, range varies per feature):
++ *   F0: cache coldness       — log2p1(time since last exec) (higher = colder = better)
++ *   F1: load contribution    — log2p1(task hierarchical load) (higher = more effective)
++ *   F2: vol switch ratio     — nvcsw/(nvcsw+nivcsw) × 64 (higher = I/O-bound = cheaper)
++ *   F3: wakee penalty        — log2p1(wakee_flips + 1) (higher = riskier)
++ *
++ * Score range: max ~392, min ~-24 → fits in s16.
++ *
++ * When feat_out is non-NULL, also packs the raw u8 features for SIMD
++ * batch scoring.  The scalar score is always returned for use when
++ * nr_cands <= SIMD threshold or SIMD is unavailable.
++ */
++static s16 score_task_cambyses(struct task_struct *p, struct lb_env *env,
++			       u8 *feat_out)
++{
++	int f0 = log2p1_u64_u8fp2(rq_clock_task(env->src_rq) - p->se.exec_start);
++	int f1 = log2p1_u64_u8fp2(max_t(unsigned long, task_h_load(p), 1));
++	int f2 = vol_switch_ratio_u6(p);
++	int f3 = log2p1_u64_u8fp2(p->wakee_flips + 1);
++
++	if (feat_out) {
++		feat_out[0] = (u8)f0;
++		feat_out[1] = (u8)f1;
++		feat_out[2] = (u8)f2;
++		feat_out[3] = (u8)f3;
++	}
++
++	return (s16)((int)sysctl_cambyses_w0 * f0
++		   + (int)sysctl_cambyses_w1 * f1
++		   + (int)sysctl_cambyses_w2 * f2
++		   - (int)sysctl_cambyses_w3 * f3);
++}
++
++/*
++ * check_imbalance_cambyses — coarse filter for Phase 1 candidate inclusion
++ *
++ * Mirrors the existing detach_tasks() switch logic but does NOT consume
++ * imbalance (that happens in Phase 3 after sorting by score).
++ */
++static bool check_imbalance_cambyses(struct task_struct *p,
++				     struct lb_env *env)
++{
++	switch (env->migration_type) {
++	case migrate_load: {
++		unsigned long load = max_t(unsigned long, task_h_load(p), 1);
++
++		if (sched_feat(LB_MIN) &&
++		    load < 16 && !env->sd->nr_balance_failed)
++			return false;
++		if (shr_bound(load, env->sd->nr_balance_failed) > env->imbalance)
++			return false;
++		return true;
++	}
++	case migrate_util: {
++		unsigned long util = task_util_est(p);
++
++		if (shr_bound(util, env->sd->nr_balance_failed) > env->imbalance)
++			return false;
++		return true;
++	}
++	case migrate_task:
++		return true;
++	case migrate_misfit:
++		return !task_fits_cpu(p, env->src_cpu);
++	}
++	return false;
++}
++
++/*
++ * consume_imbalance_cambyses — deduct task cost from imbalance budget
++ *
++ * Called in Phase 3 for each detached task, in score-descending order.
++ * Matches Vanilla behavior: allows imbalance to go negative on the last task.
++ */
++static void consume_imbalance_cambyses(struct task_struct *p,
++				       struct lb_env *env)
++{
++	switch (env->migration_type) {
++	case migrate_load:
++		env->imbalance -= max_t(unsigned long, task_h_load(p), 1);
++		break;
++	case migrate_util:
++		env->imbalance -= task_util_est(p);
++		break;
++	case migrate_task:
++		env->imbalance--;
++		break;
++	case migrate_misfit:
++		env->imbalance = 0;
++		break;
++	}
++}
++
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++#include <asm/fpu/api.h>
++
++/*
++ * score_and_sort_cambyses — SIMD dispatch for scoring + sort
++ *
++ * For nr_cands <= CAMBYSES_SIMD_THRESHOLD (8): scalar path only.
++ * Scores are already computed during collection.
++ *
++ * For nr_cands > 8 with AVX2: SIMD batch scoring + SIMD bitonic sort
++ * within one kernel_fpu_begin/end context.  Scores are packed as
++ * s32 = (score << 16) | index for the sort, then cands[] is reordered.
++ *
++ * For nr_cands > 8 with SSSE3: SIMD batch scoring, then scalar sort.
++ * (SSSE3 lacks PMINSD — no s32 compare-and-swap for SIMD sort.)
++ */
++static void score_and_sort_cambyses(struct cambyses_candidate *cands,
++				    u8 *features_packed, int nr_cands)
++{
++	if (nr_cands <= CAMBYSES_SIMD_THRESHOLD) {
++		sort_candidates_cambyses(cands, nr_cands);
++		return;
++	}
++
++	/*
++	 * Pad feature buffer to alignment boundary (zeroed slots produce
++	 * score 0, harmless — those slots have p=NULL in cands[]).
++	 */
++	{
++		int padded = (nr_cands + 7) & ~7;
++		int j;
++
++		for (j = nr_cands * CAMBYSES_NR_FEATURES;
++		     j < padded * CAMBYSES_NR_FEATURES; j++)
++			features_packed[j] = 0;
++	}
++
++	kernel_fpu_begin();
++
++	if (static_branch_likely(&cambyses_has_avx2)) {
++		s16 scores[SCHED_NR_MIGRATE_BREAK];
++		s32 packed[SCHED_NR_MIGRATE_BREAK] __aligned(32);
++		struct cambyses_candidate tmp[SCHED_NR_MIGRATE_BREAK];
++		int j;
++
++		/* SIMD batch scoring */
++		cambyses_simd_score_avx2(features_packed, scores, nr_cands);
++
++		/*
++		 * Pack: (score << 16) | index.  Sorting s32 descending
++		 * automatically sorts by score, with index preserved for
++		 * free in the low 16 bits.
++		 */
++		for (j = 0; j < nr_cands; j++)
++			packed[j] = ((s32)scores[j] << 16) | (u16)j;
++		for (j = nr_cands; j < SCHED_NR_MIGRATE_BREAK; j++)
++			packed[j] = (s32)0x80000000; /* INT_MIN: sinks */
++
++		/* SIMD bitonic sort — descending by s32 */
++		cambyses_simd_sort_avx2(packed);
++
++		kernel_fpu_end();
++
++		/* Reorder cands[] to match sorted order */
++		memcpy(tmp, cands, sizeof(cands[0]) * nr_cands);
++		for (j = 0; j < nr_cands; j++) {
++			int idx = packed[j] & 0xFFFF;
++
++			cands[j] = tmp[idx];
++		}
++
++		return; /* AVX2 path: scoring + sorting complete */
++	}
++
++	if (static_branch_likely(&cambyses_has_ssse3)) {
++		s16 scores[SCHED_NR_MIGRATE_BREAK];
++		int j;
++
++		cambyses_simd_score_ssse3(features_packed, scores, nr_cands);
++		for (j = 0; j < nr_cands; j++)
++			cands[j].score = scores[j];
++	}
++	/* else: keep scalar scores computed during collection */
++
++	kernel_fpu_end();
++
++	/* SSSE3 / scalar fallback: scalar bitonic sort */
++	sort_candidates_cambyses(cands, nr_cands);
++}
++#endif /* CONFIG_SCHED_CAMBYSES_SIMD */
++
++/*
++ * detach_tasks_cambyses — scored migration selection for Pull path
++ *
++ * Called from detach_tasks() when sched_cambyses is active.
++ * Operates under rq_lock_irqsave (inherited from caller).
++ *
++ * Phase 1: Sample candidates from cfs_tasks, score each one
++ *          (also pack features for SIMD if enabled)
++ * Phase 2: Sort candidates by score (descending) via bitonic sort
++ *          (SIMD scoring if nr_cands > threshold)
++ * Phase 3: Detach in score order, consuming imbalance budget
++ */
++static int detach_tasks_cambyses(struct lb_env *env)
++{
++	struct list_head *tasks = &env->src_rq->cfs_tasks;
++	struct cambyses_candidate cands[SCHED_NR_MIGRATE_BREAK];
++	LIST_HEAD(cand_tasks);
++	int nr_cands = 0;
++	int detached = 0;
++	struct task_struct *p;
++	int i;
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++	/*
++	 * Feature buffer for SIMD batch scoring (AoS layout).
++	 * 32 candidates × 4 features = 128 bytes on stack.
++	 */
++	u8 features_packed[SCHED_NR_MIGRATE_BREAK * CAMBYSES_NR_FEATURES]
++		__aligned(32);
++#endif
++
++	/*
++	 * Phase 1: Sampling — collect eligible candidates and score them.
++	 *
++	 * Mirrors the loop structure of vanilla detach_tasks():
++	 * same loop_max, loop_break, idle checks.
++	 *
++	 * Accepted candidates are moved to cand_tasks (off cfs_tasks)
++	 * to prevent the list rotation from re-collecting the same task
++	 * as the loop wraps around.  Skipped tasks stay on cfs_tasks.
++	 */
++	while (!list_empty(tasks)) {
++		if (env->idle && env->src_rq->nr_running <= 1)
++			break;
++
++		env->loop++;
++		if (env->loop > env->loop_max)
++			break;
++		if (env->loop > env->loop_break) {
++			env->loop_break += SCHED_NR_MIGRATE_BREAK;
++			env->flags |= LBF_NEED_BREAK;
++			break;
++		}
++
++		p = list_last_entry(tasks, struct task_struct, se.group_node);
++
++		if (!can_migrate_task(p, env)) {
++			if (p->sched_task_hot)
++				schedstat_inc(p->stats.nr_failed_migrations_hot);
++			list_move(&p->se.group_node, tasks);
++			continue;
++		}
++
++		if (!check_imbalance_cambyses(p, env))
++			goto skip;
++
++		/* Score and collect (also pack features for SIMD) */
++		cands[nr_cands].p = p;
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++		cands[nr_cands].score = score_task_cambyses(p, env,
++			&features_packed[nr_cands * CAMBYSES_NR_FEATURES]);
++#else
++		cands[nr_cands].score = score_task_cambyses(p, env, NULL);
++#endif
++		nr_cands++;
++
++		/*
++		 * Remove from cfs_tasks so it cannot be re-scanned.
++		 * detach_task() in Phase 3 will list_del this node;
++		 * non-detached candidates are spliced back below.
++		 */
++		list_move(&p->se.group_node, &cand_tasks);
++
++		if (nr_cands >= SCHED_NR_MIGRATE_BREAK)
++			break;
++		continue;
++skip:
++		list_move(&p->se.group_node, tasks);
++	}
++
++	if (!nr_cands) {
++		/* cand_tasks is empty here — nothing to splice back */
++		return 0;
++	}
++
++	/*
++	 * Phase 2: Score (SIMD if applicable) + sort (descending).
++	 * Bitonic sort network — branch-free, compile-time fixed comparisons.
++	 */
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++	score_and_sort_cambyses(cands, features_packed, nr_cands);
++#else
++	sort_candidates_cambyses(cands, nr_cands);
++#endif
++
++	/*
++	 * Phase 3: Detach in score order, consuming imbalance budget.
++	 *
++	 * rq_lock + IRQ disabled from Phase 1 — candidates cannot be
++	 * dequeued between phases.
++	 *
++	 * detach_task() removes the task from cand_tasks (via
++	 * dequeue_entity → list_del on group_node), then list_add
++	 * places it on env->tasks for attach_tasks().
++	 */
++	for (i = 0; i < nr_cands && env->imbalance > 0; i++) {
++		p = cands[i].p;
++
++		/* Skip padding entries */
++		if (!p)
++			continue;
++
++		consume_imbalance_cambyses(p, env);
++		detach_task(p, env);
++		list_add(&p->se.group_node, &env->tasks);
++		detached++;
++
++#ifdef CONFIG_PREEMPTION
++		if (env->idle == CPU_NEWLY_IDLE)
++			break;
++#endif
++	}
++
++	/*
++	 * Return non-detached candidates to cfs_tasks.
++	 * These were removed in Phase 1 but not selected in Phase 3
++	 * (imbalance exhausted or preemption break).
++	 */
++	list_splice(&cand_tasks, tasks);
++
++	schedstat_add(env->sd->lb_gained[env->idle], detached);
++	return detached;
++}
++
++/*
++ * detach_one_task_cambyses — scored selection for Push path (active balancing)
++ *
++ * Replaces the FIFO "first migratable task" policy in detach_one_task().
++ * Scans all migratable tasks on src_rq and selects the one with the
++ * highest migration score.
++ *
++ * Push moves exactly 1 task, so no sort is needed — simple max scan.
++ * The stop_machine context is already heavy, so scoring overhead is negligible.
++ */
++static struct task_struct *detach_one_task_cambyses(struct lb_env *env)
++{
++	struct task_struct *p, *best = NULL;
++	s16 best_score = S16_MIN;
++
++	lockdep_assert_rq_held(env->src_rq);
++
++	list_for_each_entry_reverse(p,
++			&env->src_rq->cfs_tasks, se.group_node) {
++		s16 score;
++
++		if (!can_migrate_task(p, env))
++			continue;
++
++		score = score_task_cambyses(p, env, NULL);
++		if (score > best_score) {
++			best_score = score;
++			best = p;
++		}
++	}
++
++	if (!best)
++		return NULL;
++
++	detach_task(best, env);
++	schedstat_inc(env->sd->lb_gained[env->idle]);
++	return best;
++}
++
++/* ======== SIMD ISA detection ======== */
++
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++#include <asm/cpufeature.h>
++
++static int __init cambyses_simd_init(void)
++{
++	const char *simd_name;
++
++	if (boot_cpu_has(X86_FEATURE_AVX2)) {
++		static_branch_enable(&cambyses_has_avx2);
++		simd_name = "AVX2";
++	} else if (boot_cpu_has(X86_FEATURE_SSSE3)) {
++		static_branch_enable(&cambyses_has_ssse3);
++		simd_name = "SSSE3";
++	} else {
++		simd_name = "none";
++	}
++
++	pr_info("%s v%s by %s [SIMD: %s]\n",
++		CAMBYSES_PROGNAME, CAMBYSES_VERSION,
++		CAMBYSES_AUTHOR, simd_name);
++
++	return 0;
++}
++late_initcall(cambyses_simd_init);
++
++#else /* !CONFIG_SCHED_CAMBYSES_SIMD */
++
++static int __init cambyses_init(void)
++{
++	pr_info("%s v%s by %s [SIMD: disabled]\n",
++		CAMBYSES_PROGNAME, CAMBYSES_VERSION,
++		CAMBYSES_AUTHOR);
++
++	return 0;
++}
++late_initcall(cambyses_init);
++
++#endif /* CONFIG_SCHED_CAMBYSES_SIMD */
++
++/* ======== sysctl interface ======== */
++
++#ifdef CONFIG_SYSCTL
++static int sched_cambyses_handler(const struct ctl_table *table,
++					  int write, void *buffer,
++					  size_t *lenp, loff_t *ppos)
++{
++	static u8 sched_cambyses_val;
++	struct ctl_table tmp = {
++		.data	= &sched_cambyses_val,
++		.maxlen	= sizeof(u8),
++		.mode	= table->mode,
++		.extra1	= SYSCTL_ZERO,
++		.extra2	= SYSCTL_ONE,
++	};
++	int ret;
++
++	if (!write)
++		sched_cambyses_val = static_key_enabled(&sched_cambyses);
++
++	ret = proc_dou8vec_minmax(&tmp, write, buffer, lenp, ppos);
++	if (ret || !write)
++		return ret;
++
++	if (sched_cambyses_val)
++		static_branch_enable(&sched_cambyses);
++	else
++		static_branch_disable(&sched_cambyses);
++
++	return 0;
++}
++
++static struct ctl_table sched_cambyses_sysctls[] = {
++	{
++		.procname	= "sched_cambyses",
++		.data		= NULL, /* handled by custom handler */
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= sched_cambyses_handler,
++	},
++	{
++		.procname	= "sched_cambyses_w0",
++		.data		= &sysctl_cambyses_w0,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_THREE,
++	},
++	{
++		.procname	= "sched_cambyses_w1",
++		.data		= &sysctl_cambyses_w1,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_THREE,
++	},
++	{
++		.procname	= "sched_cambyses_w2",
++		.data		= &sysctl_cambyses_w2,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_THREE, /* vol switch ratio weight */
++	},
++	{
++		.procname	= "sched_cambyses_w3",
++		.data		= &sysctl_cambyses_w3,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_THREE,
++	},
++};
++
++static int __init sched_cambyses_sysctl_init(void)
++{
++	register_sysctl_init("kernel", sched_cambyses_sysctls);
++	return 0;
++}
++late_initcall(sched_cambyses_sysctl_init);
++#endif /* CONFIG_SYSCTL */
+diff --git a/kernel/sched/cambyses.h b/kernel/sched/cambyses.h
+new file mode 100644
+index 000000000..3c613eced
+--- /dev/null
++++ b/kernel/sched/cambyses.h
+@@ -0,0 +1,99 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Cambyses — Context-Aware Migration Balancer Yielding Scored Entity Selection
++ *
++ * Scored migration selection for CFS load balancer Pull path.
++ * See IMPLEMENTATION.md for design details.
++ */
++#ifndef _KERNEL_SCHED_CAMBYSES_H
++#define _KERNEL_SCHED_CAMBYSES_H
++
++#include <linux/types.h>
++#include <linux/jump_label.h>
++
++#ifdef CONFIG_SCHED_CAMBYSES
++
++/*
++ * Candidate entry for scored migration selection.
++ * Stored on stack during detach_tasks_cambyses().
++ *
++ * Size: 16 bytes (pointer 8 + score 2 + padding 6)
++ * Stack usage: 32 candidates = 512 bytes, 8 candidates = 128 bytes
++ */
++struct cambyses_candidate {
++	struct task_struct	*p;
++	s16			score;
++};
++
++/* Static key for zero-cost runtime disable (NOP patching) */
++extern struct static_key_true sched_cambyses;
++
++/* sysctl tunable weights (0–3, 2bit) */
++extern u8 sysctl_cambyses_w0;	/* cache coldness weight (default: 1) */
++extern u8 sysctl_cambyses_w1;	/* load contribution weight (default: 2) */
++extern u8 sysctl_cambyses_w2;	/* vol switch ratio weight (default: 1) */
++extern u8 sysctl_cambyses_w3;	/* wakee penalty weight (default: 1) */
++
++/*
++ * Scalar sort — separate TU (cambyses_sort.c), no SIMD flags.
++ */
++void sort_candidates_cambyses(struct cambyses_candidate *cands, int nr_cands);
++
++/*
++ * SIMD batch scoring — separate TUs to prevent auto-vectorization
++ * contamination.  Each file is compiled with its own ISA flags.
++ *
++ * Scoring uses PMADDUBSW (u8 features × s8 weights → s16 scores).
++ * Features are packed in AoS layout: [F0,F1,F2,F3] per candidate,
++ * 4 bytes/candidate, aligned to xmm/ymm boundaries.
++ */
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++
++#define CAMBYSES_SIMD_THRESHOLD		8
++#define CAMBYSES_NR_FEATURES		4
++
++/* Static keys for ISA dispatch — enabled at boot based on CPUID */
++extern struct static_key_false cambyses_has_avx2;
++extern struct static_key_false cambyses_has_ssse3;
++
++/* SSSE3: 4 candidates/xmm, PMADDUBSW + PHADDW */
++void cambyses_simd_score_ssse3(const u8 *features_packed,
++				s16 *scores, int nr_cands);
++
++/* AVX2: 8 candidates/ymm, VPMADDUBSW + VPHADDW */
++void cambyses_simd_score_avx2(const u8 *features_packed,
++			       s16 *scores, int nr_cands);
++
++/*
++ * SIMD vector type definitions — only available in TUs compiled
++ * with the corresponding ISA flags.
++ *
++ * Following Nap's pattern: GCC vector extensions + __builtin_ia32_*.
++ * <immintrin.h> is a userspace header and cannot be used in kernel.
++ */
++#ifdef __SSSE3__
++typedef short v8hi  __attribute__((__vector_size__(16)));  /* 8 × s16 */
++typedef char  v16qi __attribute__((__vector_size__(16)));   /* 16 × s8/u8 */
++#endif
++
++#ifdef __AVX2__
++typedef short v16hi __attribute__((__vector_size__(32)));   /* 16 × s16 */
++typedef char  v32qi __attribute__((__vector_size__(32)));    /* 32 × s8/u8 */
++typedef int   v8si  __attribute__((__vector_size__(32)));    /* 8 × s32 */
++typedef long long v4di __attribute__((__vector_size__(32))); /* 4 × s64 */
++#endif
++
++/*
++ * AVX2 bitonic sort — 32 elements via s32 packing.
++ *
++ * Input: array of s32 packed as ((s16 score) << 16) | (u16 index).
++ * Sorting by s32 naturally sorts by score with index tracking for free.
++ * Must be called within kernel_fpu_begin/end.  Array must be exactly
++ * 32 elements, 32-byte aligned, padded with INT_MIN for unused slots.
++ */
++void cambyses_simd_sort_avx2(s32 *packed);
++
++#endif /* CONFIG_SCHED_CAMBYSES_SIMD */
++
++#endif /* CONFIG_SCHED_CAMBYSES */
++#endif /* _KERNEL_SCHED_CAMBYSES_H */
+diff --git a/kernel/sched/cambyses_simd_avx2.c b/kernel/sched/cambyses_simd_avx2.c
+new file mode 100644
+index 000000000..902bc8406
+--- /dev/null
++++ b/kernel/sched/cambyses_simd_avx2.c
+@@ -0,0 +1,259 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * cambyses_simd_avx2.c — AVX2 batch scoring for Cambyses
++ *
++ * Computes migration scores for up to 32 candidates using VPMADDUBSW.
++ * 8 candidates per ymm register, 4 features (u8) × 4 weights (s8).
++ *
++ * Must be called within kernel_fpu_begin/end.
++ * Compiled with: CFLAGS += -mavx -mavx2
++ *
++ * Separate TU to prevent auto-vectorization contamination of scalar code.
++ */
++
++#include "cambyses.h"
++#include <linux/types.h>
++
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++
++/*
++ * Score up to 32 candidates using AVX2 (8 candidates per ymm pass).
++ *
++ * @features_packed: AoS layout [F0,F1,F2,F3] × nr_cands, padded to
++ *                   multiple of 32 bytes (8 candidates).
++ * @scores:          Output s16 scores, one per candidate.
++ * @nr_cands:        Number of candidates (9..32).
++ */
++void cambyses_simd_score_avx2(const u8 *features_packed,
++			       s16 *scores, int nr_cands)
++{
++	int i;
++	/* Round up to multiple of 8 for ymm processing */
++	int nr_rounds = (nr_cands + 7) & ~7;
++
++	for (i = 0; i < nr_rounds; i += 8) {
++		v32qi feat;
++		v32qi wt;
++		v16hi partial;
++		v16hi summed;
++
++		/*
++		 * Load 8 candidates' features: 32 bytes = 1 ymm
++		 * Each candidate = [F0, F1, F2, F3] = 4 bytes
++		 */
++		feat = *(const v32qi *)&features_packed[i * 4];
++
++		/* Broadcast weight pattern: [w0, w1, w2, -w3] × 8 */
++		{
++			s8 w0 = (s8)sysctl_cambyses_w0;
++			s8 w1 = (s8)sysctl_cambyses_w1;
++			s8 w2 = (s8)sysctl_cambyses_w2;
++			s8 w3 = -(s8)sysctl_cambyses_w3;
++
++			wt = (v32qi){w0, w1, w2, w3, w0, w1, w2, w3,
++				     w0, w1, w2, w3, w0, w1, w2, w3,
++				     w0, w1, w2, w3, w0, w1, w2, w3,
++				     w0, w1, w2, w3, w0, w1, w2, w3};
++		}
++
++		/*
++		 * VPMADDUBSW: u8 × s8 → s16 pairwise add
++		 * 8 candidates → 16 × s16 partial sums (2 per candidate)
++		 */
++		partial = __builtin_ia32_pmaddubsw256(feat, wt);
++
++		/*
++		 * VPHADDW: horizontal add adjacent s16 pairs
++		 * Result layout (AVX2 operates per 128-bit lane):
++		 *   [score₀, score₁, score₂, score₃,
++		 *    score₀, score₁, score₂, score₃,
++		 *    score₄, score₅, score₆, score₇,
++		 *    score₄, score₅, score₆, score₇]
++		 *
++		 * AVX2 VPHADDW operates within each 128-bit lane:
++		 *   low 128:  hadd(partial[0:7], partial[0:7])
++		 *   high 128: hadd(partial[8:15], partial[8:15])
++		 *
++		 * Scores for candidates 0-3 are in low lane [0:3],
++		 * scores for candidates 4-7 are in high lane [8:11].
++		 */
++		summed = __builtin_ia32_phaddw256(partial, partial);
++
++		/*
++		 * Extract scores from lane-interleaved layout.
++		 * Low lane [0..3] = candidates 0-3
++		 * High lane [8..11] = candidates 4-7
++		 */
++		scores[i]     = summed[0];
++		scores[i + 1] = summed[1];
++		scores[i + 2] = summed[2];
++		scores[i + 3] = summed[3];
++		scores[i + 4] = summed[8];
++		scores[i + 5] = summed[9];
++		scores[i + 6] = summed[10];
++		scores[i + 7] = summed[11];
++	}
++}
++
++/*
++ * AVX2 bitonic sort for 32 × s32 packed values (descending).
++ *
++ * Packed format: ((s32)score << 16) | (u16)index
++ * VPMINSD/VPMAXSD on s32 naturally sorts by score, preserving indices.
++ *
++ * 32 elements in 4 ymm registers (R0-R3), 5-phase bitonic network,
++ * 15 steps, ~204 SIMD operations total.
++ *
++ * Comparator primitives:
++ *   d1: VPSHUFD 0xB1    — swap adjacent dwords
++ *   d2: VPSHUFD 0x4E    — swap dword pairs
++ *   d4: VPERM2I128 0x01 — swap 128-bit lanes
++ *   d8/d16: inter-register VPMINSD/VPMAXSD
++ *
++ * Direction selection via VPBLENDD blend masks.
++ * Blend semantics: pblendd(hi, lo, mask) — bit=0 takes hi, bit=1 takes lo.
++ *
++ * Must be called within kernel_fpu_begin/end.
++ * @packed: 32 × s32 array, 32-byte aligned, padded with INT_MIN.
++ */
++
++/* Signed 32-bit min/max — guaranteed single VPMINSD/VPMAXSD on GCC and clang */
++static __always_inline v8si v8si_min(v8si a, v8si b)
++{
++	v8si r;
++
++	asm("vpminsd %2, %1, %0" : "=x"(r) : "x"(a), "x"(b));
++	return r;
++}
++
++static __always_inline v8si v8si_max(v8si a, v8si b)
++{
++	v8si r;
++
++	asm("vpmaxsd %2, %1, %0" : "=x"(r) : "x"(a), "x"(b));
++	return r;
++}
++
++/* Intra-register compare-and-swap at distance 1 */
++#define CAS_D1(r, blend) do {						\
++	v8si _s = __builtin_ia32_pshufd256(r, 0xB1);			\
++	v8si _lo = v8si_min(r, _s);					\
++	v8si _hi = v8si_max(r, _s);					\
++	r = __builtin_ia32_pblendd256(_hi, _lo, blend);			\
++} while (0)
++
++/* Intra-register compare-and-swap at distance 2 */
++#define CAS_D2(r, blend) do {						\
++	v8si _s = __builtin_ia32_pshufd256(r, 0x4E);			\
++	v8si _lo = v8si_min(r, _s);					\
++	v8si _hi = v8si_max(r, _s);					\
++	r = __builtin_ia32_pblendd256(_hi, _lo, blend);			\
++} while (0)
++
++/* Intra-register compare-and-swap at distance 4 (cross 128-bit lane) */
++#define CAS_D4(r, blend) do {						\
++	v8si _s = (v8si)__builtin_ia32_permti256((v4di)(r),		\
++						  (v4di)(r), 0x01);	\
++	v8si _lo = v8si_min(r, _s);					\
++	v8si _hi = v8si_max(r, _s);					\
++	r = __builtin_ia32_pblendd256(_hi, _lo, blend);			\
++} while (0)
++
++/* Inter-register compare-and-swap: descending (lower reg gets max) */
++#define CAS_REG_DESC(ra, rb) do {					\
++	v8si _lo = v8si_min(ra, rb);					\
++	v8si _hi = v8si_max(ra, rb);					\
++	ra = _hi; rb = _lo;						\
++} while (0)
++
++/* Inter-register compare-and-swap: ascending (lower reg gets min) */
++#define CAS_REG_ASC(ra, rb) do {					\
++	v8si _lo = v8si_min(ra, rb);					\
++	v8si _hi = v8si_max(ra, rb);					\
++	ra = _lo; rb = _hi;						\
++} while (0)
++
++void cambyses_simd_sort_avx2(s32 *packed)
++{
++	v8si r0 = *(v8si *)&packed[0];
++	v8si r1 = *(v8si *)&packed[8];
++	v8si r2 = *(v8si *)&packed[16];
++	v8si r3 = *(v8si *)&packed[24];
++
++	/*
++	 * Phase 1 (k=1): Sort pairs, alternating desc/asc.
++	 * Blend 0x66: desc at even pairs (0,1)(4,5), asc at odd (2,3)(6,7).
++	 */
++	CAS_D1(r0, 0x66); CAS_D1(r1, 0x66);
++	CAS_D1(r2, 0x66); CAS_D1(r3, 0x66);
++
++	/*
++	 * Phase 2 (k=2): Sort groups of 4, alternating desc/asc.
++	 * Step 1: d=2, blend 0x3C (desc block 0-3, asc block 4-7).
++	 * Step 2: d=1, blend 0x5A (cleanup within each 4-element block).
++	 */
++	CAS_D2(r0, 0x3C); CAS_D2(r1, 0x3C);
++	CAS_D2(r2, 0x3C); CAS_D2(r3, 0x3C);
++	CAS_D1(r0, 0x5A); CAS_D1(r1, 0x5A);
++	CAS_D1(r2, 0x5A); CAS_D1(r3, 0x5A);
++
++	/*
++	 * Phase 3 (k=3): Sort groups of 8 (one register each).
++	 * R0/R2 descending, R1/R3 ascending.
++	 * Step 1: d=4, desc=0xF0, asc=0x0F.
++	 * Step 2: d=2, desc=0xCC, asc=0x33.
++	 * Step 3: d=1, desc=0xAA, asc=0x55.
++	 */
++	CAS_D4(r0, 0xF0); CAS_D4(r1, 0x0F);
++	CAS_D4(r2, 0xF0); CAS_D4(r3, 0x0F);
++	CAS_D2(r0, 0xCC); CAS_D2(r1, 0x33);
++	CAS_D2(r2, 0xCC); CAS_D2(r3, 0x33);
++	CAS_D1(r0, 0xAA); CAS_D1(r1, 0x55);
++	CAS_D1(r2, 0xAA); CAS_D1(r3, 0x55);
++
++	/*
++	 * Phase 4 (k=4): Sort groups of 16.
++	 * R0+R1 descending, R2+R3 ascending.
++	 * Step 1: d=8, inter-register.
++	 * Steps 2-4: d=4/2/1 within each register.
++	 */
++	CAS_REG_DESC(r0, r1);
++	CAS_REG_ASC(r2, r3);
++	CAS_D4(r0, 0xF0); CAS_D4(r1, 0xF0);
++	CAS_D4(r2, 0x0F); CAS_D4(r3, 0x0F);
++	CAS_D2(r0, 0xCC); CAS_D2(r1, 0xCC);
++	CAS_D2(r2, 0x33); CAS_D2(r3, 0x33);
++	CAS_D1(r0, 0xAA); CAS_D1(r1, 0xAA);
++	CAS_D1(r2, 0x55); CAS_D1(r3, 0x55);
++
++	/*
++	 * Phase 5 (k=5): Final merge — all descending.
++	 * Step 1: d=16, inter-register (R0↔R2, R1↔R3).
++	 * Step 2: d=8, inter-register (R0↔R1, R2↔R3).
++	 * Steps 3-5: d=4/2/1 within each register, all descending.
++	 */
++	CAS_REG_DESC(r0, r2);
++	CAS_REG_DESC(r1, r3);
++	CAS_REG_DESC(r0, r1);
++	CAS_REG_DESC(r2, r3);
++	CAS_D4(r0, 0xF0); CAS_D4(r1, 0xF0);
++	CAS_D4(r2, 0xF0); CAS_D4(r3, 0xF0);
++	CAS_D2(r0, 0xCC); CAS_D2(r1, 0xCC);
++	CAS_D2(r2, 0xCC); CAS_D2(r3, 0xCC);
++	CAS_D1(r0, 0xAA); CAS_D1(r1, 0xAA);
++	CAS_D1(r2, 0xAA); CAS_D1(r3, 0xAA);
++
++	/* Store sorted results */
++	*(v8si *)&packed[0] = r0;
++	*(v8si *)&packed[8] = r1;
++	*(v8si *)&packed[16] = r2;
++	*(v8si *)&packed[24] = r3;
++}
++
++#undef CAS_D1
++#undef CAS_D2
++#undef CAS_D4
++#undef CAS_REG_DESC
++#undef CAS_REG_ASC
++
++#endif /* CONFIG_SCHED_CAMBYSES_SIMD */
+diff --git a/kernel/sched/cambyses_simd_ssse3.c b/kernel/sched/cambyses_simd_ssse3.c
+new file mode 100644
+index 000000000..5f97617ab
+--- /dev/null
++++ b/kernel/sched/cambyses_simd_ssse3.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * cambyses_simd_ssse3.c — SSSE3 batch scoring for Cambyses
++ *
++ * Computes migration scores for up to 32 candidates using PMADDUBSW.
++ * 4 candidates per xmm register, 4 features (u8) × 4 weights (s8).
++ *
++ * Must be called within kernel_fpu_begin/end.
++ * Compiled with: CFLAGS += -mssse3
++ *
++ * Separate TU to prevent auto-vectorization contamination of scalar code.
++ */
++
++#include "cambyses.h"
++#include <linux/types.h>
++
++#ifdef CONFIG_SCHED_CAMBYSES_SIMD
++
++/*
++ * PMADDUBSW: Multiply unsigned bytes by signed bytes, then add
++ * adjacent pairs to produce signed words.
++ *
++ *   For each i in 0..7:
++ *     dst[i] = saturate_s16(src1[2i] * src2[2i] + src1[2i+1] * src2[2i+1])
++ *
++ * With 4 features packed as [F0,F1,F2,F3] per candidate:
++ *   After PMADDUBSW: [w0*F0+w1*F1, w2*F2+(-w3)*F3] per candidate (2 × s16)
++ *   After PHADDW:    [score] per candidate (1 × s16)
++ */
++
++/*
++ * Score up to 32 candidates using SSSE3 (4 candidates per xmm pass).
++ *
++ * @features_packed: AoS layout [F0,F1,F2,F3] × nr_cands, padded to
++ *                   multiple of 16 bytes (4 candidates).
++ * @scores:          Output s16 scores, one per candidate.
++ * @nr_cands:        Number of candidates (9..32).
++ * @weights_packed:  Pre-broadcast weight vector [w0,w1,w2,-w3] × 4.
++ */
++void cambyses_simd_score_ssse3(const u8 *features_packed,
++				s16 *scores, int nr_cands)
++{
++	int i;
++	/* Round up to multiple of 4 for xmm processing */
++	int nr_rounds = (nr_cands + 3) & ~3;
++
++	for (i = 0; i < nr_rounds; i += 4) {
++		v16qi feat;
++		v16qi wt;
++		v8hi partial;
++		v8hi summed;
++
++		/*
++		 * Load 4 candidates' features: 16 bytes = 1 xmm
++		 * [F0₀ F1₀ F2₀ F3₀ | F0₁ F1₁ F2₁ F3₁ |
++		 *  F0₂ F1₂ F2₂ F3₂ | F0₃ F1₃ F2₃ F3₃]
++		 */
++		feat = *(const v16qi *)&features_packed[i * 4];
++
++		/*
++		 * Broadcast weight pattern: [w0, w1, w2, -w3] × 4
++		 * Loaded from the first 16 bytes of features_packed's
++		 * companion weight array — but we construct it inline
++		 * since weights are runtime sysctl values.
++		 *
++		 * We receive the weight vector pre-packed at the
++		 * 16-byte-aligned area right after feature data.
++		 * Actually, construct it from sysctl globals directly.
++		 */
++		{
++			s8 w0 = (s8)sysctl_cambyses_w0;
++			s8 w1 = (s8)sysctl_cambyses_w1;
++			s8 w2 = (s8)sysctl_cambyses_w2;
++			s8 w3 = -(s8)sysctl_cambyses_w3;
++
++			wt = (v16qi){w0, w1, w2, w3, w0, w1, w2, w3,
++				     w0, w1, w2, w3, w0, w1, w2, w3};
++		}
++
++		/*
++		 * PMADDUBSW: u8 × s8 → s16 pairwise add
++		 * Result: [w0*F0₀+w1*F1₀, w2*F2₀+w3'*F3₀,
++		 *          w0*F0₁+w1*F1₁, w2*F2₁+w3'*F3₁,
++		 *          w0*F0₂+w1*F1₂, w2*F2₂+w3'*F3₂,
++		 *          w0*F0₃+w1*F1₃, w2*F2₃+w3'*F3₃]
++		 */
++		partial = __builtin_ia32_pmaddubsw128(feat, wt);
++
++		/*
++		 * PHADDW: horizontal add adjacent pairs
++		 * Result: [score₀, score₁, score₂, score₃,
++		 *          score₀, score₁, score₂, score₃]
++		 * We only need the lower 4 words (indices 0-3).
++		 */
++		summed = __builtin_ia32_phaddw128(partial, partial);
++
++		/* Store 4 scores — extract lower 4 s16 values */
++		scores[i]     = summed[0];
++		scores[i + 1] = summed[1];
++		scores[i + 2] = summed[2];
++		scores[i + 3] = summed[3];
++	}
++}
++
++#endif /* CONFIG_SCHED_CAMBYSES_SIMD */
+diff --git a/kernel/sched/cambyses_sort.c b/kernel/sched/cambyses_sort.c
+new file mode 100644
+index 000000000..7418e193f
+--- /dev/null
++++ b/kernel/sched/cambyses_sort.c
+@@ -0,0 +1,209 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Cambyses — Bitonic sort networks for candidate ranking
++ *
++ * Separate translation unit to prevent auto-vectorization contamination.
++ * This file is compiled WITHOUT SIMD flags (-msse2, -mavx2).
++ * Future SIMD sort variants live in cambyses_simd_{sse2,avx2}.c
++ * with their own CC_FLAGS_FPU.
++ */
++
++#include "cambyses.h"
++
++#include <linux/types.h>
++#include <linux/limits.h>
++
++#ifdef CONFIG_SCHED_CAMBYSES
++
++/*
++ * Compare-and-swap: ensure cands[a].score >= cands[b].score (descending).
++ * Branch-free on most architectures via CMOV.
++ */
++#define CAMBYSES_CAS(a, b) do {					\
++	if (cands[a].score < cands[b].score) {			\
++		struct cambyses_candidate _tmp = cands[a];	\
++		cands[a] = cands[b];				\
++		cands[b] = _tmp;				\
++	}							\
++} while (0)
++
++/*
++ * Bitonic sort network for 8 elements — 19 comparators, 6 stages.
++ * Sorts in descending order (highest score first).
++ */
++static void bitonic_sort_8(struct cambyses_candidate *cands)
++{
++	/* Stage 1: pairs */
++	CAMBYSES_CAS(0, 1); CAMBYSES_CAS(2, 3);
++	CAMBYSES_CAS(4, 5); CAMBYSES_CAS(6, 7);
++	/* Stage 2: quads */
++	CAMBYSES_CAS(0, 2); CAMBYSES_CAS(1, 3);
++	CAMBYSES_CAS(4, 6); CAMBYSES_CAS(5, 7);
++	/* Stage 3 */
++	CAMBYSES_CAS(1, 2); CAMBYSES_CAS(5, 6);
++	/* Stage 4: octets */
++	CAMBYSES_CAS(0, 4); CAMBYSES_CAS(1, 5);
++	CAMBYSES_CAS(2, 6); CAMBYSES_CAS(3, 7);
++	/* Stage 5 */
++	CAMBYSES_CAS(2, 4); CAMBYSES_CAS(3, 5);
++	/* Stage 6 */
++	CAMBYSES_CAS(1, 2); CAMBYSES_CAS(3, 4);
++	CAMBYSES_CAS(5, 6);
++}
++
++/*
++ * Bitonic sort network for 16 elements — 63 comparators.
++ */
++static void bitonic_sort_16(struct cambyses_candidate *cands)
++{
++	/* Sort each half of 8 */
++	bitonic_sort_8(cands);
++	bitonic_sort_8(cands + 8);
++
++	/* Reverse the second half's order for bitonic merge */
++	CAMBYSES_CAS(0, 15); CAMBYSES_CAS(1, 14);
++	CAMBYSES_CAS(2, 13); CAMBYSES_CAS(3, 12);
++	CAMBYSES_CAS(4, 11); CAMBYSES_CAS(5, 10);
++	CAMBYSES_CAS(6, 9);  CAMBYSES_CAS(7, 8);
++
++	/* Merge stage: size 8 */
++	CAMBYSES_CAS(0, 8);  CAMBYSES_CAS(1, 9);
++	CAMBYSES_CAS(2, 10); CAMBYSES_CAS(3, 11);
++	CAMBYSES_CAS(4, 12); CAMBYSES_CAS(5, 13);
++	CAMBYSES_CAS(6, 14); CAMBYSES_CAS(7, 15);
++
++	/* Merge stage: size 4 */
++	CAMBYSES_CAS(0, 4);  CAMBYSES_CAS(1, 5);
++	CAMBYSES_CAS(2, 6);  CAMBYSES_CAS(3, 7);
++	CAMBYSES_CAS(8, 12); CAMBYSES_CAS(9, 13);
++	CAMBYSES_CAS(10, 14); CAMBYSES_CAS(11, 15);
++
++	/* Merge stage: size 2 */
++	CAMBYSES_CAS(0, 2);  CAMBYSES_CAS(1, 3);
++	CAMBYSES_CAS(4, 6);  CAMBYSES_CAS(5, 7);
++	CAMBYSES_CAS(8, 10); CAMBYSES_CAS(9, 11);
++	CAMBYSES_CAS(12, 14); CAMBYSES_CAS(13, 15);
++
++	/* Merge stage: size 1 */
++	CAMBYSES_CAS(0, 1);  CAMBYSES_CAS(2, 3);
++	CAMBYSES_CAS(4, 5);  CAMBYSES_CAS(6, 7);
++	CAMBYSES_CAS(8, 9);  CAMBYSES_CAS(10, 11);
++	CAMBYSES_CAS(12, 13); CAMBYSES_CAS(14, 15);
++}
++
++/*
++ * Bitonic sort network for 32 elements — 159 comparators.
++ */
++static void bitonic_sort_32(struct cambyses_candidate *cands)
++{
++	/* Sort each half of 16 */
++	bitonic_sort_16(cands);
++	bitonic_sort_16(cands + 16);
++
++	/* Reverse the second half's order for bitonic merge */
++	CAMBYSES_CAS(0, 31); CAMBYSES_CAS(1, 30);
++	CAMBYSES_CAS(2, 29); CAMBYSES_CAS(3, 28);
++	CAMBYSES_CAS(4, 27); CAMBYSES_CAS(5, 26);
++	CAMBYSES_CAS(6, 25); CAMBYSES_CAS(7, 24);
++	CAMBYSES_CAS(8, 23); CAMBYSES_CAS(9, 22);
++	CAMBYSES_CAS(10, 21); CAMBYSES_CAS(11, 20);
++	CAMBYSES_CAS(12, 19); CAMBYSES_CAS(13, 18);
++	CAMBYSES_CAS(14, 17); CAMBYSES_CAS(15, 16);
++
++	/* Merge stage: size 16 */
++	CAMBYSES_CAS(0, 16); CAMBYSES_CAS(1, 17);
++	CAMBYSES_CAS(2, 18); CAMBYSES_CAS(3, 19);
++	CAMBYSES_CAS(4, 20); CAMBYSES_CAS(5, 21);
++	CAMBYSES_CAS(6, 22); CAMBYSES_CAS(7, 23);
++	CAMBYSES_CAS(8, 24); CAMBYSES_CAS(9, 25);
++	CAMBYSES_CAS(10, 26); CAMBYSES_CAS(11, 27);
++	CAMBYSES_CAS(12, 28); CAMBYSES_CAS(13, 29);
++	CAMBYSES_CAS(14, 30); CAMBYSES_CAS(15, 31);
++
++	/* Merge stage: size 8 */
++	CAMBYSES_CAS(0, 8);  CAMBYSES_CAS(1, 9);
++	CAMBYSES_CAS(2, 10); CAMBYSES_CAS(3, 11);
++	CAMBYSES_CAS(4, 12); CAMBYSES_CAS(5, 13);
++	CAMBYSES_CAS(6, 14); CAMBYSES_CAS(7, 15);
++	CAMBYSES_CAS(16, 24); CAMBYSES_CAS(17, 25);
++	CAMBYSES_CAS(18, 26); CAMBYSES_CAS(19, 27);
++	CAMBYSES_CAS(20, 28); CAMBYSES_CAS(21, 29);
++	CAMBYSES_CAS(22, 30); CAMBYSES_CAS(23, 31);
++
++	/* Merge stage: size 4 */
++	CAMBYSES_CAS(0, 4);  CAMBYSES_CAS(1, 5);
++	CAMBYSES_CAS(2, 6);  CAMBYSES_CAS(3, 7);
++	CAMBYSES_CAS(8, 12); CAMBYSES_CAS(9, 13);
++	CAMBYSES_CAS(10, 14); CAMBYSES_CAS(11, 15);
++	CAMBYSES_CAS(16, 20); CAMBYSES_CAS(17, 21);
++	CAMBYSES_CAS(18, 22); CAMBYSES_CAS(19, 23);
++	CAMBYSES_CAS(24, 28); CAMBYSES_CAS(25, 29);
++	CAMBYSES_CAS(26, 30); CAMBYSES_CAS(27, 31);
++
++	/* Merge stage: size 2 */
++	CAMBYSES_CAS(0, 2);  CAMBYSES_CAS(1, 3);
++	CAMBYSES_CAS(4, 6);  CAMBYSES_CAS(5, 7);
++	CAMBYSES_CAS(8, 10); CAMBYSES_CAS(9, 11);
++	CAMBYSES_CAS(12, 14); CAMBYSES_CAS(13, 15);
++	CAMBYSES_CAS(16, 18); CAMBYSES_CAS(17, 19);
++	CAMBYSES_CAS(20, 22); CAMBYSES_CAS(21, 23);
++	CAMBYSES_CAS(24, 26); CAMBYSES_CAS(25, 27);
++	CAMBYSES_CAS(28, 30); CAMBYSES_CAS(29, 31);
++
++	/* Merge stage: size 1 */
++	CAMBYSES_CAS(0, 1);  CAMBYSES_CAS(2, 3);
++	CAMBYSES_CAS(4, 5);  CAMBYSES_CAS(6, 7);
++	CAMBYSES_CAS(8, 9);  CAMBYSES_CAS(10, 11);
++	CAMBYSES_CAS(12, 13); CAMBYSES_CAS(14, 15);
++	CAMBYSES_CAS(16, 17); CAMBYSES_CAS(18, 19);
++	CAMBYSES_CAS(20, 21); CAMBYSES_CAS(22, 23);
++	CAMBYSES_CAS(24, 25); CAMBYSES_CAS(26, 27);
++	CAMBYSES_CAS(28, 29); CAMBYSES_CAS(30, 31);
++}
++
++#undef CAMBYSES_CAS
++
++/*
++ * sort_candidates_cambyses — variable-length bitonic sort dispatch
++ *
++ * Pads the candidate array to the smallest 2^k size (8/16/32) and
++ * dispatches to the corresponding fixed-size bitonic sort network.
++ * Padding entries (score=S16_MIN, p=NULL) sink to the tail after sort.
++ */
++void sort_candidates_cambyses(struct cambyses_candidate *cands, int nr_cands)
++{
++	int padded_size;
++	int i;
++
++	if (nr_cands <= 1)
++		return;
++
++	/* Determine smallest power-of-2 container */
++	if (nr_cands <= 8)
++		padded_size = 8;
++	else if (nr_cands <= 16)
++		padded_size = 16;
++	else
++		padded_size = 32;
++
++	/* Pad unused slots — S16_MIN ensures they sink to the tail */
++	for (i = nr_cands; i < padded_size; i++) {
++		cands[i].p = NULL;
++		cands[i].score = S16_MIN;
++	}
++
++	/* Dispatch to fixed-size network */
++	switch (padded_size) {
++	case 8:
++		bitonic_sort_8(cands);
++		break;
++	case 16:
++		bitonic_sort_16(cands);
++		break;
++	case 32:
++		bitonic_sort_32(cands);
++		break;
++	}
++}
++
++#endif /* CONFIG_SCHED_CAMBYSES */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a8e766eac..45d609cf1 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -58,6 +58,11 @@
+ #include "stats.h"
+ #include "autogroup.h"
+ 
++#ifdef CONFIG_SCHED_CAMBYSES
++#include "cambyses.h"
++#endif
++
++
+ /*
+  * The initial- and re-scaling of tunables is configurable
+  *
+@@ -9656,12 +9661,21 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
+  *
+  * Returns a task if successful and NULL otherwise.
+  */
++#ifdef CONFIG_SCHED_CAMBYSES
++#include "cambyses.c"
++#endif
++
+ static struct task_struct *detach_one_task(struct lb_env *env)
+ {
+ 	struct task_struct *p;
+ 
+ 	lockdep_assert_rq_held(env->src_rq);
+ 
++#ifdef CONFIG_SCHED_CAMBYSES
++	if (static_branch_likely(&sched_cambyses))
++		return detach_one_task_cambyses(env);
++#endif
++
+ 	list_for_each_entry_reverse(p,
+ 			&env->src_rq->cfs_tasks, se.group_node) {
+ 		if (!can_migrate_task(p, env))
+@@ -9708,6 +9722,11 @@ static int detach_tasks(struct lb_env *env)
+ 	if (env->imbalance <= 0)
+ 		return 0;
+ 
++#ifdef CONFIG_SCHED_CAMBYSES
++	if (static_branch_likely(&sched_cambyses))
++		return detach_tasks_cambyses(env);
++#endif
++
+ 	while (!list_empty(tasks)) {
+ 		/*
+ 		 * We don't want to steal all, otherwise we may be treated likewise,
+-- 
+2.53.0
+
