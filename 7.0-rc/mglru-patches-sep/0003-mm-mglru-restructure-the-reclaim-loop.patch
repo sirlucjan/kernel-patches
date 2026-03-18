@@ -1,0 +1,191 @@
+From d93dd52b0ede94345310e982972f19e531e2ef7e Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Wed, 18 Mar 2026 03:08:59 +0800
+Subject: [PATCH 3/8] mm/mglru: restructure the reclaim loop
+
+The current loop will calculate the scan number on each iteration. The
+number of folios to scan is based on the LRU length, with some unclear
+behaviors, eg, it only shifts the scan number by reclaim priority at the
+default priority, and it couples the number calculation with aging and
+rotation.
+
+Adjust, simplify it, and decouple aging and rotation. Just calculate the
+scan number for once at the beginning of the reclaim, always respect the
+reclaim priority, and make the aging and rotation more explicit.
+
+This slightly changes how offline memcg aging works: previously, offline
+memcg wouldn't be aged unless it didn't have any evictable folios. Now,
+we might age it if it has only 3 generations and the reclaim priority is
+less than DEF_PRIORITY, which should be fine. On one hand, offline memcg
+might still hold long-term folios, and in fact, a long-existing offline
+memcg must be pinned by some long-term folios like shmem. These folios
+might be used by other memcg, so aging them as ordinary memcg doesn't
+seem wrong. And besides, aging enables further reclaim of an offlined
+memcg, which will certainly happen if we keep shrinking it. And offline
+memcg might soon be no longer an issue once reparenting is all ready.
+
+Overall, the memcg LRU rotation, as described in mmzone.h,
+remains the same.
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/vmscan.c | 74 ++++++++++++++++++++++++++---------------------------
+ 1 file changed, 36 insertions(+), 38 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index b0a353cda..3c7e79a15 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4782,49 +4782,35 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ }
+ 
+ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
+-			     int swappiness, unsigned long *nr_to_scan)
++			     struct scan_control *sc, int swappiness)
+ {
+ 	DEFINE_MIN_SEQ(lruvec);
+ 
+-	*nr_to_scan = 0;
+ 	/* have to run aging, since eviction is not possible anymore */
+ 	if (evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS > max_seq)
+ 		return true;
+ 
+-	*nr_to_scan = lruvec_evictable_size(lruvec, swappiness);
++	/* try to get away with not aging at the default priority */
++	if (sc->priority == DEF_PRIORITY)
++		return false;
++
+ 	/* better to run aging even though eviction is still possible */
+ 	return evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;
+ }
+ 
+-/*
+- * For future optimizations:
+- * 1. Defer try_to_inc_max_seq() to workqueues to reduce latency for memcg
+- *    reclaim.
+- */
+-static long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc, int swappiness)
++static long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc,
++			   struct mem_cgroup *memcg, int swappiness)
+ {
+-	bool need_aging;
+ 	unsigned long nr_to_scan;
+-	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+-	DEFINE_MAX_SEQ(lruvec);
+-
+-	if (mem_cgroup_below_min(sc->target_mem_cgroup, memcg))
+-		return -1;
+-
+-	need_aging = should_run_aging(lruvec, max_seq, swappiness, &nr_to_scan);
+ 
++	nr_to_scan = lruvec_evictable_size(lruvec, swappiness);
+ 	/* try to scrape all its memory if this memcg was deleted */
+-	if (nr_to_scan && !mem_cgroup_online(memcg))
++	if (!mem_cgroup_online(memcg))
+ 		return nr_to_scan;
+ 
+ 	nr_to_scan = apply_proportional_protection(memcg, sc, nr_to_scan);
+-
+-	/* try to get away with not aging at the default priority */
+-	if (!need_aging || sc->priority == DEF_PRIORITY)
+-		return nr_to_scan >> sc->priority;
+-
+-	/* stop scanning this lruvec as it's low on cold folios */
+-	return try_to_inc_max_seq(lruvec, max_seq, swappiness, false) ? -1 : 0;
++	/* always respect scan priority */
++	return nr_to_scan >> sc->priority;
+ }
+ 
+ static bool should_abort_scan(struct lruvec *lruvec, struct scan_control *sc)
+@@ -4858,31 +4844,43 @@ static bool should_abort_scan(struct lruvec *lruvec, struct scan_control *sc)
+ 	return true;
+ }
+ 
++/*
++ * For future optimizations:
++ * 1. Defer try_to_inc_max_seq() to workqueues to reduce latency for memcg
++ *    reclaim.
++ */
+ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ {
++	bool need_rotate = false;
+ 	long nr_batch, nr_to_scan;
+-	unsigned long scanned = 0;
+ 	int swappiness = get_swappiness(lruvec, sc);
++	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 
+-	while (true) {
++	nr_to_scan = get_nr_to_scan(lruvec, sc, memcg, swappiness);
++	while (nr_to_scan > 0) {
+ 		int delta;
++		DEFINE_MAX_SEQ(lruvec);
+ 
+-		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness);
+-		if (nr_to_scan <= 0)
++		if (mem_cgroup_below_min(sc->target_mem_cgroup, memcg)) {
++			need_rotate = true;
+ 			break;
++		}
++
++		if (should_run_aging(lruvec, max_seq, sc, swappiness)) {
++			if (try_to_inc_max_seq(lruvec, max_seq, swappiness, false))
++				need_rotate = true;
++			break;
++		}
+ 
+ 		nr_batch = min(nr_to_scan, MAX_LRU_BATCH);
+ 		delta = evict_folios(nr_batch, lruvec, sc, swappiness);
+ 		if (!delta)
+ 			break;
+ 
+-		scanned += delta;
+-		if (scanned >= nr_to_scan)
+-			break;
+-
+ 		if (should_abort_scan(lruvec, sc))
+ 			break;
+ 
++		nr_to_scan -= delta;
+ 		cond_resched();
+ 	}
+ 
+@@ -4894,12 +4892,12 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 		wakeup_flusher_threads(WB_REASON_VMSCAN);
+ 
+ 	/* whether this lruvec should be rotated */
+-	return nr_to_scan < 0;
++	return need_rotate;
+ }
+ 
+ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
+ {
+-	bool success;
++	bool need_rotate;
+ 	unsigned long scanned = sc->nr_scanned;
+ 	unsigned long reclaimed = sc->nr_reclaimed;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+@@ -4917,7 +4915,7 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
+ 		memcg_memory_event(memcg, MEMCG_LOW);
+ 	}
+ 
+-	success = try_to_shrink_lruvec(lruvec, sc);
++	need_rotate = try_to_shrink_lruvec(lruvec, sc);
+ 
+ 	shrink_slab(sc->gfp_mask, pgdat->node_id, memcg, sc->priority);
+ 
+@@ -4927,10 +4925,10 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
+ 
+ 	flush_reclaim_state(sc);
+ 
+-	if (success && mem_cgroup_online(memcg))
++	if (need_rotate && mem_cgroup_online(memcg))
+ 		return MEMCG_LRU_YOUNG;
+ 
+-	if (!success && lruvec_is_sizable(lruvec, sc))
++	if (!need_rotate && lruvec_is_sizable(lruvec, sc))
+ 		return 0;
+ 
+ 	/* one retry if offlined or too small */
+-- 
+2.53.0
+

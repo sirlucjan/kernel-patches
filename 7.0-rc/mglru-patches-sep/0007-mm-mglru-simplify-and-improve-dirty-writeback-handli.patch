@@ -1,0 +1,147 @@
+From b65617d7a941e220937765bdc4ac2a41a9655461 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Wed, 18 Mar 2026 21:43:59 +0100
+Subject: [PATCH 7/8] mm/mglru: simplify and improve dirty writeback handling
+
+The current handling of dirty writeback folios is not working well for
+file page heavy workloads: Dirty folios are protected and move to next
+gen upon isolation of getting throttled or reactivated upon pageout
+(shrink_folio_list).
+
+This might help to reduce the LRU lock contention slightly, but as a
+result, the ping-pong effect of folios between head and tail of last two
+gens is serious as the shrinker will run into protected dirty writeback
+folios more frequently compared to activation. The dirty flush wakeup
+condition is also much more passive compared to active/inactive LRU.
+
+So instead, just drop the special handling for dirty writeback, just
+re-activate it like active / inactive LRU. And also move the dirty flush
+wake up check right after shrink_folio_list.
+
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/vmscan.c | 44 +++++++++++++-------------------------------
+ 1 file changed, 13 insertions(+), 31 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 8ef5f9fe1..4dd5f7977 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4442,7 +4442,6 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 		       int tier_idx)
+ {
+ 	bool success;
+-	bool dirty, writeback;
+ 	int gen = folio_lru_gen(folio);
+ 	int type = folio_is_file_lru(folio);
+ 	int zone = folio_zonenum(folio);
+@@ -4492,21 +4491,6 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 		return true;
+ 	}
+ 
+-	dirty = folio_test_dirty(folio);
+-	writeback = folio_test_writeback(folio);
+-	if (type == LRU_GEN_FILE && dirty) {
+-		sc->nr.file_taken += delta;
+-		if (!writeback)
+-			sc->nr.unqueued_dirty += delta;
+-	}
+-
+-	/* waiting for writeback */
+-	if (writeback || (type == LRU_GEN_FILE && dirty)) {
+-		gen = folio_inc_gen(lruvec, folio, true);
+-		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
+-		return true;
+-	}
+-
+ 	return false;
+ }
+ 
+@@ -4618,8 +4602,6 @@ static int scan_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, nr_to_scan,
+ 				scanned, skipped, isolated,
+ 				type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+-	if (type == LRU_GEN_FILE)
+-		sc->nr.file_taken += isolated;
+ 
+ 	*isolatedp = isolated;
+ 	return scanned;
+@@ -4666,11 +4648,11 @@ static int get_type_to_scan(struct lruvec *lruvec, int swappiness)
+ 
+ static int isolate_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 			  struct scan_control *sc, int swappiness,
+-			  int *type_scanned, struct list_head *list)
++			  int *type_scanned,
++			  struct list_head *list, int *isolated)
+ {
+ 	int i;
+ 	int scanned = 0;
+-	int isolated = 0;
+ 	int type = get_type_to_scan(lruvec, swappiness);
+ 
+ 	for_each_evictable_type(i, swappiness) {
+@@ -4679,8 +4661,8 @@ static int isolate_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 		*type_scanned = type;
+ 
+ 		scanned += scan_folios(nr_to_scan, lruvec, sc,
+-				      type, tier, list, &isolated);
+-		if (isolated)
++				      type, tier, list, isolated);
++		if (*isolated)
+ 			return scanned;
+ 
+ 		type = !type;
+@@ -4695,6 +4677,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	int type;
+ 	int scanned;
+ 	int reclaimed;
++	int isolated = 0;
+ 	LIST_HEAD(list);
+ 	LIST_HEAD(clean);
+ 	struct folio *folio;
+@@ -4708,7 +4691,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 
+ 	spin_lock_irq(&lruvec->lru_lock);
+ 
+-	scanned = isolate_folios(nr_to_scan, lruvec, sc, swappiness, &type, &list);
++	scanned = isolate_folios(nr_to_scan, lruvec, sc, swappiness, &type, &list, &isolated);
+ 
+ 	try_to_inc_min_seq(lruvec, swappiness);
+ 
+@@ -4718,12 +4701,18 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 		return scanned;
+ retry:
+ 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);
+-	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
+ 	sc->nr_reclaimed += reclaimed;
+ 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
+ 			scanned, reclaimed, &stat, sc->priority,
+ 			type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+ 
++	/*
++	 * If too many file cache in the coldest generation can't be evicted
++	 * due to being dirty, wake up the flusher.
++	 */
++	if (stat.nr_unqueued_dirty == isolated)
++		wakeup_flusher_threads(WB_REASON_VMSCAN);
++
+ 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
+ 		DEFINE_MIN_SEQ(lruvec);
+ 
+@@ -4883,13 +4872,6 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 		cond_resched();
+ 	}
+ 
+-	/*
+-	 * If too many file cache in the coldest generation can't be evicted
+-	 * due to being dirty, wake up the flusher.
+-	 */
+-	if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)
+-		wakeup_flusher_threads(WB_REASON_VMSCAN);
+-
+ 	/* whether this lruvec should be rotated */
+ 	return need_rotate;
+ }
+-- 
+2.53.0
+
