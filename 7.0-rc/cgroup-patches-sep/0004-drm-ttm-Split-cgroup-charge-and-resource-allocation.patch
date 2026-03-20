@@ -1,0 +1,257 @@
+From fa2b9256f831ae607bdb5eb7043147e30505c6e1 Mon Sep 17 00:00:00 2001
+From: Natalie Vock <natalie.vock@gmx.de>
+Date: Wed, 25 Feb 2026 11:29:40 +0100
+Subject: [PATCH 4/6] drm/ttm: Split cgroup charge and resource allocation
+
+Coupling resource allocation and cgroup charging is racy when charging
+succeeds, but subsequent resource allocation fails. Certain eviction
+decisions are made on the basis of whether the allocating cgroup is
+protected, i.e. within its min/low limits, but with the charge being
+tied to resource allocation (and uncharged when the resource allocation
+fails), this check is done at a point where the allocation is not actually
+charged to the cgroup.
+
+This is subtly wrong if the allocation were to cause the cgroup to exceed
+the min/low protection, but it's even more wrong if the same cgroup tries
+allocating multiple buffers concurrently: In this case, the min/low
+protection may pass for all allocation attempts when the real min/low
+protection covers only some, or potentially none of the allocated
+buffers.
+
+Instead, charge the allocation to the cgroup once and keep the charge
+for as long as we try to allocate a ttm_resource, and only undo the charge
+if allocating the resource is ultimately unsuccessful and we move on to
+a different ttm_place.
+
+Signed-off-by: Natalie Vock <natalie.vock@gmx.de>
+---
+ drivers/gpu/drm/ttm/ttm_bo.c       | 66 ++++++++++++++++++++----------
+ drivers/gpu/drm/ttm/ttm_resource.c | 54 ++++++++++++++++--------
+ include/drm/ttm/ttm_resource.h     |  6 ++-
+ 3 files changed, 88 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index ef68197e3..45a54e404 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -490,8 +490,12 @@ int ttm_bo_evict_first(struct ttm_device *bdev, struct ttm_resource_manager *man
+ }
+ 
+ struct ttm_bo_alloc_state {
++	/** @charge_pool: The memory pool the resource is charged to */
++	struct dmem_cgroup_pool_state *charge_pool;
+ 	/** @limit_pool: Which pool limit we should test against */
+ 	struct dmem_cgroup_pool_state *limit_pool;
++	/** @in_evict: Whether we are currently evicting buffers */
++	bool in_evict;
+ };
+ 
+ /**
+@@ -520,28 +524,39 @@ static int ttm_bo_alloc_at_place(struct ttm_buffer_object *bo,
+ 	bool may_evict;
+ 	int ret;
+ 
+-	may_evict = force_space && place->mem_type != TTM_PL_SYSTEM;
+-
+-	ret = ttm_resource_alloc(bo, place, res,
+-				 force_space ? &alloc_state->limit_pool : NULL);
++	may_evict = !alloc_state->in_evict && force_space &&
++		    place->mem_type != TTM_PL_SYSTEM;
++	if (!alloc_state->charge_pool) {
++		ret = ttm_resource_try_charge(bo, place, &alloc_state->charge_pool,
++					      force_space ? &alloc_state->limit_pool
++							  : NULL);
++		if (ret) {
++			/*
++			 * -EAGAIN means the charge failed, which we treat
++			 * like an allocation failure. Therefore, return an
++			 * error code indicating the allocation failed -
++			 * either -EBUSY if the allocation should be
++			 * retried with eviction, or -ENOSPC if there should
++			 * be no second attempt.
++			 */
++			if (ret == -EAGAIN)
++				ret = may_evict ? -EBUSY : -ENOSPC;
++			return ret;
++		}
++	}
+ 
++	ret = ttm_resource_alloc(bo, place, res, alloc_state->charge_pool);
+ 	if (ret) {
+-		/*
+-		 * -EAGAIN means the charge failed, which we treat like an
+-		 * allocation failure. Therefore, return an error code indicating
+-		 * the allocation failed - either -EBUSY if the allocation should
+-		 * be retried with eviction, or -ENOSPC if there should be no second
+-		 * attempt.
+-		 */
+-		if (ret == -EAGAIN)
+-			return may_evict ? -EBUSY : -ENOSPC;
+-
+ 		if (ret == -ENOSPC && may_evict)
+-			return -EBUSY;
+-
++			ret = -EBUSY;
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Ownership of charge_pool has been transferred to the TTM resource,
++	 * don't make the caller think we still hold a reference to it.
++	 */
++	alloc_state->charge_pool = NULL;
+ 	return 0;
+ }
+ 
+@@ -596,8 +611,9 @@ static s64 ttm_bo_evict_cb(struct ttm_lru_walk *walk, struct ttm_buffer_object *
+ 
+ 	evict_walk->evicted++;
+ 	if (evict_walk->res)
+-		lret = ttm_resource_alloc(evict_walk->evictor, evict_walk->place,
+-					  evict_walk->res, NULL);
++		lret = ttm_bo_alloc_at_place(evict_walk->evictor, evict_walk->place,
++					     walk->arg.ctx, false, evict_walk->res,
++					     evict_walk->alloc_state);
+ 	if (lret == 0)
+ 		return 1;
+ out:
+@@ -636,6 +652,8 @@ static int ttm_bo_evict_alloc(struct ttm_device *bdev,
+ 	};
+ 	s64 lret;
+ 
++	state->in_evict = true;
++
+ 	evict_walk.walk.arg.trylock_only = true;
+ 	lret = ttm_lru_walk_for_evict(&evict_walk.walk, bdev, man, 1);
+ 
+@@ -666,6 +684,7 @@ static int ttm_bo_evict_alloc(struct ttm_device *bdev,
+ 		goto retry;
+ 	}
+ out:
++	state->in_evict = false;
+ 	if (lret < 0)
+ 		return lret;
+ 	if (lret == 0)
+@@ -798,6 +817,7 @@ static int ttm_bo_alloc_resource(struct ttm_buffer_object *bo,
+ 				res, &alloc_state);
+ 
+ 		if (ret == -ENOSPC) {
++			dmem_cgroup_uncharge(alloc_state.charge_pool, bo->base.size);
+ 			dmem_cgroup_pool_state_put(alloc_state.limit_pool);
+ 			continue;
+ 		} else if (ret == -EBUSY) {
+@@ -806,11 +826,15 @@ static int ttm_bo_alloc_resource(struct ttm_buffer_object *bo,
+ 
+ 			dmem_cgroup_pool_state_put(alloc_state.limit_pool);
+ 
+-			if (ret == -EBUSY)
+-				continue;
+-			else if (ret)
++			if (ret) {
++				dmem_cgroup_uncharge(alloc_state.charge_pool,
++						bo->base.size);
++				if (ret == -EBUSY)
++					continue;
+ 				return ret;
++			}
+ 		} else if (ret) {
++			dmem_cgroup_uncharge(alloc_state.charge_pool, bo->base.size);
+ 			dmem_cgroup_pool_state_put(alloc_state.limit_pool);
+ 			return ret;
+ 		}
+diff --git a/drivers/gpu/drm/ttm/ttm_resource.c b/drivers/gpu/drm/ttm/ttm_resource.c
+index 192fca24f..a8a836f6e 100644
+--- a/drivers/gpu/drm/ttm/ttm_resource.c
++++ b/drivers/gpu/drm/ttm/ttm_resource.c
+@@ -373,30 +373,52 @@ void ttm_resource_fini(struct ttm_resource_manager *man,
+ }
+ EXPORT_SYMBOL(ttm_resource_fini);
+ 
+-int ttm_resource_alloc(struct ttm_buffer_object *bo,
+-		       const struct ttm_place *place,
+-		       struct ttm_resource **res_ptr,
+-		       struct dmem_cgroup_pool_state **ret_limit_pool)
++/**
++ * ttm_resource_try_charge - charge a resource manager's cgroup pool
++ * @bo: buffer for which an allocation should be charged
++ * @place: where the allocation is attempted to be placed
++ * @ret_pool: on charge success, the pool that was charged
++ * @ret_limit_pool: on charge failure, the pool responsible for the failure
++ *
++ * Should be used to charge cgroups before attempting resource allocation.
++ * When charging succeeds, the value of ret_pool should be passed to
++ * ttm_resource_alloc.
++ *
++ * Returns: 0 on charge success, negative errno on failure.
++ */
++int ttm_resource_try_charge(struct ttm_buffer_object *bo,
++			    const struct ttm_place *place,
++			    struct dmem_cgroup_pool_state **ret_pool,
++			    struct dmem_cgroup_pool_state **ret_limit_pool)
++{
++	struct ttm_resource_manager *man =
++		ttm_manager_type(bo->bdev, place->mem_type);
++
++	if (!man->cg) {
++		*ret_pool = NULL;
++		if (ret_limit_pool)
++			*ret_limit_pool = NULL;
++		return 0;
++	}
++
++	return dmem_cgroup_try_charge(man->cg, bo->base.size, ret_pool,
++				      ret_limit_pool);
++}
++
++int ttm_resource_alloc(struct ttm_buffer_object *bo,
++		       const struct ttm_place *place,
++		       struct ttm_resource **res_ptr,
++		       struct dmem_cgroup_pool_state *charge_pool)
+ {
+ 	struct ttm_resource_manager *man =
+ 		ttm_manager_type(bo->bdev, place->mem_type);
+-	struct dmem_cgroup_pool_state *pool = NULL;
+ 	int ret;
+ 
+-	if (man->cg) {
+-		ret = dmem_cgroup_try_charge(man->cg, bo->base.size, &pool, ret_limit_pool);
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	ret = man->func->alloc(man, bo, place, res_ptr);
+-	if (ret) {
+-		if (pool)
+-			dmem_cgroup_uncharge(pool, bo->base.size);
++	if (ret)
+ 		return ret;
+-	}
+ 
+-	(*res_ptr)->css = pool;
++	(*res_ptr)->css = charge_pool;
+ 
+ 	spin_lock(&bo->bdev->lru_lock);
+ 	ttm_resource_add_bulk_move(*res_ptr, bo);
+diff --git a/include/drm/ttm/ttm_resource.h b/include/drm/ttm/ttm_resource.h
+index 33e80f30b..549b5b796 100644
+--- a/include/drm/ttm/ttm_resource.h
++++ b/include/drm/ttm/ttm_resource.h
+@@ -456,10 +456,14 @@ void ttm_resource_init(struct ttm_buffer_object *bo,
+ void ttm_resource_fini(struct ttm_resource_manager *man,
+ 		       struct ttm_resource *res);
+ 
++int ttm_resource_try_charge(struct ttm_buffer_object *bo,
++			    const struct ttm_place *place,
++			    struct dmem_cgroup_pool_state **ret_pool,
++			    struct dmem_cgroup_pool_state **ret_limit_pool);
+ int ttm_resource_alloc(struct ttm_buffer_object *bo,
+ 		       const struct ttm_place *place,
+ 		       struct ttm_resource **res,
+-		       struct dmem_cgroup_pool_state **ret_limit_pool);
++		       struct dmem_cgroup_pool_state *charge_pool);
+ void ttm_resource_free(struct ttm_buffer_object *bo, struct ttm_resource **res);
+ bool ttm_resource_intersects(struct ttm_device *bdev,
+ 			     struct ttm_resource *res,
+-- 
+2.53.0
+
