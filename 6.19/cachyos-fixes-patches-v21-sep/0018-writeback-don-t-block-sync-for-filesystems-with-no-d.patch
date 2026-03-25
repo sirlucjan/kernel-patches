@@ -1,0 +1,180 @@
+From fa000b4909185bc6efc96f9871e3bce41d7103f6 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Thu, 19 Mar 2026 17:51:45 -0700
+Subject: [PATCH 18/19] writeback: don't block sync for filesystems with no
+ data integrity guarantees
+
+Add a SB_I_NO_DATA_INTEGRITY superblock flag for filesystems that cannot
+guarantee data persistence on sync (eg fuse). For superblocks with this
+flag set, sync kicks off writeback of dirty inodes but does not wait
+for the flusher threads to complete the writeback.
+
+This replaces the per-inode AS_NO_DATA_INTEGRITY mapping flag added in
+commit f9a49aa302a0 ("fs/writeback: skip AS_NO_DATA_INTEGRITY mappings
+in wait_sb_inodes()"). The flag belongs at the superblock level because
+data integrity is a filesystem-wide property, not a per-inode one.
+Having this flag at the superblock level also allows us to skip having
+to iterate every dirty inode in wait_sb_inodes() only to skip each inode
+individually.
+
+Prior to this commit, mappings with no data integrity guarantees skipped
+waiting on writeback completion but still waited on the flusher threads
+to finish initiating the writeback. Waiting on the flusher threads is
+unnecessary. This commit kicks off writeback but does not wait on the
+flusher threads. This change properly addresses a recent report [1] for
+a suspend-to-RAM hang seen on fuse-overlayfs that was caused by waiting
+on the flusher threads to finish:
+
+Workqueue: pm_fs_sync pm_fs_sync_work_fn
+Call Trace:
+ <TASK>
+ __schedule+0x457/0x1720
+ schedule+0x27/0xd0
+ wb_wait_for_completion+0x97/0xe0
+ sync_inodes_sb+0xf8/0x2e0
+ __iterate_supers+0xdc/0x160
+ ksys_sync+0x43/0xb0
+ pm_fs_sync_work_fn+0x17/0xa0
+ process_one_work+0x193/0x350
+ worker_thread+0x1a1/0x310
+ kthread+0xfc/0x240
+ ret_from_fork+0x243/0x280
+ ret_from_fork_asm+0x1a/0x30
+ </TASK>
+
+On fuse this is problematic because there are paths that may cause the
+flusher thread to block (eg if systemd freezes the user session cgroups
+first, which freezes the fuse daemon, before invoking the kernel
+suspend. The kernel suspend triggers ->write_node() which on fuse issues
+a synchronous setattr request, which cannot be processed since the
+daemon is frozen. Or if the daemon is buggy and cannot properly complete
+writeback, initiating writeback on a dirty folio already under writeback
+leads to writeback_get_folio() -> folio_prepare_writeback() ->
+unconditional wait on writeback to finish, which will cause a hang).
+This commit restores fuse to its prior behavior before tmp folios were
+removed, where sync was essentially a no-op.
+
+[1] https://lore.kernel.org/linux-fsdevel/CAJnrk1a-asuvfrbKXbEwwDSctvemF+6zfhdnuzO65Pt8HsFSRw@mail.gmail.com/T/#m632c4648e9cafc4239299887109ebd880ac6c5c1
+
+Fixes: 0c58a97f919c ("fuse: remove tmp folio for writebacks and internal rb tree")
+Reported-by: John <therealgraysky@proton.me>
+Cc: stable@vger.kernel.org
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: David Hildenbrand (Arm) <david@kernel.org>
+---
+ fs/fs-writeback.c              | 18 ++++++++++++------
+ fs/fuse/file.c                 |  4 +---
+ fs/fuse/inode.c                |  1 +
+ include/linux/fs/super_types.h |  1 +
+ include/linux/pagemap.h        | 11 -----------
+ 5 files changed, 15 insertions(+), 20 deletions(-)
+
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 79b02ac66..993f865c9 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -2759,13 +2759,8 @@ static void wait_sb_inodes(struct super_block *sb)
+ 		 * The mapping can appear untagged while still on-list since we
+ 		 * do not have the mapping lock. Skip it here, wb completion
+ 		 * will remove it.
+-		 *
+-		 * If the mapping does not have data integrity semantics,
+-		 * there's no need to wait for the writeout to complete, as the
+-		 * mapping cannot guarantee that data is persistently stored.
+ 		 */
+-		if (!mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK) ||
+-		    mapping_no_data_integrity(mapping))
++		if (!mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK))
+ 			continue;
+ 
+ 		spin_unlock_irq(&sb->s_inode_wblist_lock);
+@@ -2900,6 +2895,17 @@ void sync_inodes_sb(struct super_block *sb)
+ 	 */
+ 	if (bdi == &noop_backing_dev_info)
+ 		return;
++
++	/*
++	 * If the superblock has SB_I_NO_DATA_INTEGRITY set, there's no need to
++	 * wait for the writeout to complete, as the filesystem cannot guarantee
++	 * data persistence on sync. Just kick off writeback and return.
++	 */
++	if (sb->s_iflags & SB_I_NO_DATA_INTEGRITY) {
++		wakeup_flusher_threads_bdi(bdi, WB_REASON_SYNC);
++		return;
++	}
++
+ 	WARN_ON(!rwsem_is_locked(&sb->s_umount));
+ 
+ 	/* protect against inode wb switch, see inode_switch_wbs_work_fn() */
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 3b2a171e6..01bc894e9 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -3200,10 +3200,8 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
+ 
+ 	inode->i_fop = &fuse_file_operations;
+ 	inode->i_data.a_ops = &fuse_file_aops;
+-	if (fc->writeback_cache) {
++	if (fc->writeback_cache)
+ 		mapping_set_writeback_may_deadlock_on_reclaim(&inode->i_data);
+-		mapping_set_no_data_integrity(&inode->i_data);
+-	}
+ 
+ 	INIT_LIST_HEAD(&fi->write_files);
+ 	INIT_LIST_HEAD(&fi->queued_writes);
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 819e50d66..d7a226e6a 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1709,6 +1709,7 @@ static void fuse_sb_defaults(struct super_block *sb)
+ 	sb->s_export_op = &fuse_export_operations;
+ 	sb->s_iflags |= SB_I_IMA_UNVERIFIABLE_SIGNATURE;
+ 	sb->s_iflags |= SB_I_NOIDMAP;
++	sb->s_iflags |= SB_I_NO_DATA_INTEGRITY;
+ 	if (sb->s_user_ns != &init_user_ns)
+ 		sb->s_iflags |= SB_I_UNTRUSTED_MOUNTER;
+ 	sb->s_flags &= ~(SB_NOSEC | SB_I_VERSION);
+diff --git a/include/linux/fs/super_types.h b/include/linux/fs/super_types.h
+index 6bd3009e0..72ef2ae24 100644
+--- a/include/linux/fs/super_types.h
++++ b/include/linux/fs/super_types.h
+@@ -332,5 +332,6 @@ struct super_block {
+ #define SB_I_NOUMASK	0x00001000	/* VFS does not apply umask */
+ #define SB_I_NOIDMAP	0x00002000	/* No idmapped mounts on this superblock */
+ #define SB_I_ALLOW_HSM	0x00004000	/* Allow HSM events on this superblock */
++#define SB_I_NO_DATA_INTEGRITY	0x00008000 /* fs cannot guarantee data persistence on sync */
+ 
+ #endif /* _LINUX_FS_SUPER_TYPES_H */
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index ec442af3f..31a848485 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -210,7 +210,6 @@ enum mapping_flags {
+ 	AS_WRITEBACK_MAY_DEADLOCK_ON_RECLAIM = 9,
+ 	AS_KERNEL_FILE = 10,	/* mapping for a fake kernel file that shouldn't
+ 				   account usage to user cgroups */
+-	AS_NO_DATA_INTEGRITY = 11, /* no data integrity guarantees */
+ 	/* Bits 16-25 are used for FOLIO_ORDER */
+ 	AS_FOLIO_ORDER_BITS = 5,
+ 	AS_FOLIO_ORDER_MIN = 16,
+@@ -346,16 +345,6 @@ static inline bool mapping_writeback_may_deadlock_on_reclaim(const struct addres
+ 	return test_bit(AS_WRITEBACK_MAY_DEADLOCK_ON_RECLAIM, &mapping->flags);
+ }
+ 
+-static inline void mapping_set_no_data_integrity(struct address_space *mapping)
+-{
+-	set_bit(AS_NO_DATA_INTEGRITY, &mapping->flags);
+-}
+-
+-static inline bool mapping_no_data_integrity(const struct address_space *mapping)
+-{
+-	return test_bit(AS_NO_DATA_INTEGRITY, &mapping->flags);
+-}
+-
+ static inline gfp_t mapping_gfp_mask(const struct address_space *mapping)
+ {
+ 	return mapping->gfp_mask;
+-- 
+2.53.0
+
