@@ -1,0 +1,166 @@
+From b65ab545199aa54aa909779207c46d9e4d99a2cb Mon Sep 17 00:00:00 2001
+From: Kairui Song <kasong@tencent.com>
+Date: Sun, 29 Mar 2026 03:52:34 +0800
+Subject: [PATCH 09/13] mm/mglru: simplify and improve dirty writeback handling
+
+The current handling of dirty writeback folios is not working well for
+file page heavy workloads: Dirty folios are protected and move to next
+gen upon isolation of getting throttled or reactivation upon pageout
+(shrink_folio_list).
+
+This might help to reduce the LRU lock contention slightly, but as a
+result, the ping-pong effect of folios between head and tail of last two
+gens is serious as the shrinker will run into protected dirty writeback
+folios more frequently compared to activation. The dirty flush wakeup
+condition is also much more passive compared to active/inactive LRU.
+Active / inactve LRU wakes the flusher if one batch of folios passed to
+shrink_folio_list is unevictable due to under writeback, but MGLRU
+instead has to check this after the whole reclaim loop is done, and then
+count the isolation protection number compared to the total reclaim
+number.
+
+And we previously saw OOM problems with it, too, which were fixed but
+still not perfect [1].
+
+So instead, just drop the special handling for dirty writeback, just
+re-activate it like active / inactive LRU. And also move the dirty flush
+wake up check right after shrink_folio_list. This should improve both
+throttling and performance.
+
+Test with YCSB workloadb showed a major performance improvement:
+
+Before this series:
+Throughput(ops/sec): 61642.78008938203
+AverageLatency(us):  507.11127774145166
+pgpgin 158190589
+pgpgout 5880616
+workingset_refault 7262988
+
+After this commit:
+Throughput(ops/sec): 80216.04855744806  (+30.1%, higher is better)
+AverageLatency(us):  388.17633477268913 (-23.5%, lower is better)
+pgpgin 101871227                        (-35.6%, lower is better)
+pgpgout 5770028
+workingset_refault 3418186              (-52.9%, lower is better)
+
+The refault rate is ~50% lower, and throughput is ~30% higher, which
+is a huge gain. We also observed significant performance gain for
+other real-world workloads.
+
+We were concerned that the dirty flush could cause more wear for SSD:
+that should not be the problem here, since the wakeup condition is when
+the dirty folios have been pushed to the tail of LRU, which indicates
+that memory pressure is so high that writeback is blocking the workload
+already.
+
+Reviewed-by: Axel Rasmussen <axelrasmussen@google.com>
+Link: https://lore.kernel.org/linux-mm/20241026115714.1437435-1-jingxiangzeng.cas@gmail.com/ [1]
+Signed-off-by: Kairui Song <kasong@tencent.com>
+---
+ mm/vmscan.c | 57 +++++++++++++++--------------------------------------
+ 1 file changed, 16 insertions(+), 41 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index fb32e96a4..32942482d 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4442,7 +4442,6 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 		       int tier_idx)
+ {
+ 	bool success;
+-	bool dirty, writeback;
+ 	int gen = folio_lru_gen(folio);
+ 	int type = folio_is_file_lru(folio);
+ 	int zone = folio_zonenum(folio);
+@@ -4492,21 +4491,6 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
+ 		return true;
+ 	}
+ 
+-	dirty = folio_test_dirty(folio);
+-	writeback = folio_test_writeback(folio);
+-	if (type == LRU_GEN_FILE && dirty) {
+-		sc->nr.file_taken += delta;
+-		if (!writeback)
+-			sc->nr.unqueued_dirty += delta;
+-	}
+-
+-	/* waiting for writeback */
+-	if (writeback || (type == LRU_GEN_FILE && dirty)) {
+-		gen = folio_inc_gen(lruvec, folio, true);
+-		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
+-		return true;
+-	}
+-
+ 	return false;
+ }
+ 
+@@ -4618,8 +4602,6 @@ static int scan_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, nr_to_scan,
+ 				scanned, skipped, isolated,
+ 				type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+-	if (type == LRU_GEN_FILE)
+-		sc->nr.file_taken += isolated;
+ 
+ 	*isolatedp = isolated;
+ 	return scanned;
+@@ -4722,12 +4704,27 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 		return scanned;
+ retry:
+ 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);
+-	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
+ 	sc->nr_reclaimed += reclaimed;
+ 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
+ 			type_scanned, reclaimed, &stat, sc->priority,
+ 			type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+ 
++	/*
++	 * If too many file cache in the coldest generation can't be evicted
++	 * due to being dirty, wake up the flusher.
++	 */
++	if (stat.nr_unqueued_dirty == isolated) {
++		wakeup_flusher_threads(WB_REASON_VMSCAN);
++
++		/*
++		 * For cgroupv1 dirty throttling is achieved by waking up
++		 * the kernel flusher here and later waiting on folios
++		 * which are in writeback to finish (see shrink_folio_list()).
++		 */
++		if (!writeback_throttling_sane(sc))
++			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
++	}
++
+ 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
+ 		DEFINE_MIN_SEQ(lruvec);
+ 
+@@ -4892,28 +4889,6 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 		cond_resched();
+ 	}
+ 
+-	/*
+-	 * If too many file cache in the coldest generation can't be evicted
+-	 * due to being dirty, wake up the flusher.
+-	 */
+-	if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken) {
+-		struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+-
+-		wakeup_flusher_threads(WB_REASON_VMSCAN);
+-
+-		/*
+-		 * For cgroupv1 dirty throttling is achieved by waking up
+-		 * the kernel flusher here and later waiting on folios
+-		 * which are in writeback to finish (see shrink_folio_list()).
+-		 *
+-		 * Flusher may not be able to issue writeback quickly
+-		 * enough for cgroupv1 writeback throttling to work
+-		 * on a large system.
+-		 */
+-		if (!writeback_throttling_sane(sc))
+-			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
+-	}
+-
+ 	return need_rotate;
+ }
+ 
+-- 
+2.53.0
+
