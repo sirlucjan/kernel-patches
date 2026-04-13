@@ -1,0 +1,217 @@
+From 122c768648dbca00b935dabf31cf52da1c66b71b Mon Sep 17 00:00:00 2001
+From: Tim Chen <tim.c.chen@linux.intel.com>
+Date: Wed, 1 Apr 2026 14:52:17 -0700
+Subject: [PATCH 05/20] sched/cache: Make LLC id continuous
+
+Introduce an index mapping between CPUs and their LLCs. This provides
+a roughly continuous per LLC index needed for cache-aware load balancing in
+later patches.
+
+The existing per_cpu llc_id usually points to the first CPU of the
+LLC domain, which is sparse and unsuitable as an array index. Using
+llc_id directly would waste memory.
+
+With the new mapping, CPUs in the same LLC share an approximate
+continuous id:
+
+  per_cpu(llc_id, CPU=0...15)  = 0
+  per_cpu(llc_id, CPU=16...31) = 1
+  per_cpu(llc_id, CPU=32...47) = 2
+  ...
+
+Note that the LLC IDs are allocated via bitmask, so the IDs may be
+reused during CPU offline->online transitions.
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Originally-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Co-developed-by: Chen Yu <yu.c.chen@intel.com>
+Signed-off-by: Chen Yu <yu.c.chen@intel.com>
+Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+---
+ kernel/sched/core.c     |  2 +
+ kernel/sched/sched.h    |  3 ++
+ kernel/sched/topology.c | 90 ++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 93 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 7e3173f7d..e8ced8950 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8420,6 +8420,8 @@ int sched_cpu_deactivate(unsigned int cpu)
+ 	 */
+ 	synchronize_rcu();
+ 
++	sched_domains_free_llc_id(cpu);
++
+ 	sched_set_rq_offline(rq, cpu);
+ 
+ 	scx_rq_deactivate(rq);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e36aa95fc..bd0ecf539 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -4022,6 +4022,9 @@ static inline bool sched_cache_enabled(void)
+ 	return false;
+ }
+ #endif
++
++void sched_domains_free_llc_id(int cpu);
++
+ extern void init_sched_mm(struct task_struct *p);
+ 
+ extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 32dcddaea..edf6d7ec7 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -18,8 +18,10 @@ void sched_domains_mutex_unlock(void)
+ }
+ 
+ /* Protected by sched_domains_mutex: */
++static cpumask_var_t sched_domains_llc_id_allocmask;
+ static cpumask_var_t sched_domains_tmpmask;
+ static cpumask_var_t sched_domains_tmpmask2;
++int max_lid;
+ 
+ static int __init sched_debug_setup(char *str)
+ {
+@@ -663,7 +665,7 @@ static void destroy_sched_domains(struct sched_domain *sd)
+  */
+ DEFINE_PER_CPU(struct sched_domain __rcu *, sd_llc);
+ DEFINE_PER_CPU(int, sd_llc_size);
+-DEFINE_PER_CPU(int, sd_llc_id);
++DEFINE_PER_CPU(int, sd_llc_id) = -1;
+ DEFINE_PER_CPU(int, sd_share_id);
+ DEFINE_PER_CPU(struct sched_domain_shared __rcu *, sd_llc_shared);
+ DEFINE_PER_CPU(struct sched_domain __rcu *, sd_numa);
+@@ -689,7 +691,6 @@ static void update_top_cache_domain(int cpu)
+ 
+ 	rcu_assign_pointer(per_cpu(sd_llc, cpu), sd);
+ 	per_cpu(sd_llc_size, cpu) = size;
+-	per_cpu(sd_llc_id, cpu) = id;
+ 	rcu_assign_pointer(per_cpu(sd_llc_shared, cpu), sds);
+ 
+ 	sd = lowest_flag_domain(cpu, SD_CLUSTER);
+@@ -1776,6 +1777,11 @@ const struct cpumask *tl_mc_mask(struct sched_domain_topology_level *tl, int cpu
+ {
+ 	return cpu_coregroup_mask(cpu);
+ }
++
++#define llc_mask(cpu) cpu_coregroup_mask(cpu)
++
++#else
++#define llc_mask(cpu) cpumask_of(cpu)
+ #endif
+ 
+ const struct cpumask *tl_pkg_mask(struct sched_domain_topology_level *tl, int cpu)
+@@ -2548,6 +2554,61 @@ static bool topology_span_sane(const struct cpumask *cpu_map)
+ 	return true;
+ }
+ 
++static int __sched_domains_alloc_llc_id(void)
++{
++	int lid, max;
++
++	lockdep_assert_held(&sched_domains_mutex);
++
++	lid = cpumask_first_zero(sched_domains_llc_id_allocmask);
++	/*
++	 * llc_id space should never grow larger than the
++	 * possible number of CPUs in the system.
++	 */
++	if (lid >= nr_cpu_ids)
++		return -1;
++
++	__cpumask_set_cpu(lid, sched_domains_llc_id_allocmask);
++	max = cpumask_last(sched_domains_llc_id_allocmask);
++	if (max > max_lid)
++		max_lid = max;
++
++	return lid;
++}
++
++static void __sched_domains_free_llc_id(int cpu)
++{
++	int i, lid, max;
++
++	lockdep_assert_held(&sched_domains_mutex);
++
++	lid = per_cpu(sd_llc_id, cpu);
++	if (lid == -1 || lid >= nr_cpu_ids)
++		return;
++
++	per_cpu(sd_llc_id, cpu) = -1;
++
++	for_each_cpu(i, llc_mask(cpu)) {
++		/* An online CPU owns the llc_id. */
++		if (per_cpu(sd_llc_id, i) == lid)
++			return;
++	}
++
++	__cpumask_clear_cpu(lid, sched_domains_llc_id_allocmask);
++
++	max = cpumask_last(sched_domains_llc_id_allocmask);
++	/* shrink max lid to save memory */
++	if (max < max_lid)
++		max_lid = max;
++}
++
++void sched_domains_free_llc_id(int cpu)
++{
++	sched_domains_mutex_lock();
++	__sched_domains_free_llc_id(cpu);
++	sched_domains_mutex_unlock();
++}
++
+ /*
+  * Build sched domains for a given set of CPUs and attach the sched domains
+  * to the individual CPUs
+@@ -2573,6 +2634,7 @@ build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *att
+ 	/* Set up domains for CPUs specified by the cpu_map: */
+ 	for_each_cpu(i, cpu_map) {
+ 		struct sched_domain_topology_level *tl;
++		int lid;
+ 
+ 		sd = NULL;
+ 		for_each_sd_topology(tl) {
+@@ -2586,6 +2648,29 @@ build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *att
+ 			if (cpumask_equal(cpu_map, sched_domain_span(sd)))
+ 				break;
+ 		}
++
++		lid = per_cpu(sd_llc_id, i);
++		if (lid == -1) {
++			/* try to reuse the llc_id of its siblings */
++			for (int j = cpumask_first(llc_mask(i));
++			     j < nr_cpu_ids;
++			     j = cpumask_next(j, llc_mask(i))) {
++				if (i == j)
++					continue;
++
++				lid = per_cpu(sd_llc_id, j);
++
++				if (lid != -1) {
++					per_cpu(sd_llc_id, i) = lid;
++
++					break;
++				}
++			}
++
++			/* a new LLC is detected */
++			if (lid == -1)
++				per_cpu(sd_llc_id, i) = __sched_domains_alloc_llc_id();
++		}
+ 	}
+ 
+ 	if (WARN_ON(!topology_span_sane(cpu_map)))
+@@ -2762,6 +2847,7 @@ int __init sched_init_domains(const struct cpumask *cpu_map)
+ {
+ 	int err;
+ 
++	zalloc_cpumask_var(&sched_domains_llc_id_allocmask, GFP_KERNEL);
+ 	zalloc_cpumask_var(&sched_domains_tmpmask, GFP_KERNEL);
+ 	zalloc_cpumask_var(&sched_domains_tmpmask2, GFP_KERNEL);
+ 	zalloc_cpumask_var(&fallback_doms, GFP_KERNEL);
+-- 
+2.53.0
+
