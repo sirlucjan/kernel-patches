@@ -1,0 +1,292 @@
+From 14dc23ca9ec8a3c25ed94027c8b183f259c6669f Mon Sep 17 00:00:00 2001
+From: Ryan Roberts <ryan.roberts@arm.com>
+Date: Wed, 1 Apr 2026 11:16:19 +0100
+Subject: [PATCH 12/17] mm/page_alloc: Optimize free_contig_range()
+
+Decompose the range of order-0 pages to be freed into the set of largest
+possible power-of-2 size and aligned chunks and free them to the pcp or
+buddy. This improves on the previous approach which freed each order-0
+page individually in a loop. Testing shows performance to be improved by
+more than 10x in some cases.
+
+Since each page is order-0, we must decrement each page's reference
+count individually and only consider the page for freeing as part of a
+high order chunk if the reference count goes to zero. Additionally
+free_pages_prepare() must be called for each individual order-0 page
+too, so that the struct page state and global accounting state can be
+appropriately managed. But once this is done, the resulting high order
+chunks can be freed as a unit to the pcp or buddy.
+
+This significantly speeds up the free operation but also has the side
+benefit that high order blocks are added to the pcp instead of each page
+ending up on the pcp order-0 list; memory remains more readily available
+in high orders.
+
+vmalloc will shortly become a user of this new optimized
+free_contig_range() since it aggressively allocates high order
+non-compound pages, but then calls split_page() to end up with
+contiguous order-0 pages. These can now be freed much more efficiently.
+
+The execution time of the following function was measured in a server
+class arm64 machine:
+
+static int page_alloc_high_order_test(void)
+{
+	unsigned int order = HPAGE_PMD_ORDER;
+	struct page *page;
+	int i;
+
+	for (i = 0; i < 100000; i++) {
+		page = alloc_pages(GFP_KERNEL, order);
+		if (!page)
+			return -1;
+		split_page(page, order);
+		free_contig_range(page_to_pfn(page), 1UL << order);
+	}
+
+	return 0;
+}
+
+Execution time before: 4097358 usec
+Execution time after:   729831 usec
+
+Perf trace before:
+
+    99.63%     0.00%  kthreadd         [kernel.kallsyms]      [.] kthread
+            |
+            ---kthread
+               0xffffb33c12a26af8
+               |
+               |--98.13%--0xffffb33c12a26060
+               |          |
+               |          |--97.37%--free_contig_range
+               |          |          |
+               |          |          |--94.93%--___free_pages
+               |          |          |          |
+               |          |          |          |--55.42%--__free_frozen_pages
+               |          |          |          |          |
+               |          |          |          |           --43.20%--free_frozen_page_commit
+               |          |          |          |                     |
+               |          |          |          |                      --35.37%--_raw_spin_unlock_irqrestore
+               |          |          |          |
+               |          |          |          |--11.53%--_raw_spin_trylock
+               |          |          |          |
+               |          |          |          |--8.19%--__preempt_count_dec_and_test
+               |          |          |          |
+               |          |          |          |--5.64%--_raw_spin_unlock
+               |          |          |          |
+               |          |          |          |--2.37%--__get_pfnblock_flags_mask.isra.0
+               |          |          |          |
+               |          |          |           --1.07%--free_frozen_page_commit
+               |          |          |
+               |          |           --1.54%--__free_frozen_pages
+               |          |
+               |           --0.77%--___free_pages
+               |
+                --0.98%--0xffffb33c12a26078
+                          alloc_pages_noprof
+
+Perf trace after:
+
+     8.42%     2.90%  kthreadd         [kernel.kallsyms]         [k] __free_contig_range
+            |
+            |--5.52%--__free_contig_range
+            |          |
+            |          |--5.00%--free_prepared_contig_range
+            |          |          |
+            |          |          |--1.43%--__free_frozen_pages
+            |          |          |          |
+            |          |          |           --0.51%--free_frozen_page_commit
+            |          |          |
+            |          |          |--1.08%--_raw_spin_trylock
+            |          |          |
+            |          |           --0.89%--_raw_spin_unlock
+            |          |
+            |           --0.52%--free_pages_prepare
+            |
+             --2.90%--ret_from_fork
+                       kthread
+                       0xffffae1c12abeaf8
+                       0xffffae1c12abe7a0
+                       |
+                        --2.69%--vfree
+                                  __free_contig_range
+
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Acked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Co-developed-by: Muhammad Usama Anjum <usama.anjum@arm.com>
+Signed-off-by: Muhammad Usama Anjum <usama.anjum@arm.com>
+---
+ include/linux/gfp.h |   2 +
+ mm/page_alloc.c     | 112 ++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 110 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 51ef13ed7..87259e309 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -467,6 +467,8 @@ void free_contig_frozen_range(unsigned long pfn, unsigned long nr_pages);
+ void free_contig_range(unsigned long pfn, unsigned long nr_pages);
+ #endif
+ 
++void __free_contig_range(unsigned long pfn, unsigned long nr_pages);
++
+ DEFINE_FREE(free_page, void *, free_page((unsigned long)_T))
+ 
+ #endif /* __LINUX_GFP_H */
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 65e205111..ab95050b8 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -90,6 +90,9 @@ typedef int __bitwise fpi_t;
+ /* Free the page without taking locks. Rely on trylock only. */
+ #define FPI_TRYLOCK		((__force fpi_t)BIT(2))
+ 
++/* free_pages_prepare() has already been called for page(s) being freed. */
++#define FPI_PREPARED		((__force fpi_t)BIT(3))
++
+ /* prevent >1 _updater_ of zone percpu pageset ->high and ->batch fields */
+ static DEFINE_MUTEX(pcp_batch_high_lock);
+ #define MIN_PERCPU_PAGELIST_HIGH_FRACTION (8)
+@@ -1300,8 +1303,8 @@ static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr)
+ 
+ #endif /* CONFIG_MEM_ALLOC_PROFILING */
+ 
+-__always_inline bool __free_pages_prepare(struct page *page,
+-					  unsigned int order, fpi_t fpi_flags)
++static __always_inline bool __free_pages_prepare(struct page *page,
++		unsigned int order, fpi_t fpi_flags)
+ {
+ 	int bad = 0;
+ 	bool skip_kasan_poison = should_skip_kasan_poison(page);
+@@ -1309,6 +1312,9 @@ __always_inline bool __free_pages_prepare(struct page *page,
+ 	bool compound = PageCompound(page);
+ 	struct folio *folio = page_folio(page);
+ 
++	if (fpi_flags & FPI_PREPARED)
++		return true;
++
+ 	VM_BUG_ON_PAGE(PageTail(page), page);
+ 
+ 	trace_mm_page_free(page, order);
+@@ -6763,6 +6769,105 @@ void __init page_alloc_sysctl_init(void)
+ 	register_sysctl_init("vm", page_alloc_sysctl_table);
+ }
+ 
++static void free_prepared_contig_range(struct page *page,
++		unsigned long nr_pages)
++{
++	unsigned long pfn = page_to_pfn(page);
++
++	while (nr_pages) {
++		unsigned int order;
++
++		/* We are limited by the largest buddy order. */
++		order = pfn ? __ffs(pfn) : MAX_PAGE_ORDER;
++		/* Don't exceed the number of pages to free. */
++		order = min_t(unsigned int, order, ilog2(nr_pages));
++		order = min_t(unsigned int, order, MAX_PAGE_ORDER);
++
++		/*
++		 * Free the chunk as a single block. Our caller has already
++		 * called free_pages_prepare() for each order-0 page.
++		 */
++		__free_frozen_pages(page, order, FPI_PREPARED);
++
++		pfn += 1UL << order;
++		page += 1UL << order;
++		nr_pages -= 1UL << order;
++	}
++}
++
++static void __free_contig_range_common(unsigned long pfn, unsigned long nr_pages,
++		bool is_frozen)
++{
++	struct page *page, *start = NULL;
++	unsigned long nr_start = 0;
++	unsigned long start_sec;
++	unsigned long i;
++
++	for (i = 0; i < nr_pages; i++) {
++		bool can_free = true;
++
++		/*
++		 * Contiguous PFNs might not have contiguous "struct pages"
++		 * in some kernel configs: page++ across a section boundary
++		 * is undefined. Use pfn_to_page() for each PFN.
++		 */
++		page = pfn_to_page(pfn + i);
++
++		VM_WARN_ON_ONCE(PageHead(page));
++		VM_WARN_ON_ONCE(PageTail(page));
++
++		if (!is_frozen)
++			can_free = put_page_testzero(page);
++
++		if (can_free)
++			can_free = free_pages_prepare(page, 0);
++
++		if (!can_free) {
++			if (start) {
++				free_prepared_contig_range(start, i - nr_start);
++				start = NULL;
++			}
++			continue;
++		}
++
++		if (start && memdesc_section(page->flags) != start_sec) {
++			free_prepared_contig_range(start, i - nr_start);
++			start = page;
++			nr_start = i;
++			start_sec = memdesc_section(page->flags);
++		} else if (!start) {
++			start = page;
++			nr_start = i;
++			start_sec = memdesc_section(page->flags);
++		}
++	}
++
++	if (start)
++		free_prepared_contig_range(start, nr_pages - nr_start);
++}
++
++/**
++ * __free_contig_range - Free contiguous range of order-0 pages.
++ * @pfn: Page frame number of the first page in the range.
++ * @nr_pages: Number of pages to free.
++ *
++ * For each order-0 struct page in the physically contiguous range, put a
++ * reference. Free any page who's reference count falls to zero. The
++ * implementation is functionally equivalent to, but significantly faster than
++ * calling __free_page() for each struct page in a loop.
++ *
++ * Memory allocated with alloc_pages(order>=1) then subsequently split to
++ * order-0 with split_page() is an example of appropriate contiguous pages that
++ * can be freed with this API.
++ *
++ * Context: May be called in interrupt context or while holding a normal
++ * spinlock, but not in NMI context or while holding a raw spinlock.
++ */
++void __free_contig_range(unsigned long pfn, unsigned long nr_pages)
++{
++	__free_contig_range_common(pfn, nr_pages, /* is_frozen= */ false);
++}
++
+ #ifdef CONFIG_CONTIG_ALLOC
+ /* Usage: See admin-guide/dynamic-debug-howto.rst */
+ static void alloc_contig_dump_pages(struct list_head *page_list)
+@@ -7309,8 +7414,7 @@ void free_contig_range(unsigned long pfn, unsigned long nr_pages)
+ 	if (WARN_ON_ONCE(PageHead(pfn_to_page(pfn))))
+ 		return;
+ 
+-	for (; nr_pages--; pfn++)
+-		__free_page(pfn_to_page(pfn));
++	__free_contig_range(pfn, nr_pages);
+ }
+ EXPORT_SYMBOL(free_contig_range);
+ #endif /* CONFIG_CONTIG_ALLOC */
+-- 
+2.54.0
+
