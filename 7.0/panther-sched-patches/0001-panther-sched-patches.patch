@@ -1,0 +1,230 @@
+From c293692200e0f5264c3ebe598976036d431b34c8 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 29 Apr 2026 14:19:44 -0700
+Subject: [PATCH 1/4] sched/fair: Check CPU capacity before comparing group
+ types during load balance
+
+update_sd_pick_busiest() may incorrectly select a fully_busy group as the
+busiest group when its per-CPU capacity exceeds that of the destination
+CPU. This happens because the type of busiest group is initialized to
+group_has_spare and allows the fully_busy group to win the type comparison.
+
+update_sd_pick_busiest() should not choose a candidate scheduling group
+with at most one runnable task if its per-CPU capacity is greater than that
+of the destination CPU. Such a check already exists, but it is done too
+late: after the type comparison, preventing a subsequent fully_busy group
+of equal per-CPU capacity from being correctly selected.
+
+Move this check to occur before comparing group types.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ kernel/sched/fair.c | 25 ++++++++++++++-----------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index ab4114712..25f05b0a7 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -10582,6 +10582,20 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 	     sds->local_stat.group_type != group_has_spare))
+ 		return false;
+ 
++	/*
++	 * Candidate sg has no more than one task per CPU and has higher
++	 * per-CPU capacity. Migrating tasks to less capable CPUs may harm
++	 * throughput. Maximize throughput, power/energy consequences are not
++	 * considered.
++	 *
++	 * Systems with SMT are unaffected, as asymmetric capacity is not set
++	 * in such case.
++	 */
++	if ((env->sd->flags & SD_ASYM_CPUCAPACITY) &&
++	    (sgs->group_type <= group_fully_busy) &&
++	    (capacity_greater(sg->sgc->min_capacity, capacity_of(env->dst_cpu))))
++		return false;
++
+ 	if (sgs->group_type > busiest->group_type)
+ 		return true;
+ 
+@@ -10684,17 +10698,6 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 		break;
+ 	}
+ 
+-	/*
+-	 * Candidate sg has no more than one task per CPU and has higher
+-	 * per-CPU capacity. Migrating tasks to less capable CPUs may harm
+-	 * throughput. Maximize throughput, power/energy consequences are not
+-	 * considered.
+-	 */
+-	if ((env->sd->flags & SD_ASYM_CPUCAPACITY) &&
+-	    (sgs->group_type <= group_fully_busy) &&
+-	    (capacity_greater(sg->sgc->min_capacity, capacity_of(env->dst_cpu))))
+-		return false;
+-
+ 	return true;
+ }
+ 
+-- 
+2.54.0
+
+
+From cfdbcd4cfbef3ed8efa3e52f7a663a10b492806e Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 29 Apr 2026 14:19:45 -0700
+Subject: [PATCH 2/4] sched/fair: Skip misfit load accounting when the
+ destination CPU cannot help
+
+In domains with asymmetric capacity, identifying misfit load in a
+scheduling group is not useful when the destination CPU cannot help (i.e.,
+its capacity exceeds the group's maximum CPU capacity by less than ~5%). In
+such cases, it also prevents load balance among clusters of equal capacity
+when CONFIG_SCHED_CLUSTER is enabled. This happens because
+update_sd_pick_busiest() skips candidate groups of type misfit_task if the
+destination CPU has similar capacity.
+
+Skipping misfit load accounting in this situation allows the group to be
+classified as has_spare or fully_busy and lets load balancing proceed. Keep
+marking scheduling groups as overloaded when misfit tasks are present. This
+flag propagates to the root domain and allows bigger CPUs in it to help
+via newly idle balance.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ kernel/sched/fair.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 25f05b0a7..f1bcd3d0c 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -10513,10 +10513,24 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 			continue;
+ 
+ 		if (sd_flags & SD_ASYM_CPUCAPACITY) {
+-			/* Check for a misfit task on the cpu */
+-			if (sgs->group_misfit_task_load < rq->misfit_task_load) {
+-				sgs->group_misfit_task_load = rq->misfit_task_load;
++			if (rq->misfit_task_load) {
++				/*
++				 * Always mark the domain overloaded so big CPUs
++				 * can pick up misfit tasks via newly idle
++				 * balance.
++				 */
+ 				*sg_overloaded = 1;
++
++				/*
++				 * Only account misfit load if @dst_cpu can
++				 * help, otherwise the group may be classified
++				 * as misfit_task and update_sd_pick_busiest()
++				 * will skip it.
++				 */
++				if (capacity_greater(capacity_of(env->dst_cpu),
++						     group->sgc->max_capacity) &&
++				    (sgs->group_misfit_task_load < rq->misfit_task_load))
++					sgs->group_misfit_task_load = rq->misfit_task_load;
+ 			}
+ 		} else if (env->idle && sched_reduced_capacity(rq, env->sd)) {
+ 			/* Check for a task running on a CPU with reduced capacity */
+-- 
+2.54.0
+
+
+From 21447905f6ac1f2f5e5974fe4c5bb7cc2f3fa1f9 Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 29 Apr 2026 14:19:46 -0700
+Subject: [PATCH 3/4] sched/fair: Allow load balancing between CPUs of
+ identical capacity
+
+sched_balance_find_src_rq() avoids selecting a runqueue with a single
+running task as busiest if doing so results in migrating the task to a
+CPU with less than ~5% of extra capacity. It also unintentionally
+prevents migrations between CPUs of identical capacity.
+
+When CONFIG_SCHED_CLUSTER is enabled, load should be balanced across
+clusters of CPUs with the same capacity. Allowing migration between CPUs
+of identical capacity is necessary to meet this goal.
+
+We are interested in the architectural capacity of the involved CPUs,
+excluding any reductions due to side activity or thermal pressure. Use
+arch_scale_cpu_capacity().
+
+While here, invert the check for runtime capacity for clarity.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ kernel/sched/fair.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index f1bcd3d0c..a723daa14 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -11610,9 +11610,14 @@ static struct rq *sched_balance_find_src_rq(struct lb_env *env,
+ 		 * eventually lead to active_balancing high->low capacity.
+ 		 * Higher per-CPU capacity is considered better than balancing
+ 		 * average load.
++		 *
++		 * Cluster scheduling requires balancing load across clusters
++		 * of identical capacity. Use architectural capacity to ignore
++		 * runtime variability.
+ 		 */
+ 		if (env->sd->flags & SD_ASYM_CPUCAPACITY &&
+-		    !capacity_greater(capacity_of(env->dst_cpu), capacity) &&
++		    arch_scale_cpu_capacity(env->dst_cpu) != arch_scale_cpu_capacity(i) &&
++		    capacity_greater(capacity, capacity_of(env->dst_cpu)) &&
+ 		    nr_running == 1)
+ 			continue;
+ 
+-- 
+2.54.0
+
+
+From 1db154dcc55627962bd03776d9e1d9e5b123761d Mon Sep 17 00:00:00 2001
+From: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+Date: Wed, 29 Apr 2026 14:19:47 -0700
+Subject: [PATCH 4/4] sched/topology: Do not clear SD_PREFER_SIBLING in domains
+ with clusters
+
+Some topologies have scheduling domains that contain CPUs of asymmetric
+capacity, grouped into two or more clusters of equal-capacity CPUs
+sharing an L2 cache. When CONFIG_SCHED_CLUSTER is enabled, load must be
+balanced across these resource-sharing clusters.
+
+Do not clear the SD_PREFER_SIBLING in the child domains to indicate to
+the load balancer that it should spread load among cluster siblings.
+
+Checks for capacity in the load balancer will prevent migrations from
+high- to low-capacity CPUs. Likewise, misfit load will still be used to
+move high-utilization tasks to bigger CPUs.
+
+Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+---
+ kernel/sched/topology.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 32dcddaea..377d39bb8 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1699,8 +1699,15 @@ sd_init(struct sched_domain_topology_level *tl,
+ 	/*
+ 	 * Convert topological properties into behaviour.
+ 	 */
+-	/* Don't attempt to spread across CPUs of different capacities. */
+-	if ((sd->flags & SD_ASYM_CPUCAPACITY) && sd->child)
++	/*
++	 * Don't attempt to spread across CPUs of different capacities. An
++	 * exception to this rule are domains in which there are clusters of
++	 * CPUs sharing a resource. Keep the flag in such case to balance load
++	 * among them. The load balancer will prevent task migrations from
++	 * high- to low-capacity CPUs.
++	 */
++	if ((sd->flags & SD_ASYM_CPUCAPACITY) && sd->child &&
++	    !(sd->child->flags & SD_CLUSTER))
+ 		sd->child->flags &= ~SD_PREFER_SIBLING;
+ 
+ 	if (sd->flags & SD_SHARE_CPUCAPACITY) {
+-- 
+2.54.0
+
