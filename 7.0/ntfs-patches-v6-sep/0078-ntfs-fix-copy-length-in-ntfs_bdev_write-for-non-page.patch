@@ -1,0 +1,98 @@
+From 0e527bbc9f10f1b32a579637dced10cfaf4f86f6 Mon Sep 17 00:00:00 2001
+From: DaeMyung Kang <charsyam@gmail.com>
+Date: Sat, 2 May 2026 09:48:52 +0900
+Subject: [PATCH 78/80] ntfs: fix copy length in ntfs_bdev_write() for
+ non-page-aligned start
+
+This is not a normal data I/O hot path.  The single in-tree caller is
+the $LogFile emptying path used during read-write mount/remount, and
+the bug only becomes visible on NTFS volumes whose cluster_size is
+strictly smaller than the kernel's PAGE_SIZE (typically 4 KiB on
+x86_64).  Per Microsoft's format command documentation, NTFS supports
+allocation unit sizes starting at 512 bytes, so 512 B, 1 KiB and 2 KiB
+clusters are uncommon but valid on-disk configurations.  When
+cluster_size >= PAGE_SIZE every "start" passed in is page-aligned and
+the buggy "from != 0" path is never taken.
+
+ntfs_bdev_write() splits the write across one or more block-device
+folios.  Inside the loop, "to" is computed as the *end byte offset*
+within the current page (0..PAGE_SIZE), and "from" is the start byte
+offset within the page (reset to 0 from the second iteration onward).
+The copy length should therefore be "to - from", but the current code
+uses "to" directly:
+
+	to = min_t(u32, end - offset, PAGE_SIZE);
+	memcpy_to_folio(folio, from, buf + buf_off, to);
+	buf_off += to;
+
+When "from != 0" (i.e. "start" is not page-aligned) memcpy_to_folio()
+copies "from" extra bytes:
+
+  - it reads "from" bytes past the source buffer into kernel heap;
+  - it writes "from" bytes past the requested range into the next part
+    of the block-device page (or, if "from + to > PAGE_SIZE", past the
+    folio boundary entirely, which trips the VM_BUG_ON inside
+    memcpy_to_folio() on CONFIG_DEBUG_VM=y kernels).
+
+"buf_off" is then advanced by the wrong amount, so every subsequent
+iteration also reads the source buffer at the wrong offset and writes
+the wrong content to disk.
+
+ntfs_empty_logfile() calls
+
+	ntfs_bdev_write(sb, empty_buf, NTFS_CLU_TO_B(vol, lcn),
+			vol->cluster_size);
+
+with empty_buf sized to vol->cluster_size.  On a sub-PAGE_SIZE-cluster
+volume, any $LogFile run whose LCN is not aligned to
+PAGE_SIZE / cluster_size reaches the non-page-aligned path.  The
+over-copy can read beyond empty_buf and overwrite the sectors following
+the requested cluster in the block-device page with unrelated kernel
+heap contents while $LogFile is being emptied.
+
+A userspace reducer of the same arithmetic and copy loop confirms the
+bug under AddressSanitizer: ASan reports a heap-buffer-overflow read
+past the source buffer for the buggy length, and the fixed version is
+ASan-clean.
+
+Compute the copy length as "to - from" and advance buf_off by the same
+amount.
+
+Fixes: 5218cd102aec ("ntfs: update misc operations")
+Link: https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/format
+Signed-off-by: DaeMyung Kang <charsyam@gmail.com>
+Reviewed-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+---
+ fs/ntfs/bdev-io.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ntfs/bdev-io.c b/fs/ntfs/bdev-io.c
+index 67e65c88d..27d7c2767 100644
+--- a/fs/ntfs/bdev-io.c
++++ b/fs/ntfs/bdev-io.c
+@@ -97,6 +97,8 @@ int ntfs_bdev_write(struct super_block *sb, void *buf, loff_t start, size_t size
+ 		idx_end++;
+ 
+ 	for (; idx < idx_end; idx++, from = 0) {
++		u32 len;
++
+ 		folio = read_mapping_folio(sb->s_bdev->bd_mapping, idx, NULL);
+ 		if (IS_ERR(folio)) {
+ 			ntfs_error(sb, "Unable to read %ld page", idx);
+@@ -105,9 +107,10 @@ int ntfs_bdev_write(struct super_block *sb, void *buf, loff_t start, size_t size
+ 
+ 		offset = (loff_t)idx << PAGE_SHIFT;
+ 		to = min_t(u32, end - offset, PAGE_SIZE);
++		len = to - from;
+ 
+-		memcpy_to_folio(folio, from, buf + buf_off, to);
+-		buf_off += to;
++		memcpy_to_folio(folio, from, buf + buf_off, len);
++		buf_off += len;
+ 		folio_mark_uptodate(folio);
+ 		folio_mark_dirty(folio);
+ 		folio_put(folio);
+-- 
+2.54.0
+
