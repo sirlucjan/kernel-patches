@@ -1,0 +1,173 @@
+From d2a7eba527f46756dba31f88971e5b0cd339fd5d Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 11 May 2026 13:31:10 +0200
+Subject: [PATCH 06/10] sched/fair: Add cgroup_mode: MAX
+
+In order to avoid the CPU shares becoming tiny '1 / nr_cpus', assume each
+cgroup is maximally concurrent and distrubute 'nr_cpus * tg->shares',
+such that each CPU ends up with a 'tg->shares' sized fraction (on
+average).
+
+There is the corner case, when a cgroup is minimally loaded, eg a
+single spinner, therefore limit the CPU shares to that of a nice -20
+task to avoid getting too much load.
+
+It was previously suggested to allow raising cpu.weight to '100 * nr_cpus'
+to combat this same problem, but the problem there is the above corner case,
+allowing multiple cgroups with such immense weight to the runqueue has
+significant problems.
+
+It would drown the kthreads, but it also risks overflowing the load values.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ include/linux/cpuset.h |  6 +++++
+ kernel/cgroup/cpuset.c | 15 ++++++++++++
+ kernel/sched/debug.c   |  1 +
+ kernel/sched/fair.c    | 52 ++++++++++++++++++++++++++++++++++++++----
+ 4 files changed, 69 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/cpuset.h b/include/linux/cpuset.h
+index 65d76a389..9db2d4fce 100644
+--- a/include/linux/cpuset.h
++++ b/include/linux/cpuset.h
+@@ -80,6 +80,7 @@ extern void lockdep_assert_cpuset_lock_held(void);
+ extern void cpuset_cpus_allowed_locked(struct task_struct *p, struct cpumask *mask);
+ extern void cpuset_cpus_allowed(struct task_struct *p, struct cpumask *mask);
+ extern bool cpuset_cpus_allowed_fallback(struct task_struct *p);
++extern int cpuset_num_cpus(struct cgroup *cgroup);
+ extern nodemask_t cpuset_mems_allowed(struct task_struct *p);
+ #define cpuset_current_mems_allowed (current->mems_allowed)
+ void cpuset_init_current_mems_allowed(void);
+@@ -216,6 +217,11 @@ static inline bool cpuset_cpus_allowed_fallback(struct task_struct *p)
+ 	return false;
+ }
+ 
++static inline int cpuset_num_cpus(struct cgroup *cgroup)
++{
++	return num_online_cpus();
++}
++
+ static inline nodemask_t cpuset_mems_allowed(struct task_struct *p)
+ {
+ 	return node_possible_map;
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index 1335e4370..305dff7c4 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -4111,6 +4111,21 @@ bool cpuset_cpus_allowed_fallback(struct task_struct *tsk)
+ 	return changed;
+ }
+ 
++int cpuset_num_cpus(struct cgroup *cgrp)
++{
++	int nr = num_online_cpus();
++	struct cpuset *cs;
++
++	if (is_in_v2_mode()) {
++		guard(rcu)();
++		cs = css_cs(cgroup_e_css(cgrp, &cpuset_cgrp_subsys));
++		if (cs)
++			nr = cpumask_weight(cs->effective_cpus);
++	}
++
++	return nr;
++}
++
+ void __init cpuset_init_current_mems_allowed(void)
+ {
+ 	nodes_setall(current->mems_allowed);
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 6a5a554fd..95a264f31 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -593,6 +593,7 @@ int cgroup_mode = 1;
+ static const char *cgroup_mode_str[] = {
+ 	"up",
+ 	"smp",
++	"max",
+ };
+ 
+ static int sched_cgroup_mode(const char *str)
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 21d001933..4b0556fb3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3986,12 +3986,10 @@ static inline int throttled_hierarchy(struct cfs_rq *cfs_rq);
+  *
+  * hence icky!
+  */
+-static long calc_smp_shares(struct cfs_rq *cfs_rq)
++static long __calc_smp_shares(struct cfs_rq *cfs_rq, long tg_shares, long shares_max)
+ {
+-	long tg_weight, tg_shares, load, shares;
+ 	struct task_group *tg = cfs_rq->tg;
+-
+-	tg_shares = READ_ONCE(tg->shares);
++	long tg_weight, load, shares;
+ 
+ 	load = max(scale_load_down(cfs_rq->load.weight), cfs_rq->avg.load_avg);
+ 
+@@ -4017,7 +4015,48 @@ static long calc_smp_shares(struct cfs_rq *cfs_rq)
+ 	 * case no task is runnable on a CPU MIN_SHARES=2 should be returned
+ 	 * instead of 0.
+ 	 */
+-	return clamp_t(long, shares, MIN_SHARES, tg_shares);
++	return clamp_t(long, shares, MIN_SHARES, shares_max);
++}
++
++static int tg_cpus(struct task_group *tg)
++{
++	int nr = num_online_cpus();
++
++	if (cpusets_enabled()) {
++		struct cgroup *cgrp = tg->css.cgroup;
++		if (cgrp)
++			nr = cpuset_num_cpus(cgrp);
++	}
++
++	return nr;
++}
++
++/*
++ * Func: min(fraction(num_cpus * tg->shares), nice -20)
++ *
++ * Scale tg->shares by the maximal number of CPUs; but clip the max shares at
++ * nice -20, otherwise a single spinner on a 512 CPU machine would result in
++ * 512*NICE_0_LOAD, which is also crazy.
++ */
++static long calc_max_shares(struct cfs_rq *cfs_rq)
++{
++	struct task_group *tg = cfs_rq->tg;
++	int nr = tg_cpus(tg);
++	long tg_shares = READ_ONCE(tg->shares);
++	long max_shares = scale_load(sched_prio_to_weight[0]);
++	return __calc_smp_shares(cfs_rq, tg_shares * nr, max_shares);
++}
++
++/*
++ * Func: fraction(tg->shares)
++ *
++ * This infamously results in tiny shares when you have many CPUs.
++ */
++static long calc_smp_shares(struct cfs_rq *cfs_rq)
++{
++	struct task_group *tg = cfs_rq->tg;
++	long tg_shares = READ_ONCE(tg->shares);
++	return __calc_smp_shares(cfs_rq, tg_shares, tg_shares);
+ }
+ 
+ /*
+@@ -4036,6 +4075,9 @@ static long calc_group_shares(struct cfs_rq *cfs_rq)
+ 	if (mode == 0)
+ 		return calc_up_shares(cfs_rq);
+ 
++	if (mode == 2)
++		return calc_max_shares(cfs_rq);
++
+ 	return calc_smp_shares(cfs_rq);
+ }
+ 
+-- 
+2.54.0
+
