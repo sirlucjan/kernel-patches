@@ -1,0 +1,397 @@
+From 3c42c9e62068be1e3b56731a65c86a3b5c3034e0 Mon Sep 17 00:00:00 2001
+From: Serge Hallyn <serge.hallyn@canonical.com>
+Date: Fri, 31 May 2013 19:12:12 +0100
+Subject: [PATCH 1/4] add sysctl to allow disabling unprivileged CLONE_NEWUSER
+
+This is a short-term patch.  Unprivileged use of CLONE_NEWUSER
+is certainly an intended feature of user namespaces.  However
+for at least saucy we want to make sure that, if any security
+issues are found, we have a fail-safe.
+
+[bwh: Remove unneeded binary sysctl bits]
+[bwh: Keep this sysctl, but change the default to enabled]
+[heftig: correct commit subject to reduce confusion]
+[heftig: for 6.17, move all code into kernel/fork.c]
+---
+ kernel/fork.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 2383c25b9..7e2c7d1a7 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -125,6 +125,12 @@
+ 
+ #include <kunit/visibility.h>
+ 
++#ifdef CONFIG_USER_NS
++static int unprivileged_userns_clone = 1;
++#else
++#define unprivileged_userns_clone 1
++#endif
++
+ /*
+  * Minimum number of threads to boot the kernel
+  */
+@@ -2029,6 +2035,11 @@ __latent_entropy struct task_struct *copy_process(
+ 			return ERR_PTR(-EINVAL);
+ 	}
+ 
++	if ((clone_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
++		if (!capable(CAP_SYS_ADMIN))
++			return ERR_PTR(-EPERM);
++	}
++
+ 	/*
+ 	 * Force any signals received before this point to be delivered
+ 	 * before the fork happens.  Collect up signals sent to multiple
+@@ -3071,6 +3082,10 @@ static int check_unshare_flags(unsigned long unshare_flags)
+ 		if (!current_is_single_threaded())
+ 			return -EINVAL;
+ 	}
++	if ((unshare_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++	}
+ 
+ 	return 0;
+ }
+@@ -3301,6 +3316,15 @@ static const struct ctl_table fork_sysctl_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= sysctl_max_threads,
+ 	},
++#ifdef CONFIG_USER_NS
++	{
++		.procname	= "unprivileged_userns_clone",
++		.data		= &unprivileged_userns_clone,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++#endif
+ };
+ 
+ static int __init init_fork_sysctl(void)
+-- 
+2.54.0
+
+
+From 09ca69a9e645ad74daa7b8477fa1eb94a58ee3e7 Mon Sep 17 00:00:00 2001
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Fri, 13 Mar 2026 14:41:05 -0300
+Subject: [PATCH 2/4] udmabuf: Do not create malformed scatterlists
+
+Using a sg_set_folio() loop for every 4K results in a malformed scatterlist
+because sg_set_folio() has an issue with offsets > PAGE_SIZE and because
+scatterlist expects the creator to build a list which consolidates any
+physical contiguity.
+
+sg_alloc_table_from_pages() creates a valid scatterlist directly from a
+struct page array, so go back to that.
+
+Remove the offsets allocation and just store an array of tail pages as it
+did before the below commit. Everything wants that anyhow.
+
+Fixes: 0c8b91ef5100 ("udmabuf: add back support for mapping hugetlb pages")
+Reported-by: Julian Orth <ju.orth@gmail.com>
+Closes: https://lore.kernel.org/all/20260308-scatterlist-v1-1-39c4566b0bba@gmail.com/
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Cherry-picked-for: https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/issues/183
+---
+ drivers/dma-buf/udmabuf.c | 49 +++++++++++----------------------------
+ 1 file changed, 13 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/dma-buf/udmabuf.c b/drivers/dma-buf/udmabuf.c
+index 94b8ecb89..5d6878604 100644
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -26,10 +26,10 @@ MODULE_PARM_DESC(size_limit_mb, "Max size of a dmabuf, in megabytes. Default is
+ 
+ struct udmabuf {
+ 	pgoff_t pagecount;
+-	struct folio **folios;
++	struct page **pages;
+ 
+ 	/**
+-	 * Unlike folios, pinned_folios is only used for unpin.
++	 * Unlike pages, pinned_folios is only used for unpin.
+ 	 * So, nr_pinned is not the same to pagecount, the pinned_folios
+ 	 * only set each folio which already pinned when udmabuf_create.
+ 	 * Note that, since a folio may be pinned multiple times, each folio
+@@ -41,7 +41,6 @@ struct udmabuf {
+ 
+ 	struct sg_table *sg;
+ 	struct miscdevice *device;
+-	pgoff_t *offsets;
+ };
+ 
+ static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
+@@ -55,8 +54,7 @@ static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
+ 	if (pgoff >= ubuf->pagecount)
+ 		return VM_FAULT_SIGBUS;
+ 
+-	pfn = folio_pfn(ubuf->folios[pgoff]);
+-	pfn += ubuf->offsets[pgoff] >> PAGE_SHIFT;
++	pfn = page_to_pfn(ubuf->pages[pgoff]);
+ 
+ 	ret = vmf_insert_pfn(vma, vmf->address, pfn);
+ 	if (ret & VM_FAULT_ERROR)
+@@ -73,8 +71,7 @@ static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
+ 		if (WARN_ON(pgoff >= ubuf->pagecount))
+ 			break;
+ 
+-		pfn = folio_pfn(ubuf->folios[pgoff]);
+-		pfn += ubuf->offsets[pgoff] >> PAGE_SHIFT;
++		pfn = page_to_pfn(ubuf->pages[pgoff]);
+ 
+ 		/**
+ 		 * If the below vmf_insert_pfn() fails, we do not return an
+@@ -109,22 +106,11 @@ static int mmap_udmabuf(struct dma_buf *buf, struct vm_area_struct *vma)
+ static int vmap_udmabuf(struct dma_buf *buf, struct iosys_map *map)
+ {
+ 	struct udmabuf *ubuf = buf->priv;
+-	struct page **pages;
+ 	void *vaddr;
+-	pgoff_t pg;
+ 
+ 	dma_resv_assert_held(buf->resv);
+ 
+-	pages = kvmalloc_objs(*pages, ubuf->pagecount);
+-	if (!pages)
+-		return -ENOMEM;
+-
+-	for (pg = 0; pg < ubuf->pagecount; pg++)
+-		pages[pg] = folio_page(ubuf->folios[pg],
+-				       ubuf->offsets[pg] >> PAGE_SHIFT);
+-
+-	vaddr = vm_map_ram(pages, ubuf->pagecount, -1);
+-	kvfree(pages);
++	vaddr = vm_map_ram(ubuf->pages, ubuf->pagecount, -1);
+ 	if (!vaddr)
+ 		return -EINVAL;
+ 
+@@ -146,22 +132,18 @@ static struct sg_table *get_sg_table(struct device *dev, struct dma_buf *buf,
+ {
+ 	struct udmabuf *ubuf = buf->priv;
+ 	struct sg_table *sg;
+-	struct scatterlist *sgl;
+-	unsigned int i = 0;
+ 	int ret;
+ 
+ 	sg = kzalloc_obj(*sg);
+ 	if (!sg)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	ret = sg_alloc_table(sg, ubuf->pagecount, GFP_KERNEL);
++	ret = sg_alloc_table_from_pages(sg, ubuf->pages, ubuf->pagecount, 0,
++					ubuf->pagecount << PAGE_SHIFT,
++					GFP_KERNEL);
+ 	if (ret < 0)
+ 		goto err_alloc;
+ 
+-	for_each_sg(sg->sgl, sgl, ubuf->pagecount, i)
+-		sg_set_folio(sgl, ubuf->folios[i], PAGE_SIZE,
+-			     ubuf->offsets[i]);
+-
+ 	ret = dma_map_sgtable(dev, sg, direction, 0);
+ 	if (ret < 0)
+ 		goto err_map;
+@@ -207,12 +189,8 @@ static void unpin_all_folios(struct udmabuf *ubuf)
+ 
+ static __always_inline int init_udmabuf(struct udmabuf *ubuf, pgoff_t pgcnt)
+ {
+-	ubuf->folios = kvmalloc_objs(*ubuf->folios, pgcnt);
+-	if (!ubuf->folios)
+-		return -ENOMEM;
+-
+-	ubuf->offsets = kvzalloc_objs(*ubuf->offsets, pgcnt);
+-	if (!ubuf->offsets)
++	ubuf->pages = kvmalloc_objs(*ubuf->pages, pgcnt);
++	if (!ubuf->pages)
+ 		return -ENOMEM;
+ 
+ 	ubuf->pinned_folios = kvmalloc_objs(*ubuf->pinned_folios, pgcnt);
+@@ -225,8 +203,7 @@ static __always_inline int init_udmabuf(struct udmabuf *ubuf, pgoff_t pgcnt)
+ static __always_inline void deinit_udmabuf(struct udmabuf *ubuf)
+ {
+ 	unpin_all_folios(ubuf);
+-	kvfree(ubuf->offsets);
+-	kvfree(ubuf->folios);
++	kvfree(ubuf->pages);
+ }
+ 
+ static void release_udmabuf(struct dma_buf *buf)
+@@ -344,8 +321,8 @@ static long udmabuf_pin_folios(struct udmabuf *ubuf, struct file *memfd,
+ 		ubuf->pinned_folios[nr_pinned++] = folios[cur_folio];
+ 
+ 		for (; subpgoff < fsize; subpgoff += PAGE_SIZE) {
+-			ubuf->folios[upgcnt] = folios[cur_folio];
+-			ubuf->offsets[upgcnt] = subpgoff;
++			ubuf->pages[upgcnt] = folio_page(folios[cur_folio],
++						subpgoff >> PAGE_SHIFT);
+ 			++upgcnt;
+ 
+ 			if (++cur_pgcnt >= pgcnt)
+-- 
+2.54.0
+
+
+From f8f0c870093abe10e8cd5b18a1eb8e452cd783d8 Mon Sep 17 00:00:00 2001
+From: Hyunwoo Kim <imv4bel@gmail.com>
+Date: Thu, 14 May 2026 20:57:48 +0900
+Subject: [PATCH 3/4] net: skbuff: propagate shared-frag marker through
+ frag-transfer helpers
+
+Three frag-transfer helpers (__pskb_copy_fclone(), skb_try_coalesce(),
+and skb_shift()) fail to propagate the SKBFL_SHARED_FRAG bit in
+skb_shinfo()->flags when moving frags from source to destination.
+__pskb_copy_fclone() defers the rest of the shinfo metadata to
+skb_copy_header() after copying frag descriptors, but that helper
+only carries over gso_{size,segs,type} and never touches
+skb_shinfo()->flags; skb_try_coalesce() and skb_shift() move frag
+descriptors directly and leave flags untouched.  As a result, the
+destination skb keeps a reference to the same externally-owned or
+page-cache-backed pages while reporting skb_has_shared_frag() as
+false.
+
+The mismatch is harmful in any in-place writer that uses
+skb_has_shared_frag() to decide whether shared pages must be detoured
+through skb_cow_data().  ESP input is one such writer (esp4.c,
+esp6.c), and a single nft 'dup to <local>' rule -- or any other
+nf_dup_ipv4() / xt_TEE caller -- is enough to land a pskb_copy()'d
+skb in esp_input() with the marker stripped, letting an unprivileged
+user write into the page cache of a root-owned read-only file via
+authencesn-ESN stray writes.
+
+Set SKBFL_SHARED_FRAG on the destination whenever frag descriptors
+were actually moved from the source.  skb_copy() and skb_copy_expand()
+share skb_copy_header() too but linearize all paged data into freshly
+allocated head storage and emerge with nr_frags == 0, so
+skb_has_shared_frag() returns false on its own; they need no change.
+
+The same omission exists in skb_gro_receive() and skb_gro_receive_list().
+The former moves the incoming skb's frag descriptors into the
+accumulator's last sub-skb via two paths (a direct frag-move loop and
+the head_frag + memcpy path); the latter chains the incoming skb whole
+onto p's frag_list.  Downstream skb_segment() reads only
+skb_shinfo(p)->flags, and skb_segment_list() reuses each sub-skb's
+shinfo as the nskb -- both p and lp must carry the marker.
+
+Fixes: cef401de7be8 ("net: fix possible wrong checksum generation")
+Fixes: f4c50a4034e6 ("xfrm: esp: avoid in-place decrypt on shared skb frags")
+Reported-by: William Bowling <vakzz@zellic.io>
+Reported-by: Hyunwoo Kim <imv4bel@gmail.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Hyunwoo Kim <imv4bel@gmail.com>
+Cherry-picked-for: https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/work_items/193
+---
+ net/core/gro.c    | 4 ++++
+ net/core/skbuff.c | 5 +++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/net/core/gro.c b/net/core/gro.c
+index 31d21de5b..9f8960789 100644
+--- a/net/core/gro.c
++++ b/net/core/gro.c
+@@ -213,10 +213,12 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
+ 	p->data_len += len;
+ 	p->truesize += delta_truesize;
+ 	p->len += len;
++	skb_shinfo(p)->flags |= skbinfo->flags & SKBFL_SHARED_FRAG;
+ 	if (lp != p) {
+ 		lp->data_len += len;
+ 		lp->truesize += delta_truesize;
+ 		lp->len += len;
++		skb_shinfo(lp)->flags |= skbinfo->flags & SKBFL_SHARED_FRAG;
+ 	}
+ 	NAPI_GRO_CB(skb)->same_flow = 1;
+ 	return 0;
+@@ -244,6 +246,8 @@ int skb_gro_receive_list(struct sk_buff *p, struct sk_buff *skb)
+ 	p->truesize += skb->truesize;
+ 	p->len += skb->len;
+ 
++	skb_shinfo(p)->flags |= skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG;
++
+ 	NAPI_GRO_CB(skb)->same_flow = 1;
+ 
+ 	return 0;
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 43ee86dcf..4cfb4886e 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -2258,6 +2258,7 @@ struct sk_buff *__pskb_copy_fclone(struct sk_buff *skb, int headroom,
+ 			skb_frag_ref(skb, i);
+ 		}
+ 		skb_shinfo(n)->nr_frags = i;
++		skb_shinfo(n)->flags |= skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG;
+ 	}
+ 
+ 	if (skb_has_frag_list(skb)) {
+@@ -4373,6 +4374,8 @@ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen)
+ 	tgt->ip_summed = CHECKSUM_PARTIAL;
+ 	skb->ip_summed = CHECKSUM_PARTIAL;
+ 
++	skb_shinfo(tgt)->flags |= skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG;
++
+ 	skb_len_add(skb, -shiftlen);
+ 	skb_len_add(tgt, shiftlen);
+ 
+@@ -6226,6 +6229,8 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
+ 	       from_shinfo->frags,
+ 	       from_shinfo->nr_frags * sizeof(skb_frag_t));
+ 	to_shinfo->nr_frags += from_shinfo->nr_frags;
++	if (from_shinfo->nr_frags)
++		to_shinfo->flags |= from_shinfo->flags & SKBFL_SHARED_FRAG;
+ 
+ 	if (!skb_cloned(from))
+ 		from_shinfo->nr_frags = 0;
+-- 
+2.54.0
+
+
+From 3514024ff7ee2b63d9ccf074469d701e94414d82 Mon Sep 17 00:00:00 2001
+From: Pauli Virtanen <pav@iki.fi>
+Date: Fri, 24 Apr 2026 22:24:29 +0300
+Subject: [PATCH 4/4] Bluetooth: btmtk: accept too short WMT FUNC_CTRL events
+
+MT7925 (USB ID 0e8d:e025) on fw version 20260106153314 sends WMT
+FUNC_CTRL events that are missing the status field.
+
+Prior to commit 006b9943b982 ("Bluetooth: btmtk: validate WMT event SKB
+length before struct access") the status was read from out-of-bounds of
+SKB data, which usually would result to success with
+BTMTK_WMT_ON_UNDONE, although I don't know the intent here.  The bounds
+check added in that commit returns with error instead, producing
+"Bluetooth: hci0: Failed to send wmt func ctrl (-22)" and makes the
+device unusable.
+
+Fix the regression by interpreting too short packet as status
+BTMTK_WMT_ON_UNDONE, which makes the device work normally again.
+
+Fixes: 634a4408c061 ("Bluetooth: btmtk: validate WMT event SKB length before struct access")
+Signed-off-by: Pauli Virtanen <pav@iki.fi>
+Tested-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com> # MT7922 (0489:e0e2)
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Cherry-picked-for: https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/work_items/194
+---
+ drivers/bluetooth/btmtk.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/bluetooth/btmtk.c b/drivers/bluetooth/btmtk.c
+index 31ff133b6..a4b4dacfd 100644
+--- a/drivers/bluetooth/btmtk.c
++++ b/drivers/bluetooth/btmtk.c
+@@ -678,8 +678,8 @@ static int btmtk_usb_hci_wmt_sync(struct hci_dev *hdev,
+ 	case BTMTK_WMT_FUNC_CTRL:
+ 		if (!skb_pull_data(data->evt_skb,
+ 				   sizeof(wmt_evt_funcc->status))) {
+-			err = -EINVAL;
+-			goto err_free_skb;
++			status = BTMTK_WMT_ON_UNDONE;
++			break;
+ 		}
+ 
+ 		wmt_evt_funcc = (struct btmtk_hci_wmt_evt_funcc *)wmt_evt;
+-- 
+2.54.0
+
