@@ -1,0 +1,1632 @@
+From 097695811c44c3fe31ac4501f327dddf880f99e7 Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Sun, 12 Apr 2026 14:11:12 -0700
+Subject: [PATCH 1/7] platform/x86: lenovo: Decouple lenovo-wmi-gamezone and
+ lenovo-wmi-other
+
+Currently, lenovo-wmi-gamezone depends on lenovo-wmi-other as the former
+imports symbols from the latter. The imported symbols are just used to
+register a notifier block. However, there is no runtime dependency
+between both drivers, and either of them can run without the other,
+which is the major purpose of using the notifier framework.
+
+Such a link-time dependency is non-optimal. A previous attempt to "fix"
+it made LENOVO_WMI_GAMEZONE select LENOVO_WMI_TUNING, which was
+fundamentally broken and resulted in undefined Kconfig behavior, as
+`select' cannot be used on a symbol with potentially unmet dependencies.
+
+Decouple both drivers by moving the thermal mode notifier chain to
+lenovo-wmi-helpers. Methods for notifier block (un)registration are
+exported for lenovo-wmi-gamezone, while a method for querying the
+current thermal mode are exported for lenovo-wmi-other.
+
+This turns the dependency graph from
+
+            +------------ lenovo-wmi-gamezone
+            |                     |
+            v                     |
+    lenovo-wmi-helpers            |
+            ^                     |
+            |                     V
+            +------------ lenovo-wmi-other
+
+into
+
+            +------------ lenovo-wmi-gamezone
+            |
+            v
+    lenovo-wmi-helpers
+            ^
+            |
+            +------------ lenovo-wmi-other
+
+To make it clear, the name of the notifier chain is also renamed from
+`om_chain_head' to `tm_chain_head', indicating that it's used to query
+the current thermal mode.
+
+No functional change intended.
+
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+Fixes: 6e38b9fcbfa3 ("platform/x86: lenovo: gamezone needs "other mode"")
+Cc: stable@vger.kernel.org
+Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202603252259.gHvJDyh3-lkp@intel.com/
+Closes: https://lore.kernel.org/oe-kbuild-all/202603260302.X0NjQOda-lkp@intel.com/
+Signed-off-by: Rong Zhang <i@rong.moe>
+Signed-off-by: Derek J. Clark <derekjohn.clark@gmail.com>
+---
+ drivers/platform/x86/lenovo/Kconfig        |   1 -
+ drivers/platform/x86/lenovo/wmi-gamezone.c |   4 +-
+ drivers/platform/x86/lenovo/wmi-helpers.c  | 101 ++++++++++++++++++++
+ drivers/platform/x86/lenovo/wmi-helpers.h  |   8 ++
+ drivers/platform/x86/lenovo/wmi-other.c    | 104 +--------------------
+ drivers/platform/x86/lenovo/wmi-other.h    |  16 ----
+ 6 files changed, 112 insertions(+), 122 deletions(-)
+ delete mode 100644 drivers/platform/x86/lenovo/wmi-other.h
+
+diff --git a/drivers/platform/x86/lenovo/Kconfig b/drivers/platform/x86/lenovo/Kconfig
+index f885127b0..09b1b055d 100644
+--- a/drivers/platform/x86/lenovo/Kconfig
++++ b/drivers/platform/x86/lenovo/Kconfig
+@@ -252,7 +252,6 @@ config LENOVO_WMI_GAMEZONE
+ 	select ACPI_PLATFORM_PROFILE
+ 	select LENOVO_WMI_EVENTS
+ 	select LENOVO_WMI_HELPERS
+-	select LENOVO_WMI_TUNING
+ 	help
+ 	  Say Y here if you have a WMI aware Lenovo Legion device and would like to use the
+ 	  platform-profile firmware interface to manage power usage.
+diff --git a/drivers/platform/x86/lenovo/wmi-gamezone.c b/drivers/platform/x86/lenovo/wmi-gamezone.c
+index 686d9128b..109c0b564 100644
+--- a/drivers/platform/x86/lenovo/wmi-gamezone.c
++++ b/drivers/platform/x86/lenovo/wmi-gamezone.c
+@@ -22,7 +22,6 @@
+ 
+ #include "wmi-events.h"
+ #include "wmi-helpers.h"
+-#include "wmi-other.h"
+ 
+ #define LENOVO_GAMEZONE_GUID "887B54E3-DDDC-4B2C-8B88-68A26A8835D0"
+ 
+@@ -382,7 +381,7 @@ static int lwmi_gz_probe(struct wmi_device *wdev, const void *context)
+ 		return ret;
+ 
+ 	priv->mode_nb.notifier_call = lwmi_gz_mode_call;
+-	return devm_lwmi_om_register_notifier(&wdev->dev, &priv->mode_nb);
++	return devm_lwmi_tm_register_notifier(&wdev->dev, &priv->mode_nb);
+ }
+ 
+ static const struct wmi_device_id lwmi_gz_id_table[] = {
+@@ -404,7 +403,6 @@ module_wmi_driver(lwmi_gz_driver);
+ 
+ MODULE_IMPORT_NS("LENOVO_WMI_EVENTS");
+ MODULE_IMPORT_NS("LENOVO_WMI_HELPERS");
+-MODULE_IMPORT_NS("LENOVO_WMI_OTHER");
+ MODULE_DEVICE_TABLE(wmi, lwmi_gz_id_table);
+ MODULE_AUTHOR("Derek J. Clark <derekjohn.clark@gmail.com>");
+ MODULE_DESCRIPTION("Lenovo GameZone WMI Driver");
+diff --git a/drivers/platform/x86/lenovo/wmi-helpers.c b/drivers/platform/x86/lenovo/wmi-helpers.c
+index 018d7642e..7a198259e 100644
+--- a/drivers/platform/x86/lenovo/wmi-helpers.c
++++ b/drivers/platform/x86/lenovo/wmi-helpers.c
+@@ -21,11 +21,15 @@
+ #include <linux/errno.h>
+ #include <linux/export.h>
+ #include <linux/module.h>
++#include <linux/notifier.h>
+ #include <linux/unaligned.h>
+ #include <linux/wmi.h>
+ 
+ #include "wmi-helpers.h"
+ 
++/* Thermal mode notifier chain. */
++static BLOCKING_NOTIFIER_HEAD(tm_chain_head);
++
+ /**
+  * lwmi_dev_evaluate_int() - Helper function for calling WMI methods that
+  * return an integer.
+@@ -84,6 +88,103 @@ int lwmi_dev_evaluate_int(struct wmi_device *wdev, u8 instance, u32 method_id,
+ };
+ EXPORT_SYMBOL_NS_GPL(lwmi_dev_evaluate_int, "LENOVO_WMI_HELPERS");
+ 
++/**
++ * lwmi_tm_register_notifier() - Add a notifier to the blocking notifier chain
++ * @nb: The notifier_block struct to register
++ *
++ * Call blocking_notifier_chain_register to register the notifier block to the
++ * thermal mode notifier chain.
++ *
++ * Return: 0 on success, %-EEXIST on error.
++ */
++int lwmi_tm_register_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&tm_chain_head, nb);
++}
++EXPORT_SYMBOL_NS_GPL(lwmi_tm_register_notifier, "LENOVO_WMI_HELPERS");
++
++/**
++ * lwmi_tm_unregister_notifier() - Remove a notifier from the blocking notifier
++ * chain.
++ * @nb: The notifier_block struct to register
++ *
++ * Call blocking_notifier_chain_unregister to unregister the notifier block from the
++ * thermal mode notifier chain.
++ *
++ * Return: 0 on success, %-ENOENT on error.
++ */
++int lwmi_tm_unregister_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_unregister(&tm_chain_head, nb);
++}
++EXPORT_SYMBOL_NS_GPL(lwmi_tm_unregister_notifier, "LENOVO_WMI_HELPERS");
++
++/**
++ * devm_lwmi_tm_unregister_notifier() - Remove a notifier from the blocking
++ * notifier chain.
++ * @data: Void pointer to the notifier_block struct to register.
++ *
++ * Call lwmi_tm_unregister_notifier to unregister the notifier block from the
++ * thermal mode notifier chain.
++ *
++ * Return: 0 on success, %-ENOENT on error.
++ */
++static void devm_lwmi_tm_unregister_notifier(void *data)
++{
++	struct notifier_block *nb = data;
++
++	lwmi_tm_unregister_notifier(nb);
++}
++
++/**
++ * devm_lwmi_tm_register_notifier() - Add a notifier to the blocking notifier
++ * chain.
++ * @dev: The parent device of the notifier_block struct.
++ * @nb: The notifier_block struct to register
++ *
++ * Call lwmi_tm_register_notifier to register the notifier block to the
++ * thermal mode notifier chain. Then add devm_lwmi_tm_unregister_notifier
++ * as a device managed action to automatically unregister the notifier block
++ * upon parent device removal.
++ *
++ * Return: 0 on success, or an error code.
++ */
++int devm_lwmi_tm_register_notifier(struct device *dev,
++				   struct notifier_block *nb)
++{
++	int ret;
++
++	ret = lwmi_tm_register_notifier(nb);
++	if (ret < 0)
++		return ret;
++
++	return devm_add_action_or_reset(dev, devm_lwmi_tm_unregister_notifier,
++					nb);
++}
++EXPORT_SYMBOL_NS_GPL(devm_lwmi_tm_register_notifier, "LENOVO_WMI_HELPERS");
++
++/**
++ * lwmi_tm_notifier_call() - Call functions for the notifier call chain.
++ * @mode: Pointer to a thermal mode enum to retrieve the data from.
++ *
++ * Call blocking_notifier_call_chain to retrieve the thermal mode from the
++ * lenovo-wmi-gamezone driver.
++ *
++ * Return: 0 on success, or an error code.
++ */
++int lwmi_tm_notifier_call(enum thermal_mode *mode)
++{
++	int ret;
++
++	ret = blocking_notifier_call_chain(&tm_chain_head,
++					   LWMI_GZ_GET_THERMAL_MODE, &mode);
++	if ((ret & ~NOTIFY_STOP_MASK) != NOTIFY_OK)
++		return -EINVAL;
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(lwmi_tm_notifier_call, "LENOVO_WMI_HELPERS");
++
+ MODULE_AUTHOR("Derek J. Clark <derekjohn.clark@gmail.com>");
+ MODULE_DESCRIPTION("Lenovo WMI Helpers Driver");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/platform/x86/lenovo/wmi-helpers.h b/drivers/platform/x86/lenovo/wmi-helpers.h
+index 3364d8e15..ed7db3ebb 100644
+--- a/drivers/platform/x86/lenovo/wmi-helpers.h
++++ b/drivers/platform/x86/lenovo/wmi-helpers.h
+@@ -7,6 +7,8 @@
+ 
+ #include <linux/types.h>
+ 
++struct device;
++struct notifier_block;
+ struct wmi_device;
+ 
+ struct wmi_method_args_32 {
+@@ -30,4 +32,10 @@ enum thermal_mode {
+ int lwmi_dev_evaluate_int(struct wmi_device *wdev, u8 instance, u32 method_id,
+ 			  unsigned char *buf, size_t size, u32 *retval);
+ 
++int lwmi_tm_register_notifier(struct notifier_block *nb);
++int lwmi_tm_unregister_notifier(struct notifier_block *nb);
++int devm_lwmi_tm_register_notifier(struct device *dev,
++				   struct notifier_block *nb);
++int lwmi_tm_notifier_call(enum thermal_mode *mode);
++
+ #endif /* !_LENOVO_WMI_HELPERS_H_ */
+diff --git a/drivers/platform/x86/lenovo/wmi-other.c b/drivers/platform/x86/lenovo/wmi-other.c
+index d1cab4d57..e6834dec2 100644
+--- a/drivers/platform/x86/lenovo/wmi-other.c
++++ b/drivers/platform/x86/lenovo/wmi-other.c
+@@ -40,7 +40,6 @@
+ #include <linux/kobject.h>
+ #include <linux/limits.h>
+ #include <linux/module.h>
+-#include <linux/notifier.h>
+ #include <linux/platform_profile.h>
+ #include <linux/types.h>
+ #include <linux/wmi.h>
+@@ -48,7 +47,6 @@
+ #include "wmi-capdata.h"
+ #include "wmi-events.h"
+ #include "wmi-helpers.h"
+-#include "wmi-other.h"
+ #include "../firmware_attributes_class.h"
+ 
+ #define LENOVO_OTHER_MODE_GUID "DC2A8805-3A8C-41BA-A6F7-092E0089CD3B"
+@@ -77,7 +75,6 @@
+ #define LWMI_OM_FW_ATTR_BASE_PATH "lenovo-wmi-other"
+ #define LWMI_OM_HWMON_NAME "lenovo_wmi_other"
+ 
+-static BLOCKING_NOTIFIER_HEAD(om_chain_head);
+ static DEFINE_IDA(lwmi_om_ida);
+ 
+ enum attribute_property {
+@@ -105,7 +102,6 @@ struct lwmi_om_priv {
+ 	struct device *hwmon_dev;
+ 	struct device *fw_attr_dev;
+ 	struct kset *fw_attr_kset;
+-	struct notifier_block nb;
+ 	struct wmi_device *wdev;
+ 	int ida_id;
+ 
+@@ -585,102 +581,6 @@ struct capdata01_attr_group {
+ 	struct tunable_attr_01 *tunable_attr;
+ };
+ 
+-/**
+- * lwmi_om_register_notifier() - Add a notifier to the blocking notifier chain
+- * @nb: The notifier_block struct to register
+- *
+- * Call blocking_notifier_chain_register to register the notifier block to the
+- * lenovo-wmi-other driver notifier chain.
+- *
+- * Return: 0 on success, %-EEXIST on error.
+- */
+-int lwmi_om_register_notifier(struct notifier_block *nb)
+-{
+-	return blocking_notifier_chain_register(&om_chain_head, nb);
+-}
+-EXPORT_SYMBOL_NS_GPL(lwmi_om_register_notifier, "LENOVO_WMI_OTHER");
+-
+-/**
+- * lwmi_om_unregister_notifier() - Remove a notifier from the blocking notifier
+- * chain.
+- * @nb: The notifier_block struct to register
+- *
+- * Call blocking_notifier_chain_unregister to unregister the notifier block from the
+- * lenovo-wmi-other driver notifier chain.
+- *
+- * Return: 0 on success, %-ENOENT on error.
+- */
+-int lwmi_om_unregister_notifier(struct notifier_block *nb)
+-{
+-	return blocking_notifier_chain_unregister(&om_chain_head, nb);
+-}
+-EXPORT_SYMBOL_NS_GPL(lwmi_om_unregister_notifier, "LENOVO_WMI_OTHER");
+-
+-/**
+- * devm_lwmi_om_unregister_notifier() - Remove a notifier from the blocking
+- * notifier chain.
+- * @data: Void pointer to the notifier_block struct to register.
+- *
+- * Call lwmi_om_unregister_notifier to unregister the notifier block from the
+- * lenovo-wmi-other driver notifier chain.
+- *
+- * Return: 0 on success, %-ENOENT on error.
+- */
+-static void devm_lwmi_om_unregister_notifier(void *data)
+-{
+-	struct notifier_block *nb = data;
+-
+-	lwmi_om_unregister_notifier(nb);
+-}
+-
+-/**
+- * devm_lwmi_om_register_notifier() - Add a notifier to the blocking notifier
+- * chain.
+- * @dev: The parent device of the notifier_block struct.
+- * @nb: The notifier_block struct to register
+- *
+- * Call lwmi_om_register_notifier to register the notifier block to the
+- * lenovo-wmi-other driver notifier chain. Then add devm_lwmi_om_unregister_notifier
+- * as a device managed action to automatically unregister the notifier block
+- * upon parent device removal.
+- *
+- * Return: 0 on success, or an error code.
+- */
+-int devm_lwmi_om_register_notifier(struct device *dev,
+-				   struct notifier_block *nb)
+-{
+-	int ret;
+-
+-	ret = lwmi_om_register_notifier(nb);
+-	if (ret < 0)
+-		return ret;
+-
+-	return devm_add_action_or_reset(dev, devm_lwmi_om_unregister_notifier,
+-					nb);
+-}
+-EXPORT_SYMBOL_NS_GPL(devm_lwmi_om_register_notifier, "LENOVO_WMI_OTHER");
+-
+-/**
+- * lwmi_om_notifier_call() - Call functions for the notifier call chain.
+- * @mode: Pointer to a thermal mode enum to retrieve the data from.
+- *
+- * Call blocking_notifier_call_chain to retrieve the thermal mode from the
+- * lenovo-wmi-gamezone driver.
+- *
+- * Return: 0 on success, or an error code.
+- */
+-static int lwmi_om_notifier_call(enum thermal_mode *mode)
+-{
+-	int ret;
+-
+-	ret = blocking_notifier_call_chain(&om_chain_head,
+-					   LWMI_GZ_GET_THERMAL_MODE, &mode);
+-	if ((ret & ~NOTIFY_STOP_MASK) != NOTIFY_OK)
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+ /* Attribute Methods */
+ 
+ /**
+@@ -783,7 +683,7 @@ static ssize_t attr_current_value_store(struct kobject *kobj,
+ 	u32 value;
+ 	int ret;
+ 
+-	ret = lwmi_om_notifier_call(&mode);
++	ret = lwmi_tm_notifier_call(&mode);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -840,7 +740,7 @@ static ssize_t attr_current_value_show(struct kobject *kobj,
+ 	int retval;
+ 	int ret;
+ 
+-	ret = lwmi_om_notifier_call(&mode);
++	ret = lwmi_tm_notifier_call(&mode);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/platform/x86/lenovo/wmi-other.h b/drivers/platform/x86/lenovo/wmi-other.h
+deleted file mode 100644
+index 8ebf5602b..000000000
+--- a/drivers/platform/x86/lenovo/wmi-other.h
++++ /dev/null
+@@ -1,16 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0-or-later */
+-
+-/* Copyright (C) 2025 Derek J. Clark <derekjohn.clark@gmail.com> */
+-
+-#ifndef _LENOVO_WMI_OTHER_H_
+-#define _LENOVO_WMI_OTHER_H_
+-
+-struct device;
+-struct notifier_block;
+-
+-int lwmi_om_register_notifier(struct notifier_block *nb);
+-int lwmi_om_unregister_notifier(struct notifier_block *nb);
+-int devm_lwmi_om_register_notifier(struct device *dev,
+-				   struct notifier_block *nb);
+-
+-#endif /* !_LENOVO_WMI_OTHER_H_ */
+-- 
+2.54.0
+
+
+From c8de395cd890d82977c36631a60f85b4fa065b97 Mon Sep 17 00:00:00 2001
+From: "Derek J. Clark" <derekjohn.clark@gmail.com>
+Date: Sun, 12 Apr 2026 14:11:16 -0700
+Subject: [PATCH 2/7] platform/x86: lenovo-wmi-other: Add missing CPU tunable
+ attributes
+
+Use an enum for all device ID's and CPU attribute feature ID's,
+add missing CPU attributes.
+
+Reviewed-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+Signed-off-by: Derek J. Clark <derekjohn.clark@gmail.com>
+---
+ .../wmi/devices/lenovo-wmi-other.rst          |  9 ++
+ drivers/platform/x86/lenovo/wmi-capdata.h     |  5 +-
+ drivers/platform/x86/lenovo/wmi-other.c       | 99 ++++++++++++++++++-
+ 3 files changed, 107 insertions(+), 6 deletions(-)
+
+diff --git a/Documentation/wmi/devices/lenovo-wmi-other.rst b/Documentation/wmi/devices/lenovo-wmi-other.rst
+index 01d471156..189dd4d31 100644
+--- a/Documentation/wmi/devices/lenovo-wmi-other.rst
++++ b/Documentation/wmi/devices/lenovo-wmi-other.rst
+@@ -68,9 +68,18 @@ Each attribute has the following properties:
+  - type
+ 
+ The following firmware-attributes are implemented:
++ - cpu_temp: CPU Thermal Load Limit
++ - ppt_cpu_cl: CPU Cross Loading Power Limit
++ - ppt_pl1_apu_spl: Platform Profile Tracking APU Sustained Power Limit
+  - ppt_pl1_spl: Platform Profile Tracking Sustained Power Limit
++ - ppt_pl1_spl_cl: Platform Profile Tracking Cross Loading Sustained Power Limit
++ - ppt_pl1_tau: Exceed Duration for Platform Profile Tracking Sustained Power Limit
+  - ppt_pl2_sppt: Platform Profile Tracking Slow Package Power Tracking
++ - ppt_pl2_sppt_cl: Platform Profile Tracking Cross Loading Slow Package Tracking
+  - ppt_pl3_fppt: Platform Profile Tracking Fast Package Power Tracking
++ - ppt_pl3_fppt_cl: Platform Profile Tracking Cross Loading Fast Package Power Tracking
++ - ppt_pl4_ipl: Platform Profile Tracking Instantaneous Power Limit
++ - ppt_pl4_ipl_cl: Platform Profile Tracking Cross Loading Instantaneous Power Limit
+ 
+ LENOVO_FAN_TEST_DATA
+ -------------------------
+diff --git a/drivers/platform/x86/lenovo/wmi-capdata.h b/drivers/platform/x86/lenovo/wmi-capdata.h
+index c3e760b8c..c74a0e529 100644
+--- a/drivers/platform/x86/lenovo/wmi-capdata.h
++++ b/drivers/platform/x86/lenovo/wmi-capdata.h
+@@ -18,7 +18,10 @@
+ #define LWMI_ATTR_MODE_ID_MASK	GENMASK(15, 8)
+ #define LWMI_ATTR_TYPE_ID_MASK	GENMASK(7, 0)
+ 
+-#define LWMI_DEVICE_ID_FAN	0x04
++enum lwmi_device_id {
++	LWMI_DEVICE_ID_CPU = 0x01,
++	LWMI_DEVICE_ID_FAN = 0x04,
++};
+ 
+ #define LWMI_TYPE_ID_NONE 0x00
+ 
+diff --git a/drivers/platform/x86/lenovo/wmi-other.c b/drivers/platform/x86/lenovo/wmi-other.c
+index e6834dec2..5f7d7d353 100644
+--- a/drivers/platform/x86/lenovo/wmi-other.c
++++ b/drivers/platform/x86/lenovo/wmi-other.c
+@@ -51,14 +51,21 @@
+ 
+ #define LENOVO_OTHER_MODE_GUID "DC2A8805-3A8C-41BA-A6F7-092E0089CD3B"
+ 
+-#define LWMI_DEVICE_ID_CPU 0x01
+-
+-#define LWMI_FEATURE_ID_CPU_SPPT 0x01
+-#define LWMI_FEATURE_ID_CPU_SPL 0x02
+-#define LWMI_FEATURE_ID_CPU_FPPT 0x03
++enum lwmi_feature_id_cpu {
++	LWMI_FEATURE_ID_CPU_SPPT =	0x01,
++	LWMI_FEATURE_ID_CPU_SPL =	0x02,
++	LWMI_FEATURE_ID_CPU_FPPT =	0x03,
++	LWMI_FEATURE_ID_CPU_TEMP =	0x04,
++	LWMI_FEATURE_ID_CPU_APU =	0x05,
++	LWMI_FEATURE_ID_CPU_CL =	0x06,
++	LWMI_FEATURE_ID_CPU_TAU =	0x07,
++	LWMI_FEATURE_ID_CPU_IPL =	0x09,
++};
+ 
+ #define LWMI_FEATURE_ID_FAN_RPM 0x03
+ 
++#define LWMI_TYPE_ID_CROSSLOAD	0x01
++
+ #define LWMI_FEATURE_VALUE_GET 17
+ #define LWMI_FEATURE_VALUE_SET 18
+ 
+@@ -564,18 +571,72 @@ static struct tunable_attr_01 ppt_pl1_spl = {
+ 	.type_id = LWMI_TYPE_ID_NONE,
+ };
+ 
++static struct tunable_attr_01 ppt_pl1_spl_cl = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_SPL,
++	.type_id = LWMI_TYPE_ID_CROSSLOAD,
++};
++
+ static struct tunable_attr_01 ppt_pl2_sppt = {
+ 	.device_id = LWMI_DEVICE_ID_CPU,
+ 	.feature_id = LWMI_FEATURE_ID_CPU_SPPT,
+ 	.type_id = LWMI_TYPE_ID_NONE,
+ };
+ 
++static struct tunable_attr_01 ppt_pl2_sppt_cl = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_SPPT,
++	.type_id = LWMI_TYPE_ID_CROSSLOAD,
++};
++
+ static struct tunable_attr_01 ppt_pl3_fppt = {
+ 	.device_id = LWMI_DEVICE_ID_CPU,
+ 	.feature_id = LWMI_FEATURE_ID_CPU_FPPT,
+ 	.type_id = LWMI_TYPE_ID_NONE,
+ };
+ 
++static struct tunable_attr_01 ppt_pl3_fppt_cl = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_FPPT,
++	.type_id = LWMI_TYPE_ID_CROSSLOAD,
++};
++
++static struct tunable_attr_01 cpu_temp = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_TEMP,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 ppt_pl1_apu_spl = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_APU,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 ppt_cpu_cl = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_CL,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 ppt_pl1_tau = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_TAU,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 ppt_pl4_ipl = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_IPL,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 ppt_pl4_ipl_cl = {
++	.device_id = LWMI_DEVICE_ID_CPU,
++	.feature_id = LWMI_FEATURE_ID_CPU_IPL,
++	.type_id = LWMI_TYPE_ID_CROSSLOAD,
++};
++
+ struct capdata01_attr_group {
+ 	const struct attribute_group *attr_group;
+ 	struct tunable_attr_01 *tunable_attr;
+@@ -911,17 +972,45 @@ static bool lwmi_attr_01_is_supported(struct tunable_attr_01 *tunable_attr)
+ 		.name = _fsname, .attrs = _attrname##_attrs               \
+ 	}
+ 
++LWMI_ATTR_GROUP_TUNABLE_CAP01(cpu_temp, "cpu_temp",
++			      "Set the CPU thermal load limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_cpu_cl, "ppt_cpu_cl",
++			      "Set the CPU cross loading power limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl1_apu_spl, "ppt_pl1_apu_spl",
++			      "Set the APU sustained power limit");
+ LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl1_spl, "ppt_pl1_spl",
+ 			      "Set the CPU sustained power limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl1_spl_cl, "ppt_pl1_spl_cl",
++			      "Set the CPU cross loading sustained power limit");
+ LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl2_sppt, "ppt_pl2_sppt",
+ 			      "Set the CPU slow package power tracking limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl2_sppt_cl, "ppt_pl2_sppt_cl",
++			      "Set the CPU cross loading slow package power tracking limit");
+ LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl3_fppt, "ppt_pl3_fppt",
+ 			      "Set the CPU fast package power tracking limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl3_fppt_cl, "ppt_pl3_fppt_cl",
++			      "Set the CPU cross loading fast package power tracking limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl1_tau, "ppt_pl1_tau",
++			      "Set the CPU sustained power limit exceed duration");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl4_ipl, "ppt_pl4_ipl",
++			      "Set the CPU instantaneous power limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl4_ipl_cl, "ppt_pl4_ipl_cl",
++			      "Set the CPU cross loading instantaneous power limit");
++
+ 
+ static struct capdata01_attr_group cd01_attr_groups[] = {
++	{ &cpu_temp_attr_group, &cpu_temp },
++	{ &ppt_cpu_cl_attr_group, &ppt_cpu_cl },
++	{ &ppt_pl1_apu_spl_attr_group, &ppt_pl1_apu_spl },
+ 	{ &ppt_pl1_spl_attr_group, &ppt_pl1_spl },
++	{ &ppt_pl1_spl_cl_attr_group, &ppt_pl1_spl_cl },
++	{ &ppt_pl1_tau_attr_group, &ppt_pl1_tau },
+ 	{ &ppt_pl2_sppt_attr_group, &ppt_pl2_sppt },
++	{ &ppt_pl2_sppt_cl_attr_group, &ppt_pl2_sppt_cl },
+ 	{ &ppt_pl3_fppt_attr_group, &ppt_pl3_fppt },
++	{ &ppt_pl3_fppt_cl_attr_group, &ppt_pl3_fppt_cl },
++	{ &ppt_pl4_ipl_attr_group, &ppt_pl4_ipl },
++	{ &ppt_pl4_ipl_cl_attr_group, &ppt_pl4_ipl_cl },
+ 	{},
+ };
+ 
+-- 
+2.54.0
+
+
+From d144dad79333df10647b665a708324e78c6d9aa6 Mon Sep 17 00:00:00 2001
+From: "Derek J. Clark" <derekjohn.clark@gmail.com>
+Date: Sun, 12 Apr 2026 14:11:17 -0700
+Subject: [PATCH 3/7] platform/x86: lenovo-wmi-other: Add GPU tunable
+ attributes
+
+Use an enum for all GPU attribute feature ID's and add GPU attributes.
+
+Reviewed-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+Signed-off-by: Derek J. Clark <derekjohn.clark@gmail.com>
+---
+ .../wmi/devices/lenovo-wmi-other.rst          |  10 ++
+ drivers/platform/x86/lenovo/wmi-capdata.h     |   1 +
+ drivers/platform/x86/lenovo/wmi-other.c       | 105 ++++++++++++++++++
+ 3 files changed, 116 insertions(+)
+
+diff --git a/Documentation/wmi/devices/lenovo-wmi-other.rst b/Documentation/wmi/devices/lenovo-wmi-other.rst
+index 189dd4d31..011054d64 100644
+--- a/Documentation/wmi/devices/lenovo-wmi-other.rst
++++ b/Documentation/wmi/devices/lenovo-wmi-other.rst
+@@ -69,6 +69,16 @@ Each attribute has the following properties:
+ 
+ The following firmware-attributes are implemented:
+  - cpu_temp: CPU Thermal Load Limit
++ - dgpu_boost_clk: Dedicated GPU Boost Clock
++ - dgpu_didvid: Dedicated GPU Device Identifier and Vendor Identifier
++ - dgpu_enable: Dedicated GPU Enabled Status
++ - gpu_mode: GPU Mode by Power Limit
++ - gpu_nv_ac_offset: Nvidia GPU AC Total Processing Power Baseline Offset
++ - gpu_nv_bpl: Nvidia GPU Base Power Limit
++ - gpu_nv_cpu_boost: Nvidia GPU to CPU Dynamic Boost Limit
++ - gpu_nv_ctgp: Nvidia GPU Configurable Total Graphics Power
++ - gpu_nv_ppab: Nvidia GPU Power Performance Aware Boost Limit
++ - gpu_temp: GPU Thermal Load Limit
+  - ppt_cpu_cl: CPU Cross Loading Power Limit
+  - ppt_pl1_apu_spl: Platform Profile Tracking APU Sustained Power Limit
+  - ppt_pl1_spl: Platform Profile Tracking Sustained Power Limit
+diff --git a/drivers/platform/x86/lenovo/wmi-capdata.h b/drivers/platform/x86/lenovo/wmi-capdata.h
+index c74a0e529..a7cfdeaa5 100644
+--- a/drivers/platform/x86/lenovo/wmi-capdata.h
++++ b/drivers/platform/x86/lenovo/wmi-capdata.h
+@@ -20,6 +20,7 @@
+ 
+ enum lwmi_device_id {
+ 	LWMI_DEVICE_ID_CPU = 0x01,
++	LWMI_DEVICE_ID_GPU = 0x02,
+ 	LWMI_DEVICE_ID_FAN = 0x04,
+ };
+ 
+diff --git a/drivers/platform/x86/lenovo/wmi-other.c b/drivers/platform/x86/lenovo/wmi-other.c
+index 5f7d7d353..d31af6943 100644
+--- a/drivers/platform/x86/lenovo/wmi-other.c
++++ b/drivers/platform/x86/lenovo/wmi-other.c
+@@ -62,6 +62,19 @@ enum lwmi_feature_id_cpu {
+ 	LWMI_FEATURE_ID_CPU_IPL =	0x09,
+ };
+ 
++enum lwmi_feature_id_gpu {
++	LWMI_FEATURE_ID_GPU_NV_PPAB =		0x01,
++	LWMI_FEATURE_ID_GPU_NV_CTGP =		0x02,
++	LWMI_FEATURE_ID_GPU_TEMP =		0x03,
++	LWMI_FEATURE_ID_GPU_AC_OFFSET =		0x04,
++	LWMI_FEATURE_ID_DGPU_BOOST_CLK =	0x06,
++	LWMI_FEATURE_ID_DGPU_EN =		0x07,
++	LWMI_FEATURE_ID_GPU_MODE =		0x08,
++	LWMI_FEATURE_ID_DGPU_DIDVID =		0x09,
++	LWMI_FEATURE_ID_GPU_NV_BPL =		0x0a,
++	LWMI_FEATURE_ID_GPU_NV_CPU_BOOST =	0x0b,
++};
++
+ #define LWMI_FEATURE_ID_FAN_RPM 0x03
+ 
+ #define LWMI_TYPE_ID_CROSSLOAD	0x01
+@@ -637,6 +650,66 @@ static struct tunable_attr_01 ppt_pl4_ipl_cl = {
+ 	.type_id = LWMI_TYPE_ID_CROSSLOAD,
+ };
+ 
++static struct tunable_attr_01 gpu_nv_ppab = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_GPU_NV_PPAB,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 gpu_nv_ctgp = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_GPU_NV_CTGP,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 gpu_temp = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_GPU_TEMP,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 gpu_nv_ac_offset = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_GPU_AC_OFFSET,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 dgpu_boost_clk = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_DGPU_BOOST_CLK,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 dgpu_enable = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_DGPU_EN,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 gpu_mode = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_GPU_MODE,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 dgpu_didvid = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_DGPU_DIDVID,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 gpu_nv_bpl = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_GPU_NV_BPL,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
++static struct tunable_attr_01 gpu_nv_cpu_boost = {
++	.device_id = LWMI_DEVICE_ID_GPU,
++	.feature_id = LWMI_FEATURE_ID_GPU_NV_CPU_BOOST,
++	.type_id = LWMI_TYPE_ID_NONE,
++};
++
+ struct capdata01_attr_group {
+ 	const struct attribute_group *attr_group;
+ 	struct tunable_attr_01 *tunable_attr;
+@@ -972,6 +1045,7 @@ static bool lwmi_attr_01_is_supported(struct tunable_attr_01 *tunable_attr)
+ 		.name = _fsname, .attrs = _attrname##_attrs               \
+ 	}
+ 
++/* CPU tunable attributes */
+ LWMI_ATTR_GROUP_TUNABLE_CAP01(cpu_temp, "cpu_temp",
+ 			      "Set the CPU thermal load limit");
+ LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_cpu_cl, "ppt_cpu_cl",
+@@ -997,9 +1071,40 @@ LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl4_ipl, "ppt_pl4_ipl",
+ LWMI_ATTR_GROUP_TUNABLE_CAP01(ppt_pl4_ipl_cl, "ppt_pl4_ipl_cl",
+ 			      "Set the CPU cross loading instantaneous power limit");
+ 
++/* GPU tunable attributes */
++LWMI_ATTR_GROUP_TUNABLE_CAP01(dgpu_boost_clk, "dgpu_boost_clk",
++			      "Set the dedicated GPU boost clock");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(dgpu_didvid, "dgpu_didvid",
++			      "Get the GPU device identifier and vendor identifier");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(dgpu_enable, "dgpu_enable",
++			      "Set the dedicated Nvidia GPU enabled status");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(gpu_mode, "gpu_mode",
++			      "Set the GPU mode by power limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(gpu_nv_ac_offset, "gpu_nv_ac_offset",
++			      "Set the Nvidia GPU AC total processing power baseline offset");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(gpu_nv_bpl, "gpu_nv_bpl",
++			      "Set the Nvidia GPU base power limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(gpu_nv_cpu_boost, "gpu_nv_cpu_boost",
++			      "Set the Nvidia GPU to CPU dynamic boost limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(gpu_nv_ctgp, "gpu_nv_ctgp",
++			      "Set the GPU configurable total graphics power");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(gpu_nv_ppab, "gpu_nv_ppab",
++			      "Set the Nvidia GPU power performance aware boost limit");
++LWMI_ATTR_GROUP_TUNABLE_CAP01(gpu_temp, "gpu_temp",
++			      "Set the GPU thermal load limit");
+ 
+ static struct capdata01_attr_group cd01_attr_groups[] = {
+ 	{ &cpu_temp_attr_group, &cpu_temp },
++	{ &dgpu_boost_clk_attr_group, &dgpu_boost_clk },
++	{ &dgpu_didvid_attr_group, &dgpu_didvid },
++	{ &dgpu_enable_attr_group, &dgpu_enable },
++	{ &gpu_mode_attr_group, &gpu_mode },
++	{ &gpu_nv_ac_offset_attr_group, &gpu_nv_ac_offset },
++	{ &gpu_nv_bpl_attr_group, &gpu_nv_bpl },
++	{ &gpu_nv_cpu_boost_attr_group, &gpu_nv_cpu_boost },
++	{ &gpu_nv_ctgp_attr_group, &gpu_nv_ctgp },
++	{ &gpu_nv_ppab_attr_group, &gpu_nv_ppab },
++	{ &gpu_temp_attr_group, &gpu_temp },
+ 	{ &ppt_cpu_cl_attr_group, &ppt_cpu_cl },
+ 	{ &ppt_pl1_apu_spl_attr_group, &ppt_pl1_apu_spl },
+ 	{ &ppt_pl1_spl_attr_group, &ppt_pl1_spl },
+-- 
+2.54.0
+
+
+From 4be6a906fed1c0213a7dcecb97d2a894bbb47be1 Mon Sep 17 00:00:00 2001
+From: "Derek J. Clark" <derekjohn.clark@gmail.com>
+Date: Sun, 12 Apr 2026 14:11:18 -0700
+Subject: [PATCH 4/7] platform/x86: lenovo-wmi-other: Rename
+ LWMI_OM_FW_ATTR_BASE_PATH
+
+In the next patch a power supply extension is added which requires
+a name attribute. Instead of creating another const macro with the
+same information, rename LWMI_OM_FW_ATTR_BASE_PATH to
+LWMI_OM_SYSFS_NAME.
+
+Reviewed-by: Rong Zhang <i@rong.moe>
+Tested-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+Signed-off-by: Derek J. Clark <derekjohn.clark@gmail.com>
+---
+ drivers/platform/x86/lenovo/wmi-other.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/platform/x86/lenovo/wmi-other.c b/drivers/platform/x86/lenovo/wmi-other.c
+index d31af6943..1cd2bb524 100644
+--- a/drivers/platform/x86/lenovo/wmi-other.c
++++ b/drivers/platform/x86/lenovo/wmi-other.c
+@@ -92,7 +92,7 @@ enum lwmi_feature_id_gpu {
+ 	lwmi_attr_id(LWMI_DEVICE_ID_FAN, LWMI_FEATURE_ID_FAN_RPM, \
+ 		     LWMI_GZ_THERMAL_MODE_NONE, LWMI_FAN_ID(x))
+ 
+-#define LWMI_OM_FW_ATTR_BASE_PATH "lenovo-wmi-other"
++#define LWMI_OM_SYSFS_NAME "lenovo-wmi-other"
+ #define LWMI_OM_HWMON_NAME "lenovo_wmi_other"
+ 
+ static DEFINE_IDA(lwmi_om_ida);
+@@ -1136,8 +1136,7 @@ static void lwmi_om_fw_attr_add(struct lwmi_om_priv *priv)
+ 
+ 	priv->fw_attr_dev = device_create(&firmware_attributes_class, NULL,
+ 					  MKDEV(0, 0), NULL, "%s-%u",
+-					  LWMI_OM_FW_ATTR_BASE_PATH,
+-					  priv->ida_id);
++					  LWMI_OM_SYSFS_NAME, priv->ida_id);
+ 	if (IS_ERR(priv->fw_attr_dev)) {
+ 		err = PTR_ERR(priv->fw_attr_dev);
+ 		goto err_free_ida;
+-- 
+2.54.0
+
+
+From a22a728d64307b056682e440529b26267f070ed7 Mon Sep 17 00:00:00 2001
+From: "Derek J. Clark" <derekjohn.clark@gmail.com>
+Date: Sun, 12 Apr 2026 14:11:19 -0700
+Subject: [PATCH 5/7] platform/x86: lenovo-wmi-other: Add WMI battery charge
+ limiting
+
+Add charge-type power supply extension for devices that support WMI based
+charge enable/disable.
+
+Lenovo Legion devices that implement WMI function and capdata ID
+0x03010001 in their BIOS are able to enable or disable charging at 80%
+through the lenovo-wmi-other interface. Add a charge_type power supply
+extension to expose this capability to the sysfs.
+
+The ideapad_laptop driver can also provide the charge_type attribute. To
+avoid conflicts between the drivers, get the acpi_handle and do the same
+check that ideapad_laptop does when it enables the feature. If the
+feature is supported in ideapad_laptop, abort adding the extension from
+lenovo-wmi-other. The ACPI method is more reliable when both are
+present, from my testing, so we can prefer that implementation and do
+not need to worry about de-conflicting from inside that driver. A new
+module parameter, force_load_psy_ext, is provided to bypass this ACPI
+check, if desired.
+
+Reviewed-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+Signed-off-by: Derek J. Clark <derekjohn.clark@gmail.com>
+---
+ drivers/platform/x86/lenovo/Kconfig       |   1 +
+ drivers/platform/x86/lenovo/wmi-capdata.h |   1 +
+ drivers/platform/x86/lenovo/wmi-other.c   | 293 +++++++++++++++++++++-
+ 3 files changed, 294 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/platform/x86/lenovo/Kconfig b/drivers/platform/x86/lenovo/Kconfig
+index 09b1b055d..b9a5d18ca 100644
+--- a/drivers/platform/x86/lenovo/Kconfig
++++ b/drivers/platform/x86/lenovo/Kconfig
+@@ -262,6 +262,7 @@ config LENOVO_WMI_GAMEZONE
+ config LENOVO_WMI_TUNING
+ 	tristate "Lenovo Other Mode WMI Driver"
+ 	depends on ACPI_WMI
++	depends on ACPI_BATTERY
+ 	select HWMON
+ 	select FW_ATTR_CLASS
+ 	select LENOVO_WMI_CAPDATA
+diff --git a/drivers/platform/x86/lenovo/wmi-capdata.h b/drivers/platform/x86/lenovo/wmi-capdata.h
+index a7cfdeaa5..a49229cec 100644
+--- a/drivers/platform/x86/lenovo/wmi-capdata.h
++++ b/drivers/platform/x86/lenovo/wmi-capdata.h
+@@ -21,6 +21,7 @@
+ enum lwmi_device_id {
+ 	LWMI_DEVICE_ID_CPU = 0x01,
+ 	LWMI_DEVICE_ID_GPU = 0x02,
++	LWMI_DEVICE_ID_PSU = 0x03,
+ 	LWMI_DEVICE_ID_FAN = 0x04,
+ };
+ 
+diff --git a/drivers/platform/x86/lenovo/wmi-other.c b/drivers/platform/x86/lenovo/wmi-other.c
+index 1cd2bb524..84160eac0 100644
+--- a/drivers/platform/x86/lenovo/wmi-other.c
++++ b/drivers/platform/x86/lenovo/wmi-other.c
+@@ -41,9 +41,12 @@
+ #include <linux/limits.h>
+ #include <linux/module.h>
+ #include <linux/platform_profile.h>
++#include <linux/power_supply.h>
+ #include <linux/types.h>
+ #include <linux/wmi.h>
+ 
++#include <acpi/battery.h>
++
+ #include "wmi-capdata.h"
+ #include "wmi-events.h"
+ #include "wmi-helpers.h"
+@@ -75,9 +78,11 @@ enum lwmi_feature_id_gpu {
+ 	LWMI_FEATURE_ID_GPU_NV_CPU_BOOST =	0x0b,
+ };
+ 
+-#define LWMI_FEATURE_ID_FAN_RPM 0x03
++#define LWMI_FEATURE_ID_FAN_RPM		0x03
++#define LWMI_FEATURE_ID_PSU_CHARGE_TYPE	0x01
+ 
+ #define LWMI_TYPE_ID_CROSSLOAD	0x01
++#define LWMI_TYPE_ID_PSU_AC	0x01
+ 
+ #define LWMI_FEATURE_VALUE_GET 17
+ #define LWMI_FEATURE_VALUE_SET 18
+@@ -88,10 +93,17 @@ enum lwmi_feature_id_gpu {
+ 
+ #define LWMI_FAN_DIV 100
+ 
++#define LWMI_CHARGE_TYPE_STANDARD	0x00
++#define LWMI_CHARGE_TYPE_LONGLIFE	0x01
++
+ #define LWMI_ATTR_ID_FAN_RPM(x)                                   \
+ 	lwmi_attr_id(LWMI_DEVICE_ID_FAN, LWMI_FEATURE_ID_FAN_RPM, \
+ 		     LWMI_GZ_THERMAL_MODE_NONE, LWMI_FAN_ID(x))
+ 
++#define LWMI_ATTR_ID_PSU(feat, type)			\
++	lwmi_attr_id(LWMI_DEVICE_ID_PSU, feat,		\
++		     LWMI_GZ_THERMAL_MODE_NONE, type)
++
+ #define LWMI_OM_SYSFS_NAME "lenovo-wmi-other"
+ #define LWMI_OM_HWMON_NAME "lenovo_wmi_other"
+ 
+@@ -131,6 +143,9 @@ struct lwmi_om_priv {
+ 		bool capdata00_collected : 1;
+ 		bool capdata_fan_collected : 1;
+ 	} fan_flags;
++
++	struct acpi_battery_hook battery_hook;
++	bool bh_registered;
+ };
+ 
+ /*
+@@ -555,6 +570,279 @@ static void lwmi_om_fan_info_collect_cd_fan(struct device *dev, struct cd_list *
+ 	lwmi_om_hwmon_add(priv);
+ }
+ 
++/* ======== Power Supply Extension (component: lenovo-wmi-capdata 00) ======== */
++
++/**
++ * lwmi_psy_ext_get_prop() - Get a power_supply_ext property
++ * @ps: The battery that was extended
++ * @ext: The extension
++ * @ext_data: Pointer the lwmi_om_priv drvdata
++ * @prop: The property to read
++ * @val: The value to return
++ *
++ * Writes the given value to the power_supply_ext property
++ *
++ * Return: 0 on success, or an error
++ */
++static int lwmi_psy_ext_get_prop(struct power_supply *ps,
++				 const struct power_supply_ext *ext,
++				 void *ext_data,
++				 enum power_supply_property prop,
++				 union power_supply_propval *val)
++{
++	struct wmi_method_args_32 args = {};
++	struct lwmi_om_priv *priv = ext_data;
++	u32 retval;
++	int ret;
++
++	args.arg0 = LWMI_ATTR_ID_PSU(LWMI_FEATURE_ID_PSU_CHARGE_TYPE, LWMI_TYPE_ID_PSU_AC);
++
++	ret = lwmi_dev_evaluate_int(priv->wdev, 0x0, LWMI_FEATURE_VALUE_GET,
++				    (unsigned char *)&args, sizeof(args),
++				    &retval);
++	if (ret)
++		return ret;
++
++	dev_dbg(&priv->wdev->dev, "Got return value %#x for property %#x\n", retval, prop);
++
++	switch (retval) {
++	case LWMI_CHARGE_TYPE_LONGLIFE:
++		val->intval = POWER_SUPPLY_CHARGE_TYPE_LONGLIFE;
++		break;
++	case LWMI_CHARGE_TYPE_STANDARD:
++		val->intval = POWER_SUPPLY_CHARGE_TYPE_STANDARD;
++		break;
++	default:
++		dev_err(&priv->wdev->dev, "Got invalid charge value: %#x\n", retval);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/**
++ * lwmi_psy_ext_set_prop() - Set a power_supply_ext property
++ * @ps: The battery that was extended
++ * @ext: The extension
++ * @ext_data: Pointer the lwmi_om_priv drvdata
++ * @prop: The property to write
++ * @val: The value to write
++ *
++ * Writes the given value to the power_supply_ext property
++ *
++ * Return: 0 on success, or an error
++ */
++static int lwmi_psy_ext_set_prop(struct power_supply *ps,
++				 const struct power_supply_ext *ext,
++				 void *ext_data,
++				 enum power_supply_property prop,
++				 const union power_supply_propval *val)
++{
++	struct wmi_method_args_32 args = {};
++	struct lwmi_om_priv *priv = ext_data;
++
++	args.arg0 = LWMI_ATTR_ID_PSU(LWMI_FEATURE_ID_PSU_CHARGE_TYPE, LWMI_TYPE_ID_PSU_AC);
++	switch (val->intval) {
++	case POWER_SUPPLY_CHARGE_TYPE_LONGLIFE:
++		args.arg1 = LWMI_CHARGE_TYPE_LONGLIFE;
++		break;
++	case POWER_SUPPLY_CHARGE_TYPE_STANDARD:
++		args.arg1 = LWMI_CHARGE_TYPE_STANDARD;
++		break;
++	default:
++		dev_err(&priv->wdev->dev, "Got invalid charge value: %#x\n", val->intval);
++		return -EINVAL;
++	}
++
++	dev_dbg(&priv->wdev->dev, "Attempting to set %#010x for property %#x to %#x\n",
++		args.arg0, prop, args.arg1);
++
++	return lwmi_dev_evaluate_int(priv->wdev, 0x0, LWMI_FEATURE_VALUE_SET,
++				     (unsigned char *)&args, sizeof(args), NULL);
++}
++
++/**
++ * lwmi_psy_prop_is_supported() - Determine if the property is supported
++ * @priv: Pointer the lwmi_om_priv drvdata
++ *
++ * Checks capdata 00 to determine if the property is supported.
++ *
++ * Return: true if readable, or false
++ */
++static bool lwmi_psy_prop_is_supported(struct lwmi_om_priv *priv)
++{
++	u32 attribute_id = LWMI_ATTR_ID_PSU(LWMI_FEATURE_ID_PSU_CHARGE_TYPE, LWMI_TYPE_ID_PSU_AC);
++	struct capdata00 capdata;
++	int ret;
++
++	ret = lwmi_cd00_get_data(priv->cd00_list, attribute_id, &capdata);
++	if (ret)
++		return false;
++
++	dev_dbg(&priv->wdev->dev, "Battery charge mode (%#010x) support level: %#x\n",
++		attribute_id, capdata.supported);
++
++	return ((capdata.supported & LWMI_SUPP_VALID) && (capdata.supported & LWMI_SUPP_GET));
++}
++
++/**
++ * lwmi_psy_prop_is_writeable() - Determine if the property is writeable
++ * @ps: The battery that was extended
++ * @ext: The extension
++ * @ext_data: Pointer the lwmi_om_priv drvdata
++ * @prop: The property to check
++ *
++ * Checks capdata 00 to determine if the property is writable.
++ *
++ * Return: true if writable, or false
++ */
++static int lwmi_psy_prop_is_writeable(struct power_supply *ps,
++				      const struct power_supply_ext *ext,
++				      void *ext_data,
++				      enum power_supply_property prop)
++{
++	u32 attribute_id = LWMI_ATTR_ID_PSU(LWMI_FEATURE_ID_PSU_CHARGE_TYPE, LWMI_TYPE_ID_PSU_AC);
++	struct lwmi_om_priv *priv = ext_data;
++	struct capdata00 capdata;
++	int ret;
++
++	ret = lwmi_cd00_get_data(priv->cd00_list, attribute_id, &capdata);
++	if (ret)
++		return false;
++
++	return !!(capdata.supported & LWMI_SUPP_SET);
++}
++
++static const enum power_supply_property lwmi_psy_ext_props[] = {
++	POWER_SUPPLY_PROP_CHARGE_TYPES,
++};
++
++static const struct power_supply_ext lwmi_psy_ext = {
++	.name			= LWMI_OM_SYSFS_NAME,
++	.properties		= lwmi_psy_ext_props,
++	.num_properties		= ARRAY_SIZE(lwmi_psy_ext_props),
++	.charge_types		= (BIT(POWER_SUPPLY_CHARGE_TYPE_STANDARD) |
++				   BIT(POWER_SUPPLY_CHARGE_TYPE_LONGLIFE)),
++	.get_property		= lwmi_psy_ext_get_prop,
++	.set_property		= lwmi_psy_ext_set_prop,
++	.property_is_writeable	= lwmi_psy_prop_is_writeable,
++};
++
++/**
++ * lwmi_add_battery() - Connect the power_supply_ext
++ * @battery: The battery to extend
++ * @hook: The driver hook used to extend the battery
++ *
++ * Return: 0 on success, or an error.
++ */
++static int lwmi_add_battery(struct power_supply *battery, struct acpi_battery_hook *hook)
++{
++	struct lwmi_om_priv *priv = container_of(hook, struct lwmi_om_priv, battery_hook);
++
++	return power_supply_register_extension(battery, &lwmi_psy_ext, &priv->wdev->dev, priv);
++}
++
++/**
++ * lwmi_remove_battery() - Disconnect the power_supply_ext
++ * @battery: The battery that was extended
++ * @hook: The driver hook used to extend the battery
++ *
++ * Return: 0 on success, or an error.
++ */
++static int lwmi_remove_battery(struct power_supply *battery, struct acpi_battery_hook *hook)
++{
++	power_supply_unregister_extension(battery, &lwmi_psy_ext);
++	return 0;
++}
++
++/**
++ * lwmi_acpi_match() - Attempts to return the ideapad acpi handle
++ * @handle: The ACPI handle that manages battery charging
++ * @lvl: Unused
++ * @context: Void pointer to the acpi_handle object to return
++ * @retval: Unused
++ *
++ * Checks if the ideapad_laptop driver is going to manage charge_type first,
++ * then if not, hooks the battery to our WMI methods.
++ *
++ * Return: AE_CTRL_TERMINATE if found, AE_OK if not found.
++ */
++static acpi_status lwmi_acpi_match(acpi_handle handle, u32 lvl,
++				   void *context, void **retval)
++{
++	acpi_handle *ahand = context;
++
++	if (!handle)
++		return AE_OK;
++
++	*ahand = handle;
++
++	return AE_CTRL_TERMINATE;
++}
++
++static bool force_load_psy_ext;
++module_param(force_load_psy_ext, bool, 0444);
++MODULE_PARM_DESC(force_load_psy_ext,
++	"This option will skip checking if the ideapad_laptop driver will conflict "
++	"with adding an extension to set the battery charge type. It is recommended "
++	"to blacklist the ideapad driver before using this option.");
++
++/**
++ * lwmi_om_psy_ext_init() - Hooks power supply extension to device battery
++ * @priv: Driver private data
++ *
++ * Checks if the ideapad_laptop driver is going to manage charge_type first,
++ * then if not, hooks the battery to our WMI methods.
++ */
++static void lwmi_om_psy_ext_init(struct lwmi_om_priv *priv)
++{
++	static const char * const ideapad_hid = "VPC2004";
++	acpi_handle handle = NULL;
++	int ret;
++
++	priv->bh_registered = false;
++
++	/* Deconflict ideapad_laptop driver */
++	if (force_load_psy_ext)
++		goto load_psy_ext;
++
++	if (!lwmi_psy_prop_is_supported(priv))
++		return;
++
++	ret = acpi_get_devices(ideapad_hid, lwmi_acpi_match, &handle, NULL);
++	if (ret)
++		return;
++
++	if (handle && acpi_has_method(handle, "GBMD") && acpi_has_method(handle, "SBMC")) {
++		dev_dbg(&priv->wdev->dev, "ideapad_laptop driver manages battery for device\n");
++		return;
++	}
++
++load_psy_ext:
++	/* Add battery hooks */
++	priv->battery_hook.add_battery = lwmi_add_battery;
++	priv->battery_hook.remove_battery = lwmi_remove_battery;
++	priv->battery_hook.name = "Lenovo WMI Other Battery Extension";
++	priv->bh_registered = true;
++
++	battery_hook_register(&priv->battery_hook);
++}
++
++/**
++ * lwmi_om_psy_remove() - Unregister battery hook
++ * @priv: Driver private data
++ *
++ * Unregisters the battery hook if applicable.
++ */
++static void lwmi_om_psy_remove(struct lwmi_om_priv *priv)
++{
++	if (!priv->bh_registered)
++		return;
++
++	battery_hook_unregister(&priv->battery_hook);
++	priv->bh_registered = false;
++}
++
+ /* ======== fw_attributes (component: lenovo-wmi-capdata 01) ======== */
+ 
+ struct tunable_attr_01 {
+@@ -1241,6 +1529,7 @@ static int lwmi_om_master_bind(struct device *dev)
+ 	}
+ 
+ 	lwmi_om_fan_info_collect_cd00(priv);
++	lwmi_om_psy_ext_init(priv);
+ 
+ 	lwmi_om_fw_attr_add(priv);
+ 
+@@ -1263,6 +1552,8 @@ static void lwmi_om_master_unbind(struct device *dev)
+ 
+ 	lwmi_om_hwmon_remove(priv);
+ 
++	lwmi_om_psy_remove(priv);
++
+ 	component_unbind_all(dev, NULL);
+ }
+ 
+-- 
+2.54.0
+
+
+From f43213416079d8c786debb727c899fe3fe8a6ffc Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Sun, 12 Apr 2026 14:11:20 -0700
+Subject: [PATCH 6/7] platform/x86: lenovo-wmi-helpers: Add helper for creating
+ per-device debugfs dir
+
+We are about to add debugfs support for lenovo-wmi-capdata. Let's setup
+a debugfs directory called "lenovo_wmi" for tidiness, so that any
+lenovo-wmi-* device can put its subdirectory under the directory.
+Subdirectories will be named after the corresponding WMI devices.
+
+Signed-off-by: Rong Zhang <i@rong.moe>
+Signed-off-by: Derek J. Clark <derekjohn.clark@gmail.com>
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+---
+ drivers/platform/x86/lenovo/wmi-helpers.c | 34 +++++++++++++++++++++++
+ drivers/platform/x86/lenovo/wmi-helpers.h |  2 ++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/drivers/platform/x86/lenovo/wmi-helpers.c b/drivers/platform/x86/lenovo/wmi-helpers.c
+index 7a198259e..82dfd26c9 100644
+--- a/drivers/platform/x86/lenovo/wmi-helpers.c
++++ b/drivers/platform/x86/lenovo/wmi-helpers.c
+@@ -17,6 +17,8 @@
+  */
+ 
+ #include <linux/acpi.h>
++#include <linux/debugfs.h>
++#include <linux/device.h>
+ #include <linux/cleanup.h>
+ #include <linux/errno.h>
+ #include <linux/export.h>
+@@ -185,6 +187,38 @@ int lwmi_tm_notifier_call(enum thermal_mode *mode)
+ }
+ EXPORT_SYMBOL_NS_GPL(lwmi_tm_notifier_call, "LENOVO_WMI_HELPERS");
+ 
++static struct dentry *lwmi_debugfs_dir;
++
++/**
++ * lwmi_debugfs_create_dir() - Helper function for creating a debugfs directory
++ * for a device.
++ * @wdev: Pointer to the WMI device to be called.
++ *
++ * Caller must remove the directory with debugfs_remove_recursive() on device
++ * removal.
++ *
++ * Return: Pointer to the created directory.
++ */
++struct dentry *lwmi_debugfs_create_dir(struct wmi_device *wdev)
++{
++	return debugfs_create_dir(dev_name(&wdev->dev), lwmi_debugfs_dir);
++}
++EXPORT_SYMBOL_NS_GPL(lwmi_debugfs_create_dir, "LENOVO_WMI_HELPERS");
++
++static int __init lwmi_helpers_init(void)
++{
++	lwmi_debugfs_dir = debugfs_create_dir("lenovo_wmi", NULL);
++
++	return 0;
++}
++subsys_initcall(lwmi_helpers_init)
++
++static void __exit lwmi_helpers_exit(void)
++{
++	debugfs_remove_recursive(lwmi_debugfs_dir);
++}
++module_exit(lwmi_helpers_exit)
++
+ MODULE_AUTHOR("Derek J. Clark <derekjohn.clark@gmail.com>");
+ MODULE_DESCRIPTION("Lenovo WMI Helpers Driver");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/platform/x86/lenovo/wmi-helpers.h b/drivers/platform/x86/lenovo/wmi-helpers.h
+index ed7db3ebb..039fe6100 100644
+--- a/drivers/platform/x86/lenovo/wmi-helpers.h
++++ b/drivers/platform/x86/lenovo/wmi-helpers.h
+@@ -16,6 +16,8 @@ struct wmi_method_args_32 {
+ 	u32 arg1;
+ };
+ 
++struct dentry *lwmi_debugfs_create_dir(struct wmi_device *wdev);
++
+ enum lwmi_event_type {
+ 	LWMI_GZ_GET_THERMAL_MODE = 0x01,
+ };
+-- 
+2.54.0
+
+
+From 09c6e262b18f44208131724b47a44514181e73a7 Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Sun, 12 Apr 2026 14:11:21 -0700
+Subject: [PATCH 7/7] platform/x86: lenovo-wmi-capdata: Add debugfs file for
+ dumping capdata
+
+The Lenovo GameZone/Other interfaces have some delicate divergences
+among different devices. When making a bug report or adding support for
+new devices/interfaces, capdata is the most important information to
+cross-check with.
+
+Add a debugfs file (lenovo_wmi/<device_name>/capdata), so that users can
+dump capdata and include it in their reports.
+
+Since `struct capdata01' is just an extension to `struct capdata00',
+also converts the former to include the latter anonymously
+(-fms-extensions, since v6.19). In this manner type casting won't be
+confusing.
+
+Tested-by: Kurt Borja <kuurtb@gmail.com>
+Signed-off-by: Rong Zhang <i@rong.moe>
+Signed-off-by: Derek J. Clark <derekjohn.clark@gmail.com>
+Reviewed-by: Mark Pearson <mpearson-lenovo@squebb.ca>
+---
+ drivers/platform/x86/lenovo/Kconfig       |   1 +
+ drivers/platform/x86/lenovo/wmi-capdata.c | 120 ++++++++++++++++++++++
+ drivers/platform/x86/lenovo/wmi-capdata.h |   4 +-
+ 3 files changed, 122 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/platform/x86/lenovo/Kconfig b/drivers/platform/x86/lenovo/Kconfig
+index b9a5d18ca..4443f40ef 100644
+--- a/drivers/platform/x86/lenovo/Kconfig
++++ b/drivers/platform/x86/lenovo/Kconfig
+@@ -236,6 +236,7 @@ config YT2_1380
+ config LENOVO_WMI_CAPDATA
+ 	tristate
+ 	depends on ACPI_WMI
++	depends on LENOVO_WMI_HELPERS
+ 
+ config LENOVO_WMI_EVENTS
+ 	tristate
+diff --git a/drivers/platform/x86/lenovo/wmi-capdata.c b/drivers/platform/x86/lenovo/wmi-capdata.c
+index 169665be4..b5e2c16d6 100644
+--- a/drivers/platform/x86/lenovo/wmi-capdata.c
++++ b/drivers/platform/x86/lenovo/wmi-capdata.c
+@@ -31,6 +31,7 @@
+ #include <linux/cleanup.h>
+ #include <linux/component.h>
+ #include <linux/container_of.h>
++#include <linux/debugfs.h>
+ #include <linux/device.h>
+ #include <linux/dev_printk.h>
+ #include <linux/err.h>
+@@ -42,6 +43,7 @@
+ #include <linux/mutex_types.h>
+ #include <linux/notifier.h>
+ #include <linux/overflow.h>
++#include <linux/seq_file.h>
+ #include <linux/stddef.h>
+ #include <linux/types.h>
+ #include <linux/wmi.h>
+@@ -88,6 +90,7 @@ struct lwmi_cd_priv {
+ 	struct notifier_block acpi_nb; /* ACPI events */
+ 	struct wmi_device *wdev;
+ 	struct cd_list *list;
++	struct dentry *debugfs_dir;
+ 
+ 	/*
+ 	 * A capdata device may be a component master of another capdata device.
+@@ -118,6 +121,8 @@ struct cd_list {
+ 
+ static struct wmi_driver lwmi_cd_driver;
+ 
++/* ======== Device components ======== */
++
+ /**
+  * lwmi_cd_match() - Match rule for the master driver.
+  * @dev: Pointer to the capability data parent device.
+@@ -471,6 +476,116 @@ EXPORT_SYMBOL_NS_GPL(lwmi_cd01_get_data, "LENOVO_WMI_CAPDATA");
+ DEF_LWMI_CDXX_GET_DATA(cd_fan, LENOVO_FAN_TEST_DATA, struct capdata_fan);
+ EXPORT_SYMBOL_NS_GPL(lwmi_cd_fan_get_data, "LENOVO_WMI_CAPDATA");
+ 
++/* ======== debugfs ======== */
++
++/**
++ * lwmi_cd00_show() - Dump capdata00
++ * @s: Pointer to seq_file where the capdata00 is dumped.
++ * @cd00: Pointer to a capdata00 struct to be dumped.
++ */
++static void lwmi_cd00_show(struct seq_file *s, struct capdata00 *cd00)
++{
++	u8 dev = FIELD_GET(LWMI_ATTR_DEV_ID_MASK, cd00->id);
++	u8 feat = FIELD_GET(LWMI_ATTR_FEAT_ID_MASK, cd00->id);
++	u8 mode = FIELD_GET(LWMI_ATTR_MODE_ID_MASK, cd00->id);
++	u8 type = FIELD_GET(LWMI_ATTR_TYPE_ID_MASK, cd00->id);
++	bool extra = cd00->supported & ~(LWMI_SUPP_GET | LWMI_SUPP_SET | LWMI_SUPP_VALID);
++	bool get = cd00->supported & LWMI_SUPP_GET;
++	bool set = cd00->supported & LWMI_SUPP_SET;
++	bool valid = cd00->supported & LWMI_SUPP_VALID;
++
++	seq_printf(s, "  id:             0x%08x [dev: %2u, feat: %2u, mode: %2u, type: %2u]\n",
++		   cd00->id, dev, feat, mode, type);
++
++	seq_printf(s, "  supported:      0x%08x [%c%c%c%c]\n", cd00->supported,
++		   extra ? '+' : ' ',
++		   get   ? 'R' : ' ',
++		   set   ? 'W' : ' ',
++		   valid ? 'V' : ' ');
++
++	seq_printf(s, "  default_value:  %u\n", cd00->default_value);
++}
++
++/**
++ * lwmi_cd01_show() - Dump capdata01
++ * @s: Pointer to seq_file where the capdata01 is dumped.
++ * @cd01: Pointer to a capdata01 struct to be dumped.
++ */
++static void lwmi_cd01_show(struct seq_file *s, struct capdata01 *cd01)
++{
++	/* capdata01 is an extension to capdata00. */
++	lwmi_cd00_show(s, (struct capdata00 *)cd01);
++
++	seq_printf(s, "  step:           %u\n", cd01->step);
++	seq_printf(s, "  min_value:      %u\n", cd01->min_value);
++	seq_printf(s, "  max_value:      %u\n", cd01->max_value);
++}
++
++/**
++ * lwmi_cd_fan_show() - Dump capdata_fan
++ * @s: Pointer to seq_file where the capdata_fan is dumped.
++ * @cd_fan: Pointer to a capdata_fan struct to be dumped.
++ */
++static void lwmi_cd_fan_show(struct seq_file *s, struct capdata_fan *cd_fan)
++{
++	seq_printf(s, "  id:             %u\n", cd_fan->id);
++	seq_printf(s, "  min_rpm:        %u\n", cd_fan->min_rpm);
++	seq_printf(s, "  max_rpm:        %u\n", cd_fan->max_rpm);
++}
++
++/**
++ * lwmi_cd_debugfs_show() - Dump capability data to debugfs
++ * @s: Pointer to seq_file where the capability data is dumped.
++ * @data: unused.
++ *
++ * Return: 0
++ */
++static int lwmi_cd_debugfs_show(struct seq_file *s, void *data)
++{
++	struct lwmi_cd_priv *priv = s->private;
++	u8 idx;
++
++	guard(mutex)(&priv->list->list_mutex);
++
++	/* lwmi_cd_alloc() ensured priv->list->type must be a valid type. */
++	for (idx = 0; idx < priv->list->count; idx++) {
++		seq_printf(s, "%s[%u]:\n", lwmi_cd_table[priv->list->type].name, idx);
++
++		if (priv->list->type == LENOVO_CAPABILITY_DATA_00)
++			lwmi_cd00_show(s, &priv->list->cd00[idx]);
++		else if (priv->list->type == LENOVO_CAPABILITY_DATA_01)
++			lwmi_cd01_show(s, &priv->list->cd01[idx]);
++		else if (priv->list->type == LENOVO_FAN_TEST_DATA)
++			lwmi_cd_fan_show(s, &priv->list->cd_fan[idx]);
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(lwmi_cd_debugfs);
++
++/**
++ * lwmi_cd_debugfs_add() - Create debugfs directory and files for a device
++ * @priv: lenovo-wmi-capdata driver data.
++ */
++static void lwmi_cd_debugfs_add(struct lwmi_cd_priv *priv)
++{
++	priv->debugfs_dir = lwmi_debugfs_create_dir(priv->wdev);
++
++	debugfs_create_file("capdata", 0444, priv->debugfs_dir, priv, &lwmi_cd_debugfs_fops);
++}
++
++/**
++ * lwmi_cd_debugfs_remove() - Remove debugfs directory for a device
++ * @priv: lenovo-wmi-capdata driver data.
++ */
++static void lwmi_cd_debugfs_remove(struct lwmi_cd_priv *priv)
++{
++	debugfs_remove_recursive(priv->debugfs_dir);
++	priv->debugfs_dir = NULL;
++}
++
++/* ======== WMI interface ======== */
++
+ /**
+  * lwmi_cd_cache() - Cache all WMI data block information
+  * @priv: lenovo-wmi-capdata driver data.
+@@ -773,6 +888,8 @@ static int lwmi_cd_probe(struct wmi_device *wdev, const void *context)
+ 		dev_err(&wdev->dev, "failed to register %s: %d\n",
+ 			info->name, ret);
+ 	} else {
++		lwmi_cd_debugfs_add(priv);
++
+ 		dev_dbg(&wdev->dev, "registered %s with %u items\n",
+ 			info->name, priv->list->count);
+ 	}
+@@ -783,6 +900,8 @@ static void lwmi_cd_remove(struct wmi_device *wdev)
+ {
+ 	struct lwmi_cd_priv *priv = dev_get_drvdata(&wdev->dev);
+ 
++	lwmi_cd_debugfs_remove(priv);
++
+ 	switch (priv->list->type) {
+ 	case LENOVO_CAPABILITY_DATA_00:
+ 		lwmi_cd_sub_master_del(priv);
+@@ -822,6 +941,7 @@ static struct wmi_driver lwmi_cd_driver = {
+ 
+ module_wmi_driver(lwmi_cd_driver);
+ 
++MODULE_IMPORT_NS("LENOVO_WMI_HELPERS");
+ MODULE_DEVICE_TABLE(wmi, lwmi_cd_id_table);
+ MODULE_AUTHOR("Derek J. Clark <derekjohn.clark@gmail.com>");
+ MODULE_AUTHOR("Rong Zhang <i@rong.moe>");
+diff --git a/drivers/platform/x86/lenovo/wmi-capdata.h b/drivers/platform/x86/lenovo/wmi-capdata.h
+index a49229cec..731370161 100644
+--- a/drivers/platform/x86/lenovo/wmi-capdata.h
++++ b/drivers/platform/x86/lenovo/wmi-capdata.h
+@@ -38,9 +38,7 @@ struct capdata00 {
+ };
+ 
+ struct capdata01 {
+-	u32 id;
+-	u32 supported;
+-	u32 default_value;
++	struct capdata00;
+ 	u32 step;
+ 	u32 min_value;
+ 	u32 max_value;
+-- 
+2.54.0
+
