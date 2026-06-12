@@ -1,0 +1,170 @@
+From 937934f0121cd70fcb251d52fef4532705eb828c Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 12 Mar 2026 16:04:18 +0100
+Subject: [PATCH 17/22] sched/fair: Add cgroup_mode: concur
+
+Improve upon the previous scheme ("max") by no longer assuming maximal
+concurrency. Instead scale by: 'min(nr_tasks, nr_cpus)'. This handles
+the low concurrency cases more gracefully:
+
+	F_g_n' = min(M, N) * F_g_n
+
+Notably this is the first mode where:
+
+	avg(F_g_n) = 1
+
+In the single task case it reduces to ("smp") and then it nicely scales up
+until it hits N, where it behaves like ("max").
+
+This is no longer clipped at nice -20. Strictly speaking it isn't different
+from the normal SMP scenario where all tasks are extremely unbalanced. There
+are no unnatural inflations in this scheme.
+
+The meaning of "cpu.weight" would be: weight per active CPU.
+
+NOTE: Compute the group wide number of tasks by extending the tg->load_avg
+computation with tg->runnable_avg, since cfs_rq->runnable_avg is based on
+cfs_rq->h_nr_running.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ kernel/sched/debug.c |  1 +
+ kernel/sched/fair.c  | 45 ++++++++++++++++++++++++++++++++++++--------
+ kernel/sched/sched.h |  3 +++
+ 3 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 501598193..a814ae018 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -595,6 +595,7 @@ static int cgroup_mode = 1;
+ static const char *cgroup_mode_str[] = {
+ 	"up",
+ 	"smp",
++	"concur",
+ 	"max",
+ };
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index af2fd7932..1624b207f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4248,6 +4248,11 @@ static int tg_cpus(struct task_group *tg)
+ 	return nr;
+ }
+ 
++static inline int tg_tasks(struct task_group *tg)
++{
++	return max(1, atomic_long_read(&tg->runnable_avg) >> SCHED_CAPACITY_SHIFT);
++}
++
+ /*
+  * Func: min(fraction(nr_cpus * tg->shares), nice -20)
+  *
+@@ -4264,6 +4269,20 @@ static long calc_max_shares(struct cfs_rq *cfs_rq)
+ 	return __calc_smp_shares(cfs_rq, tg_shares * nr, max_shares);
+ }
+ 
++/*
++ * Func: fraction(nr * tg->shares); nr = min(nr_tasks, nr_cpus)
++ *
++ * Scales between "smp" and "max" in a natural way. No longer needs clipping
++ * since there are no unnatural inflations like with "max".
++ */
++static long calc_concur_shares(struct cfs_rq *cfs_rq)
++{
++	struct task_group *tg = cfs_rq->tg;
++	int nr = min(tg_tasks(tg), tg_cpus(tg));
++	long tg_shares = READ_ONCE(tg->shares);
++	return __calc_smp_shares(cfs_rq, nr * tg_shares, nr * tg_shares);
++}
++
+ /*
+  * Func: fraction(tg->shares)
+  *
+@@ -4299,6 +4318,9 @@ void __sched_cgroup_mode_update(int mode)
+ 		func = &calc_smp_shares;
+ 		break;
+ 	case 2:
++		func = &calc_concur_shares;
++		break;
++	case 3:
+ 		func = &calc_max_shares;
+ 		break;
+ 	}
+@@ -4445,7 +4467,7 @@ static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
+  */
+ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+ {
+-	long delta;
++	long dl, dr;
+ 	u64 now;
+ 
+ 	/*
+@@ -4466,17 +4488,21 @@ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+ 	if (now - cfs_rq->last_update_tg_load_avg < NSEC_PER_MSEC)
+ 		return;
+ 
+-	delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
+-	if (abs(delta) > cfs_rq->tg_load_avg_contrib / 64) {
+-		atomic_long_add(delta, &cfs_rq->tg->load_avg);
++	dl = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
++	dr = cfs_rq->avg.runnable_avg - cfs_rq->tg_runnable_avg_contrib;
++	if (abs(dl) > cfs_rq->tg_load_avg_contrib / 64 ||
++	    abs(dr) > cfs_rq->tg_runnable_avg_contrib / 64) {
++		atomic_long_add(dl, &cfs_rq->tg->load_avg);
++		atomic_long_add(dr, &cfs_rq->tg->runnable_avg);
+ 		cfs_rq->tg_load_avg_contrib = cfs_rq->avg.load_avg;
++		cfs_rq->tg_runnable_avg_contrib = cfs_rq->avg.runnable_avg;
+ 		cfs_rq->last_update_tg_load_avg = now;
+ 	}
+ }
+ 
+ static inline void clear_tg_load_avg(struct cfs_rq *cfs_rq)
+ {
+-	long delta;
++	long dl, dr;
+ 	u64 now;
+ 
+ 	/*
+@@ -4485,10 +4511,13 @@ static inline void clear_tg_load_avg(struct cfs_rq *cfs_rq)
+ 	if (cfs_rq->tg == &root_task_group)
+ 		return;
+ 
+-	now = sched_clock_cpu(cpu_of(rq_of(cfs_rq)));
+-	delta = 0 - cfs_rq->tg_load_avg_contrib;
+-	atomic_long_add(delta, &cfs_rq->tg->load_avg);
++	now = rq_clock(rq_of(cfs_rq));
++	dl = 0 - cfs_rq->tg_load_avg_contrib;
++	dr = 0 - cfs_rq->tg_runnable_avg_contrib;
++	atomic_long_add(dl, &cfs_rq->tg->load_avg);
++	atomic_long_add(dr, &cfs_rq->tg->runnable_avg);
+ 	cfs_rq->tg_load_avg_contrib = 0;
++	cfs_rq->tg_runnable_avg_contrib = 0;
+ 	cfs_rq->last_update_tg_load_avg = now;
+ }
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 038ea4f1a..bffde0616 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -489,6 +489,8 @@ struct task_group {
+ 	 * will also be accessed at each tick.
+ 	 */
+ 	atomic_long_t		load_avg ____cacheline_aligned;
++	atomic_long_t		runnable_avg;
++
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
+ #ifdef CONFIG_RT_GROUP_SCHED
+@@ -718,6 +720,7 @@ struct cfs_rq {
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	u64			last_update_tg_load_avg;
+ 	unsigned long		tg_load_avg_contrib;
++	unsigned long		tg_runnable_avg_contrib;
+ 	long			propagate;
+ 	long			prop_runnable_sum;
+ 
+-- 
+2.54.0
+
