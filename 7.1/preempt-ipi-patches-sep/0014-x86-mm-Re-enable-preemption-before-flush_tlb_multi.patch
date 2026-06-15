@@ -1,0 +1,111 @@
+From 914a25dbff8c1f41d8393fa6cf4deede5093a386 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 9 Jun 2026 17:17:10 +0800
+Subject: [PATCH 14/14] x86/mm: Re-enable preemption before flush_tlb_multi()
+
+flush_tlb_mm_range() and arch_tlbbatch_flush() pin the current CPU while
+they decide whether the flush can be handled locally or must be sent to
+remote CPUs. The CPU pinning is needed for the current CPU number and for
+the local TLB flush path, which reads per-CPU TLB state.
+
+It is not needed while waiting for a remote TLB flush to complete. After
+the remote-flush path has been selected, flush_tlb_info is caller-private
+stack storage, so the caller no longer has to stay on the same CPU to
+protect a shared per-CPU flush_tlb_info object.
+
+flush_tlb_multi() may also route through x86 PV backends. Those backends
+must protect their own CPU-local scratch state instead of relying on the
+caller to stay pinned. Hyper-V already does this by disabling interrupts
+while using hyperv_pcpu_input_arg, and Xen's multicall path brackets its
+per-CPU multicall buffer with xen_mc_batch()/xen_mc_issue(). The previous
+patch makes the KVM backend do the same for __pv_cpu_mask.
+
+Remote TLB flushes may synchronously wait for many CPUs, and the wait can
+take tens of milliseconds when remote CPUs have interrupts disabled or
+when many CPUs are involved. Keeping preemption disabled for that whole
+wait unnecessarily increases scheduling latency on the initiating CPU.
+
+Drop the CPU pinning before calling flush_tlb_multi() in the remote paths
+of flush_tlb_mm_range() and arch_tlbbatch_flush(). Keep the local paths
+inside the pinned section because they still access this CPU's TLB state.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ arch/x86/mm/tlb.c | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 0c55ee84d..807a15b1a 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1404,6 +1404,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ {
+ 	struct flush_tlb_info _info;
+ 	struct flush_tlb_info *info = &_info;
++	bool remote_flush = false;
+ 	int cpu = get_cpu();
+ 	u64 new_tlb_gen;
+ 
+@@ -1421,9 +1422,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 	if (mm_global_asid(mm)) {
+ 		broadcast_tlb_flush(info);
+ 	} else if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+-		info->trim_cpumask = should_trim_cpumask(mm);
+-		flush_tlb_multi(mm_cpumask(mm), info);
+-		consider_global_asid(mm);
++		remote_flush = true;
+ 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+@@ -1432,6 +1431,13 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 	}
+ 
+ 	put_cpu();
++
++	if (remote_flush) {
++		info->trim_cpumask = should_trim_cpumask(mm);
++		flush_tlb_multi(mm_cpumask(mm), info);
++		consider_global_asid(mm);
++	}
++
+ 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
+ }
+ 
+@@ -1678,7 +1684,7 @@ EXPORT_SYMBOL_FOR_KVM(__flush_tlb_all);
+ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ {
+ 	struct flush_tlb_info info;
+-
++	bool remote_flush = false;
+ 	int cpu = get_cpu();
+ 
+ 	init_flush_tlb_info(&info, NULL, 0, TLB_FLUSH_ALL, 0, false,
+@@ -1692,7 +1698,7 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		invlpgb_flush_all_nonglobals();
+ 		batch->unmapped_pages = false;
+ 	} else if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
+-		flush_tlb_multi(&batch->cpumask, &info);
++		remote_flush = true;
+ 	} else if (cpumask_test_cpu(cpu, &batch->cpumask)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+@@ -1700,9 +1706,12 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		local_irq_enable();
+ 	}
+ 
+-	cpumask_clear(&batch->cpumask);
+-
+ 	put_cpu();
++
++	if (remote_flush)
++		flush_tlb_multi(&batch->cpumask, &info);
++
++	cpumask_clear(&batch->cpumask);
+ }
+ 
+ /*
+-- 
+2.54.0
+
