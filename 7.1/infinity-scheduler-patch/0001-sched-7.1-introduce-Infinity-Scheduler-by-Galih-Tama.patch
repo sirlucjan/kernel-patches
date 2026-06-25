@@ -1,0 +1,738 @@
+From 16caa1fe35ccfaf19f20eeadd72508f8325b0e55 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Thu, 25 Jun 2026 17:36:46 +0200
+Subject: [PATCH] sched-7.1: introduce Infinity Scheduler by Galih Tama
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ include/linux/sched.h         |   8 +
+ init/init_task.c              |   5 +
+ kernel/sched/Makefile         |   1 +
+ kernel/sched/fair.c           |  33 ++-
+ kernel/sched/infinity_sched.c | 442 ++++++++++++++++++++++++++++++++++
+ kernel/sched/infinity_sched.h | 127 ++++++++++
+ 6 files changed, 614 insertions(+), 2 deletions(-)
+ create mode 100644 kernel/sched/infinity_sched.c
+ create mode 100644 kernel/sched/infinity_sched.h
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ee06cba5c..7bdc77a0e 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -817,6 +817,13 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct infinity_ctx {
++	s64		budget_ns;
++	u64		runtime_debt;
++	u64		last_sleep_ns;
++	u64		fork_time_ns;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -871,6 +878,7 @@ struct task_struct {
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
+ 	struct sched_dl_entity		dl;
++	struct infinity_ctx		infinity;
+ 	struct sched_dl_entity		*dl_server;
+ #ifdef CONFIG_SCHED_CLASS_EXT
+ 	struct sched_ext_entity		scx;
+diff --git a/init/init_task.c b/init/init_task.c
+index b5f48ebdc..02b5f30f8 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -148,6 +148,11 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
+ 	.children	= LIST_HEAD_INIT(init_task.children),
+ 	.sibling	= LIST_HEAD_INIT(init_task.sibling),
+ 	.group_leader	= &init_task,
++	.infinity		= {
++				.budget_ns	= 0,
++				.runtime_debt	= 0,
++				.last_sleep_ns	= 0,
++	},
+ 	RCU_POINTER_INITIALIZER(real_cred, &init_cred),
+ 	RCU_POINTER_INITIALIZER(cred, &init_cred),
+ 	.comm		= INIT_TASK_COMM,
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index b1f1a3670..9bea3857e 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -40,3 +40,4 @@ obj-y += core.o
+ obj-y += fair.o
+ obj-y += build_policy.o
+ obj-y += build_utility.o
++obj-y += infinity_sched.o
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3ebec186f..0881a9f52 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -57,6 +57,7 @@
+ #include "sched.h"
+ #include "stats.h"
+ #include "autogroup.h"
++#include "infinity_sched.h"
+ 
+ /*
+  * The initial- and re-scaling of tunables is configurable
+@@ -1245,8 +1246,16 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 	 * nice) while the request time r_i is determined by
+ 	 * sysctl_sched_base_slice.
+ 	 */
+-	if (!se->custom_slice)
+-		se->slice = sysctl_sched_base_slice;
++	if (!se->custom_slice) {
++		unsigned long nr = cfs_rq->h_nr_runnable;
++#ifdef CONFIG_SCHED_SMT
++		bool smt_sec = cpumask_weight(cpu_smt_mask(smp_processor_id())) > 1 &&
++		      smp_processor_id() != cpumask_first(cpu_smt_mask(smp_processor_id()));
++#else
++		bool smt_sec = false;
++#endif
++		se->slice = infinity_slice(nr, smt_sec);
++	}
+ 
+ 	/*
+ 	 * EEVDF: vd_i = ve_i + r_i / w_i
+@@ -1424,6 +1433,10 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 	if (unlikely(delta_exec <= 0))
+ 		return;
+ 
++	/* Infinity: budget consumption */
++	if (entity_is_task(curr)) { struct task_struct *p__ = task_of(curr);
++		infinity_consume(&p__->infinity, delta_exec); }
++
+ 	curr->vruntime += calc_delta_fair(delta_exec, curr);
+ 	resched = update_deadline(cfs_rq, curr);
+ 
+@@ -5783,6 +5796,8 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq, bool protect)
+ 	struct sched_entity *se;
+ 
+ 	se = pick_eevdf(cfs_rq, protect);
++	if (!se)
++		return NULL;
+ 	if (se->sched_delayed) {
+ 		dequeue_entities(rq, se, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
+ 		/*
+@@ -7198,6 +7213,13 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	struct cfs_rq *cfs_rq;
+ 	struct sched_entity *se = &p->se;
++
++	/* Infinity: reset runtime debt on wakeup */
++	if (flags & ENQUEUE_WAKEUP) {
++		u64 now = rq_clock(rq_of(task_cfs_rq(p)));
++		if (p->infinity.last_sleep_ns && now > p->infinity.last_sleep_ns)
++			infinity_refill_budget(&p->infinity, now - p->infinity.last_sleep_ns);
++		p->infinity.runtime_debt = 0; }
+ 	int h_nr_idle = task_has_idle_policy(p);
+ 	int h_nr_runnable = 1;
+ 	int task_new = !(flags & ENQUEUE_WAKEUP);
+@@ -7430,6 +7452,8 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
+  */
+ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ {
++	/* Infinity: record sleep start */
++	if (flags & DEQUEUE_SLEEP) p->infinity.last_sleep_ns = rq_clock(rq_of(task_cfs_rq(p)));
+ 	if (task_is_throttled(p)) {
+ 		dequeue_throttled_task(p, flags);
+ 		return true;
+@@ -13713,6 +13737,11 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
+  */
+ static void task_fork_fair(struct task_struct *p)
+ {
++	struct rq *rq = this_rq();
++
++	/* Infinity: init child */
++	infinity_fork_init(&p->infinity, rq_clock(rq));
++
+ 	set_task_max_allowed_capacity(p);
+ }
+ 
+diff --git a/kernel/sched/infinity_sched.c b/kernel/sched/infinity_sched.c
+new file mode 100644
+index 000000000..ad9d575eb
+--- /dev/null
++++ b/kernel/sched/infinity_sched.c
+@@ -0,0 +1,442 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
++ *
++ * infinity_sched.c — Infinity scheduler algorithm.
++ *
++ * Accelerating budget consumption:
++ *
++ *   debt = min(runtime_debt + delta_exec, CARRIAGE_NS * CAP)
++ *   rate = 1 + debt / CARRIAGE_NS
++ *   budget -= delta_exec * rate
++ *   runtime_debt = debt
++ *
++ * A freshly woken task has debt = 0, rate = 1 (linear).
++ * As the task runs, debt grows and rate increases — budget depletes
++ * faster the longer the task runs, approaching zero asymptotically.
++ * On wakeup from sleep, debt resets to 0.
++ */
++
++#include <linux/types.h>
++#include <linux/sched.h>
++#include <linux/math64.h>
++#include <linux/sysctl.h>
++#include <linux/workqueue.h>
++#include <linux/delay.h>
++#include "infinity_sched.h"
++
++/* ------------------------------------------------------------------ */
++/* Sysctl tunables with safe clamps                                    */
++/* ------------------------------------------------------------------ */
++
++unsigned long infinity_tune_carriage_ns = INFINITY_CARRIAGE_NS_DEFAULT;
++unsigned long infinity_tune_debt_cap   = INFINITY_DEBT_CAP_DEFAULT;
++unsigned long infinity_tune_refill_div = INFINITY_REFILL_DIV_DEFAULT;
++unsigned long infinity_tune_smt_divisor = INFINITY_SMT_DIVISOR_DEFAULT;
++bool infinity_tune_self_stabilize = true;
++static int infinity_running_flag = 1;
++
++/*
++ * Write-time clamping handlers.
++ * Every tunable write is intercepted, clamped to [MIN, MAX], and stored.
++ * No value outside the safe range can be set — the scheduler can never
++ * enter an invalid state regardless of user input.
++ */
++static int clamp_carriage_ns(const struct ctl_table *table, int write,
++			     void *buf, size_t *lenp, loff_t *ppos)
++{
++	int ret;
++	unsigned long old, val;
++	struct ctl_table tmp = *table;
++
++	old = READ_ONCE(infinity_tune_carriage_ns);
++	val = old;
++	tmp.data = &val;
++	ret = proc_doulongvec_minmax(&tmp, write, buf, lenp, ppos);
++	if (write && ret == 0) {
++		val = clamp(val, INFINITY_CARRIAGE_NS_MIN, INFINITY_CARRIAGE_NS_MAX);
++		if (val != old)
++			pr_info("Infinity: carriage_ns %lu -> %lu\n", old, val);
++		WRITE_ONCE(infinity_tune_carriage_ns, val);
++	}
++	return ret;
++}
++
++static int clamp_debt_cap(const struct ctl_table *table, int write,
++			  void *buf, size_t *lenp, loff_t *ppos)
++{
++	int ret;
++	unsigned long old, val;
++	struct ctl_table tmp = *table;
++
++	old = READ_ONCE(infinity_tune_debt_cap);
++	val = old;
++	tmp.data = &val;
++	ret = proc_doulongvec_minmax(&tmp, write, buf, lenp, ppos);
++	if (write && ret == 0) {
++		val = clamp(val, INFINITY_DEBT_CAP_MIN, INFINITY_DEBT_CAP_MAX);
++		if (val != old)
++			pr_info("Infinity: debt_cap %lu -> %lu\n", old, val);
++		WRITE_ONCE(infinity_tune_debt_cap, val);
++	}
++	return ret;
++}
++
++static int clamp_refill_div(const struct ctl_table *table, int write,
++			    void *buf, size_t *lenp, loff_t *ppos)
++{
++	int ret;
++	unsigned long old, val;
++	struct ctl_table tmp = *table;
++
++	old = READ_ONCE(infinity_tune_refill_div);
++	val = old;
++	tmp.data = &val;
++	ret = proc_doulongvec_minmax(&tmp, write, buf, lenp, ppos);
++	if (write && ret == 0) {
++		val = clamp(val, INFINITY_REFILL_DIV_MIN, INFINITY_REFILL_DIV_MAX);
++		if (val != old)
++			pr_info("Infinity: refill_div %lu -> %lu\n", old, val);
++		WRITE_ONCE(infinity_tune_refill_div, val);
++	}
++	return ret;
++}
++
++static int clamp_smt_divisor(const struct ctl_table *table, int write,
++			     void *buf, size_t *lenp, loff_t *ppos)
++{
++	int ret;
++	unsigned long old, val;
++	struct ctl_table tmp = *table;
++
++	old = READ_ONCE(infinity_tune_smt_divisor);
++	val = old;
++	tmp.data = &val;
++	ret = proc_doulongvec_minmax(&tmp, write, buf, lenp, ppos);
++	if (write && ret == 0) {
++		val = clamp(val, INFINITY_SMT_DIVISOR_MIN, INFINITY_SMT_DIVISOR_MAX);
++		if (val != old)
++			pr_info("Infinity: smt_divisor %lu -> %lu\n", old, val);
++		WRITE_ONCE(infinity_tune_smt_divisor, val);
++	}
++	return ret;
++}
++
++static struct ctl_table infinity_sysctl_table[] = {
++	{
++		.procname	= "infinity_carriage_ns",
++		.data		= &infinity_tune_carriage_ns,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0644,
++		.proc_handler	= clamp_carriage_ns,
++	},
++	{
++		.procname	= "infinity_debt_cap",
++		.data		= &infinity_tune_debt_cap,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0644,
++		.proc_handler	= clamp_debt_cap,
++	},
++	{
++		.procname	= "infinity_refill_div",
++		.data		= &infinity_tune_refill_div,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0644,
++		.proc_handler	= clamp_refill_div,
++	},
++	{
++		.procname	= "infinity_smt_divisor",
++		.data		= &infinity_tune_smt_divisor,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0644,
++		.proc_handler	= clamp_smt_divisor,
++	},
++	{
++		.procname	= "infinity_self_stabilize",
++		.data		= &infinity_tune_self_stabilize,
++		.maxlen		= sizeof(bool),
++		.mode		= 0644,
++		.proc_handler	= proc_dobool,
++	},
++	{
++		.procname	= "infinity_running",
++		.data		= &infinity_running_flag,
++		.maxlen		= sizeof(int),
++		.mode		= 0444,
++		.proc_handler	= proc_dointvec,
++	},
++	{}
++};
++
++static unsigned long infinity_reset_val;
++
++static int reset_handler(const struct ctl_table *table, int write,
++			 void *buf, size_t *lenp, loff_t *ppos)
++{
++	int ret;
++	unsigned long val = 0;
++	struct ctl_table tmp = *table;
++
++	infinity_reset_val = 0;
++	tmp.data = &infinity_reset_val;
++	ret = proc_doulongvec_minmax(&tmp, write, buf, lenp, ppos);
++	if (write && ret == 0 && infinity_reset_val == 1) {
++		WRITE_ONCE(infinity_tune_carriage_ns, INFINITY_CARRIAGE_NS_DEFAULT);
++		WRITE_ONCE(infinity_tune_debt_cap, INFINITY_DEBT_CAP_DEFAULT);
++		WRITE_ONCE(infinity_tune_refill_div, INFINITY_REFILL_DIV_DEFAULT);
++		WRITE_ONCE(infinity_tune_smt_divisor, INFINITY_SMT_DIVISOR_DEFAULT);
++		pr_info("Infinity: reset to default values\n");
++	}
++	return ret;
++}
++
++static struct ctl_table infinity_reset_table[] = {
++	{
++		.procname	= "infinity_reset",
++		.data		= &infinity_reset_val,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0200,
++		.proc_handler	= reset_handler,
++	},
++	{}
++};
++
++/* ------------------------------------------------------------------ */
++/* Per-CPU stats tracking (BSS-preallocated, like scx_flow)           */
++/* ------------------------------------------------------------------ */
++
++#define INFINITY_STATS_WINDOW	16	/* sliding window length */
++
++struct infinity_cpu_stats {
++	/* Ring buffer of recent budget exhaustion counts */
++	u64 budget_exhaustions[INFINITY_STATS_WINDOW];
++	u64 exhaustion_idx;		/* current write index */
++};
++
++static DEFINE_PER_CPU(struct infinity_cpu_stats, infinity_stats);
++
++/* ------------------------------------------------------------------ */
++/* Self-stabilize delayed work                                         */
++/* ------------------------------------------------------------------ */
++
++static struct delayed_work infinity_stabilize_work;
++static unsigned int infinity_stabilize_count;	/* debounce: consecutive high/low readings */
++
++/*
++ * Called from update_curr via the budget exhaustion path.
++ * Thread-safe: bare atomic increment on a per-CPU counter.
++ */
++void infinity_try_stabilize(void)
++{
++	struct infinity_cpu_stats *st = this_cpu_ptr(&infinity_stats);
++
++	st->budget_exhaustions[st->exhaustion_idx % INFINITY_STATS_WINDOW]++;
++	st->exhaustion_idx++;
++}
++
++static void infinity_stabilize_fn(struct work_struct *work)
++{
++	int cpu;
++	u64 total_exhaustion_rate = 0;
++	u64 avg_load = 0;
++	unsigned long carriage, cap, old_carriage, old_cap;
++	int nr_active_cpus = 0;
++	bool adjusted = false;
++
++	if (!READ_ONCE(infinity_tune_self_stabilize))
++		goto reschedule;
++
++	/*
++	 * Aggregate per-CPU metrics over the last window.
++	 * Each CPU tracks its own budget exhaustion rate.
++	 */
++	for_each_online_cpu(cpu) {
++		struct infinity_cpu_stats *st = per_cpu_ptr(&infinity_stats, cpu);
++		u64 n = st->exhaustion_idx;
++		u64 exhaust_window = 0;
++		int i;
++
++		for (i = 0; i < INFINITY_STATS_WINDOW; i++) {
++			u64 idx = (n >= INFINITY_STATS_WINDOW)
++				? (n - INFINITY_STATS_WINDOW + i) % INFINITY_STATS_WINDOW
++				: i;
++			if (idx < INFINITY_STATS_WINDOW)
++				exhaust_window += st->budget_exhaustions[idx];
++		}
++
++		if (exhaust_window > 0) {
++			total_exhaustion_rate += exhaust_window;
++			nr_active_cpus++;
++		}
++	}
++
++	old_carriage = carriage = READ_ONCE(infinity_tune_carriage_ns);
++	old_cap = cap = READ_ONCE(infinity_tune_debt_cap);
++	avg_load = nr_active_cpus > 0 ? total_exhaustion_rate / nr_active_cpus : 0;
++
++	/*
++	 * Debounce: require 2 consecutive readings above/below threshold
++	 * before adjusting.  Adjustments use +12.5% (×9/8 instead of ×5/4)
++	 * to converge slowly over minutes rather than seconds.
++	 *
++	 * Thresholds: high if avg_load > 500 (was 50 — too sensitive).
++	 * With INFINITY_STATS_WINDOW = 16 exhaustions per CPU, 500 means
++	 * ~31 expensive-per-CPU budget events in the window.
++	 */
++	if (avg_load > 500 && carriage < INFINITY_CARRIAGE_NS_MAX) {
++		infinity_stabilize_count++;
++		if (infinity_stabilize_count >= 2) {
++			carriage = min(carriage + carriage / 8, INFINITY_CARRIAGE_NS_MAX);
++			if (cap > INFINITY_DEBT_CAP_MIN)
++				cap = max(cap - cap / 8, (unsigned long)INFINITY_DEBT_CAP_MIN);
++			adjusted = true;
++			infinity_stabilize_count = 0;
++		}
++	} else if (avg_load < 50 && carriage > INFINITY_CARRIAGE_NS_MIN) {
++		infinity_stabilize_count++;
++		if (infinity_stabilize_count >= 2) {
++			carriage = max(carriage - carriage / 8, INFINITY_CARRIAGE_NS_MIN);
++			if (cap < INFINITY_DEBT_CAP_MAX)
++				cap = min(cap + cap / 8, (unsigned long)INFINITY_DEBT_CAP_MAX);
++			adjusted = true;
++			infinity_stabilize_count = 0;
++		}
++	} else {
++		/* Reset debounce counter on in-range reading */
++		infinity_stabilize_count = 0;
++	}
++
++	if (adjusted) {
++		WRITE_ONCE(infinity_tune_carriage_ns, carriage);
++		WRITE_ONCE(infinity_tune_debt_cap, cap);
++		pr_info("Infinity: self-stabilize carriage_ns %lu -> %lu, debt_cap %lu -> %lu\n",
++			old_carriage, carriage, old_cap, cap);
++	}
++
++reschedule:
++	schedule_delayed_work(&infinity_stabilize_work, msecs_to_jiffies(2000));
++}
++
++/* ------------------------------------------------------------------ */
++/* Initialization                                                      */
++/* ------------------------------------------------------------------ */
++
++static int __init infinity_sched_init(void)
++{
++	/* Register sysctl table under kernel/ (matching BORE's approach).
++	 * Note: we call __register_sysctl_init() directly instead of the
++	 * register_sysctl_init() macro, because the macro computes ARRAY_SIZE
++	 * which counts the sentinel {} entry.  Kernel 7.0.12's sysctl_check_table
++	 * iterates all entries including the sentinel and rejects it (null procname).
++	 * We pass ARRAY_SIZE - 1 to exclude the sentinel from validation.
++	 */
++	__register_sysctl_init("kernel", infinity_sysctl_table,
++			      "infinity_sysctl_table",
++			      ARRAY_SIZE(infinity_sysctl_table) - 1);
++	__register_sysctl_init("kernel", infinity_reset_table,
++			      "infinity_reset_table",
++			      ARRAY_SIZE(infinity_reset_table) - 1);
++
++	/* Initialize self-stabilize workqueue */
++	INIT_DELAYED_WORK(&infinity_stabilize_work, infinity_stabilize_fn);
++	schedule_delayed_work(&infinity_stabilize_work, msecs_to_jiffies(2000));
++
++	pr_info("Infinity scheduler active: carriage=%lu ns, debt_cap=%lu, refill_div=%lu, smt_divisor=%lu\n",
++		infinity_tune_carriage_ns, infinity_tune_debt_cap,
++		infinity_tune_refill_div, infinity_tune_smt_divisor);
++
++	return 0;
++}
++
++/*
++ * Called during late init, after the sysctl and procfs infrastructures
++ * are guaranteed to be available for creating new subdirectories.
++ */
++late_initcall(infinity_sched_init);
++
++/* ------------------------------------------------------------------ */
++/* infinity_slice                                                      */
++/* ------------------------------------------------------------------ */
++
++u64 infinity_slice(unsigned long nr_runnable, bool on_smt_secondary)
++{
++	u64 slice;
++
++	if (nr_runnable == 0)
++		nr_runnable = 1;
++
++	slice = READ_ONCE(infinity_tune_carriage_ns) / nr_runnable;
++
++	if (slice < INFINITY_SLICE_MIN_NS)
++		slice = INFINITY_SLICE_MIN_NS;
++	if (slice > INFINITY_BUDGET_MAX_NS)
++		slice = INFINITY_BUDGET_MAX_NS;
++
++	if (on_smt_secondary) {
++		unsigned long div = READ_ONCE(infinity_tune_smt_divisor);
++		if (div > 1)
++			slice = div64_u64(slice, div);
++	}
++
++	return slice;
++}
++
++/* ------------------------------------------------------------------ */
++/* infinity_consume — accelerating budget consumption                  */
++/* ------------------------------------------------------------------ */
++
++void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns)
++{
++	u64 debt, rate, cap, carriage, prev;
++	u64 consumption;
++
++	carriage = READ_ONCE(infinity_tune_carriage_ns);
++	cap = READ_ONCE(infinity_tune_debt_cap);
++
++	prev = ctx->budget_ns;
++	debt = min(ctx->runtime_debt + delta_ns, carriage * cap);
++	rate = 1 + div64_u64(debt, carriage);
++	consumption = delta_ns * rate;
++	ctx->budget_ns = infinity_clamp_budget(ctx->budget_ns - (s64)consumption);
++	ctx->runtime_debt = debt;
++
++	/* Track budget exhaustion for self-stabilize feedback */
++	if (prev > 0 && ctx->budget_ns <= 0)
++		infinity_try_stabilize();
++}
++
++/* ------------------------------------------------------------------ */
++/* infinity_refill_budget                                             */
++/* ------------------------------------------------------------------ */
++
++void infinity_refill_budget(struct infinity_ctx *ctx, u64 sleep_ns)
++{
++	u64 refill_div;
++	s64 refill_ns;
++
++	refill_div = READ_ONCE(infinity_tune_refill_div);
++
++	if (sleep_ns > INFINITY_SLEEP_MAX_NS)
++		sleep_ns = INFINITY_SLEEP_MAX_NS;
++
++	refill_ns = (s64)(sleep_ns / refill_div);
++
++	/* Interactive tasks that sleep briefly get a minimum refill floor. */
++	if (sleep_ns >= INFINITY_INTERACTIVE_SLEEP_MIN_NS &&
++	    refill_ns < (s64)INFINITY_INTERACTIVE_FLOOR_NS)
++		refill_ns = (s64)INFINITY_INTERACTIVE_FLOOR_NS;
++
++	ctx->budget_ns = infinity_clamp_budget(ctx->budget_ns + refill_ns);
++}
++
++/* ------------------------------------------------------------------ */
++/* infinity_fork_init                                                 */
++/* ------------------------------------------------------------------ */
++
++void infinity_fork_init(struct infinity_ctx *ctx, u64 now)
++{
++	ctx->budget_ns = INFINITY_INIT_BUDGET_NS;
++	ctx->runtime_debt = 0;
++	ctx->last_sleep_ns = now;
++	ctx->fork_time_ns = now;
++}
+diff --git a/kernel/sched/infinity_sched.h b/kernel/sched/infinity_sched.h
+new file mode 100644
+index 000000000..7afaac141
+--- /dev/null
++++ b/kernel/sched/infinity_sched.h
+@@ -0,0 +1,127 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
++ *
++ * infinity_sched.h — Infinity scheduler API.
++ *
++ * Architecture:
++ *
++ *   fair.c (EEVDF framework)           infinity_sched.c (Infinity algorithm)
++ *   ────────────────────────           ─────────────────────────────────────
++ *   update_deadline()       ──call──► infinity_slice()        — fair-share slice
++ *   update_curr()           ──call──► infinity_consume()      — accelerating budget consumption
++ *   enqueue_task_fair()     ──call──► (resets runtime_debt)   — wakeup reset
++ *   dequeue_task_fair()     ──call──► (records last_sleep_ns) — sleep tracking
++ *   task_fork_fair()        ──call──► infinity_fork_init()    — fork init
++ *   init/init_task.c        ──init──► infinity.{}             — static init
++ *
++ * Tunables (sysctl kernel.infinity_*):
++ *   infinity_carriage_ns   — base fair-share window (default 2ms)
++ *   infinity_debt_cap      — runtime debt cap multiplier (default 256x)
++ *   infinity_refill_div    — budget refill divisor (default 100)
++ *   infinity_smt_divisor   — SMT secondary slice divisor (default 2)
++ *   infinity_self_stabilize — automatic tuning (default 1)
++ *   infinity_running       — read-only flag, 1 if active
++ *
++ * Self-stabilize mode: when enabled, a feedback loop monitors per-CPU
++ * scheduling metrics and adjusts tunables within safe clamped ranges.
++ * The mathematical bounds guarantee the scheduler can never enter an
++ * unstable state — any value within the clamp range produces valid
++ * behavior, just with different throughput/latency trade-offs.
++ */
++
++#ifndef __INFINITY_SCHED_H
++#define __INFINITY_SCHED_H
++
++#include <linux/sched.h>
++
++/* ------------------------------------------------------------------ */
++/* Tunable defaults                                                    */
++/* ------------------------------------------------------------------ */
++
++/** Base fair-share window (2ms). */
++#define INFINITY_CARRIAGE_NS_DEFAULT	2000000ULL
++
++/** Runtime debt cap multiplier (256x). */
++#define INFINITY_DEBT_CAP_DEFAULT	256
++
++/** Budget refill divisor (100). */
++#define INFINITY_REFILL_DIV_DEFAULT	100
++
++/** SMT secondary slice divisor (2 = half slice). */
++#define INFINITY_SMT_DIVISOR_DEFAULT	2
++
++/* ------------------------------------------------------------------ */
++/* Clamp bounds                                                        */
++/* ------------------------------------------------------------------ */
++
++#define INFINITY_CARRIAGE_NS_MIN	1000ULL
++#define INFINITY_CARRIAGE_NS_MAX	100000000ULL	/* 100ms */
++
++#define INFINITY_DEBT_CAP_MIN		1
++#define INFINITY_DEBT_CAP_MAX		4096
++
++#define INFINITY_REFILL_DIV_MIN		1
++#define INFINITY_REFILL_DIV_MAX		65536
++
++#define INFINITY_SMT_DIVISOR_MIN	1
++#define INFINITY_SMT_DIVISOR_MAX	16
++
++/* ------------------------------------------------------------------ */
++/* Hard constants (not user-tunable)                                   */
++/* ------------------------------------------------------------------ */
++
++/** Minimum slice floor (500us). */
++#define INFINITY_SLICE_MIN_NS		500000ULL
++
++/** Budget clamp bounds. */
++#define INFINITY_BUDGET_MAX_NS		2000000ULL
++#define INFINITY_BUDGET_MIN_NS		500000ULL
++
++/** Sleep threshold for interactive floor (750us). */
++#define INFINITY_INTERACTIVE_SLEEP_MIN_NS	750000ULL
++
++/** Minimum budget refill for interactive tasks (100us). */
++#define INFINITY_INTERACTIVE_FLOOR_NS	100000ULL
++
++/** Maximum sleep time accounted for refill calculation (250ms). */
++#define INFINITY_SLEEP_MAX_NS		250000000ULL
++
++/** Initial budget for newly forked tasks (one minimum slice). */
++#define INFINITY_INIT_BUDGET_NS		INFINITY_SLICE_MIN_NS
++
++/* ------------------------------------------------------------------ */
++/* External sysctl tunables                                            */
++/* ------------------------------------------------------------------ */
++
++extern unsigned long infinity_tune_carriage_ns;
++extern unsigned long infinity_tune_debt_cap;
++extern unsigned long infinity_tune_refill_div;
++extern unsigned long infinity_tune_smt_divisor;
++extern bool infinity_tune_self_stabilize;
++
++/* ------------------------------------------------------------------ */
++/* API — called from fair.c                                           */
++/* ------------------------------------------------------------------ */
++
++u64 infinity_slice(unsigned long nr_runnable, bool on_smt_secondary);
++void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns);
++void infinity_refill_budget(struct infinity_ctx *ctx, u64 sleep_ns);
++void infinity_fork_init(struct infinity_ctx *ctx, u64 now);
++
++/**
++ * infinity_try_stabilize — update budget exhaustion stat.
++ * Called from infinity_consume() when a task's budget drops to zero.
++ */
++void infinity_try_stabilize(void);
++
++static inline s64 infinity_clamp_budget(s64 b)
++{
++	if (b > (s64)INFINITY_BUDGET_MAX_NS)
++		return INFINITY_BUDGET_MAX_NS;
++	if (b < -(s64)INFINITY_BUDGET_MIN_NS)
++		return -(s64)INFINITY_BUDGET_MIN_NS;
++	return b;
++}
++
++#endif /* __INFINITY_SCHED_H */
+-- 
+2.54.0
+
