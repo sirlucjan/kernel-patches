@@ -1,0 +1,1387 @@
+From 1e2337ff03d6d1e2766978ec6a5be135cec8c866 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:14 +0800
+Subject: [PATCH 01/14] smp: Disable preemption explicitly in __csd_lock_wait()
+
+The latter patches will enable preemption before csd_lock_wait(), which
+could break csdlock_debug. Because the slice of other tasks on the CPU may
+be accounted between ktime_get_mono_fast_ns() calls, disable preemption
+explicitly in __csd_lock_wait(). This is a preparation for the next
+patches.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Acked-by: Muchun Song <muchun.song@linux.dev>
+Reviewed-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/smp.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index a0bb56bd8..b58975480 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -323,6 +323,8 @@ static void __csd_lock_wait(call_single_data_t *csd)
+ 	int bug_id = 0;
+ 	u64 ts0, ts1;
+ 
++	guard(preempt)();
++
+ 	ts1 = ts0 = ktime_get_mono_fast_ns();
+ 	for (;;) {
+ 		if (csd_lock_wait_toolong(csd, ts0, &ts1, &bug_id, &nmessages))
+-- 
+2.54.0
+
+
+From 43194bde6c104a16612469e621817dd084dfa506 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:15 +0800
+Subject: [PATCH 02/14] smp: Enable preemption early in
+ smp_call_function_single()
+
+Now smp_call_function_single() disables preemption mainly for the following
+reasons:
+
+- To protect the per-cpu csd_data from concurrent modification by other
+tasks on the current CPU in the !wait case. For the wait case,
+synchronization is not a concern as on-stack csd is used.
+
+- To prevent the remote online CPU from being offlined. Specifically, we
+want to ensure that no new IPIs are queued after smpcfd_dying_cpu() has
+finished.
+
+Disabling preemption for the entire execution is unnecessary, especially
+csd_lock_wait() part does not require preemption protection. This patch
+enables preemption before csd_lock_wait() to reduce the preemption-disabled
+critical section.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Muchun Song <muchun.song@linux.dev>
+Reviewed-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/smp.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index b58975480..292eefadd 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -700,11 +700,16 @@ int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
+ 
+ 	err = generic_exec_single(cpu, csd);
+ 
++	/*
++	 * @csd is stack-allocated when @wait is true. No concurrent access
++	 * except from the IPI completion path, so we can re-enable preemption
++	 * early to reduce latency.
++	 */
++	put_cpu();
++
+ 	if (wait)
+ 		csd_lock_wait(csd);
+ 
+-	put_cpu();
+-
+ 	return err;
+ }
+ EXPORT_SYMBOL(smp_call_function_single);
+-- 
+2.54.0
+
+
+From 8a94e3b786d192e81bac641cd2e8e9e89376660b Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:16 +0800
+Subject: [PATCH 03/14] smp: Refactor remote CPU selection in
+ smp_call_function_any()
+
+Currently, smp_call_function_any() disables preemption across the entire
+process of picking a target CPU, enqueueing the IPI, and synchronously
+waiting for the remote CPU. Since smp_call_function_single() has already
+been optimized to re-enable preemption before the synchronous
+csd_lock_wait(), callers of smp_call_function_any() should also benefit
+from this optimization to reduce the preemption-disabled critical section.
+
+A naive approach would be to simply remove get_cpu() and put_cpu() from
+smp_call_function_any(), leaving the preemption disablement entirely to
+smp_call_function_single(). However, doing so opens a dangerous
+preemption window between picking the remote CPU (e.g., via
+sched_numa_find_nth_cpu()) and dispatching the IPI inside
+smp_call_function_single(). If the selected remote CPU is fully offlined
+during this window, smp_call_function_single() will fail its
+cpu_online() check and return -ENXIO directly to the caller, violating
+the guarantee to execute on *any* online CPU in the mask.
+
+To safely enable this optimization, this patch refactors the logic of
+smp_call_function_any() and smp_call_function_single(). By moving the
+random remote CPU selection into a common __smp_call_function_single(),
+and keep the entire selection and IPI dispatch process within a single
+preemption-disabled region.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/smp.c | 48 ++++++++++++++++++++++++++----------------------
+ 1 file changed, 26 insertions(+), 22 deletions(-)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 292eefadd..9e9dab3b0 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -641,17 +641,8 @@ void flush_smp_call_function_queue(void)
+ 	local_irq_restore(flags);
+ }
+ 
+-/**
+- * smp_call_function_single - Run a function on a specific CPU
+- * @cpu: Specific target CPU for this function.
+- * @func: The function to run. This must be fast and non-blocking.
+- * @info: An arbitrary pointer to pass to the function.
+- * @wait: If true, wait until function has completed on other CPUs.
+- *
+- * Returns: %0 on success, else a negative status code.
+- */
+-int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
+-			     int wait)
++static int __smp_call_function_single(int cpu, smp_call_func_t func,
++			void *info, const struct cpumask *mask, int wait)
+ {
+ 	call_single_data_t *csd;
+ 	call_single_data_t csd_stack = {
+@@ -668,6 +659,14 @@ int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
+ 	 */
+ 	this_cpu = get_cpu();
+ 
++	if (mask) {
++		/* Try for same CPU (cheapest) */
++		if (!cpumask_test_cpu(this_cpu, mask))
++			cpu = sched_numa_find_nth_cpu(mask, 0, cpu_to_node(this_cpu));
++		else
++			cpu = this_cpu;
++	}
++
+ 	/*
+ 	 * Can deadlock when called with interrupts disabled.
+ 	 * We allow cpu's that are not yet online though, as no one else can
+@@ -712,6 +711,21 @@ int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
+ 
+ 	return err;
+ }
++
++/**
++ * smp_call_function_single - Run a function on a specific CPU
++ * @cpu: Specific target CPU for this function.
++ * @func: The function to run. This must be fast and non-blocking.
++ * @info: An arbitrary pointer to pass to the function.
++ * @wait: If true, wait until function has completed on other CPUs.
++ *
++ * Returns: %0 on success, else a negative status code.
++ */
++int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
++			     int wait)
++{
++	return __smp_call_function_single(cpu, func, info, NULL, wait);
++}
+ EXPORT_SYMBOL(smp_call_function_single);
+ 
+ /**
+@@ -776,17 +790,7 @@ EXPORT_SYMBOL_GPL(smp_call_function_single_async);
+ int smp_call_function_any(const struct cpumask *mask,
+ 			  smp_call_func_t func, void *info, int wait)
+ {
+-	unsigned int cpu;
+-	int ret;
+-
+-	/* Try for same CPU (cheapest) */
+-	cpu = get_cpu();
+-	if (!cpumask_test_cpu(cpu, mask))
+-		cpu = sched_numa_find_nth_cpu(mask, 0, cpu_to_node(cpu));
+-
+-	ret = smp_call_function_single(cpu, func, info, wait);
+-	put_cpu();
+-	return ret;
++	return __smp_call_function_single(-1, func, info, mask, wait);
+ }
+ EXPORT_SYMBOL_GPL(smp_call_function_any);
+ 
+-- 
+2.54.0
+
+
+From 2bd8ef06d056ae2bdab6fbe0d90bb35c2b672c57 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:17 +0800
+Subject: [PATCH 04/14] smp: Use task-local IPI cpumask in
+ smp_call_function_many_cond()
+
+This patch prepares the task-local IPI cpumask during thread creation, and
+uses the local cpumask to replace the percpu cfd cpumask in
+smp_call_function_many_cond(). We will enable preemption during
+csd_lock_wait() later, and this can prevent concurrent access to the
+cfd->cpumask from other tasks on the current CPU. For cases where
+cpumask_size() is smaller than or equal to the pointer size, it tries to
+stash the cpumask in the pointer itself to avoid extra memory allocations.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ include/linux/sched.h |  6 ++++
+ include/linux/smp.h   | 11 ++++++++
+ kernel/fork.c         |  9 +++++-
+ kernel/smp.c          | 66 +++++++++++++++++++++++++++++++++++++++----
+ 4 files changed, 85 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 373bcc059..eefef9035 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1359,6 +1359,12 @@ struct task_struct {
+ 	struct list_head		perf_event_list;
+ 	struct perf_ctx_data __rcu	*perf_ctx_data;
+ #endif
++#if defined(CONFIG_SMP) && defined(CONFIG_PREEMPTION)
++	union {
++		cpumask_t                       *ipi_mask_ptr;
++		unsigned long			ipi_mask_val;
++	};
++#endif
+ #ifdef CONFIG_DEBUG_PREEMPT
+ 	unsigned long			preempt_disable_ip;
+ #endif
+diff --git a/include/linux/smp.h b/include/linux/smp.h
+index 6925d15cc..15da88411 100644
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@ -239,6 +239,17 @@ static inline int get_boot_cpu_id(void)
+ 
+ #endif /* !SMP */
+ 
++#if defined(CONFIG_PREEMPTION) && defined(CONFIG_SMP)
++int smp_task_ipi_mask_alloc(struct task_struct *task);
++void smp_task_ipi_mask_free(struct task_struct *task);
++#else
++static inline int smp_task_ipi_mask_alloc(struct task_struct *task)
++{
++	return 0;
++}
++static inline void smp_task_ipi_mask_free(struct task_struct *task) { }
++#endif
++
+ /*
+  * raw_smp_processor_id() - get the current (unstable) CPU id
+  *
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 13e38e89a..ac3fc49d9 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -537,6 +537,7 @@ void free_task(struct task_struct *tsk)
+ #endif
+ 	release_user_cpus_ptr(tsk);
+ 	scs_release(tsk);
++	smp_task_ipi_mask_free(tsk);
+ 
+ #ifndef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -935,10 +936,14 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ #endif
+ 	account_kernel_stack(tsk, 1);
+ 
+-	err = scs_prepare(tsk, node);
++	err = smp_task_ipi_mask_alloc(tsk);
+ 	if (err)
+ 		goto free_stack;
+ 
++	err = scs_prepare(tsk, node);
++	if (err)
++		goto free_ipi_mask;
++
+ #ifdef CONFIG_SECCOMP
+ 	/*
+ 	 * We must handle setting up seccomp filters once we're under
+@@ -1011,6 +1016,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ #endif
+ 	return tsk;
+ 
++free_ipi_mask:
++	smp_task_ipi_mask_free(tsk);
+ free_stack:
+ 	exit_task_stack_account(tsk);
+ 	free_thread_stack(tsk);
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 9e9dab3b0..8f8a9ee2a 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -16,6 +16,7 @@
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/gfp.h>
++#include <linux/slab.h>
+ #include <linux/smp.h>
+ #include <linux/cpu.h>
+ #include <linux/sched.h>
+@@ -794,6 +795,49 @@ int smp_call_function_any(const struct cpumask *mask,
+ }
+ EXPORT_SYMBOL_GPL(smp_call_function_any);
+ 
++static DEFINE_STATIC_KEY_FALSE(ipi_mask_inlined);
++
++#ifdef CONFIG_PREEMPTION
++
++int smp_task_ipi_mask_alloc(struct task_struct *task)
++{
++	if (static_branch_unlikely(&ipi_mask_inlined))
++		return 0;
++
++	task->ipi_mask_ptr = kmalloc(cpumask_size(), GFP_KERNEL);
++	if (!task->ipi_mask_ptr)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void smp_task_ipi_mask_free(struct task_struct *task)
++{
++	if (static_branch_unlikely(&ipi_mask_inlined))
++		return;
++
++	kfree(task->ipi_mask_ptr);
++}
++
++static cpumask_t *smp_task_ipi_mask(struct task_struct *cur)
++{
++	/*
++	 * If cpumask_size() is smaller than or equal to the pointer
++	 * size, it stashes the cpumask in the pointer itself to
++	 * avoid extra memory allocations.
++	 */
++	if (static_branch_unlikely(&ipi_mask_inlined))
++		return (cpumask_t *)&cur->ipi_mask_val;
++
++	return cur->ipi_mask_ptr;
++}
++#else
++static cpumask_t *smp_task_ipi_mask(struct task_struct *cur)
++{
++	return NULL;
++}
++#endif
++
+ /*
+  * Flags to be used as scf_flags argument of smp_call_function_many_cond().
+  *
+@@ -811,11 +855,19 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 	int cpu, last_cpu, this_cpu = smp_processor_id();
+ 	struct call_function_data *cfd;
+ 	bool wait = scf_flags & SCF_WAIT;
++	struct cpumask *cpumask, *task_mask;
+ 	int nr_cpus = 0;
+ 	bool run_remote = false;
+ 
+ 	lockdep_assert_preemption_disabled();
+ 
++	task_mask = smp_task_ipi_mask(current);
++	cfd = this_cpu_ptr(&cfd_data);
++	if (task_mask)
++		cpumask = task_mask;
++	else
++		cpumask = cfd->cpumask;
++
+ 	/*
+ 	 * Can deadlock when called with interrupts disabled.
+ 	 * We allow cpu's that are not yet online though, as no one else can
+@@ -836,16 +888,15 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 
+ 	/* Check if we need remote execution, i.e., any CPU excluding this one. */
+ 	if (cpumask_any_and_but(mask, cpu_online_mask, this_cpu) < nr_cpu_ids) {
+-		cfd = this_cpu_ptr(&cfd_data);
+-		cpumask_and(cfd->cpumask, mask, cpu_online_mask);
+-		__cpumask_clear_cpu(this_cpu, cfd->cpumask);
++		cpumask_and(cpumask, mask, cpu_online_mask);
++		__cpumask_clear_cpu(this_cpu, cpumask);
+ 
+ 		cpumask_clear(cfd->cpumask_ipi);
+-		for_each_cpu(cpu, cfd->cpumask) {
++		for_each_cpu(cpu, cpumask) {
+ 			call_single_data_t *csd = per_cpu_ptr(cfd->csd, cpu);
+ 
+ 			if (cond_func && !cond_func(cpu, info)) {
+-				__cpumask_clear_cpu(cpu, cfd->cpumask);
++				__cpumask_clear_cpu(cpu, cpumask);
+ 				continue;
+ 			}
+ 
+@@ -896,7 +947,7 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 	}
+ 
+ 	if (run_remote && wait) {
+-		for_each_cpu(cpu, cfd->cpumask) {
++		for_each_cpu(cpu, cpumask) {
+ 			call_single_data_t *csd;
+ 
+ 			csd = per_cpu_ptr(cfd->csd, cpu);
+@@ -1010,6 +1061,9 @@ EXPORT_SYMBOL(nr_cpu_ids);
+ void __init setup_nr_cpu_ids(void)
+ {
+ 	set_nr_cpu_ids(find_last_bit(cpumask_bits(cpu_possible_mask), NR_CPUS) + 1);
++
++	if (IS_ENABLED(CONFIG_PREEMPTION) && cpumask_size() <= sizeof(unsigned long))
++		static_branch_enable(&ipi_mask_inlined);
+ }
+ 
+ /* Called by boot processor to activate the rest. */
+-- 
+2.54.0
+
+
+From 7883992f440231429fd7fee0227c2e1178aaee68 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:18 +0800
+Subject: [PATCH 05/14] smp: Alloc percpu csd data in smpcfd_prepare_cpu() only
+ once
+
+Later patch would enable preemption during csd_lock_wait() in
+smp_call_function_many_cond(), which may cause access cfd->csd data that
+has already been freed in smpcfd_dead_cpu().
+
+One way to fix the above issue is to use the RCU mechanism to protect the
+csd data and wait for all read critical sections to exit before freeing
+the memory in smpcfd_dead_cpu(), but this could delay CPU shutdown. This
+patch chooses a simpler approach: allocate the percpu csd on the UP side
+only once and skip freeing the csd memory in smpcfd_dead_cpu().
+
+Suggested-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Acked-by: Muchun Song <muchun.song@linux.dev>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/smp.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 8f8a9ee2a..9ef136bac 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -64,7 +64,15 @@ int smpcfd_prepare_cpu(unsigned int cpu)
+ 		free_cpumask_var(cfd->cpumask);
+ 		return -ENOMEM;
+ 	}
+-	cfd->csd = alloc_percpu(call_single_data_t);
++
++	/*
++	 * The percpu csd is allocated only once and never freed.
++	 * This ensures that smp_call_function_many_cond() can safely
++	 * access the csd of an offlined CPU if it gets preempted
++	 * during csd_lock_wait().
++	 */
++	if (!cfd->csd)
++		cfd->csd = alloc_percpu(call_single_data_t);
+ 	if (!cfd->csd) {
+ 		free_cpumask_var(cfd->cpumask);
+ 		free_cpumask_var(cfd->cpumask_ipi);
+@@ -80,7 +88,6 @@ int smpcfd_dead_cpu(unsigned int cpu)
+ 
+ 	free_cpumask_var(cfd->cpumask);
+ 	free_cpumask_var(cfd->cpumask_ipi);
+-	free_percpu(cfd->csd);
+ 	return 0;
+ }
+ 
+-- 
+2.54.0
+
+
+From 47e4c06c37e12edbfa4e7c90a6b3186d2fa54765 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:19 +0800
+Subject: [PATCH 06/14] smp: Enable preemption early in
+ smp_call_function_many_cond()
+
+Disabling preemption entirely during smp_call_function_many_cond() was
+primarily for the following reasons:
+
+- To prevent the remote online CPU from going offline. Specifically, we
+want to ensure that no new csds are queued after smpcfd_dying_cpu() has
+finished. Therefore, preemption must be disabled until all necessary IPIs
+are sent.
+
+- To prevent current CPU from going offline. Being migrated to another CPU
+and calling csd_lock_wait() may cause UAF due to smpcfd_dead_cpu() during
+the current CPU offline process.
+
+- To protect the per-cpu cfd_data from concurrent modification by other
+tasks on the current CPU. cfd_data contains cpumasks and per-cpu csds.
+Before enqueueing a csd, we block on the csd_lock() to ensure the
+previous async csd->func() has completed, and then initialize csd->func and
+csd->info. After sending the IPI, we spin-wait for the remote CPU to call
+csd_unlock(). Actually the csd_lock mechanism already guarantees csd
+serialization. If preemption occurs during csd_lock_wait, other concurrent
+smp_call_function_many_cond calls will simply block until the previous
+csd->func() completes:
+
+task A                    task B
+
+sd->func = fun_a
+send ipis
+
+                preempted by B
+               --------------->
+                        csd_lock(csd); // block until last
+                                       // fun_a finished
+
+                        csd->func = func_b;
+                        csd->info = info;
+                            ...
+                        send ipis
+
+                switch back to A
+                <---------------
+
+csd_lock_wait(csd); // block until remote finish func_*
+
+Previous patches replaced the per-cpu cfd->cpumask with task-local cpumask,
+and the percpu csd is allocated only once and is never freed to ensure
+we can safely access csd. Now we can enable preemption before
+csd_lock_wait() which makes the potentially unpredictable csd_lock_wait()
+preemptible and migratable.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/smp.c | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 9ef136bac..390e65265 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -859,15 +859,14 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 					unsigned int scf_flags,
+ 					smp_cond_func_t cond_func)
+ {
+-	int cpu, last_cpu, this_cpu = smp_processor_id();
++	int cpu, last_cpu, this_cpu;
+ 	struct call_function_data *cfd;
+ 	bool wait = scf_flags & SCF_WAIT;
+ 	struct cpumask *cpumask, *task_mask;
+ 	int nr_cpus = 0;
+ 	bool run_remote = false;
+ 
+-	lockdep_assert_preemption_disabled();
+-
++	this_cpu = get_cpu();
+ 	task_mask = smp_task_ipi_mask(current);
+ 	cfd = this_cpu_ptr(&cfd_data);
+ 	if (task_mask)
+@@ -953,6 +952,17 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 		local_irq_restore(flags);
+ 	}
+ 
++	/*
++	 * Waiting for completion can take time, especially with many CPUs.
++	 * On a PREEMPT kernel a per-task cpumask is used to track CPUs with
++	 * pending IPI requests. This allows preemption to be enabled before
++	 * waiting. On a !PREEMPT kernel the cpumask is shared and the call
++	 * must block until completion to avoid modifications by another caller
++	 * on this CPU.
++	 */
++	if (task_mask)
++		put_cpu();
++
+ 	if (run_remote && wait) {
+ 		for_each_cpu(cpu, cpumask) {
+ 			call_single_data_t *csd;
+@@ -961,6 +971,9 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 			csd_lock_wait(csd);
+ 		}
+ 	}
++
++	if (!task_mask)
++		put_cpu();
+ }
+ 
+ /**
+@@ -972,8 +985,7 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+  *        on other CPUs.
+  *
+  * You must not call this function with disabled interrupts or from a
+- * hardware interrupt handler or from a bottom half handler. Preemption
+- * must be disabled when calling this function.
++ * hardware interrupt handler or from a bottom half handler.
+  *
+  * @func is not called on the local CPU even if @mask contains it.  Consider
+  * using on_each_cpu_cond_mask() instead if this is not desirable.
+-- 
+2.54.0
+
+
+From 88073e24336dd403bfed0655003b3d4dae0017b2 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:20 +0800
+Subject: [PATCH 07/14] smp: Remove preempt_disable() from smp_call_function()
+
+Now smp_call_function_many_cond() internally handles the preemption logic,
+so smp_call_function() does not need to explicitly disable preemption.
+Remove preempt_{enable, disable} from smp_call_function().
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Muchun Song <muchun.song@linux.dev>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/smp.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 390e65265..096d857dc 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -1012,9 +1012,8 @@ EXPORT_SYMBOL(smp_call_function_many);
+  */
+ void smp_call_function(smp_call_func_t func, void *info, int wait)
+ {
+-	preempt_disable();
+-	smp_call_function_many(cpu_online_mask, func, info, wait);
+-	preempt_enable();
++	smp_call_function_many_cond(cpu_online_mask, func, info,
++			wait ? SCF_WAIT : 0, NULL);
+ }
+ EXPORT_SYMBOL(smp_call_function);
+ 
+-- 
+2.54.0
+
+
+From a5b620574a5bd21e696933ffa5ec93ab5d838338 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:21 +0800
+Subject: [PATCH 08/14] smp: Remove preempt_disable() from
+ on_each_cpu_cond_mask()
+
+Now smp_call_function_many_cond() internally handles the preemption logic,
+so on_each_cpu_cond_mask does not need to explicitly disable preemption.
+Remove preempt_{enable, disable} from on_each_cpu_cond_mask().
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Muchun Song <muchun.song@linux.dev>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/smp.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 096d857dc..0595e0043 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -1136,9 +1136,7 @@ void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
+ 	if (wait)
+ 		scf_flags |= SCF_WAIT;
+ 
+-	preempt_disable();
+ 	smp_call_function_many_cond(mask, func, info, scf_flags, cond_func);
+-	preempt_enable();
+ }
+ EXPORT_SYMBOL(on_each_cpu_cond_mask);
+ 
+-- 
+2.54.0
+
+
+From 26a384757a8f05af3859bb89bc3253223057deab Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:22 +0800
+Subject: [PATCH 09/14] scftorture: Remove preempt_disable() in
+ scftorture_invoke_one()
+
+Previous patches make smp_call*() functions handle preemption logic
+internally. Thus, the explicit preempt_disable() surrounding these calls
+becomes unnecessary. Furthermore, keeping the external preempt_disable()
+would prevent scftorture from exercising the newly narrowed internal
+preemption-disabled regions during IPI dispatch. This patch removes
+the preempt_{enable, disable} pairs in scftorture_invoke_one().
+
+Removing this preemption protection could expose a race condition with
+CPU hotplug when use_cpus_read_lock is false. Specifically, for
+multi-cast operations (SCF_PRIM_MANY or SCF_PRIM_ALL), if only 1 CPU is
+online, smp_call_function_many() correctly skips sending IPIs and leaves
+scfc_out as false. Without preemption disabled, a CPU hotplug thread
+could preempt the test thread, bring a second CPU online, and increment
+num_online_cpus(). When the test thread resumes, the validation check
+would see num_online_cpus() > 1 and falsely trigger the memory-ordering
+warning, leaking the scfcp structure.
+
+To avoid this potential false positive, restrict the num_online_cpus() > 1
+condition to only apply when use_cpus_read_lock is true, ensuring the CPU
+count remains stable during evaluation.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ kernel/scftorture.c | 13 ++++---------
+ 1 file changed, 4 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/scftorture.c b/kernel/scftorture.c
+index 327c315f4..2082f9b44 100644
+--- a/kernel/scftorture.c
++++ b/kernel/scftorture.c
+@@ -348,6 +348,8 @@ static void scftorture_invoke_one(struct scf_statistics *scfp, struct torture_ra
+ 	int ret = 0;
+ 	struct scf_check *scfcp = NULL;
+ 	struct scf_selector *scfsp = scf_sel_rand(trsp);
++	bool is_single = (scfsp->scfs_prim == SCF_PRIM_SINGLE ||
++			  scfsp->scfs_prim == SCF_PRIM_SINGLE_RPC);
+ 
+ 	if (scfsp->scfs_prim == SCF_PRIM_SINGLE || scfsp->scfs_wait) {
+ 		scfcp = kmalloc_obj(*scfcp, GFP_ATOMIC);
+@@ -364,8 +366,6 @@ static void scftorture_invoke_one(struct scf_statistics *scfp, struct torture_ra
+ 	}
+ 	if (use_cpus_read_lock)
+ 		cpus_read_lock();
+-	else
+-		preempt_disable();
+ 	switch (scfsp->scfs_prim) {
+ 	case SCF_PRIM_RESCHED:
+ 		if (IS_BUILTIN(CONFIG_SCF_TORTURE_TEST)) {
+@@ -411,13 +411,10 @@ static void scftorture_invoke_one(struct scf_statistics *scfp, struct torture_ra
+ 		if (!ret) {
+ 			if (use_cpus_read_lock)
+ 				cpus_read_unlock();
+-			else
+-				preempt_enable();
++
+ 			wait_for_completion(&scfcp->scfc_completion);
+ 			if (use_cpus_read_lock)
+ 				cpus_read_lock();
+-			else
+-				preempt_disable();
+ 		} else {
+ 			scfp->n_single_rpc_ofl++;
+ 			scf_add_to_free_list(scfcp);
+@@ -452,7 +449,7 @@ static void scftorture_invoke_one(struct scf_statistics *scfp, struct torture_ra
+ 			scfcp->scfc_out = true;
+ 	}
+ 	if (scfcp && scfsp->scfs_wait) {
+-		if (WARN_ON_ONCE((num_online_cpus() > 1 || scfsp->scfs_prim == SCF_PRIM_SINGLE) &&
++		if (WARN_ON_ONCE(((use_cpus_read_lock && num_online_cpus() > 1) || is_single) &&
+ 				 !scfcp->scfc_out)) {
+ 			pr_warn("%s: Memory-ordering failure, scfs_prim: %d.\n", __func__, scfsp->scfs_prim);
+ 			atomic_inc(&n_mb_out_errs); // Leak rather than trash!
+@@ -463,8 +460,6 @@ static void scftorture_invoke_one(struct scf_statistics *scfp, struct torture_ra
+ 	}
+ 	if (use_cpus_read_lock)
+ 		cpus_read_unlock();
+-	else
+-		preempt_enable();
+ 	if (allocfail)
+ 		schedule_timeout_idle((1 + longwait) * HZ);  // Let no-wait handlers complete.
+ 	else if (!(torture_random(trsp) & 0xfff))
+-- 
+2.54.0
+
+
+From 435700d73d7b32c863a61316dc847c542b4764f7 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:23 +0800
+Subject: [PATCH 10/14] x86/mm: Factor out flush_tlb_info initialization
+
+get_flush_tlb_info() currently does two things: it reserves the per-CPU
+flush_tlb_info storage and initializes the fields that describe the
+flush.
+
+Split the field setup into init_flush_tlb_info(). The per-CPU storage,
+DEBUG_VM reentrancy check and put_flush_tlb_info() lifetime rules are
+unchanged.
+
+This is a preparatory cleanup for allowing callers to provide their own
+flush_tlb_info storage.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+---
+ arch/x86/mm/tlb.c | 40 +++++++++++++++++++++++++---------------
+ 1 file changed, 25 insertions(+), 15 deletions(-)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 1023acadd..f74206106 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1379,22 +1379,12 @@ static DEFINE_PER_CPU_SHARED_ALIGNED(struct flush_tlb_info, flush_tlb_info);
+ static DEFINE_PER_CPU(unsigned int, flush_tlb_info_idx);
+ #endif
+ 
+-static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+-			unsigned long start, unsigned long end,
+-			unsigned int stride_shift, bool freed_tables,
+-			u64 new_tlb_gen)
++static void init_flush_tlb_info(struct flush_tlb_info *info,
++				struct mm_struct *mm,
++				unsigned long start, unsigned long end,
++				unsigned int stride_shift, bool freed_tables,
++				u64 new_tlb_gen)
+ {
+-	struct flush_tlb_info *info = this_cpu_ptr(&flush_tlb_info);
+-
+-#ifdef CONFIG_DEBUG_VM
+-	/*
+-	 * Ensure that the following code is non-reentrant and flush_tlb_info
+-	 * is not overwritten. This means no TLB flushing is initiated by
+-	 * interrupt handlers and machine-check exception handlers.
+-	 */
+-	BUG_ON(this_cpu_inc_return(flush_tlb_info_idx) != 1);
+-#endif
+-
+ 	/*
+ 	 * If the number of flushes is so large that a full flush
+ 	 * would be faster, do a full flush.
+@@ -1412,6 +1402,26 @@ static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+ 	info->new_tlb_gen	= new_tlb_gen;
+ 	info->initiating_cpu	= smp_processor_id();
+ 	info->trim_cpumask	= 0;
++}
++
++static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
++			unsigned long start, unsigned long end,
++			unsigned int stride_shift, bool freed_tables,
++			u64 new_tlb_gen)
++{
++	struct flush_tlb_info *info = this_cpu_ptr(&flush_tlb_info);
++
++#ifdef CONFIG_DEBUG_VM
++	/*
++	 * Ensure that the following code is non-reentrant and flush_tlb_info
++	 * is not overwritten. This means no TLB flushing is initiated by
++	 * interrupt handlers and machine-check exception handlers.
++	 */
++	BUG_ON(this_cpu_inc_return(flush_tlb_info_idx) != 1);
++#endif
++
++	init_flush_tlb_info(info, mm, start, end, stride_shift, freed_tables,
++			    new_tlb_gen);
+ 
+ 	return info;
+ }
+-- 
+2.54.0
+
+
+From 9f04ce41755047c3cd5ee8776718cf606862c9f7 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:24 +0800
+Subject: [PATCH 11/14] x86/mm: Cap flush_tlb_info alignment at 64 bytes
+
+A stack allocated flush_tlb_info should keep cacheline alignment to
+avoid the regression that motivated the per-CPU storage, but using
+SMP_CACHE_BYTES directly can make the stack frame grow excessively on
+configurations with large cache lines[1].
+
+Add FLUSH_TLB_INFO_ALIGN and cap the type alignment at 64 bytes. The
+existing per-CPU flush_tlb_info instance remains
+DEFINE_PER_CPU_SHARED_ALIGNED(), so its per-CPU shared-cacheline
+alignment is unchanged.
+
+The capped type alignment matters once flush_tlb_info is moved back to the
+stack by the next patch.
+
+link[1]: https://lore.kernel.org/all/tip-780e0106d468a2962b16b52fdf42898f2639e0a0@git.kernel.org/
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+---
+ arch/x86/include/asm/tlbflush.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 0545fe75c..5889a6c4e 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/mm_types.h>
+ #include <linux/mmu_notifier.h>
++#include <linux/minmax.h>
+ #include <linux/sched.h>
+ 
+ #include <asm/barrier.h>
+@@ -211,6 +212,8 @@ extern u16 invlpgb_count_max;
+ 
+ extern void initialize_tlbstate_and_flush(void);
+ 
++#define FLUSH_TLB_INFO_ALIGN MIN(SMP_CACHE_BYTES, 64)
++
+ /*
+  * TLB flushing:
+  *
+@@ -249,7 +252,7 @@ struct flush_tlb_info {
+ 	u8			stride_shift;
+ 	u8			freed_tables;
+ 	u8			trim_cpumask;
+-};
++} __aligned(FLUSH_TLB_INFO_ALIGN);
+ 
+ void flush_tlb_local(void);
+ void flush_tlb_one_user(unsigned long addr);
+-- 
+2.54.0
+
+
+From 7e1754589f2d24d59303ad3c05896de367489cfc Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:25 +0800
+Subject: [PATCH 12/14] x86/mm: Move flush_tlb_info back to the stack
+
+flush_tlb_info benefits from cacheline alignment, but using
+cacheline-aligned stack storage directly can grow stack usage too much on
+configurations with large SMP_CACHE_BYTES values[1]. That problem caused
+commit 515ab7c41306 ("x86/mm: Align TLB invalidation info") to be
+reverted. Commit 3db6d5a5ecaf ("x86/mm/tlb: Remove 'struct flush_tlb_info'
+from the stack") moved flush_tlb_info to per-CPU storage, which avoided the
+stack growth problem while preserving cacheline alignment. That was a good
+fit while the callers kept preemption disabled for the whole flush
+operation.
+
+However, a single per-CPU flush_tlb_info also requires all flush_tlb*
+operations to keep preemption disabled while the object is in use, so
+that it cannot be overwritten by another flush on the same CPU.
+flush_tlb* may send IPIs to remote CPUs and synchronously wait for all
+remote CPUs to complete their local TLB flushes. That wait can take tens
+of milliseconds when interrupts are disabled on a remote CPU or when a
+large number of remote CPUs are involved.
+
+The following changes need to shorten the CPU-pinned/preemption-disabled
+section around those remote TLB flush waits. Move flush_tlb_info back to
+caller-private stack storage so the caller does not have to stay on the
+same CPU until the remote flush completes.
+
+The previous patch capped the type alignment at 64 bytes. This keeps the
+alignment benefit for stack objects without reintroducing the old
+large-cacheline stack usage problem.
+
+To evaluate the performance impact of this patch, use the following
+script to reproduce the microbenchmark mentioned in commit 3db6d5a5ecaf
+("x86/mm/tlb: Remove 'struct flush_tlb_info' from the stack"). The test
+environment is an Ice Lake system (Intel(R) Xeon(R) Platinum 8336C) with
+128 CPUs and 2 NUMA nodes. During the test, the threads were bound to
+specific CPUs, and both pti and mitigations were disabled:
+
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <pthread.h>
+    #include <sys/mman.h>
+    #include <sys/time.h>
+    #include <unistd.h>
+
+    #define NUM_OPS 1000000
+    #define NUM_THREADS 3
+    #define NUM_RUNS 5
+    #define PAGE_SIZE 4096
+
+    volatile int stop_threads = 0;
+
+    void *busy_wait_thread(void *arg) {
+        while (!stop_threads) {
+            __asm__ volatile ("nop");
+        }
+        return NULL;
+    }
+
+    long long get_usec() {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        return tv.tv_sec * 1000000LL + tv.tv_usec;
+    }
+
+    int main() {
+        pthread_t threads[NUM_THREADS];
+        char *addr;
+        int i, r;
+        addr = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE
+                | MAP_ANONYMOUS, -1, 0);
+
+        if (addr == MAP_FAILED) {
+            perror("mmap");
+            exit(1);
+        }
+
+        for (i = 0; i < NUM_THREADS; i++) {
+            if (pthread_create(&threads[i], NULL, busy_wait_thread, NULL))
+                exit(1);
+        }
+
+        printf("Running benchmark: %d runs, %d ops each, %d background\n"
+               "threads\n", NUM_RUNS, NUM_OPS, NUM_THREADS);
+
+        for (r = 0; r < NUM_RUNS; r++) {
+            long long start, end;
+            start = get_usec();
+            for (i = 0; i < NUM_OPS; i++) {
+                addr[0] = 1;
+                if (madvise(addr, PAGE_SIZE, MADV_DONTNEED)) {
+                    perror("madvise");
+                    exit(1);
+                }
+            }
+            end = get_usec();
+            double duration = (double)(end - start);
+            double avg_lat = duration / NUM_OPS;
+            printf("Run %d: Total time %.2f us, Avg latency %.4f us/op\n",
+                   r + 1, duration, avg_lat);
+        }
+        stop_threads = 1;
+        for (i = 0; i < NUM_THREADS; i++)
+            pthread_join(threads[i], NULL);
+        munmap(addr, PAGE_SIZE);
+        return 0;
+    }
+
+                   base   on-stack-aligned  on-stack-not-aligned
+                   ----       ---------      -----------
+avg (usec/op)     2.5278       2.5261         2.5508
+stddev            0.0007       0.0027         0.0023
+
+The benchmark results show that the average latency difference between
+the baseline (base) and the properly aligned stack variable
+(on-stack-aligned) is within the standard deviation (stddev). This
+indicates that the variations are caused by testing noise, and reverting
+to a stack variable with proper alignment causes no performance
+regression compared to the per-CPU implementation. The unaligned version
+(on-stack-not-aligned) shows a minor performance drop. This demonstrates
+that we can shorten the CPU-pinned/preemption-disabled section without
+sacrificing performance.
+
+With caller-private storage there is no shared per-CPU object to protect,
+so remove the DEBUG_VM reentrancy counter as well.
+
+Link[1]: https://lore.kernel.org/all/tip-780e0106d468a2962b16b52fdf42898f2639e0a0@git.kernel.org/
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Acked-by: Nadav Amit <nadav.amit@gmail.com>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ arch/x86/mm/tlb.c | 78 +++++++++++------------------------------------
+ 1 file changed, 18 insertions(+), 60 deletions(-)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index f74206106..d2f513e2c 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1373,12 +1373,6 @@ void flush_tlb_multi(const struct cpumask *cpumask,
+  */
+ unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
+ 
+-static DEFINE_PER_CPU_SHARED_ALIGNED(struct flush_tlb_info, flush_tlb_info);
+-
+-#ifdef CONFIG_DEBUG_VM
+-static DEFINE_PER_CPU(unsigned int, flush_tlb_info_idx);
+-#endif
+-
+ static void init_flush_tlb_info(struct flush_tlb_info *info,
+ 				struct mm_struct *mm,
+ 				unsigned long start, unsigned long end,
+@@ -1404,50 +1398,19 @@ static void init_flush_tlb_info(struct flush_tlb_info *info,
+ 	info->trim_cpumask	= 0;
+ }
+ 
+-static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+-			unsigned long start, unsigned long end,
+-			unsigned int stride_shift, bool freed_tables,
+-			u64 new_tlb_gen)
+-{
+-	struct flush_tlb_info *info = this_cpu_ptr(&flush_tlb_info);
+-
+-#ifdef CONFIG_DEBUG_VM
+-	/*
+-	 * Ensure that the following code is non-reentrant and flush_tlb_info
+-	 * is not overwritten. This means no TLB flushing is initiated by
+-	 * interrupt handlers and machine-check exception handlers.
+-	 */
+-	BUG_ON(this_cpu_inc_return(flush_tlb_info_idx) != 1);
+-#endif
+-
+-	init_flush_tlb_info(info, mm, start, end, stride_shift, freed_tables,
+-			    new_tlb_gen);
+-
+-	return info;
+-}
+-
+-static void put_flush_tlb_info(void)
+-{
+-#ifdef CONFIG_DEBUG_VM
+-	/* Complete reentrancy prevention checks */
+-	barrier();
+-	this_cpu_dec(flush_tlb_info_idx);
+-#endif
+-}
+-
+ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 				unsigned long end, unsigned int stride_shift,
+ 				bool freed_tables)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
+ 	int cpu = get_cpu();
+ 	u64 new_tlb_gen;
+ 
+ 	/* This is also a barrier that synchronizes with switch_mm(). */
+ 	new_tlb_gen = inc_mm_tlb_gen(mm);
+ 
+-	info = get_flush_tlb_info(mm, start, end, stride_shift, freed_tables,
+-				  new_tlb_gen);
++	init_flush_tlb_info(&info, mm, start, end, stride_shift, freed_tables,
++			    new_tlb_gen);
+ 
+ 	/*
+ 	 * flush_tlb_multi() is not optimized for the common case in which only
+@@ -1455,19 +1418,18 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 	 * flush_tlb_func_local() directly in this case.
+ 	 */
+ 	if (mm_global_asid(mm)) {
+-		broadcast_tlb_flush(info);
++		broadcast_tlb_flush(&info);
+ 	} else if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+-		info->trim_cpumask = should_trim_cpumask(mm);
+-		flush_tlb_multi(mm_cpumask(mm), info);
++		info.trim_cpumask = should_trim_cpumask(mm);
++		flush_tlb_multi(mm_cpumask(mm), &info);
+ 		consider_global_asid(mm);
+ 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+-		flush_tlb_func(info);
++		flush_tlb_func(&info);
+ 		local_irq_enable();
+ 	}
+ 
+-	put_flush_tlb_info();
+ 	put_cpu();
+ 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
+ }
+@@ -1537,19 +1499,16 @@ static void kernel_tlb_flush_range(struct flush_tlb_info *info)
+ 
+ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
+ 
+ 	guard(preempt)();
++	init_flush_tlb_info(&info, NULL, start, end, PAGE_SHIFT, false,
++			    TLB_GENERATION_INVALID);
+ 
+-	info = get_flush_tlb_info(NULL, start, end, PAGE_SHIFT, false,
+-				  TLB_GENERATION_INVALID);
+-
+-	if (info->end == TLB_FLUSH_ALL)
+-		kernel_tlb_flush_all(info);
++	if (info.end == TLB_FLUSH_ALL)
++		kernel_tlb_flush_all(&info);
+ 	else
+-		kernel_tlb_flush_range(info);
+-
+-	put_flush_tlb_info();
++		kernel_tlb_flush_range(&info);
+ }
+ 
+ /*
+@@ -1717,12 +1676,12 @@ EXPORT_SYMBOL_FOR_KVM(__flush_tlb_all);
+ 
+ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
+ 
+ 	int cpu = get_cpu();
+ 
+-	info = get_flush_tlb_info(NULL, 0, TLB_FLUSH_ALL, 0, false,
+-				  TLB_GENERATION_INVALID);
++	init_flush_tlb_info(&info, NULL, 0, TLB_FLUSH_ALL, 0, false,
++			    TLB_GENERATION_INVALID);
+ 	/*
+ 	 * flush_tlb_multi() is not optimized for the common case in which only
+ 	 * a local TLB flush is needed. Optimize this use-case by calling
+@@ -1732,17 +1691,16 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		invlpgb_flush_all_nonglobals();
+ 		batch->unmapped_pages = false;
+ 	} else if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
+-		flush_tlb_multi(&batch->cpumask, info);
++		flush_tlb_multi(&batch->cpumask, &info);
+ 	} else if (cpumask_test_cpu(cpu, &batch->cpumask)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+-		flush_tlb_func(info);
++		flush_tlb_func(&info);
+ 		local_irq_enable();
+ 	}
+ 
+ 	cpumask_clear(&batch->cpumask);
+ 
+-	put_flush_tlb_info();
+ 	put_cpu();
+ }
+ 
+-- 
+2.54.0
+
+
+From f46079d929e5cf36aeee85bf2129b837d60f3ec0 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:26 +0800
+Subject: [PATCH 13/14] x86/kvm: Disable preemption in kvm_flush_tlb_multi()
+
+kvm_flush_tlb_multi() is installed as an x86 PV TLB flush backend, so
+flush_tlb_multi() can reach it through pv_ops when running as a KVM
+guest.
+
+kvm_flush_tlb_multi() uses the per-CPU scratch cpumask __pv_cpu_mask.
+That buffer must remain tied to the current CPU until the mask has been
+copied, filtered, and consumed by native_flush_tlb_multi().  Today the
+x86/mm callers enter flush_tlb_multi() while pinned to a CPU, but a
+subsequent x86/mm change will drop that caller-side CPU pinning before
+issuing the remote TLB flush so the caller can be preempted while waiting
+for remote CPUs.
+
+Make the KVM backend protect its own per-CPU scratch cpumask by disabling
+preemption locally.  This is harmless with the current callers, where the
+preemption disable is nested, and makes the KVM pv_ops dependency explicit
+before changing the x86/mm call sites.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+---
+ arch/x86/kernel/kvm.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/kvm.c b/arch/x86/kernel/kvm.c
+index dcef84da3..5b554e480 100644
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -663,8 +663,10 @@ static void kvm_flush_tlb_multi(const struct cpumask *cpumask,
+ 	u8 state;
+ 	int cpu;
+ 	struct kvm_steal_time *src;
+-	struct cpumask *flushmask = this_cpu_cpumask_var_ptr(__pv_cpu_mask);
++	struct cpumask *flushmask;
+ 
++	guard(preempt)();
++	flushmask = this_cpu_cpumask_var_ptr(__pv_cpu_mask);
+ 	cpumask_copy(flushmask, cpumask);
+ 	/*
+ 	 * We have to call flush only on online vCPUs. And
+-- 
+2.54.0
+
+
+From a0afa637ca383744cdb45f10db9756168e3d1def Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 16 Jun 2026 19:11:27 +0800
+Subject: [PATCH 14/14] x86/mm: Re-enable preemption before flush_tlb_multi()
+
+flush_tlb_mm_range() and arch_tlbbatch_flush() pin the current CPU while
+they decide whether the flush can be handled locally or must be sent to
+remote CPUs. The CPU pinning is needed for the current CPU number and for
+the local TLB flush path, which reads per-CPU TLB state.
+
+It is not needed while waiting for a remote TLB flush to complete. After
+the remote-flush path has been selected, flush_tlb_info is caller-private
+stack storage, so the caller no longer has to stay on the same CPU to
+protect a shared per-CPU flush_tlb_info object.
+
+flush_tlb_multi() may also route through x86 PV backends. Those backends
+must protect their own CPU-local scratch state instead of relying on the
+caller to stay pinned. Hyper-V already does this by disabling interrupts
+while using hyperv_pcpu_input_arg, and Xen's multicall path brackets its
+per-CPU multicall buffer with xen_mc_batch()/xen_mc_issue(). The previous
+patch makes the KVM backend do the same for __pv_cpu_mask.
+
+Remote TLB flushes may synchronously wait for many CPUs, and the wait can
+take tens of milliseconds when remote CPUs have interrupts disabled or
+when many CPUs are involved. Keeping preemption disabled for that whole
+wait unnecessarily increases scheduling latency on the initiating CPU.
+
+Drop the CPU pinning before calling flush_tlb_multi() in the remote paths
+of flush_tlb_mm_range() and arch_tlbbatch_flush(). Keep the local paths
+inside the pinned section because they still access this CPU's TLB state.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+---
+ arch/x86/mm/tlb.c | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index d2f513e2c..2511b994e 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1403,6 +1403,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 				bool freed_tables)
+ {
+ 	struct flush_tlb_info info;
++	bool remote_flush = false;
+ 	int cpu = get_cpu();
+ 	u64 new_tlb_gen;
+ 
+@@ -1420,9 +1421,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 	if (mm_global_asid(mm)) {
+ 		broadcast_tlb_flush(&info);
+ 	} else if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+-		info.trim_cpumask = should_trim_cpumask(mm);
+-		flush_tlb_multi(mm_cpumask(mm), &info);
+-		consider_global_asid(mm);
++		remote_flush = true;
+ 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+@@ -1431,6 +1430,13 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 	}
+ 
+ 	put_cpu();
++
++	if (remote_flush) {
++		info.trim_cpumask = should_trim_cpumask(mm);
++		flush_tlb_multi(mm_cpumask(mm), &info);
++		consider_global_asid(mm);
++	}
++
+ 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
+ }
+ 
+@@ -1677,7 +1683,7 @@ EXPORT_SYMBOL_FOR_KVM(__flush_tlb_all);
+ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ {
+ 	struct flush_tlb_info info;
+-
++	bool remote_flush = false;
+ 	int cpu = get_cpu();
+ 
+ 	init_flush_tlb_info(&info, NULL, 0, TLB_FLUSH_ALL, 0, false,
+@@ -1691,7 +1697,7 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		invlpgb_flush_all_nonglobals();
+ 		batch->unmapped_pages = false;
+ 	} else if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
+-		flush_tlb_multi(&batch->cpumask, &info);
++		remote_flush = true;
+ 	} else if (cpumask_test_cpu(cpu, &batch->cpumask)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+@@ -1699,9 +1705,12 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		local_irq_enable();
+ 	}
+ 
+-	cpumask_clear(&batch->cpumask);
+-
+ 	put_cpu();
++
++	if (remote_flush)
++		flush_tlb_multi(&batch->cpumask, &info);
++
++	cpumask_clear(&batch->cpumask);
+ }
+ 
+ /*
+-- 
+2.54.0
+
