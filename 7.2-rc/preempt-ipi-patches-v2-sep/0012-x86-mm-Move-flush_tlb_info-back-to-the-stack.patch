@@ -1,0 +1,299 @@
+From 2edae3ec9a8c078e80f30f414cc9d40e0ce6447c Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 30 Jun 2026 19:10:06 +0800
+Subject: [PATCH 12/14] x86/mm: Move flush_tlb_info back to the stack
+
+flush_tlb_info benefits from cacheline alignment, but using
+cacheline-aligned stack storage directly can grow stack usage too much on
+configurations with large SMP_CACHE_BYTES values. Commit 515ab7c41306
+("x86/mm: Align TLB invalidation info") attempted to align stack storage,
+and commit 780e0106d468 ("x86/mm/tlb: Revert "x86/mm: Align TLB
+invalidation info"") reverted it because using SMP_CACHE_BYTES led to 320
+bytes of stack consumption. Commit 3db6d5a5ecaf ("x86/mm/tlb: Remove
+'struct flush_tlb_info' from the stack") moved flush_tlb_info to per-CPU
+storage, which avoided the stack growth problem while preserving
+cacheline alignment. That was a good fit while the callers kept
+preemption disabled for the whole flush operation.
+
+However, a single per-CPU flush_tlb_info also requires all flush_tlb*()
+operations to keep preemption disabled while the object is in use, so
+that it cannot be overwritten by another flush on the same CPU.
+flush_tlb*() may send IPIs to remote CPUs and synchronously wait for all
+remote CPUs to complete their local TLB flushes. That wait can take tens
+of milliseconds when interrupts are disabled on a remote CPU or when a
+large number of remote CPUs are involved.
+
+To shorten the CPU-pinned and preemption-disabled section around those
+remote TLB flush waits, move flush_tlb_info back to caller-private stack
+storage. The caller then does not have to stay on the same CPU until the
+remote flush completes.
+
+The type alignment is capped at 64 bytes. This keeps the alignment
+benefit for stack objects without reintroducing the old large-cacheline
+stack usage problem.
+
+To evaluate the performance impact, use the following script to reproduce
+the microbenchmark mentioned in commit 3db6d5a5ecaf ("x86/mm/tlb: Remove
+'struct flush_tlb_info' from the stack"). The test environment is an Ice
+Lake system (Intel(R) Xeon(R) Platinum 8336C) with 128 CPUs and 2 NUMA
+nodes. During the test, the threads were bound to specific CPUs, and both
+pti and mitigations were disabled:
+
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <pthread.h>
+    #include <sys/mman.h>
+    #include <sys/time.h>
+    #include <unistd.h>
+
+    #define NUM_OPS 1000000
+    #define NUM_THREADS 3
+    #define NUM_RUNS 5
+    #define PAGE_SIZE 4096
+
+    volatile int stop_threads = 0;
+
+    void *busy_wait_thread(void *arg) {
+        while (!stop_threads) {
+            __asm__ volatile ("nop");
+        }
+        return NULL;
+    }
+
+    long long get_usec() {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        return tv.tv_sec * 1000000LL + tv.tv_usec;
+    }
+
+    int main() {
+        pthread_t threads[NUM_THREADS];
+        char *addr;
+        int i, r;
+        addr = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE
+                | MAP_ANONYMOUS, -1, 0);
+
+        if (addr == MAP_FAILED) {
+            perror("mmap");
+            exit(1);
+        }
+
+        for (i = 0; i < NUM_THREADS; i++) {
+            if (pthread_create(&threads[i], NULL, busy_wait_thread, NULL))
+                exit(1);
+        }
+
+        printf("Running benchmark: %d runs, %d ops each, %d background\n"
+               "threads\n", NUM_RUNS, NUM_OPS, NUM_THREADS);
+
+        for (r = 0; r < NUM_RUNS; r++) {
+            long long start, end;
+            start = get_usec();
+            for (i = 0; i < NUM_OPS; i++) {
+                addr[0] = 1;
+                if (madvise(addr, PAGE_SIZE, MADV_DONTNEED)) {
+                    perror("madvise");
+                    exit(1);
+                }
+            }
+            end = get_usec();
+            double duration = (double)(end - start);
+            double avg_lat = duration / NUM_OPS;
+            printf("Run %d: Total time %.2f us, Avg latency %.4f us/op\n",
+                   r + 1, duration, avg_lat);
+        }
+        stop_threads = 1;
+        for (i = 0; i < NUM_THREADS; i++)
+            pthread_join(threads[i], NULL);
+        munmap(addr, PAGE_SIZE);
+        return 0;
+    }
+
+                   base   on-stack-aligned  on-stack-not-aligned
+                   ----       ---------      -----------
+avg (usec/op)     2.5278       2.5261         2.5508
+stddev            0.0007       0.0027         0.0023
+
+The benchmark results show that the average latency difference between
+the baseline (base) and the properly aligned stack variable
+(on-stack-aligned) is within the standard deviation (stddev). This
+indicates that the variations are caused by testing noise, and reverting
+to a stack variable with proper alignment causes no performance
+regression compared to the per-CPU implementation. The unaligned version
+(on-stack-not-aligned) shows a minor performance drop. The
+CPU-pinned/preemption-disabled section can therefore be shortened without
+sacrificing performance.
+
+With caller-private storage there is no shared per-CPU object to protect,
+so remove the DEBUG_VM reentrancy counter as well.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Acked-by: Nadav Amit <nadav.amit@gmail.com>
+---
+ arch/x86/mm/tlb.c | 80 +++++++++++------------------------------------
+ 1 file changed, 18 insertions(+), 62 deletions(-)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 9a57da588..d2f513e2c 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1373,12 +1373,6 @@ void flush_tlb_multi(const struct cpumask *cpumask,
+  */
+ unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
+ 
+-static DEFINE_PER_CPU_SHARED_ALIGNED(struct flush_tlb_info, flush_tlb_info);
+-
+-#ifdef CONFIG_DEBUG_VM
+-static DEFINE_PER_CPU(unsigned int, flush_tlb_info_idx);
+-#endif
+-
+ static void init_flush_tlb_info(struct flush_tlb_info *info,
+ 				struct mm_struct *mm,
+ 				unsigned long start, unsigned long end,
+@@ -1404,52 +1398,19 @@ static void init_flush_tlb_info(struct flush_tlb_info *info,
+ 	info->trim_cpumask	= 0;
+ }
+ 
+-static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+-						 unsigned long start,
+-						 unsigned long end,
+-						 unsigned int stride_shift,
+-						 bool freed_tables,
+-						 u64 new_tlb_gen)
+-{
+-	struct flush_tlb_info *info = this_cpu_ptr(&flush_tlb_info);
+-
+-#ifdef CONFIG_DEBUG_VM
+-	/*
+-	 * Ensure that the following code is non-reentrant and flush_tlb_info
+-	 * is not overwritten. This means no TLB flushing is initiated by
+-	 * interrupt handlers and machine-check exception handlers.
+-	 */
+-	BUG_ON(this_cpu_inc_return(flush_tlb_info_idx) != 1);
+-#endif
+-
+-	init_flush_tlb_info(info, mm, start, end, stride_shift, freed_tables,
+-			    new_tlb_gen);
+-
+-	return info;
+-}
+-
+-static void put_flush_tlb_info(void)
+-{
+-#ifdef CONFIG_DEBUG_VM
+-	/* Complete reentrancy prevention checks */
+-	barrier();
+-	this_cpu_dec(flush_tlb_info_idx);
+-#endif
+-}
+-
+ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 				unsigned long end, unsigned int stride_shift,
+ 				bool freed_tables)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
+ 	int cpu = get_cpu();
+ 	u64 new_tlb_gen;
+ 
+ 	/* This is also a barrier that synchronizes with switch_mm(). */
+ 	new_tlb_gen = inc_mm_tlb_gen(mm);
+ 
+-	info = get_flush_tlb_info(mm, start, end, stride_shift, freed_tables,
+-				  new_tlb_gen);
++	init_flush_tlb_info(&info, mm, start, end, stride_shift, freed_tables,
++			    new_tlb_gen);
+ 
+ 	/*
+ 	 * flush_tlb_multi() is not optimized for the common case in which only
+@@ -1457,19 +1418,18 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 	 * flush_tlb_func_local() directly in this case.
+ 	 */
+ 	if (mm_global_asid(mm)) {
+-		broadcast_tlb_flush(info);
++		broadcast_tlb_flush(&info);
+ 	} else if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+-		info->trim_cpumask = should_trim_cpumask(mm);
+-		flush_tlb_multi(mm_cpumask(mm), info);
++		info.trim_cpumask = should_trim_cpumask(mm);
++		flush_tlb_multi(mm_cpumask(mm), &info);
+ 		consider_global_asid(mm);
+ 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+-		flush_tlb_func(info);
++		flush_tlb_func(&info);
+ 		local_irq_enable();
+ 	}
+ 
+-	put_flush_tlb_info();
+ 	put_cpu();
+ 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
+ }
+@@ -1539,19 +1499,16 @@ static void kernel_tlb_flush_range(struct flush_tlb_info *info)
+ 
+ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
+ 
+ 	guard(preempt)();
++	init_flush_tlb_info(&info, NULL, start, end, PAGE_SHIFT, false,
++			    TLB_GENERATION_INVALID);
+ 
+-	info = get_flush_tlb_info(NULL, start, end, PAGE_SHIFT, false,
+-				  TLB_GENERATION_INVALID);
+-
+-	if (info->end == TLB_FLUSH_ALL)
+-		kernel_tlb_flush_all(info);
++	if (info.end == TLB_FLUSH_ALL)
++		kernel_tlb_flush_all(&info);
+ 	else
+-		kernel_tlb_flush_range(info);
+-
+-	put_flush_tlb_info();
++		kernel_tlb_flush_range(&info);
+ }
+ 
+ /*
+@@ -1719,12 +1676,12 @@ EXPORT_SYMBOL_FOR_KVM(__flush_tlb_all);
+ 
+ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ {
+-	struct flush_tlb_info *info;
++	struct flush_tlb_info info;
+ 
+ 	int cpu = get_cpu();
+ 
+-	info = get_flush_tlb_info(NULL, 0, TLB_FLUSH_ALL, 0, false,
+-				  TLB_GENERATION_INVALID);
++	init_flush_tlb_info(&info, NULL, 0, TLB_FLUSH_ALL, 0, false,
++			    TLB_GENERATION_INVALID);
+ 	/*
+ 	 * flush_tlb_multi() is not optimized for the common case in which only
+ 	 * a local TLB flush is needed. Optimize this use-case by calling
+@@ -1734,17 +1691,16 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ 		invlpgb_flush_all_nonglobals();
+ 		batch->unmapped_pages = false;
+ 	} else if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
+-		flush_tlb_multi(&batch->cpumask, info);
++		flush_tlb_multi(&batch->cpumask, &info);
+ 	} else if (cpumask_test_cpu(cpu, &batch->cpumask)) {
+ 		lockdep_assert_irqs_enabled();
+ 		local_irq_disable();
+-		flush_tlb_func(info);
++		flush_tlb_func(&info);
+ 		local_irq_enable();
+ 	}
+ 
+ 	cpumask_clear(&batch->cpumask);
+ 
+-	put_flush_tlb_info();
+ 	put_cpu();
+ }
+ 
+-- 
+2.54.0
+

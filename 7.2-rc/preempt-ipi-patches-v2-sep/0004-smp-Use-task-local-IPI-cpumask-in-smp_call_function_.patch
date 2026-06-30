@@ -1,0 +1,269 @@
+From 559e3a7bb78a4ea6ed86a66d3b5ddab565c125a6 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 30 Jun 2026 19:09:58 +0800
+Subject: [PATCH 04/14] smp: Use task-local IPI cpumask in
+ smp_call_function_many_cond()
+
+smp_call_function_many_cond() uses the per-CPU cfd->cpumask as the list
+of remote CPUs to wait for. That is safe while the caller remains pinned
+to the current CPU for the whole operation, because another task cannot
+run on the same CPU and reuse the per-CPU mask.
+
+The synchronous wait is the long-latency part of the operation. To make
+that wait preemptible, the mask iterated by csd_lock_wait() must remain
+stable even if the task is preempted or migrates. If the wait used the
+per-CPU cfd->cpumask after dropping CPU pinning, another task scheduled
+on the original CPU could enter smp_call_function_many_cond() and
+overwrite the mask while the first task is still iterating it.
+
+Give each task private IPI cpumask storage and use it as the wait mask in
+smp_call_function_many_cond(). Other cpumask storage choices do not fit
+this use case:
+
+ - Per-CPU storage is the state that becomes unsafe once the wait is
+   made preemptible. After the caller drops CPU pinning, another task
+   scheduled on the original CPU can enter smp_call_function_many_cond()
+   and reuse the same per-CPU mask.
+
+ - Stack storage is not suitable for large NR_CPUS or
+   CONFIG_CPUMASK_OFFSTACK=y configurations. The wait mask needs to
+   scale with cpumask_size(), and putting that storage on the stack is
+   not acceptable on large systems.
+
+ - Allocating the mask inside smp_call_function_many_cond() would put an
+   allocation and a failure path in the generic IPI path. A sleeping
+   allocation is not suitable because callers have historically only
+   provided a preempt-disabled context, not a sleepable one. GFP_ATOMIC
+   would avoid sleeping, but a failure fallback would make the latency
+   improvement opportunistic instead of guaranteed.
+
+The users are not limited to a small, pre-identifiable class of tasks. On
+x86, ordinary tasks can reach this path through TLB flushes during exit,
+unmap and reclaim, so allocating the mask only for a known subset of
+tasks is not straightforward.
+
+The memory cost is explicit: one word is added to task_struct. When
+cpumask_size() fits in that word, the mask is stored inline and no
+separate allocation is needed. Larger systems allocate cpumask_size() per
+task; on x86-64 NR_CPUS=8192 this is about 1 KiB per task. For context,
+x86 already carries several KiB of per-task architecture and FPU state,
+depending on the enabled features and configuration. That does not make
+the extra cpumask free, but it puts the large-NR_CPUS case in
+perspective.
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+---
+ include/linux/sched.h |  6 ++++
+ include/linux/smp.h   | 12 ++++++++
+ kernel/fork.c         |  9 +++++-
+ kernel/smp.c          | 70 ++++++++++++++++++++++++++++++++++++++-----
+ 4 files changed, 88 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 373bcc059..e29c97ace 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1359,6 +1359,12 @@ struct task_struct {
+ 	struct list_head		perf_event_list;
+ 	struct perf_ctx_data __rcu	*perf_ctx_data;
+ #endif
++#if defined(CONFIG_SMP) && defined(CONFIG_PREEMPTION)
++	union {
++		cpumask_t			*ipi_mask_ptr;
++		unsigned long			ipi_mask_val;
++	};
++#endif
+ #ifdef CONFIG_DEBUG_PREEMPT
+ 	unsigned long			preempt_disable_ip;
+ #endif
+diff --git a/include/linux/smp.h b/include/linux/smp.h
+index 11e36c7bc..2dfa73907 100644
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@ -238,6 +238,18 @@ static inline int get_boot_cpu_id(void)
+ 
+ #endif /* !SMP */
+ 
++#if defined(CONFIG_PREEMPTION) && defined(CONFIG_SMP)
++int smp_task_ipi_mask_alloc(struct task_struct *task);
++void smp_task_ipi_mask_free(struct task_struct *task);
++#else
++static inline int smp_task_ipi_mask_alloc(struct task_struct *task)
++{
++	return 0;
++}
++
++static inline void smp_task_ipi_mask_free(struct task_struct *task) { }
++#endif
++
+ /*
+  * raw_smp_processor_id() - get the current (unstable) CPU id
+  *
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 13e38e89a..ac3fc49d9 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -537,6 +537,7 @@ void free_task(struct task_struct *tsk)
+ #endif
+ 	release_user_cpus_ptr(tsk);
+ 	scs_release(tsk);
++	smp_task_ipi_mask_free(tsk);
+ 
+ #ifndef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -935,10 +936,14 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ #endif
+ 	account_kernel_stack(tsk, 1);
+ 
+-	err = scs_prepare(tsk, node);
++	err = smp_task_ipi_mask_alloc(tsk);
+ 	if (err)
+ 		goto free_stack;
+ 
++	err = scs_prepare(tsk, node);
++	if (err)
++		goto free_ipi_mask;
++
+ #ifdef CONFIG_SECCOMP
+ 	/*
+ 	 * We must handle setting up seccomp filters once we're under
+@@ -1011,6 +1016,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ #endif
+ 	return tsk;
+ 
++free_ipi_mask:
++	smp_task_ipi_mask_free(tsk);
+ free_stack:
+ 	exit_task_stack_account(tsk);
+ 	free_thread_stack(tsk);
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 92e1dffe4..e9d647385 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -16,6 +16,7 @@
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/gfp.h>
++#include <linux/slab.h>
+ #include <linux/smp.h>
+ #include <linux/cpu.h>
+ #include <linux/sched.h>
+@@ -794,6 +795,49 @@ int smp_call_function_any(const struct cpumask *mask,
+ }
+ EXPORT_SYMBOL_GPL(smp_call_function_any);
+ 
++static DEFINE_STATIC_KEY_FALSE(ipi_mask_inlined);
++
++#ifdef CONFIG_PREEMPTION
++
++int smp_task_ipi_mask_alloc(struct task_struct *task)
++{
++	if (static_branch_unlikely(&ipi_mask_inlined))
++		return 0;
++
++	task->ipi_mask_ptr = kmalloc(cpumask_size(), GFP_KERNEL);
++	if (!task->ipi_mask_ptr)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void smp_task_ipi_mask_free(struct task_struct *task)
++{
++	if (static_branch_unlikely(&ipi_mask_inlined))
++		return;
++
++	kfree(task->ipi_mask_ptr);
++}
++
++static cpumask_t *smp_task_ipi_mask(struct task_struct *cur)
++{
++	/*
++	 * If cpumask_size() is smaller than or equal to the pointer
++	 * size, it stashes the cpumask in the pointer itself to
++	 * avoid extra memory allocations.
++	 */
++	if (static_branch_unlikely(&ipi_mask_inlined))
++		return (cpumask_t *)&cur->ipi_mask_val;
++
++	return cur->ipi_mask_ptr;
++}
++#else
++static cpumask_t *smp_task_ipi_mask(struct task_struct *cur)
++{
++	return NULL;
++}
++#endif
++
+ /*
+  * Flags to be used as scf_flags argument of smp_call_function_many_cond().
+  *
+@@ -809,13 +853,21 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 					smp_cond_func_t cond_func)
+ {
+ 	int cpu, last_cpu, this_cpu = smp_processor_id();
+-	struct call_function_data *cfd;
++	struct cpumask *cpumask, *task_mask;
+ 	bool wait = scf_flags & SCF_WAIT;
+-	int nr_cpus = 0;
++	struct call_function_data *cfd;
+ 	bool run_remote = false;
++	int nr_cpus = 0;
+ 
+ 	lockdep_assert_preemption_disabled();
+ 
++	cfd = this_cpu_ptr(&cfd_data);
++	task_mask = smp_task_ipi_mask(current);
++	if (task_mask)
++		cpumask = task_mask;
++	else
++		cpumask = cfd->cpumask;
++
+ 	/*
+ 	 * Can deadlock when called with interrupts disabled.
+ 	 * We allow cpu's that are not yet online though, as no one else can
+@@ -836,16 +888,15 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 
+ 	/* Check if we need remote execution, i.e., any CPU excluding this one. */
+ 	if (cpumask_any_and_but(mask, cpu_online_mask, this_cpu) < nr_cpu_ids) {
+-		cfd = this_cpu_ptr(&cfd_data);
+-		cpumask_and(cfd->cpumask, mask, cpu_online_mask);
+-		__cpumask_clear_cpu(this_cpu, cfd->cpumask);
++		cpumask_and(cpumask, mask, cpu_online_mask);
++		__cpumask_clear_cpu(this_cpu, cpumask);
+ 
+ 		cpumask_clear(cfd->cpumask_ipi);
+-		for_each_cpu(cpu, cfd->cpumask) {
++		for_each_cpu(cpu, cpumask) {
+ 			call_single_data_t *csd = per_cpu_ptr(cfd->csd, cpu);
+ 
+ 			if (cond_func && !cond_func(cpu, info)) {
+-				__cpumask_clear_cpu(cpu, cfd->cpumask);
++				__cpumask_clear_cpu(cpu, cpumask);
+ 				continue;
+ 			}
+ 
+@@ -896,7 +947,7 @@ static void smp_call_function_many_cond(const struct cpumask *mask,
+ 	}
+ 
+ 	if (run_remote && wait) {
+-		for_each_cpu(cpu, cfd->cpumask) {
++		for_each_cpu(cpu, cpumask) {
+ 			call_single_data_t *csd;
+ 
+ 			csd = per_cpu_ptr(cfd->csd, cpu);
+@@ -1010,6 +1061,9 @@ EXPORT_SYMBOL(nr_cpu_ids);
+ void __init setup_nr_cpu_ids(void)
+ {
+ 	set_nr_cpu_ids(find_last_bit(cpumask_bits(cpu_possible_mask), NR_CPUS) + 1);
++
++	if (IS_ENABLED(CONFIG_PREEMPTION) && cpumask_size() <= sizeof(unsigned long))
++		static_branch_enable(&ipi_mask_inlined);
+ }
+ 
+ /* Called by boot processor to activate the rest. */
+-- 
+2.54.0
+

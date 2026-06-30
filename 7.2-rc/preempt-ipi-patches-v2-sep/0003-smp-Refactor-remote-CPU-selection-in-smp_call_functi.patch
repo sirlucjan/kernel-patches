@@ -1,0 +1,164 @@
+From 48d1e7b1b4a2168801e0ca0132d238c862ff1325 Mon Sep 17 00:00:00 2001
+From: Chuyi Zhou <zhouchuyi@bytedance.com>
+Date: Tue, 30 Jun 2026 19:09:57 +0800
+Subject: [PATCH 03/14] smp: Refactor remote CPU selection in
+ smp_call_function_any()
+
+smp_call_function_any() disables preemption across the entire operation:
+selecting a target CPU, enqueueing the IPI, and synchronously waiting for
+the remote CPU. smp_call_function_single() already re-enables preemption
+before the synchronous csd_lock_wait(), so callers of
+smp_call_function_any() should benefit from the same shorter
+preemption-disabled section.
+
+Simply removing get_cpu() and put_cpu() from smp_call_function_any()
+would leave the preemption disablement entirely to
+smp_call_function_single(). That opens a preemption window between
+selecting the remote CPU, for example via sched_numa_find_nth_cpu(), and
+dispatching the IPI in smp_call_function_single(). If the selected CPU is
+fully offlined in that window, smp_call_function_single() fails its
+cpu_online() check and returns -ENXIO to the caller, violating the
+guarantee that smp_call_function_any() executes on any online CPU in the
+mask.
+
+Move the remote CPU selection into a common
+__smp_call_function_single() helper. Keep the target CPU selection and
+IPI dispatch within the same preemption-disabled region, while still
+allowing the wait path to use the shorter preemption-disabled section
+provided by smp_call_function_single().
+
+Signed-off-by: Chuyi Zhou <zhouchuyi@bytedance.com>
+Tested-by: Paul E. McKenney <paulmck@kernel.org>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+---
+ include/linux/smp.h |  3 +--
+ kernel/smp.c        | 56 ++++++++++++++++++++++++---------------------
+ kernel/up.c         |  3 +--
+ 3 files changed, 32 insertions(+), 30 deletions(-)
+
+diff --git a/include/linux/smp.h b/include/linux/smp.h
+index 6925d15cc..11e36c7bc 100644
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@ -47,8 +47,7 @@ extern void __smp_call_single_queue(int cpu, struct llist_node *node);
+ /* total number of cpus in this system (may exceed NR_CPUS) */
+ extern unsigned int total_cpus;
+ 
+-int smp_call_function_single(int cpuid, smp_call_func_t func, void *info,
+-			     int wait);
++int smp_call_function_single(int cpuid, smp_call_func_t func, void *info, bool wait);
+ 
+ void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
+ 			   void *info, bool wait, const struct cpumask *mask);
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 292eefadd..92e1dffe4 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -641,17 +641,9 @@ void flush_smp_call_function_queue(void)
+ 	local_irq_restore(flags);
+ }
+ 
+-/**
+- * smp_call_function_single - Run a function on a specific CPU
+- * @cpu: Specific target CPU for this function.
+- * @func: The function to run. This must be fast and non-blocking.
+- * @info: An arbitrary pointer to pass to the function.
+- * @wait: If true, wait until function has completed on other CPUs.
+- *
+- * Returns: %0 on success, else a negative status code.
+- */
+-int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
+-			     int wait)
++static int __smp_call_function_single(int cpu, smp_call_func_t func,
++				      void *info, const struct cpumask *mask,
++				      bool wait)
+ {
+ 	call_single_data_t *csd;
+ 	call_single_data_t csd_stack = {
+@@ -668,6 +660,14 @@ int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
+ 	 */
+ 	this_cpu = get_cpu();
+ 
++	if (mask) {
++		/* Try for same CPU (cheapest) */
++		if (!cpumask_test_cpu(this_cpu, mask))
++			cpu = sched_numa_find_nth_cpu(mask, 0, cpu_to_node(this_cpu));
++		else
++			cpu = this_cpu;
++	}
++
+ 	/*
+ 	 * Can deadlock when called with interrupts disabled.
+ 	 * We allow cpu's that are not yet online though, as no one else can
+@@ -712,6 +712,20 @@ int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
+ 
+ 	return err;
+ }
++
++/**
++ * smp_call_function_single - Run a function on a specific CPU
++ * @cpu:	Specific target CPU for this function.
++ * @func:	The function to run. This must be fast and non-blocking.
++ * @info:	An arbitrary pointer to pass to the function.
++ * @wait:	If true, wait until function has completed on other CPUs.
++ *
++ * Returns: %0 on success, else a negative status code.
++ */
++int smp_call_function_single(int cpu, smp_call_func_t func, void *info, bool wait)
++{
++	return __smp_call_function_single(cpu, func, info, NULL, wait);
++}
+ EXPORT_SYMBOL(smp_call_function_single);
+ 
+ /**
+@@ -762,10 +776,10 @@ EXPORT_SYMBOL_GPL(smp_call_function_single_async);
+ 
+ /**
+  * smp_call_function_any - Run a function on any of the given cpus
+- * @mask: The mask of cpus it can run on.
+- * @func: The function to run. This must be fast and non-blocking.
+- * @info: An arbitrary pointer to pass to the function.
+- * @wait: If true, wait until function has completed.
++ * @mask:	The mask of cpus it can run on.
++ * @func:	The function to run. This must be fast and non-blocking.
++ * @info:	An arbitrary pointer to pass to the function.
++ * @wait:	If true, wait until function has completed.
+  *
+  * Selection preference:
+  *	1) current cpu if in @mask
+@@ -776,17 +790,7 @@ EXPORT_SYMBOL_GPL(smp_call_function_single_async);
+ int smp_call_function_any(const struct cpumask *mask,
+ 			  smp_call_func_t func, void *info, int wait)
+ {
+-	unsigned int cpu;
+-	int ret;
+-
+-	/* Try for same CPU (cheapest) */
+-	cpu = get_cpu();
+-	if (!cpumask_test_cpu(cpu, mask))
+-		cpu = sched_numa_find_nth_cpu(mask, 0, cpu_to_node(cpu));
+-
+-	ret = smp_call_function_single(cpu, func, info, wait);
+-	put_cpu();
+-	return ret;
++	return __smp_call_function_single(-1, func, info, mask, wait);
+ }
+ EXPORT_SYMBOL_GPL(smp_call_function_any);
+ 
+diff --git a/kernel/up.c b/kernel/up.c
+index df50828cc..6d4ac9502 100644
+--- a/kernel/up.c
++++ b/kernel/up.c
+@@ -9,8 +9,7 @@
+ #include <linux/smp.h>
+ #include <linux/hypervisor.h>
+ 
+-int smp_call_function_single(int cpu, void (*func) (void *info), void *info,
+-				int wait)
++int smp_call_function_single(int cpu, void (*func)(void *info), void *info, bool wait)
+ {
+ 	unsigned long flags;
+ 
+-- 
+2.54.0
+
