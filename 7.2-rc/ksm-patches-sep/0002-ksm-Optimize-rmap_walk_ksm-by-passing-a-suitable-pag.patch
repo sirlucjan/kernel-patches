@@ -1,0 +1,150 @@
+From d3128f8de632ef38967c1b3067f28203cbe00e32 Mon Sep 17 00:00:00 2001
+From: xu xin <xu.xin16@zte.com.cn>
+Date: Fri, 3 Jul 2026 16:25:10 +0800
+Subject: [PATCH 2/3] ksm: Optimize rmap_walk_ksm by passing a suitable page
+ index
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+User impact / Why this matters to Linux users
+=============================================
+When a system runs with KSM enabled and memory becomes tight, KSM pages
+may be swapped out or migrated. The kernel then performs a reverse map
+walk by rmap_walk_ksm to locate all page table entries that reference
+these pages. If A large number of unrelated VMAs can attach to a single
+anon_vma related with this KSM page, then rmap_walk might be severe
+performance bottleneck.  In our embedded test environment, we observed
+~20,000 VMAs sharing one anon_vma without any fork – purely from VMA
+splits， which cause 200~700ms duration of rmap_walk_ksm.
+
+When one of those VMAs mapped a KSM page, then this KSM page's rmapping
+will become bottleneck with hold its anon_vma lock for a long time. The
+anon_vma lock is not only used by KSM; it is a core lock protecting the
+VMA interval tree and is acquired by many critical memory operations:
+
+  • Page faults: do_anonymous_page(), do_wp_page() (during COW)
+  • Memory reclaim: try_to_unmap()
+  • Page migration & compaction: migrate_pages(), compact_zone()
+  • mlock / munlock: mlock_fixup()
+  • Process exit: exit_mmap() (tearing down VMAs)
+  • Cgroup memory accounting: mem_cgroup_move_charge()
+
+If one thread holds the anon_vma lock for hundreds of milliseconds
+because of an inefficient KSM rmap walk, any other thread that
+tries to acquire the same lock (e.g., an application taking a page
+fault, kswapd reclaiming pages, or a migration thread) will block.
+This leads to stalled application threads, increased latency
+spikes, and in extreme cases container timeouts or watchdog
+triggers.
+
+This patch reduces the worst-case anon_vma lock hold time during
+ksm_rmap_walk from >500 ms to <1 ms, thereby almost eliminating
+this source of lock contention and improving system responsiveness
+under memory pressure.
+
+Real-world examples:
+====================
+ - JVM / Go runtime: These use mmap for heap regions and later call
+mprotect(PROT_NONE) for garbage collection barriers or guard pages,
+splitting the original VMA into thousands of small pieces over time.
+
+ - Database engines (MySQL, PostgreSQL): Large shared memory buffers
+or anonymous mappings are managed with madvise(MADV_DONTNEED) to
+release specific pages, which also splits VMAs.
+
+Root Cause
+==========
+Through local debugging trace analysis, we found that most of the
+latency of rmap_walk_ksm occurs within anon_vma_interval_tree_foreach,
+leading to an excessively long hold time on the anon_vma lock (even
+reaching 500ms or more), which in turn causes upper-layer applications
+(waiting for the anon_vma lock) to be blocked for extended periods.
+
+Further investigation revealed that 99.9% of iterations inside the
+anon_vma_interval_tree_foreach loop are skipped due to the first check
+"if (addr < vma->vm_start || addr >= vma->vm_end)), indicating that a
+large number of loop iterations are ineffective. This inefficiency
+arises because the start page index and the end page index parameters
+passed to anon_vma_interval_tree_foreach span the entire address space
+from 0 to ULONG_MAX, resulting in very poor loop efficiency.
+
+Solution
+========
+We cannot rely solely on anon_vma to locate all PTEs mapping this page
+but also need to have the original page's linear_page_index. Since the
+implementation of anon_vma_interval_tree_foreach — it essentially
+iterates to find a suitable VMA such that the provided page index
+falls within the candidate's vm_pgoff range.
+
+vm_pgoff <= original linear page offset <= (vm_pgoff + vma_pages(v) - 1)
+
+Fortunately, an earlier commit introduced the linear_page_index to struct
+ksm_rmap_item, allowing for optimizing the RMAP walk.
+
+Test results
+============
+A rmap testbench can be obtained with two Out-Of-Tree patches at [1][2].
+After applying the OOT patches and building rmap_benchmark from:
+tools/testing/rmap/rmap_benchmark.c, we can start the performance test.
+
+The testing result in QEMU is shown as follows:
+
+KSM rmapping	Maximum duration		Average duration
+
+Before:		705.12 ms (705119858 ns)	532.04 ms (532041586 ns)
+After:		1.67 ms (1665917 ns)		1.44 ms (1443784 ns)
+
+The benchmark numbers are realistic, since we observed ~20,000 VMAs
+sharing one anon_vma on a production system running a Java application
+with KSM enabled. The lock hold time before the patch was measured at
+228 ms (max) during rmap walks triggered by memory compaction and page
+migration. The benchmark reproduces that VMA count and lock‑hold
+behavior in a controlled environment.
+
+[1] https://lore.kernel.org/all/202605301703094695zmVgcSC27BNR0rH0N8_x@zte.com.cn
+[2] https://lore.kernel.org/all/20260530170404509QpJmBtpSjn3uQHeVKA2iA@zte.com.cn/
+
+Co-developed-by: Wang Yaxin <wang.yaxin@zte.com.cn>
+Signed-off-by: Wang Yaxin <wang.yaxin@zte.com.cn>
+Signed-off-by: xu xin <xu.xin16@zte.com.cn>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+---
+ mm/ksm.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 60c6f959d..454ba2eb4 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -3207,6 +3207,7 @@ void rmap_walk_ksm(struct folio *folio, struct rmap_walk_control *rwc)
+ 	hlist_for_each_entry(rmap_item, &stable_node->hlist, hlist) {
+ 		/* Ignore the stable/unstable/sqnr flags */
+ 		const unsigned long addr = rmap_item->address & PAGE_MASK;
++		const unsigned long index = rmap_item->linear_page_index;
+ 		struct anon_vma *anon_vma = rmap_item->anon_vma;
+ 		struct anon_vma_chain *vmac;
+ 		struct vm_area_struct *vma;
+@@ -3220,8 +3221,18 @@ void rmap_walk_ksm(struct folio *folio, struct rmap_walk_control *rwc)
+ 			anon_vma_lock_read(anon_vma);
+ 		}
+ 
++		/*
++		 * Currently, KSM folios are always small folios, so it's
++		 * sufficient to search for a single page. We can simply use
++		 * the linear_page_index of the original de-duplicate
++		 * anonymous page that we remembered in the rmap_item while
++		 * de-duplicating. Note that mremap() always de-duplicates KSM
++		 * folios: so if there was mremap() in our parent or our child,
++		 * we wouldn't have the KSM folio mapped in these processes
++		 * anymore.
++		 */
+ 		anon_vma_interval_tree_foreach(vmac, &anon_vma->rb_root,
+-					       0, ULONG_MAX) {
++					       index, index) {
+ 
+ 			cond_resched();
+ 			vma = vmac->vma;
+-- 
+2.55.0
+

@@ -1,0 +1,443 @@
+From 9ee8be6cf8f487cf54e6848060be8d9d21035004 Mon Sep 17 00:00:00 2001
+From: xu xin <xu.xin16@zte.com.cn>
+Date: Fri, 3 Jul 2026 16:23:57 +0800
+Subject: [PATCH 1/3] ksm: add linear_page_index into ksm_rmap_item
+
+As preparation for KSM rmap optimizations, let's track the original
+linear_page_index() of a de-duplicated page in its ksm_rmap_item, so we can
+efficiently search for the page in an address space, avoiding scanning the
+entire address space. This was previously discussed in [1, 2].
+
+To avoid growing ksm_rmap_item, let's squeeze it into the existing
+structure by overlying some members (oldchecksum, age, remaining_skips)
+that are only relevant while on the unstable tree. The new entry will
+only be relevant for entries in the stable tree.
+
+However, as the age information is read by should_skip_rmap_item() with the
+smart-scanning approach even while we have an entry in the stable tree, but
+the page changes (no longer a KSM page, for example due to COW), we have to
+change the handling there a bit.
+
+We'll calculate the linear page index in try_to_merge_with_ksm_page(), when
+adding it to the stable tree, and reset the index (to reset overlayed data)
+when removing an item from the stable tree -- in
+remove_rmap_item_from_tree(), remove_node_from_stable_tree() and
+break_cow().
+
+To be specially clarified, the reason for resetting the stored index at
+break_cow() is:
+
+- When a page successfully becomes a KSM page (i.e., after
+  stable_tree_append() sets STABLE_FLAG), both anon_vma and the index are
+  stored and remain valid.
+
+- However, during the merging process, there are several failure paths
+  where we already prepared an rmap item to be added to the stable tree,
+  but must revert that as some part of the merge process failed. Examples
+  include:
+    1 The second call to try_to_merge_with_ksm_page() fails in
+      try_to_merge_two_pages().
+    2 stable_tree_insert() fails in cmp_and_merge_page().
+  In such cases, break_cow() is invoked to break the COW mapping and
+  discard the KSM state.
+
+Currently, break_cow() already contains a put_anon_vma(rmap_item->anon_vma)
+to release the reference taken during the aborted merge. Because the index
+is logically paired with anon_vma (both are only meaningful when the
+rmap_item is in a stable state), it must also be cleared (or reset) in
+break_cow() to avoid leaving stale linear_page_index values that could
+confuse subsequent rmap walks or scanning logic.
+
+[1] https://lore.kernel.org/all/adTPQSb-qSSHviJN@lucifer/
+[2] https://lore.kernel.org/all/202604091806051535BJWZ_FTtdIm3Snk24ei_@zte.com.cn/
+
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: xu xin <xu.xin16@zte.com.cn>
+---
+ mm/ksm.c | 48 +++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 41 insertions(+), 7 deletions(-)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 7d5b76478..60c6f959d 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -195,22 +195,28 @@ struct ksm_stable_node {
+  * @node: rb node of this rmap_item in the unstable tree
+  * @head: pointer to stable_node heading this list in the stable tree
+  * @hlist: link into hlist of rmap_items hanging off that stable_node
+- * @age: number of scan iterations since creation
+- * @remaining_skips: how many scans to skip
++ * @age: number of scan iterations since creation (unstable node)
++ * @remaining_skips: how many scans to skip (unstable node)
++ * @linear_page_index: the original page's index before merged by KSM (stable node)
+  */
+ struct ksm_rmap_item {
+ 	struct ksm_rmap_item *rmap_list;
+ 	union {
+-		struct anon_vma *anon_vma;	/* when stable */
++		struct anon_vma *anon_vma;	/* for reverse mapping, when stable */
+ #ifdef CONFIG_NUMA
+ 		int nid;		/* when node of unstable tree */
+ #endif
+ 	};
+ 	struct mm_struct *mm;
+ 	unsigned long address;		/* + low bits used for flags below */
+-	unsigned int oldchecksum;	/* when unstable */
+-	rmap_age_t age;
+-	rmap_age_t remaining_skips;
++	union {
++		struct {
++			unsigned int oldchecksum;
++			rmap_age_t age;
++			rmap_age_t remaining_skips;
++		};			/* when unstable */
++		unsigned long linear_page_index;    /* for reverse mapping, when stable */
++	};
+ 	union {
+ 		struct rb_node node;	/* when node of unstable tree */
+ 		struct {		/* when listed from stable tree */
+@@ -776,6 +782,11 @@ static struct vm_area_struct *find_mergeable_vma(struct mm_struct *mm,
+ 	return vma;
+ }
+ 
++/*
++ * break_cow: actively break COW, replacing the KSM page by a fresh anonymous
++ * page. This is called when rmap_item has not yet become stable, but page
++ * has been merged.
++ */
+ static void break_cow(struct ksm_rmap_item *rmap_item)
+ {
+ 	struct mm_struct *mm = rmap_item->mm;
+@@ -787,6 +798,11 @@ static void break_cow(struct ksm_rmap_item *rmap_item)
+ 	 * to undo, we also need to drop a reference to the anon_vma.
+ 	 */
+ 	put_anon_vma(rmap_item->anon_vma);
++	/*
++	 * Reset linear_page_index that might overlay age-related
++	 * information. (it's still unstable node)
++	 */
++	rmap_item->linear_page_index = 0;
+ 
+ 	mmap_read_lock(mm);
+ 	vma = find_mergeable_vma(mm, addr);
+@@ -899,6 +915,8 @@ static void remove_node_from_stable_tree(struct ksm_stable_node *stable_node)
+ 		VM_BUG_ON(stable_node->rmap_hlist_len <= 0);
+ 		stable_node->rmap_hlist_len--;
+ 		put_anon_vma(rmap_item->anon_vma);
++		/* Reset linear_page_index that might overlay age-related information. */
++		rmap_item->linear_page_index = 0;
+ 		rmap_item->address &= PAGE_MASK;
+ 		cond_resched();
+ 	}
+@@ -1052,6 +1070,8 @@ static void remove_rmap_item_from_tree(struct ksm_rmap_item *rmap_item)
+ 		stable_node->rmap_hlist_len--;
+ 
+ 		put_anon_vma(rmap_item->anon_vma);
++		/* Reset linear_page_index that might overlay age-related information. */
++		rmap_item->linear_page_index = 0;
+ 		rmap_item->head = NULL;
+ 		rmap_item->address &= PAGE_MASK;
+ 
+@@ -1598,8 +1618,15 @@ static int try_to_merge_with_ksm_page(struct ksm_rmap_item *rmap_item,
+ 	/* Unstable nid is in union with stable anon_vma: remove first */
+ 	remove_rmap_item_from_tree(rmap_item);
+ 
+-	/* Must get reference to anon_vma while still holding mmap_lock */
++	/*
++	 * We can consider the VMA only while still holding the mmap lock,
++	 * so lock, so reference the anon_vma and calculate the linear
++	 * page index early, before stable_tree_append(). If anything goes
++	 * wrong that prevents the rmap_item from being added to the
++	 * stable_tree, break_cow() will clean it up.
++	 */
+ 	rmap_item->anon_vma = vma->anon_vma;
++	rmap_item->linear_page_index = linear_page_index(vma, rmap_item->address);
+ 	get_anon_vma(vma->anon_vma);
+ out:
+ 	mmap_read_unlock(mm);
+@@ -2458,6 +2485,13 @@ static bool should_skip_rmap_item(struct folio *folio,
+ 	if (folio_test_ksm(folio))
+ 		return false;
+ 
++	/*
++	 * There is no age information in stable-tree nodes. We might end up
++	 * here without a KSM page for example after COW.
++	 */
++	if (rmap_item->address & STABLE_FLAG)
++		return false;
++
+ 	age = rmap_item->age;
+ 	if (age != U8_MAX)
+ 		rmap_item->age++;
+-- 
+2.55.0
+
+
+From d3128f8de632ef38967c1b3067f28203cbe00e32 Mon Sep 17 00:00:00 2001
+From: xu xin <xu.xin16@zte.com.cn>
+Date: Fri, 3 Jul 2026 16:25:10 +0800
+Subject: [PATCH 2/3] ksm: Optimize rmap_walk_ksm by passing a suitable page
+ index
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+User impact / Why this matters to Linux users
+=============================================
+When a system runs with KSM enabled and memory becomes tight, KSM pages
+may be swapped out or migrated. The kernel then performs a reverse map
+walk by rmap_walk_ksm to locate all page table entries that reference
+these pages. If A large number of unrelated VMAs can attach to a single
+anon_vma related with this KSM page, then rmap_walk might be severe
+performance bottleneck.  In our embedded test environment, we observed
+~20,000 VMAs sharing one anon_vma without any fork – purely from VMA
+splits， which cause 200~700ms duration of rmap_walk_ksm.
+
+When one of those VMAs mapped a KSM page, then this KSM page's rmapping
+will become bottleneck with hold its anon_vma lock for a long time. The
+anon_vma lock is not only used by KSM; it is a core lock protecting the
+VMA interval tree and is acquired by many critical memory operations:
+
+  • Page faults: do_anonymous_page(), do_wp_page() (during COW)
+  • Memory reclaim: try_to_unmap()
+  • Page migration & compaction: migrate_pages(), compact_zone()
+  • mlock / munlock: mlock_fixup()
+  • Process exit: exit_mmap() (tearing down VMAs)
+  • Cgroup memory accounting: mem_cgroup_move_charge()
+
+If one thread holds the anon_vma lock for hundreds of milliseconds
+because of an inefficient KSM rmap walk, any other thread that
+tries to acquire the same lock (e.g., an application taking a page
+fault, kswapd reclaiming pages, or a migration thread) will block.
+This leads to stalled application threads, increased latency
+spikes, and in extreme cases container timeouts or watchdog
+triggers.
+
+This patch reduces the worst-case anon_vma lock hold time during
+ksm_rmap_walk from >500 ms to <1 ms, thereby almost eliminating
+this source of lock contention and improving system responsiveness
+under memory pressure.
+
+Real-world examples:
+====================
+ - JVM / Go runtime: These use mmap for heap regions and later call
+mprotect(PROT_NONE) for garbage collection barriers or guard pages,
+splitting the original VMA into thousands of small pieces over time.
+
+ - Database engines (MySQL, PostgreSQL): Large shared memory buffers
+or anonymous mappings are managed with madvise(MADV_DONTNEED) to
+release specific pages, which also splits VMAs.
+
+Root Cause
+==========
+Through local debugging trace analysis, we found that most of the
+latency of rmap_walk_ksm occurs within anon_vma_interval_tree_foreach,
+leading to an excessively long hold time on the anon_vma lock (even
+reaching 500ms or more), which in turn causes upper-layer applications
+(waiting for the anon_vma lock) to be blocked for extended periods.
+
+Further investigation revealed that 99.9% of iterations inside the
+anon_vma_interval_tree_foreach loop are skipped due to the first check
+"if (addr < vma->vm_start || addr >= vma->vm_end)), indicating that a
+large number of loop iterations are ineffective. This inefficiency
+arises because the start page index and the end page index parameters
+passed to anon_vma_interval_tree_foreach span the entire address space
+from 0 to ULONG_MAX, resulting in very poor loop efficiency.
+
+Solution
+========
+We cannot rely solely on anon_vma to locate all PTEs mapping this page
+but also need to have the original page's linear_page_index. Since the
+implementation of anon_vma_interval_tree_foreach — it essentially
+iterates to find a suitable VMA such that the provided page index
+falls within the candidate's vm_pgoff range.
+
+vm_pgoff <= original linear page offset <= (vm_pgoff + vma_pages(v) - 1)
+
+Fortunately, an earlier commit introduced the linear_page_index to struct
+ksm_rmap_item, allowing for optimizing the RMAP walk.
+
+Test results
+============
+A rmap testbench can be obtained with two Out-Of-Tree patches at [1][2].
+After applying the OOT patches and building rmap_benchmark from:
+tools/testing/rmap/rmap_benchmark.c, we can start the performance test.
+
+The testing result in QEMU is shown as follows:
+
+KSM rmapping	Maximum duration		Average duration
+
+Before:		705.12 ms (705119858 ns)	532.04 ms (532041586 ns)
+After:		1.67 ms (1665917 ns)		1.44 ms (1443784 ns)
+
+The benchmark numbers are realistic, since we observed ~20,000 VMAs
+sharing one anon_vma on a production system running a Java application
+with KSM enabled. The lock hold time before the patch was measured at
+228 ms (max) during rmap walks triggered by memory compaction and page
+migration. The benchmark reproduces that VMA count and lock‑hold
+behavior in a controlled environment.
+
+[1] https://lore.kernel.org/all/202605301703094695zmVgcSC27BNR0rH0N8_x@zte.com.cn
+[2] https://lore.kernel.org/all/20260530170404509QpJmBtpSjn3uQHeVKA2iA@zte.com.cn/
+
+Co-developed-by: Wang Yaxin <wang.yaxin@zte.com.cn>
+Signed-off-by: Wang Yaxin <wang.yaxin@zte.com.cn>
+Signed-off-by: xu xin <xu.xin16@zte.com.cn>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+---
+ mm/ksm.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 60c6f959d..454ba2eb4 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -3207,6 +3207,7 @@ void rmap_walk_ksm(struct folio *folio, struct rmap_walk_control *rwc)
+ 	hlist_for_each_entry(rmap_item, &stable_node->hlist, hlist) {
+ 		/* Ignore the stable/unstable/sqnr flags */
+ 		const unsigned long addr = rmap_item->address & PAGE_MASK;
++		const unsigned long index = rmap_item->linear_page_index;
+ 		struct anon_vma *anon_vma = rmap_item->anon_vma;
+ 		struct anon_vma_chain *vmac;
+ 		struct vm_area_struct *vma;
+@@ -3220,8 +3221,18 @@ void rmap_walk_ksm(struct folio *folio, struct rmap_walk_control *rwc)
+ 			anon_vma_lock_read(anon_vma);
+ 		}
+ 
++		/*
++		 * Currently, KSM folios are always small folios, so it's
++		 * sufficient to search for a single page. We can simply use
++		 * the linear_page_index of the original de-duplicate
++		 * anonymous page that we remembered in the rmap_item while
++		 * de-duplicating. Note that mremap() always de-duplicates KSM
++		 * folios: so if there was mremap() in our parent or our child,
++		 * we wouldn't have the KSM folio mapped in these processes
++		 * anymore.
++		 */
+ 		anon_vma_interval_tree_foreach(vmac, &anon_vma->rb_root,
+-					       0, ULONG_MAX) {
++					       index, index) {
+ 
+ 			cond_resched();
+ 			vma = vmac->vma;
+-- 
+2.55.0
+
+
+From fc93fd278abc3de8ea61f0ee542d8ae1d922d20c Mon Sep 17 00:00:00 2001
+From: xu xin <xu.xin16@zte.com.cn>
+Date: Fri, 3 Jul 2026 16:26:37 +0800
+Subject: [PATCH 3/3] ksm: add mremap selftests for ksm_rmap_walk
+
+The existing tools/testing/selftests/mm/rmap.c has already one testcase
+for ksm_rmap_walk in TEST_F(migrate, ksm), which takes use of migration
+of page from one NUMA node to another NUMA node. However, it just lacks
+the scenario of mremapped VMAs.
+
+We add the calling of mremap() and then trigger KSM to merge pages before
+migrating, which is specifically to test an optimization which is
+introduced by this patch ("ksm: Optimize rmap_walk_ksm by passing a
+suitable address pgoff").
+
+This test can reproduce the issue that Hugh points out at
+https://lore.kernel.org/all/02e1b8df-d568-8cbb-b8f6-46d5476d9d75@google.com/
+
+Signed-off-by: xu xin <xu.xin16@zte.com.cn>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+---
+ tools/testing/selftests/mm/rmap.c | 81 +++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/tools/testing/selftests/mm/rmap.c b/tools/testing/selftests/mm/rmap.c
+index 53f2058b0..1c293ad3f 100644
+--- a/tools/testing/selftests/mm/rmap.c
++++ b/tools/testing/selftests/mm/rmap.c
+@@ -430,4 +430,85 @@ TEST_F(migrate, ksm)
+ 	propagate_children(_metadata, data);
+ }
+ 
++static bool range_maps_the_same_pfn(int pagemap_fd, void *region, int nr_pages)
++{
++	int i;
++	int retries = 0;
++	unsigned long first_pfn;
++
++retry:
++	if (retries > 10)
++		return false;
++
++	first_pfn = pagemap_get_pfn(pagemap_fd, region);
++	for (i = 0; i < nr_pages; i++) {
++		if (pagemap_get_pfn(pagemap_fd, region + i * getpagesize()) != first_pfn) {
++			/*
++			 * Retry up to 10 times at most in case of the low chance of page
++			 * compaction migrating the page while we check for pfn.
++			 */
++			retries++;
++			goto retry;
++		}
++	}
++
++	return true;
++}
++
++TEST_F(migrate, ksm_and_mremap)
++{
++	unsigned long old_pfn, new_pfn;
++	void *region, *mremap_region;
++	const int nr_pages = 16;
++	size_t mmap_size;
++	int pagemap_fd;
++
++	/* Skip if KSM is not available */
++	if (ksm_stop() < 0)
++		SKIP(return, "accessing \"/sys/kernel/mm/ksm/run\" failed");
++	if (ksm_get_full_scans() < 0)
++		SKIP(return, "accessing \"/sys/kernel/mm/ksm/full_scan\" failed");
++
++	pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
++	if (pagemap_fd < 0)
++		SKIP(return, "opening pagemap failed");
++
++	/* Allocate and populate twice the anon pages initially. */
++	mmap_size = 2 * nr_pages * getpagesize();
++	region = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
++		      MAP_PRIVATE | MAP_ANON, -1, 0);
++	ASSERT_NE(region, MAP_FAILED);
++	memset(region, 0x77, mmap_size);
++
++	/* mremap the second half over the first half, to stress rmap handling */
++	mmap_size /= 2;
++	mremap_region = mremap(region + mmap_size, mmap_size, mmap_size,
++			       MREMAP_MAYMOVE | MREMAP_FIXED, region);
++	ASSERT_EQ(mremap_region, region);
++
++	/* Merge all pages into a single KSM page. */
++	madvise(region, mmap_size, MADV_MERGEABLE);
++	ASSERT_EQ(ksm_start(), 0);
++
++	/* The whole range should map the same KSM page. */
++	old_pfn = pagemap_get_pfn(pagemap_fd, region);
++	if (old_pfn == -1ul)
++		SKIP(return, "Obtaining PFN failed");
++	ksm_start();
++	ASSERT_TRUE(range_maps_the_same_pfn(pagemap_fd, region, nr_pages));
++
++	/*
++	 * Migrate the KSM page; the whole range should map the new (migrated)
++	 * KSM page.
++	 */
++	ASSERT_EQ(try_to_move_page(region), 0);
++
++	new_pfn = pagemap_get_pfn(pagemap_fd, region);
++	if (new_pfn == -1ul)
++		SKIP(return, "Obtaining PFN failed");
++	ASSERT_NE(new_pfn, old_pfn);
++	ASSERT_TRUE(range_maps_the_same_pfn(pagemap_fd, region, nr_pages));
++}
++
++
+ TEST_HARNESS_MAIN
+-- 
+2.55.0
+
