@@ -1,0 +1,132 @@
+From 8959f0abffa7f7fde375c1d825378a0f4f9dc5d4 Mon Sep 17 00:00:00 2001
+From: "JP Kobryn (Meta)" <jp.kobryn@linux.dev>
+Date: Fri, 24 Apr 2026 22:34:17 -0700
+Subject: [PATCH 15/50] mm/lruvec: preemptively free dead folios during lru_add
+ drain
+
+Of all observable lruvec lock contention in our fleet, we find that ~24%
+occurs when dead folios are present in lru_add batches at drain time. This
+is wasteful in the sense that the folio is added to the LRU just to be
+immediately removed via folios_put_refs(), incurring two unnecessary lock
+acquisitions.
+
+Eliminate this overhead by preemptively cleaning up dead folios before they
+make it into the LRU. Use folio_ref_freeze() to filter folios whose only
+remaining refcount is the batch ref. When dead folios are found, move them
+off the add batch and onto a temporary batch to be freed.
+
+PG_active may be set on a batched folio as well as PG_unevictable (via
+migration path). Since filtered folios bypass the normal lru_add() cleanup,
+both flags must be cleared before freeing.
+
+During A/B testing on one of our prod instagram workloads (high-frequency
+short-lived requests), the patch intercepted almost all dead folios before
+they entered the LRU. Data collected using the mm_lru_insertion tracepoint
+shows the effectiveness of the patch:
+
+Per-host LRU add averages at 95% CPU load
+(60 hosts each side, 3 x 60s intervals)
+
+            dead folios/min  total folios/min   dead %
+unpatched:        1,297,785        19,341,986  6.7097%
+patched:                 14        19,039,996  0.0001%
+
+Within this workload, we save ~2.6M lock acquisitions per minute per host
+as a result.
+
+System-wide memory stats improved on the patched side also at 95% CPU load:
+ - direct reclaim scanning reduced 7%
+ - allocation stalls reduced 5.2%
+ - compaction stalls reduced 12.3%
+ - page frees reduced 4.9%
+
+No regressions were observed in requests served per second or request tail
+latency (p99). Both metrics showed directional improvement at higher CPU
+utilization (comparing 85% to 95%).
+
+Note that tests were performed using classic LRU.
+
+Signed-off-by: JP Kobryn (Meta) <jp.kobryn@linux.dev>
+Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Michal Hocko <mhocko@suse.com>
+---
+ mm/swap.c | 41 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/mm/swap.c b/mm/swap.c
+index 5cc44f0de..2dd84813f 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -160,14 +160,42 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
+ 	int i;
+ 	struct lruvec *lruvec = NULL;
+ 	unsigned long flags = 0;
++	struct folio_batch free_fbatch;
++	bool is_lru_add = (move_fn == lru_add);
++
++	/*
++	 * If we're adding to the LRU, preemptively filter dead folios. Use
++	 * this dedicated folio batch for temp storage and deferred cleanup.
++	 */
++	if (is_lru_add)
++		folio_batch_init(&free_fbatch);
+ 
+ 	for (i = 0; i < folio_batch_count(fbatch); i++) {
+ 		struct folio *folio = fbatch->folios[i];
+ 
+ 		/* block memcg migration while the folio moves between lru */
+-		if (move_fn != lru_add && !folio_test_clear_lru(folio))
++		if (!is_lru_add && !folio_test_clear_lru(folio))
+ 			continue;
+ 
++		/*
++		 * Filter dead folios by moving them from the add batch to the temp
++		 * batch for freeing after this loop.
++		 *
++		 * We're bypassing normal cleanup. Clear flags that are not
++		 * applicable to dead folios.
++		 *
++		 * Since the folio may be part of a huge page, unqueue from
++		 * deferred split list to avoid a dangling list entry.
++		 */
++		if (is_lru_add && folio_ref_freeze(folio, 1)) {
++			__folio_clear_active(folio);
++			__folio_clear_unevictable(folio);
++			folio_unqueue_deferred_split(folio);
++			fbatch->folios[i] = NULL;
++			folio_batch_add(&free_fbatch, folio);
++			continue;
++		}
++
+ 		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
+ 		move_fn(lruvec, folio);
+ 
+@@ -176,6 +204,13 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
+ 
+ 	if (lruvec)
+ 		lruvec_unlock_irqrestore(lruvec, flags);
++
++	/* Cleanup filtered dead folios. */
++	if (is_lru_add) {
++		mem_cgroup_uncharge_folios(&free_fbatch);
++		free_unref_folios(&free_fbatch);
++	}
++
+ 	folios_put(fbatch);
+ }
+ 
+@@ -964,6 +999,10 @@ void folios_put_refs(struct folio_batch *folios, unsigned int *refs)
+ 		struct folio *folio = folios->folios[i];
+ 		unsigned int nr_refs = refs ? refs[i] : 1;
+ 
++		/* Folio batch entry may have been preemptively removed during drain. */
++		if (!folio)
++			continue;
++
+ 		if (is_huge_zero_folio(folio))
+ 			continue;
+ 
+-- 
+2.55.0
+
