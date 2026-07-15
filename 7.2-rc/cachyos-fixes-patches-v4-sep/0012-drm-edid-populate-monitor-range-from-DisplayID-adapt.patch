@@ -1,0 +1,143 @@
+From c5168411ac614d6c8683e6e384abf57f1dc75b55 Mon Sep 17 00:00:00 2001
+From: Spencer Bull <spencer.bull@dell.com>
+Date: Mon, 30 Mar 2026 23:30:00 +0000
+Subject: [PATCH 12/20] drm/edid: populate monitor range from DisplayID
+ adaptive sync
+
+Some eDP OLED panels advertise a VRR range only via the DisplayID 2.x
+Adaptive Sync data block. In that case `display_info.monitor_range`
+stays at 0/0 because DRM currently only fills it from the legacy EDID
+monitor range descriptor.
+
+Intel's VRR capability path consumes `display_info.monitor_range`
+directly, so the connector ends up with `vrr_capable=0` despite EDID
+advertising Adaptive Sync.
+
+Backfill `monitor_range` from the DisplayID 2.x Adaptive Sync data
+block when the legacy descriptor did not provide a range.
+---
+ drivers/gpu/drm/drm_displayid_internal.h |  1 +
+ drivers/gpu/drm/drm_edid.c               | 81 ++++++++++++++++++++----
+ 2 files changed, 69 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_displayid_internal.h b/drivers/gpu/drm/drm_displayid_internal.h
+index 4590d6a3d..dbdc20533 100644
+--- a/drivers/gpu/drm/drm_displayid_internal.h
++++ b/drivers/gpu/drm/drm_displayid_internal.h
+@@ -67,6 +67,7 @@ struct drm_edid;
+ #define DATA_BLOCK_2_TILED_DISPLAY_TOPOLOGY	0x28
+ #define DATA_BLOCK_2_CONTAINER_ID		0x29
+ #define DATA_BLOCK_2_TYPE_10_FORMULA_TIMING	0x2a
++#define DATA_BLOCK_2_ADAPTIVE_SYNC		0x2b
+ #define DATA_BLOCK_2_VENDOR_SPECIFIC		0x7e
+ #define DATA_BLOCK_2_CTA_DISPLAY_ID		0x81
+ 
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index df3c25bac..de636235b 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -6598,6 +6598,46 @@ static void drm_get_monitor_range(struct drm_connector *connector,
+ 		    info->monitor_range.min_vfreq, info->monitor_range.max_vfreq);
+ }
+ 
++#define DISPLAYID_ADAPTIVE_SYNC_DESC_SIZE 6
++
++static void drm_update_displayid_adaptive_sync_range(struct drm_connector *connector,
++					     const struct displayid_block *block)
++{
++	struct drm_monitor_range_info *range = &connector->display_info.monitor_range;
++	const u8 *data = (const u8 *)(block + 1);
++	u16 best_min = 0, best_max = 0;
++	unsigned int best_span = 0;
++	int i;
++
++	if (block->rev != 0 || block->num_bytes < DISPLAYID_ADAPTIVE_SYNC_DESC_SIZE ||
++	    block->num_bytes % DISPLAYID_ADAPTIVE_SYNC_DESC_SIZE)
++		return;
++
++	for (i = 0; i < block->num_bytes; i += DISPLAYID_ADAPTIVE_SYNC_DESC_SIZE) {
++		const u8 *desc = &data[i];
++		u16 min_vfreq = desc[2];
++		u16 max_vfreq = ((((u16)desc[4]) & 0x3) << 8) | desc[3];
++		unsigned int span;
++
++		max_vfreq += 1;
++		if (!min_vfreq || max_vfreq <= min_vfreq)
++			continue;
++
++		span = max_vfreq - min_vfreq;
++		if (span <= best_span)
++			continue;
++
++		best_min = min_vfreq;
++		best_max = max_vfreq;
++		best_span = span;
++	}
++
++	if (best_span) {
++		range->min_vfreq = best_min;
++		range->max_vfreq = best_max;
++	}
++}
++
+ static void drm_parse_vesa_mso_data(struct drm_connector *connector,
+ 				    const struct displayid_block *block)
+ {
+@@ -6720,26 +6760,41 @@ static void update_displayid_info(struct drm_connector *connector,
+ {
+ 	struct drm_display_info *info = &connector->display_info;
+ 	const struct displayid_block *block;
++	bool displayid_base_logged = false;
+ 	struct displayid_iter iter;
+ 
+ 	displayid_iter_edid_begin(drm_edid, &iter);
+ 	displayid_iter_for_each(block, &iter) {
+-		drm_dbg_kms(connector->dev,
+-			    "[CONNECTOR:%d:%s] DisplayID extension version 0x%02x, primary use 0x%02x\n",
+-			    connector->base.id, connector->name,
+-			    displayid_version(&iter),
+-			    displayid_primary_use(&iter));
+-		if (displayid_version(&iter) == DISPLAY_ID_STRUCTURE_VER_20 &&
+-		    (displayid_primary_use(&iter) == PRIMARY_USE_HEAD_MOUNTED_VR ||
+-		     displayid_primary_use(&iter) == PRIMARY_USE_HEAD_MOUNTED_AR))
+-			info->non_desktop = true;
+-
+ 		/*
+-		 * We're only interested in the base section here, no need to
+-		 * iterate further.
++		 * Primary use is a DisplayID base section property, but later
++		 * blocks may still carry useful metadata like adaptive sync ranges.
+ 		 */
+-		break;
++		if (!displayid_base_logged) {
++			drm_dbg_kms(connector->dev,
++				    "[CONNECTOR:%d:%s] DisplayID extension version 0x%02x, primary use 0x%02x\n",
++				    connector->base.id, connector->name,
++				    displayid_version(&iter),
++				    displayid_primary_use(&iter));
++			if (displayid_version(&iter) == DISPLAY_ID_STRUCTURE_VER_20 &&
++			    (displayid_primary_use(&iter) == PRIMARY_USE_HEAD_MOUNTED_VR ||
++			     displayid_primary_use(&iter) == PRIMARY_USE_HEAD_MOUNTED_AR))
++				info->non_desktop = true;
++
++			displayid_base_logged = true;
++		}
++
++		if (!info->monitor_range.min_vfreq && !info->monitor_range.max_vfreq &&
++		    block->tag == DATA_BLOCK_2_ADAPTIVE_SYNC)
++			drm_update_displayid_adaptive_sync_range(connector, block);
+ 	}
++
++	if (info->monitor_range.min_vfreq && info->monitor_range.max_vfreq)
++		drm_dbg_kms(connector->dev,
++			    "[CONNECTOR:%d:%s] DisplayID adaptive sync refresh rate range is %d Hz - %d Hz\n",
++			    connector->base.id, connector->name,
++			    info->monitor_range.min_vfreq,
++			    info->monitor_range.max_vfreq);
++
+ 	displayid_iter_end(&iter);
+ }
+ 
+-- 
+2.55.0
+
