@@ -1,0 +1,141 @@
+From a11411eabe339a81c6c7ca1b48dcfc16148044f5 Mon Sep 17 00:00:00 2001
+From: Baolin Wang <baolin.wang@linux.alibaba.com>
+Date: Wed, 15 Jul 2026 14:33:03 +0800
+Subject: [PATCH 20/23] mm: mglru: promote mapped executable folios after first
+ usage
+
+Classical LRU protects mapped executable file folios through commit
+8cab4754d24a0 ("vmscan: make mapped executable pages the first class
+citizen") and commit c909e99364c8 ("vmscan: activate executable pages
+after first usage"), giving executable code a better chance to stay in
+memory, avoiding IO thrashing and improving workload performance.
+
+However, MGLRU's protection of mapped executable file folios is less
+reliable. Although shrink_folio_list() checks references, the access flag
+of mapped executable file folios may have already been checked and
+cleared by lru_gen_look_around() or walk_mm(). Additionally,
+folio_update_gen() only sets the 'PG_referenced' flag for mapped executable
+file folios, which causes shrink_folio_list() to ignore the first usage
+of these mapped executable file folios and reclaim them.
+
+Follow the classical LRU's logic, promoting mapped executable file folios
+after their first usage in folio_update_gen(), giving executable code a
+better chance to stay in memory.
+
+On my 32-core Arm machine, with the memcg limit set to 2G, running
+'make -j32' to build kernel showed some improvement in sys time.
+
+base			patched
+9248.543s		7861.579s
+
+Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+---
+ mm/vmscan.c | 25 +++++++++++++++----------
+ 1 file changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 35c3bb15a..95bfe2f34 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3195,7 +3195,7 @@ static bool positive_ctrl_err(struct ctrl_pos *sp, struct ctrl_pos *pv)
+  ******************************************************************************/
+ 
+ /* promote pages accessed through page tables */
+-static int folio_update_gen(struct folio *folio, int gen)
++static int folio_update_gen(struct vm_area_struct *vma, struct folio *folio, int gen)
+ {
+ 	unsigned long new_flags, old_flags = READ_ONCE(folio->flags.f);
+ 
+@@ -3203,10 +3203,15 @@ static int folio_update_gen(struct folio *folio, int gen)
+ 
+ 	/* see the comment on LRU_REFS_FLAGS */
+ 	if (!folio_test_referenced(folio) && !folio_test_workingset(folio)) {
++		/* Activate file-backed executable folios after first usage. */
++		if (vma_test(vma, VMA_EXEC_BIT) && folio_is_file_lru(folio))
++			goto promote;
++
+ 		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, BIT(PG_referenced));
+ 		return -1;
+ 	}
+ 
++promote:
+ 	do {
+ 		/* lru_gen_del_folio() has isolated this page? */
+ 		if (!(old_flags & LRU_GEN_MASK))
+@@ -3433,8 +3438,8 @@ static bool suitable_to_scan(int total, int young)
+ 	return young * n >= total;
+ }
+ 
+-static void walk_update_folio(struct lru_gen_mm_walk *walk, struct folio *folio,
+-			      int new_gen, bool dirty)
++static void walk_update_folio(struct lru_gen_mm_walk *walk, struct vm_area_struct *vma,
++		struct folio *folio, int new_gen, bool dirty)
+ {
+ 	int old_gen;
+ 
+@@ -3447,7 +3452,7 @@ static void walk_update_folio(struct lru_gen_mm_walk *walk, struct folio *folio,
+ 		folio_mark_dirty(folio);
+ 
+ 	if (walk) {
+-		old_gen = folio_update_gen(folio, new_gen);
++		old_gen = folio_update_gen(vma, folio, new_gen);
+ 		if (old_gen >= 0 && old_gen != new_gen)
+ 			update_batch_size(walk, folio, old_gen, new_gen);
+ 	} else if (lru_gen_set_refs(folio)) {
+@@ -3523,7 +3528,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+ 			continue;
+ 
+ 		if (last != folio) {
+-			walk_update_folio(walk, last, gen, dirty);
++			walk_update_folio(walk, args->vma, last, gen, dirty);
+ 
+ 			last = folio;
+ 			dirty = false;
+@@ -3536,7 +3541,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+ 		walk->mm_stats[MM_LEAF_YOUNG] += nr;
+ 	}
+ 
+-	walk_update_folio(walk, last, gen, dirty);
++	walk_update_folio(walk, args->vma, last, gen, dirty);
+ 	last = NULL;
+ 
+ 	if (i < PTRS_PER_PTE && get_next_vma(PMD_MASK, PAGE_SIZE, args, &start, &end))
+@@ -3614,7 +3619,7 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long addr, struct vm_area
+ 			goto next;
+ 
+ 		if (last != folio) {
+-			walk_update_folio(walk, last, gen, dirty);
++			walk_update_folio(walk, vma, last, gen, dirty);
+ 
+ 			last = folio;
+ 			dirty = false;
+@@ -3628,7 +3633,7 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long addr, struct vm_area
+ 		i = i > MIN_LRU_BATCH ? 0 : find_next_bit(bitmap, MIN_LRU_BATCH, i) + 1;
+ 	} while (i <= MIN_LRU_BATCH);
+ 
+-	walk_update_folio(walk, last, gen, dirty);
++	walk_update_folio(walk, vma, last, gen, dirty);
+ 
+ 	lazy_mmu_mode_disable();
+ 	spin_unlock(ptl);
+@@ -4266,7 +4271,7 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
+ 			continue;
+ 
+ 		if (last != folio) {
+-			walk_update_folio(walk, last, gen, dirty);
++			walk_update_folio(walk, vma, last, gen, dirty);
+ 
+ 			last = folio;
+ 			dirty = false;
+@@ -4278,7 +4283,7 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
+ 		young += nr;
+ 	}
+ 
+-	walk_update_folio(walk, last, gen, dirty);
++	walk_update_folio(walk, vma, last, gen, dirty);
+ 
+ 	lazy_mmu_mode_disable();
+ 
+-- 
+2.55.0
+
