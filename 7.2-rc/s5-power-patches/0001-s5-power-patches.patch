@@ -1,0 +1,508 @@
+From 213897b99405cc80574da269f0323a02b29fa161 Mon Sep 17 00:00:00 2001
+From: Eric Naim <dnaim@cachyos.org>
+Date: Sat, 18 Jul 2026 20:30:09 +0700
+Subject: [PATCH 1/8] sof: Add quirk for Dell XPS 13 DX13260
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+LLM yap:
+The two CS35L63 amps are SPI sidecar amps hanging off the CS42L43 (they enumerate as spi-cs35l56-left/-right, driven by the cs35l56 driver, part 0x3563) — not SoundWire devices. The kernel only creates the cs42l43-cs35l56 bridge DAI that routes audio into these amps when the SOC_SDW_SIDECAR_AMPS quirk is set. That quirk is applied per-machine by the DMI table in sound/soc/intel/boards/sof_sdw.c, keyed on Dell DMI_PRODUCT_SKU. This machine's SKU 0E53 was missing from the table, so the quirk stayed off → bridge DAI never created → external amps silent → only the CS42L43 internal amp plays
+
+Signed-off-by: Eric Naim <dnaim@cachyos.org>
+---
+ sound/soc/intel/boards/sof_sdw.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/sound/soc/intel/boards/sof_sdw.c b/sound/soc/intel/boards/sof_sdw.c
+index 59eb0328b..9d24ffc0e 100644
+--- a/sound/soc/intel/boards/sof_sdw.c
++++ b/sound/soc/intel/boards/sof_sdw.c
+@@ -845,6 +845,15 @@ static const struct dmi_system_id sof_sdw_quirk_table[] = {
+ 		},
+ 		.driver_data = (void *)(SOC_SDW_PCH_DMIC),
+ 	},
++	{
++		/* Dell XPS 13 DX13260 (Wildcat Lake), CS42L43 + 2x CS35L63 sidecar amps */
++		.callback = sof_sdw_quirk_cb,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_SKU, "0E53")
++		},
++		.driver_data = (void *)(SOC_SDW_SIDECAR_AMPS),
++	},
+ 	{}
+ };
+ 
+-- 
+2.55.0
+
+
+From bee03f2fbdfc6774a4bea8acc1deaf855f2accdd Mon Sep 17 00:00:00 2001
+From: "Mario Limonciello (AMD)" <superm1@kernel.org>
+Date: Mon, 27 Apr 2026 15:50:20 -0500
+Subject: [PATCH 2/8] PCI/PM: Disable device wakeups when halting or powering
+ off system
+
+PCI devices can be configured as wakeup sources from low power states.
+However, when the system is powering off such wakeups are not expected
+and may lead to spurious behavior.
+
+ACPI r6.5, section 16.1.5 notes:
+
+    "Hardware does allow a transition to S0 due to power button press
+     or a Remote Start."
+
+This implies that wakeups from PCI devices should not be relied upon
+in these states. To align with this expectation and avoid unintended
+wakeups, disable device wakeup capability during these transitions.
+
+Tested-by: Eric Naim <dnaim@cachyos.org>
+Signed-off-by: Mario Limonciello (AMD) <superm1@kernel.org>
+---
+ drivers/pci/pci-driver.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index f36778e62..9ed0e3940 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -1173,6 +1173,9 @@ static int pci_pm_poweroff(struct device *dev)
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+ 
++	if (device_may_wakeup(dev) && system_state == SYSTEM_POWER_OFF)
++		device_set_wakeup_enable(dev, false);
++
+ 	if (pci_has_legacy_pm_support(pci_dev))
+ 		return pci_legacy_suspend(dev, PMSG_HIBERNATE);
+ 
+-- 
+2.55.0
+
+
+From f78b68be1fcb7bfaa014ae611ae0f25fb078fb4a Mon Sep 17 00:00:00 2001
+From: "Mario Limonciello (AMD)" <superm1@kernel.org>
+Date: Mon, 27 Apr 2026 15:50:21 -0500
+Subject: [PATCH 3/8] PCI/PM: Split out code from pci_pm_suspend_noirq() into
+ helper
+
+In order to unify suspend and hibernate codepaths without code duplication
+the common code should be in common helpers.  Move it from
+pci_pm_suspend_noirq() into a helper.  No intended functional changes.
+
+Tested-by: Eric Naim <dnaim@cachyos.org>
+Signed-off-by: Mario Limonciello (AMD) <superm1@kernel.org>
+---
+ drivers/pci/pci-driver.c | 86 +++++++++++++++++++++++++---------------
+ 1 file changed, 54 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index 9ed0e3940..e9ef9a475 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -795,6 +795,54 @@ static void pci_pm_complete(struct device *dev)
+ 
+ #endif /* !CONFIG_PM_SLEEP */
+ 
++#if defined(CONFIG_SUSPEND)
++/**
++ * pci_pm_suspend_noirq_common
++ * @pci_dev: pci device
++ * @skip_bus_pm: pointer to a boolean indicating whether to skip bus PM
++ *
++ * Prepare the device to go into a low power state by saving state and
++ * deciding whether to skip bus PM.
++ *
++ */
++static void pci_pm_suspend_noirq_common(struct pci_dev *pci_dev, bool *skip_bus_pm)
++{
++	if (!pci_dev->state_saved) {
++		pci_save_state(pci_dev);
++
++		/*
++		 * If the device is a bridge with a child in D0 below it,
++		 * it needs to stay in D0, so check skip_bus_pm to avoid
++		 * putting it into a low-power state in that case.
++		 */
++		if (!pci_dev->skip_bus_pm && pci_power_manageable(pci_dev))
++			pci_prepare_to_sleep(pci_dev);
++	}
++
++	pci_dbg(pci_dev, "PCI PM: Sleep power state: %s\n",
++		pci_power_name(pci_dev->current_state));
++
++	if (pci_dev->current_state == PCI_D0) {
++		pci_dev->skip_bus_pm = true;
++		/*
++		 * Per PCI PM r1.2, table 6-1, a bridge must be in D0 if any
++		 * downstream device is in D0, so avoid changing the power state
++		 * of the parent bridge by setting the skip_bus_pm flag for it.
++		 */
++		if (pci_dev->bus->self)
++			pci_dev->bus->self->skip_bus_pm = true;
++	}
++
++	if (pci_dev->skip_bus_pm && pm_suspend_no_platform()) {
++		pci_dbg(pci_dev, "PCI PM: Skipped\n");
++		*skip_bus_pm = true;
++		return;
++	}
++
++	pci_pm_set_unknown_state(pci_dev);
++}
++#endif /* CONFIG_SUSPEND */
++
+ #ifdef CONFIG_SUSPEND
+ static void pcie_pme_root_status_cleanup(struct pci_dev *pci_dev)
+ {
+@@ -884,6 +932,7 @@ static int pci_pm_suspend_noirq(struct device *dev)
+ {
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
++	bool skip_bus_pm = false;
+ 
+ 	if (dev_pm_skip_suspend(dev))
+ 		return 0;
+@@ -893,7 +942,8 @@ static int pci_pm_suspend_noirq(struct device *dev)
+ 
+ 	if (!pm) {
+ 		pci_save_state(pci_dev);
+-		goto set_unknown;
++		pci_pm_set_unknown_state(pci_dev);
++		goto Ehci_workaround;
+ 	}
+ 
+ 	if (pm->suspend_noirq) {
+@@ -914,40 +964,12 @@ static int pci_pm_suspend_noirq(struct device *dev)
+ 		}
+ 	}
+ 
+-	if (!pci_dev->state_saved) {
+-		pci_save_state(pci_dev);
++	pci_pm_suspend_noirq_common(pci_dev, &skip_bus_pm);
+ 
+-		/*
+-		 * If the device is a bridge with a child in D0 below it,
+-		 * it needs to stay in D0, so check skip_bus_pm to avoid
+-		 * putting it into a low-power state in that case.
+-		 */
+-		if (!pci_dev->skip_bus_pm && pci_power_manageable(pci_dev))
+-			pci_prepare_to_sleep(pci_dev);
+-	}
+-
+-	pci_dbg(pci_dev, "PCI PM: Suspend power state: %s\n",
+-		pci_power_name(pci_dev->current_state));
+-
+-	if (pci_dev->current_state == PCI_D0) {
+-		pci_dev->skip_bus_pm = true;
+-		/*
+-		 * Per PCI PM r1.2, table 6-1, a bridge must be in D0 if any
+-		 * downstream device is in D0, so avoid changing the power state
+-		 * of the parent bridge by setting the skip_bus_pm flag for it.
+-		 */
+-		if (pci_dev->bus->self)
+-			pci_dev->bus->self->skip_bus_pm = true;
+-	}
+-
+-	if (pci_dev->skip_bus_pm && pm_suspend_no_platform()) {
+-		pci_dbg(pci_dev, "PCI PM: Skipped\n");
++	if (skip_bus_pm)
+ 		goto Fixup;
+-	}
+-
+-set_unknown:
+-	pci_pm_set_unknown_state(pci_dev);
+ 
++Ehci_workaround:
+ 	/*
+ 	 * Some BIOSes from ASUS have a bug: If a USB EHCI host controller's
+ 	 * PCI COMMAND register isn't 0, the BIOS assumes that the controller
+-- 
+2.55.0
+
+
+From 668f76833b0329079c8047e67bba24221791e0e1 Mon Sep 17 00:00:00 2001
+From: "Mario Limonciello (AMD)" <superm1@kernel.org>
+Date: Mon, 27 Apr 2026 15:50:22 -0500
+Subject: [PATCH 4/8] PCI/PM: Run bridge power up actions as part of restore
+ phase
+
+Suspend resume actions will check the state of the device and whether
+bus PM should be skipped.  These same actions make sense during hibernation
+image restore.  Apply them there as well.
+
+Tested-by: Eric Naim <dnaim@cachyos.org>
+Signed-off-by: Mario Limonciello (AMD) <superm1@kernel.org>
+---
+ drivers/pci/pci-driver.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index e9ef9a475..1e75e5741 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -1280,10 +1280,15 @@ static int pci_pm_restore_noirq(struct device *dev)
+ {
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
++	pci_power_t prev_state = pci_dev->current_state;
++	bool skip_bus_pm = pci_dev->skip_bus_pm;
+ 
+ 	pci_pm_default_resume_early(pci_dev);
+ 	pci_fixup_device(pci_fixup_resume_early, pci_dev);
+ 
++	if (!skip_bus_pm && prev_state == PCI_D3cold)
++		pci_pm_bridge_power_up_actions(pci_dev);
++
+ 	if (pci_has_legacy_pm_support(pci_dev))
+ 		return 0;
+ 
+-- 
+2.55.0
+
+
+From 4e415598929540be37f4c3579e3826d107702bb8 Mon Sep 17 00:00:00 2001
+From: "Mario Limonciello (AMD)" <superm1@kernel.org>
+Date: Mon, 27 Apr 2026 15:50:23 -0500
+Subject: [PATCH 5/8] PCI/PM: Use pci_power_manageable() in
+ pci_pm_poweroff_noirq()
+
+Devices with no subordinate should be put into D3 during hibernate, but
+devices that have bridge_d3 set should also be put to sleep during
+hibernate. Adjust the check in pci_pm_poweroff_noirq() to use
+pci_power_manageable() to cover those as well.
+
+Tested-by: Eric Naim <dnaim@cachyos.org>
+Signed-off-by: Mario Limonciello (AMD) <superm1@kernel.org>
+---
+ drivers/pci/pci-driver.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index 1e75e5741..dae272c8d 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -1261,7 +1261,7 @@ static int pci_pm_poweroff_noirq(struct device *dev)
+ 			return error;
+ 	}
+ 
+-	if (!pci_dev->state_saved && !pci_has_subordinate(pci_dev))
++	if (!pci_dev->state_saved && pci_power_manageable(pci_dev))
+ 		pci_prepare_to_sleep(pci_dev);
+ 
+ 	/*
+-- 
+2.55.0
+
+
+From 6ef9320167924c8cc1c5222fbd1c35c3a4fd966f Mon Sep 17 00:00:00 2001
+From: "Mario Limonciello (AMD)" <superm1@kernel.org>
+Date: Mon, 27 Apr 2026 15:50:24 -0500
+Subject: [PATCH 6/8] PCI: Put PCIe bridges with downstream devices into D3 at
+ hibernate
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+During suspend, PCIe bridges with downstream devices are transitioned into
+a low power state (D3hot or D3cold) depending on platform capabilities.
+However, during hibernate, these bridges remain in D0, which can lead to
+unnecessary power consumption.
+
+Align the hibernate flow with suspend by updating pci_pm_poweroff_noirq()
+to use pci_pm_suspend_noirq_common(). This ensures that PCIe bridges with
+active downstream devices are properly transitioned to a low power state
+during hibernate.
+
+This change introduces a functional update: the hibernate path will now
+invoke pci_save_state(), and — unless bus-level power management is
+skipped — will transition the bridge into D3hot or D3cold as appropriate.
+
+Cc: AceLan Kao <acelan.kao@canonical.com>
+Cc: Kai-Heng Feng <kaihengf@nvidia.com>
+Cc: Mark Pearson <mpearson-lenovo@squebb.ca>
+Cc: Denis Benato <benato.denis96@gmail.com>
+Cc: Merthan Karakaş <m3rthn.k@gmail.com>
+Tested-by: Eric Naim <dnaim@cachyos.org>
+Signed-off-by: Mario Limonciello (AMD) <superm1@kernel.org>
+---
+ drivers/pci/pci-driver.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index dae272c8d..c0d6ffe79 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -795,7 +795,7 @@ static void pci_pm_complete(struct device *dev)
+ 
+ #endif /* !CONFIG_PM_SLEEP */
+ 
+-#if defined(CONFIG_SUSPEND)
++#if defined(CONFIG_SUSPEND) || defined(CONFIG_HIBERNATE_CALLBACKS)
+ /**
+  * pci_pm_suspend_noirq_common
+  * @pci_dev: pci device
+@@ -841,7 +841,7 @@ static void pci_pm_suspend_noirq_common(struct pci_dev *pci_dev, bool *skip_bus_
+ 
+ 	pci_pm_set_unknown_state(pci_dev);
+ }
+-#endif /* CONFIG_SUSPEND */
++#endif /* CONFIG_SUSPEND || CONFIG_HIBERNATE_CALLBACKS */
+ 
+ #ifdef CONFIG_SUSPEND
+ static void pcie_pme_root_status_cleanup(struct pci_dev *pci_dev)
+@@ -1198,6 +1198,8 @@ static int pci_pm_poweroff(struct device *dev)
+ 	if (device_may_wakeup(dev) && system_state == SYSTEM_POWER_OFF)
+ 		device_set_wakeup_enable(dev, false);
+ 
++	pci_dev->skip_bus_pm = false;
++
+ 	if (pci_has_legacy_pm_support(pci_dev))
+ 		return pci_legacy_suspend(dev, PMSG_HIBERNATE);
+ 
+@@ -1240,6 +1242,7 @@ static int pci_pm_poweroff_noirq(struct device *dev)
+ {
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
++	bool skip_bus_pm = false;
+ 
+ 	if (dev_pm_skip_suspend(dev))
+ 		return 0;
+@@ -1261,8 +1264,9 @@ static int pci_pm_poweroff_noirq(struct device *dev)
+ 			return error;
+ 	}
+ 
+-	if (!pci_dev->state_saved && pci_power_manageable(pci_dev))
+-		pci_prepare_to_sleep(pci_dev);
++	pci_pm_suspend_noirq_common(pci_dev, &skip_bus_pm);
++	if (skip_bus_pm)
++		goto Fixup;
+ 
+ 	/*
+ 	 * The reason for doing this here is the same as for the analogous code
+@@ -1271,6 +1275,7 @@ static int pci_pm_poweroff_noirq(struct device *dev)
+ 	if (pci_dev->class == PCI_CLASS_SERIAL_USB_EHCI)
+ 		pci_write_config_word(pci_dev, PCI_COMMAND, 0);
+ 
++Fixup:
+ 	pci_fixup_device(pci_fixup_suspend_late, pci_dev);
+ 
+ 	return 0;
+-- 
+2.55.0
+
+
+From 5e076fb440cd08750a5d71684d3b119becef430d Mon Sep 17 00:00:00 2001
+From: "Mario Limonciello (AMD)" <superm1@kernel.org>
+Date: Tue, 9 Sep 2025 14:16:17 -0500
+Subject: [PATCH 7/8] drm/amd: Avoid evicting resources at S5
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Normally resources are evicted on dGPUs at suspend or hibernate and
+on APUs at hibernate.  These steps are unnecessary when using the S4
+callbacks to put the system into S5.
+
+Cc: AceLan Kao <acelan.kao@canonical.com>
+Cc: Kai-Heng Feng <kaihengf@nvidia.com>
+Cc: Mark Pearson <mpearson-lenovo@squebb.ca>
+Cc: Denis Benato <benato.denis96@gmail.com>
+Cc: Merthan Karakaş <m3rthn.k@gmail.com>
+Tested-by: Eric Naim <dnaim@cachyos.org>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Mario Limonciello (AMD) <superm1@kernel.org>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index e5f26e589..45101e289 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4359,6 +4359,10 @@ static int amdgpu_device_evict_resources(struct amdgpu_device *adev)
+ 	if (system_state == SYSTEM_POWER_OFF)
+ 		return 0;
+ 
++	/* No need to evict when going to S5 through S4 callbacks */
++	if (system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF)
++		return 0;
++
+ 	ret = amdgpu_ttm_evict_resources(adev, TTM_PL_VRAM);
+ 	if (ret) {
+ 		dev_warn(adev->dev, "evicting device resources failed\n");
+-- 
+2.55.0
+
+
+From b4cf184007c6d56dba456d423dd471fd18f3411d Mon Sep 17 00:00:00 2001
+From: "Mario Limonciello (AMD)" <superm1@kernel.org>
+Date: Tue, 9 Sep 2025 14:16:18 -0500
+Subject: [PATCH 8/8] PM: Use hibernate flows for system power off
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the system is powered off the kernel will call device_shutdown()
+which will issue callbacks into PCI core to wake up a device and call
+it's shutdown() callback.  This will leave devices in ACPI D0 which can
+cause some devices to misbehave with spurious wakeups and also leave some
+devices on which will consume power needlessly.
+
+The issue won't happen if the device is in D3 before system shutdown, so
+putting device to low power state before shutdown solves the issue.
+
+ACPI Spec 6.5, "7.4.2.5 System \_S4 State" says "Devices states are
+compatible with the current Power Resource states. In other words, all
+devices are in the D3 state when the system state is S4."
+
+The following "7.4.2.6 System \_S5 State (Soft Off)" states "The S5
+state is similar to the S4 state except that OSPM does not save any
+context." so it's safe to assume devices should be at D3 for S5.
+
+To accomplish this, use the PMSG_POWEROFF event to call all the device
+hibernate callbacks when the kernel is compiled with hibernate support.
+If compiled without hibernate support or hibernate fails fall back into
+the previous shutdown flow.
+
+Cc: AceLan Kao <acelan.kao@canonical.com>
+Cc: Kai-Heng Feng <kaihengf@nvidia.com>
+Cc: Mark Pearson <mpearson-lenovo@squebb.ca>
+Cc: Merthan Karakaş <m3rthn.k@gmail.com>
+Tested-by: Eric Naim <dnaim@cachyos.org>
+Tested-by: Denis Benato <benato.denis96@gmail.com>
+Link: https://lore.kernel.org/linux-pci/20231213182656.6165-1-mario.limonciello@amd.com/
+Link: https://lore.kernel.org/linux-pci/20250506041934.1409302-1-superm1@kernel.org/
+Signed-off-by: Mario Limonciello (AMD) <superm1@kernel.org>
+---
+ kernel/reboot.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+index 695c33e75..286c5bab3 100644
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -13,6 +13,7 @@
+ #include <linux/kexec.h>
+ #include <linux/kmod.h>
+ #include <linux/kmsg_dump.h>
++#include <linux/pm.h>
+ #include <linux/reboot.h>
+ #include <linux/suspend.h>
+ #include <linux/syscalls.h>
+@@ -305,6 +306,11 @@ static void kernel_shutdown_prepare(enum system_states state)
+ 		(state == SYSTEM_HALT) ? SYS_HALT : SYS_POWER_OFF, NULL);
+ 	system_state = state;
+ 	usermodehelper_disable();
++#ifdef CONFIG_HIBERNATE_CALLBACKS
++	if (!dpm_suspend_start(PMSG_POWEROFF) && !dpm_suspend_end(PMSG_POWEROFF))
++		return;
++	pr_emerg("Failed to power off devices, using shutdown instead.\n");
++#endif
+ 	device_shutdown();
+ }
+ /**
+-- 
+2.55.0
+
