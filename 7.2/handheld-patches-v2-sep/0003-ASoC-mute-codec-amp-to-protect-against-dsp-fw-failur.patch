@@ -1,0 +1,164 @@
+From 15c35c398c7bb4d5d6fb28598c7e7de79bf5682e Mon Sep 17 00:00:00 2001
+From: Robert Beckett <bob.beckett@collabora.com>
+Date: Thu, 11 Dec 2025 20:25:24 +0000
+Subject: [PATCH 003/188] ASoC: mute codec amp to protect against dsp fw
+ failures
+
+Add a new resume mute control to mute the speaker output on suspend
+and only restore it once DSP firmware has successfully started
+on resume.
+This protects against short loud sounds upon resume if the DSP
+firmware fails to start correctly, leavin the output muted.
+
+Signed-off-by: Robert Beckett <bob.beckett@collabora.com>
+Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+---
+ sound/soc/codecs/max98388.c | 52 +++++++++++++++++++++++++++++++++++++
+ sound/soc/codecs/max98388.h |  1 +
+ sound/soc/sof/pm.c          | 27 +++++++++++++++++++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/sound/soc/codecs/max98388.c b/sound/soc/codecs/max98388.c
+index 226c2a071..46cbee4ca 100644
+--- a/sound/soc/codecs/max98388.c
++++ b/sound/soc/codecs/max98388.c
+@@ -297,6 +297,56 @@ static SOC_ENUM_SINGLE_DECL(max98388_ssm_mod_enum,
+ 			    MAX98388_SPK_AMP_SSM_MOD_SHIFT,
+ 			    max98388_ssm_mod_text);
+ 
++
++#define MAX98388_VOL_MUTE 0x7f
++
++static int max98388_resume_mute_switch_put(struct snd_kcontrol *kcontrol,
++					   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct max98388_priv *max98388 = snd_soc_component_get_drvdata(component);
++	int mute = ucontrol->value.integer.value[0];
++	unsigned int vol, val;
++	int ret;
++
++	ret = regmap_read(max98388->regmap, MAX98388_R2090_SPK_CH_VOL_CTRL, &vol);
++	if (ret)
++		return ret;
++
++	if (vol == MAX98388_VOL_MUTE && mute)
++		return 0;
++	if (vol != MAX98388_VOL_MUTE && !mute)
++		return 0;
++
++	if (mute) {
++		max98388->saved_vol = vol;
++		val = MAX98388_VOL_MUTE;
++	} else {
++		val = max98388->saved_vol;
++	}
++
++	ret = regmap_write(max98388->regmap, MAX98388_R2090_SPK_CH_VOL_CTRL, val);
++
++	return ret;
++}
++
++static int max98388_resume_mute_switch_get(struct snd_kcontrol *kcontrol,
++					   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct max98388_priv *max98388 = snd_soc_component_get_drvdata(component);
++	unsigned int vol;
++	int ret;
++
++	ret = regmap_read(max98388->regmap, MAX98388_R2090_SPK_CH_VOL_CTRL, &vol);
++	if (ret)
++		return ret;
++
++	ucontrol->value.integer.value[0] = (vol == MAX98388_VOL_MUTE) ? 1 : 0;
++
++	return 0;
++}
++
+ static const struct snd_kcontrol_new max98388_snd_controls[] = {
+ 	SOC_SINGLE("Ramp Up Switch", MAX98388_R2091_SPK_CH_CFG,
+ 		   MAX98388_SPK_CFG_VOL_RMPUP_SHIFT, 1, 0),
+@@ -337,6 +387,8 @@ static const struct snd_kcontrol_new max98388_snd_controls[] = {
+ 	/* Digital Volume */
+ 	SOC_SINGLE_TLV("Digital Volume", MAX98388_R2090_SPK_CH_VOL_CTRL,
+ 		       0, 0x7F, 1, max98388_digital_tlv),
++	SOC_SINGLE_EXT("Resume Mute Switch", 0, 0, 1, 0,
++		       max98388_resume_mute_switch_get, max98388_resume_mute_switch_put),
+ 	/* Speaker Volume */
+ 	SOC_SINGLE_TLV("Speaker Volume", MAX98388_R2092_SPK_AMP_OUT_CFG,
+ 		       0, 5, 0, max98388_amp_gain_tlv),
+diff --git a/sound/soc/codecs/max98388.h b/sound/soc/codecs/max98388.h
+index 77833d181..d038acbf2 100644
+--- a/sound/soc/codecs/max98388.h
++++ b/sound/soc/codecs/max98388.h
+@@ -229,6 +229,7 @@ struct max98388_priv {
+ 	bool interleave_mode;
+ 	unsigned int ch_size;
+ 	bool tdm_mode;
++	unsigned int saved_vol;
+ };
+ 
+ #endif
+diff --git a/sound/soc/sof/pm.c b/sound/soc/sof/pm.c
+index dd7cd87f1..2052b35e1 100644
+--- a/sound/soc/sof/pm.c
++++ b/sound/soc/sof/pm.c
+@@ -12,6 +12,8 @@
+ #include "ops.h"
+ #include "sof-priv.h"
+ #include "sof-audio.h"
++#include "sound/soc-component.h"
++#include "sound/soc.h"
+ 
+ static int override_on_demand_boot = -1;
+ module_param_named(on_demand_boot, override_on_demand_boot, int, 0444);
+@@ -75,6 +77,28 @@ static void sof_cache_debugfs(struct snd_sof_dev *sdev)
+ }
+ #endif
+ 
++static void sof_mute_components(struct snd_sof_dev *sdev, bool mute)
++{
++	struct snd_soc_card *card = sdev->component->card;
++	struct snd_soc_component *component;
++
++	if (!card)
++		return;
++
++	for_each_card_components(card, component) {
++		struct snd_kcontrol *kctrl;
++		struct snd_ctl_elem_value val;
++
++		kctrl = snd_soc_component_get_kcontrol(component, "Resume Mute Switch");
++		if (!kctrl)
++			continue;
++
++		val.value.integer.value[0] = mute;
++
++		kctrl->put(kctrl, &val);
++	}
++}
++
+ int snd_sof_boot_dsp_firmware(struct snd_sof_dev *sdev)
+ {
+ 	const struct sof_ipc_pm_ops *pm_ops = sof_ipc_get_ops(sdev, pm);
+@@ -144,6 +168,7 @@ int snd_sof_boot_dsp_firmware(struct snd_sof_dev *sdev)
+ 				__func__, ret);
+ 	}
+ 
++	sof_mute_components(sdev, false);
+ setup_fail:
+ #if IS_ENABLED(CONFIG_SND_SOC_SOF_DEBUG_ENABLE_DEBUGFS_CACHE)
+ 	if (ret < 0) {
+@@ -263,6 +288,8 @@ static int sof_suspend(struct device *dev, bool runtime_suspend)
+ 				ret);
+ 			return ret;
+ 		}
++
++		sof_mute_components(sdev, true);
+ 	}
+ 
+ 	pm_state.event = target_state;
+-- 
+2.55.0
+

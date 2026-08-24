@@ -1,0 +1,183 @@
+From 877bfd50924e972c55748da6c1a675e904c35e89 Mon Sep 17 00:00:00 2001
+From: Matthew Schwartz <matthew.schwartz@linux.dev>
+Date: Sun, 21 Jun 2026 01:13:11 -0700
+Subject: [PATCH 136/188] mmc: rtsx: keep PCI function in D0 while an SD card
+ is present
+
+On handhelds that disable MMC_CAP_AGGRESSIVE_PM via the DMI quirk table,
+the mmc core no longer powers the card off on runtime suspend, but the
+rtsx function still force-powers-down and delinks it (rts522a:
+D3_DELINK_MODE_EN + FPDCTL ALL_POWER_DOWN). The card is reset while the
+core still believes it is initialised, so the next request hits dead
+silicon: RTS522A reports the card removed ("tuning execution failed: -22"
+on retry) and corrupts the filesystem, while RTS525A/RTS5261 get stuck
+("Card stuck being busy!", "error -110 doing runtime resume").
+
+Re-enabling aggressive PM is not an option as it reintroduces the resume
+re-init stall the quirk was added to avoid. Instead, on those devices,
+refuse runtime suspend while an SD card is present:
+rtsx_pci_runtime_suspend() returns -EBUSY rather than power-cycling a
+card the core still owns, so the function stays in D0.
+rtsx_pci_runtime_idle() still runs, so ASPM L1 stays enabled and idle
+link power is preserved.
+
+The gate (sd_pm_keepalive) is set by the SD/MMC host and read live at
+suspend time, so a card already present at boot is covered regardless of
+probe order, and the host clears it on remove so it never outlives the
+host. The gate is scoped to the quirked devices, so other systems keep
+normal runtime PM; an empty slot still suspends and delinks, and s2idle
+still re-inits via the normal ->set_ios() path. An SD-Express handoff
+clears the gate so the function can delink for the NVMe device.
+
+Fixes: 9a626290791b ("[FOR-UPSTREAM] mmc: rtsx: add quirk table to disable runtime power management")
+Assisted-by: Claude:claude-opus-4-8
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/misc/cardreader/rtsx_pcr.c | 42 +++++++++++++++++++++++++++++-
+ drivers/mmc/host/rtsx_pci_sdmmc.c  | 15 +++++++++++
+ include/linux/rtsx_pci.h           |  4 +++
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/cardreader/rtsx_pcr.c b/drivers/misc/cardreader/rtsx_pcr.c
+index c4d54ca2f..5590ea6b2 100644
+--- a/drivers/misc/cardreader/rtsx_pcr.c
++++ b/drivers/misc/cardreader/rtsx_pcr.c
+@@ -843,6 +843,28 @@ int rtsx_pci_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+ }
+ EXPORT_SYMBOL_GPL(rtsx_pci_switch_output_voltage);
+ 
++/* Open the gate for an SD-Express handoff so runtime suspend can delink. */
++void rtsx_pci_sd_express_handoff(struct rtsx_pcr *pcr)
++{
++	mutex_lock(&pcr->pcr_mutex);
++	pcr->sd_express = true;
++	mutex_unlock(&pcr->pcr_mutex);
++}
++EXPORT_SYMBOL_GPL(rtsx_pci_sd_express_handoff);
++
++/* Set whether runtime suspend must keep a present card powered.  The SD/MMC
++ * host knows the policy but may probe asynchronously after the parent, so it
++ * (un)sets the gate here; the gate is read live in rtsx_pci_runtime_suspend(),
++ * so there is no establishment race with a card already present at boot.
++ */
++void rtsx_pci_set_sd_pm_keepalive(struct rtsx_pcr *pcr, bool keepalive)
++{
++	mutex_lock(&pcr->pcr_mutex);
++	pcr->sd_pm_keepalive = keepalive;
++	mutex_unlock(&pcr->pcr_mutex);
++}
++EXPORT_SYMBOL_GPL(rtsx_pci_set_sd_pm_keepalive);
++
+ unsigned int rtsx_pci_card_exist(struct rtsx_pcr *pcr)
+ {
+ 	unsigned int val;
+@@ -914,6 +936,12 @@ static void rtsx_pci_card_detect(struct work_struct *work)
+ 		pcr->card_exist &= ~card_removed;
+ 	}
+ 
++	/* A removed SD card cancels any pending SD-Express handoff, so the gate
++	 * protects the next card inserted into the slot.
++	 */
++	if (!(pcr->card_exist & SD_EXIST))
++		pcr->sd_express = false;
++
+ 	mutex_unlock(&pcr->pcr_mutex);
+ 
+ 	if ((card_detect & SD_EXIST) && pcr->slots[RTSX_SD_CARD].card_event)
+@@ -1774,11 +1802,23 @@ static int rtsx_pci_runtime_suspend(struct device *device)
+ 
+ 	dev_dbg(device, "--> %s\n", __func__);
+ 
++	/* On devices that keep the card initialised across runtime suspend
++	 * (aggressive PM disabled), never power-cycle a card the mmc core
++	 * still owns: stay in D0 instead.  ASPM L1 was already re-enabled by
++	 * rtsx_pci_runtime_idle(), so idle link power is still saved.
++	 */
++	mutex_lock(&pcr->pcr_mutex);
++	if (pcr->sd_pm_keepalive && (pcr->card_exist & SD_EXIST) &&
++	    !pcr->sd_express) {
++		mutex_unlock(&pcr->pcr_mutex);
++		return -EBUSY;
++	}
++	mutex_unlock(&pcr->pcr_mutex);
++
+ 	cancel_delayed_work_sync(&pcr->carddet_work);
+ 
+ 	mutex_lock(&pcr->pcr_mutex);
+ 	rtsx_pci_power_off(pcr, HOST_ENTER_S3, true);
+-
+ 	mutex_unlock(&pcr->pcr_mutex);
+ 
+ 	return 0;
+diff --git a/drivers/mmc/host/rtsx_pci_sdmmc.c b/drivers/mmc/host/rtsx_pci_sdmmc.c
+index e335bd6bc..bbe509de5 100644
+--- a/drivers/mmc/host/rtsx_pci_sdmmc.c
++++ b/drivers/mmc/host/rtsx_pci_sdmmc.c
+@@ -1470,6 +1470,10 @@ static int sdmmc_init_sd_express(struct mmc_host *mmc, struct mmc_ios *ios)
+ 		RTS5261_MCU_BUS_SEL_MASK | RTS5261_MCU_CLOCK_SEL_MASK
+ 		| RTS5261_DRIVER_ENABLE_FW,
+ 		RTS5261_MCU_CLOCK_SEL_16M | RTS5261_DRIVER_ENABLE_FW);
++
++	/* Release the D0 hold so the function can delink for the NVMe handoff. */
++	rtsx_pci_sd_express_handoff(pcr);
++
+ 	host->eject = true;
+ 	return 0;
+ }
+@@ -1529,6 +1533,14 @@ static void realtek_init_host(struct realtek_pci_sdmmc *host)
+ 		MMC_CAP_UHS_SDR12 | MMC_CAP_UHS_SDR25;
+ 	if (pcr->rtd3_en && !(quirks & QUIRK_NO_AGGRESSIVE_PM))
+ 		mmc->caps = mmc->caps | MMC_CAP_AGGRESSIVE_PM;
++
++	/* These devices skip aggressive PM, so the function must stay in D0
++	 * rather than power-cycle a present card on runtime suspend.  Arm the
++	 * gate here; it is cleared in rtsx_pci_sdmmc_drv_remove() so it never
++	 * outlives this host.
++	 */
++	rtsx_pci_set_sd_pm_keepalive(pcr, !!(quirks & QUIRK_NO_AGGRESSIVE_PM));
++
+ 	mmc->caps2 = MMC_CAP2_NO_PRESCAN_POWERUP | MMC_CAP2_FULL_PWR_CYCLE |
+ 		MMC_CAP2_NO_SDIO;
+ 	mmc->max_current_330 = 400;
+@@ -1598,6 +1610,7 @@ static int rtsx_pci_sdmmc_drv_probe(struct platform_device *pdev)
+ 
+ 	ret = mmc_add_host(mmc);
+ 	if (ret) {
++		rtsx_pci_set_sd_pm_keepalive(pcr, false);
+ 		pm_runtime_dont_use_autosuspend(&pdev->dev);
+ 		pm_runtime_disable(&pdev->dev);
+ 		return ret;
+@@ -1613,6 +1626,8 @@ static void rtsx_pci_sdmmc_drv_remove(struct platform_device *pdev)
+ 	struct mmc_host *mmc;
+ 
+ 	pcr = host->pcr;
++	/* Drop the runtime-suspend gate so it never outlives this host. */
++	rtsx_pci_set_sd_pm_keepalive(pcr, false);
+ 	pcr->slots[RTSX_SD_CARD].p_dev = NULL;
+ 	pcr->slots[RTSX_SD_CARD].card_event = NULL;
+ 	mmc = host->mmc;
+diff --git a/include/linux/rtsx_pci.h b/include/linux/rtsx_pci.h
+index 3c5689356..94367fd7a 100644
+--- a/include/linux/rtsx_pci.h
++++ b/include/linux/rtsx_pci.h
+@@ -1271,6 +1271,8 @@ struct rtsx_pcr {
+ 	u8			ocp_stat2;
+ 	u8			ovp_stat;
+ 	u8			rtd3_en;
++	bool			sd_pm_keepalive;
++	bool			sd_express;
+ };
+ 
+ #define PID_524A	0x524A
+@@ -1305,6 +1307,8 @@ struct rtsx_pcr {
+ 				(((ddr50) << 16) | ((sdr50) << 8) | (sdr104))
+ 
+ void rtsx_pci_start_run(struct rtsx_pcr *pcr);
++void rtsx_pci_sd_express_handoff(struct rtsx_pcr *pcr);
++void rtsx_pci_set_sd_pm_keepalive(struct rtsx_pcr *pcr, bool keepalive);
+ int rtsx_pci_write_register(struct rtsx_pcr *pcr, u16 addr, u8 mask, u8 data);
+ int rtsx_pci_read_register(struct rtsx_pcr *pcr, u16 addr, u8 *data);
+ int rtsx_pci_write_phy_register(struct rtsx_pcr *pcr, u8 addr, u16 val);
+-- 
+2.55.0
+

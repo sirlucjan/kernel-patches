@@ -1,0 +1,224 @@
+From db08cdd12c6a6e01dfd83088767263c94381f13b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?N=C3=ADcolas=20F=2E=20R=2E=20A=2E=20Prado?=
+ <nfraprado@collabora.com>
+Date: Fri, 22 May 2026 12:00:50 -0400
+Subject: [PATCH 132/188] ASoC: cs35l41: Restore register state after system
+ sleep
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently, on the Steam Deck LCD when the system goes into hibernation
+and resumes back, the speakers are silent when playing with:
+
+  aplay -D plughw:acp5x,1 /usr/share/sounds/alsa/Front_Left.wav
+
+A crude workaround was to, after resuming the system, bypassing the
+regmap cache on the cs35l41 devices, before playing:
+
+  echo 1 > /sys/kernel/debug/regmap/spi-VLV1776\:00/cache_bypass
+  echo 1 > /sys/kernel/debug/regmap/spi-VLV1776\:01/cache_bypass
+
+That indicated that the hardware registers had gone out of sync with
+the regmap cache due to the power down in system hibernation.
+
+Fix the issue by, before system sleep, marking the regcache as cache
+only, and after system sleep, reseting the hardware and restoring the
+hardware registers from the regcache.
+
+This gets the sound working on the Steam Deck LCD after resume from S4.
+
+While the issue was only observed on S4 on this platform, the callbacks
+for suspend/resume are also set in the same way to account for platforms
+that power down the chip on S3 as well.
+
+Note that this change does not take care of restoring the DSP state,
+since the affected platform does not use the DSP and it couldn't be
+tested, so it is only shut down on resume so it can be reinitialized in
+the future.
+
+Assisted-by: GitHub Copilot CLI:claude-sonnet-4.6
+Signed-off-by: Nícolas F. R. A. Prado <nfraprado@collabora.com>
+---
+ sound/soc/codecs/cs35l41.c | 129 +++++++++++++++++++++++++++++--------
+ 1 file changed, 103 insertions(+), 26 deletions(-)
+
+diff --git a/sound/soc/codecs/cs35l41.c b/sound/soc/codecs/cs35l41.c
+index b2a076706..231341a7e 100644
+--- a/sound/soc/codecs/cs35l41.c
++++ b/sound/soc/codecs/cs35l41.c
+@@ -1199,9 +1199,41 @@ static int cs35l41_get_system_name(struct cs35l41_private *cs35l41)
+ 	return ret;
+ }
+ 
++static int cs35l41_boot(struct cs35l41_private *cs35l41)
++{
++	u32 int_status;
++	int ret;
++
++	if (cs35l41->reset_gpio) {
++		/* satisfy minimum reset pulse width spec */
++		gpiod_set_value_cansleep(cs35l41->reset_gpio, 0);
++		usleep_range(2000, 2100);
++		gpiod_set_value_cansleep(cs35l41->reset_gpio, 1);
++	}
++
++	usleep_range(2000, 2100);
++
++	ret = regmap_read_poll_timeout(cs35l41->regmap, CS35L41_IRQ1_STATUS4,
++				       int_status, int_status & CS35L41_OTP_BOOT_DONE,
++				       1000, 100000);
++	if (ret) {
++		dev_err_probe(cs35l41->dev, ret,
++			      "Failed waiting for OTP_BOOT_DONE\n");
++		return ret;
++	}
++
++	regmap_read(cs35l41->regmap, CS35L41_IRQ1_STATUS3, &int_status);
++	if (int_status & CS35L41_OTP_BOOT_ERR) {
++		dev_err(cs35l41->dev, "OTP Boot error\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ int cs35l41_probe(struct cs35l41_private *cs35l41, const struct cs35l41_hw_cfg *hw_cfg)
+ {
+-	u32 regid, reg_revid, i, mtl_revid, int_status, chipid_match;
++	u32 regid, reg_revid, i, mtl_revid, chipid_match;
+ 	int irq_pol = 0;
+ 	int ret;
+ 
+@@ -1242,29 +1274,10 @@ int cs35l41_probe(struct cs35l41_private *cs35l41, const struct cs35l41_hw_cfg *
+ 			goto err;
+ 		}
+ 	}
+-	if (cs35l41->reset_gpio) {
+-		/* satisfy minimum reset pulse width spec */
+-		usleep_range(2000, 2100);
+-		gpiod_set_value_cansleep(cs35l41->reset_gpio, 1);
+-	}
+ 
+-	usleep_range(2000, 2100);
+-
+-	ret = regmap_read_poll_timeout(cs35l41->regmap, CS35L41_IRQ1_STATUS4,
+-				       int_status, int_status & CS35L41_OTP_BOOT_DONE,
+-				       1000, 100000);
+-	if (ret) {
+-		dev_err_probe(cs35l41->dev, ret,
+-			      "Failed waiting for OTP_BOOT_DONE\n");
++	ret = cs35l41_boot(cs35l41);
++	if (ret)
+ 		goto err;
+-	}
+-
+-	regmap_read(cs35l41->regmap, CS35L41_IRQ1_STATUS3, &int_status);
+-	if (int_status & CS35L41_OTP_BOOT_ERR) {
+-		dev_err(cs35l41->dev, "OTP Boot error\n");
+-		ret = -EINVAL;
+-		goto err;
+-	}
+ 
+ 	ret = regmap_read(cs35l41->regmap, CS35L41_DEVID, &regid);
+ 	if (ret < 0) {
+@@ -1450,7 +1463,20 @@ static int cs35l41_sys_suspend(struct device *dev)
+ {
+ 	struct cs35l41_private *cs35l41 = dev_get_drvdata(dev);
+ 
+-	dev_dbg(cs35l41->dev, "System suspend, disabling IRQ\n");
++	dev_dbg(cs35l41->dev, "System suspend, saving state\n");
++	disable_irq(cs35l41->irq);
++
++	regcache_cache_only(cs35l41->regmap, true);
++	regcache_mark_dirty(cs35l41->regmap);
++
++	return 0;
++}
++
++static int cs35l41_sys_poweroff(struct device *dev)
++{
++	struct cs35l41_private *cs35l41 = dev_get_drvdata(dev);
++
++	dev_dbg(cs35l41->dev, "System poweroff, disabling IRQ\n");
+ 	disable_irq(cs35l41->irq);
+ 
+ 	return 0;
+@@ -1476,20 +1502,71 @@ static int cs35l41_sys_resume_noirq(struct device *dev)
+ 	return 0;
+ }
+ 
+-static int cs35l41_sys_resume(struct device *dev)
++static int cs35l41_sys_thaw(struct device *dev)
+ {
+ 	struct cs35l41_private *cs35l41 = dev_get_drvdata(dev);
+ 
+-	dev_dbg(cs35l41->dev, "System resume, reenabling IRQ\n");
++	dev_dbg(cs35l41->dev, "System thaw, reenabling IRQ\n");
+ 	enable_irq(cs35l41->irq);
+ 
+ 	return 0;
+ }
+ 
++static int cs35l41_sys_resume(struct device *dev)
++{
++	struct cs35l41_private *cs35l41 = dev_get_drvdata(dev);
++	int ret;
++
++	dev_dbg(cs35l41->dev, "System resume, restoring state\n");
++
++	regcache_cache_only(cs35l41->regmap, false);
++
++	ret = cs35l41_boot(cs35l41);
++	if (ret)
++		return ret;
++
++	cs35l41_test_key_unlock(cs35l41->dev, cs35l41->regmap);
++	ret = regcache_sync(cs35l41->regmap);
++	cs35l41_test_key_lock(cs35l41->dev, cs35l41->regmap);
++	if (ret) {
++		dev_err(cs35l41->dev, "Failed to restore register cache: %d\n", ret);
++		return ret;
++	}
++
++	ret = cs35l41_init_boost(cs35l41->dev, cs35l41->regmap,
++				 &cs35l41->hw_cfg);
++	if (ret)
++		return ret;
++
++	enable_irq(cs35l41->irq);
++
++	if (!cs35l41->dsp.cs_dsp.running)
++		return 0;
++
++	/*
++	 * DSP firmware is gone after a full power cycle. Reset the DSP
++	 * software state so that firmware is reloaded on next DSP preload event
++	 */
++	wm_adsp_stop(&cs35l41->dsp);
++
++	if (!cs35l41->dsp.cs_dsp.booted)
++		return 0;
++
++	wm_adsp_power_down(&cs35l41->dsp);
++
++	return 0;
++}
++
+ EXPORT_GPL_DEV_PM_OPS(cs35l41_pm_ops) = {
+ 	RUNTIME_PM_OPS(cs35l41_runtime_suspend, cs35l41_runtime_resume, NULL)
+ 
+-	SYSTEM_SLEEP_PM_OPS(cs35l41_sys_suspend, cs35l41_sys_resume)
++	.suspend  = pm_sleep_ptr(cs35l41_sys_suspend),
++	.resume   = pm_sleep_ptr(cs35l41_sys_resume),
++	.freeze   = pm_sleep_ptr(cs35l41_sys_suspend),
++	.thaw     = pm_sleep_ptr(cs35l41_sys_thaw),
++	.poweroff = pm_sleep_ptr(cs35l41_sys_poweroff),
++	.restore  = pm_sleep_ptr(cs35l41_sys_resume),
++
+ 	NOIRQ_SYSTEM_SLEEP_PM_OPS(cs35l41_sys_suspend_noirq, cs35l41_sys_resume_noirq)
+ };
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,145 @@
+From 974bf71a8d2a4622b21a569c17d626edb8960c19 Mon Sep 17 00:00:00 2001
+From: Lukas Wunner <lukas@wunner.de>
+Date: Sat, 15 Aug 2026 10:10:29 +0200
+Subject: [PATCH 188/188] mmc: rtsx_pci: Cope with hot-removal of MMC host
+
+Derek reports a lockup on hot-removal of a PCI-attached Realtek RTS525A
+MMC host if a card is inserted.  He has root-caused it to the block
+layer being unaware of the hot-removal and waiting indefinitely in
+sync_filesystem().
+
+For comparison, the NVMe subsystem copes with hot-removal by setting the
+controller state to NVME_CTRL_DEAD in nvme_remove(), which in turn leads
+to blk_mark_disk_dead() being called from nvme_mark_namespaces_dead().
+That avoids the indefinite wait in sync_filesystem().
+
+Adopt this approach:  Detect hot-removal in rtsx_pci_sdmmc_drv_remove()
+and invoke a new mmc_host_set_removed() helper which in turn invokes
+mmc_card_set_removed().  Before flushing outstanding requests to the
+card in mmc_blk_remove_req(), check for its removal and call
+blk_mark_disk_dead().
+
+Note that mmc_card_set_removed() cannot be called from the MMC host
+driver because it is private to the MMC core, hence the indirection
+through the newly introduced mmc_host_set_removed() helper.
+
+Other removable MMC hosts, in particular if attached via PCI or USB,
+may need to be amended with a similar check for hot-removal.  The
+present commit seeks to get that process going.
+
+Reported-by: Derek J. Clark <derekjohn.clark@gmail.com>
+Tested-by: Derek J. Clark <derekjohn.clark@gmail.com>
+Closes: https://lore.kernel.org/r/20260806214808.1202819-1-derekjohn.clark@gmail.com/
+Link: https://github.com/ValveSoftware/SteamOS/issues/2473
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Cc: Matthew Schwartz <matthew.schwartz@linux.dev>
+---
+ drivers/mmc/core/block.c          | 11 +++++++----
+ drivers/mmc/core/host.c           | 15 +++++++++++++++
+ drivers/mmc/host/rtsx_pci_sdmmc.c |  3 +++
+ include/linux/mmc/host.h          |  1 +
+ 4 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/mmc/core/block.c b/drivers/mmc/core/block.c
+index 54a923ba4..6183758e8 100644
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@ -2977,8 +2977,11 @@ static int mmc_blk_alloc_parts(struct mmc_card *card, struct mmc_blk_data *md)
+ 	return 0;
+ }
+ 
+-static void mmc_blk_remove_req(struct mmc_blk_data *md)
++static void mmc_blk_remove_req(struct mmc_card *card, struct mmc_blk_data *md)
+ {
++	if (mmc_card_removed(card))
++		blk_mark_disk_dead(md->disk);
++
+ 	/*
+ 	 * Flush remaining requests and free queues. It is freeing the queue
+ 	 * that stops new requests from being accepted.
+@@ -3005,7 +3008,7 @@ static void mmc_blk_remove_parts(struct mmc_card *card,
+ 	list_for_each_safe(pos, q, &md->part) {
+ 		part_md = list_entry(pos, struct mmc_blk_data, part);
+ 		list_del(pos);
+-		mmc_blk_remove_req(part_md);
++		mmc_blk_remove_req(card, part_md);
+ 	}
+ }
+ 
+@@ -3251,7 +3254,7 @@ static int mmc_blk_probe(struct mmc_card *card)
+ 
+ out:
+ 	mmc_blk_remove_parts(card, md);
+-	mmc_blk_remove_req(md);
++	mmc_blk_remove_req(card, md);
+ out_free:
+ 	destroy_workqueue(card->complete_wq);
+ 	return ret;
+@@ -3272,7 +3275,7 @@ static void mmc_blk_remove(struct mmc_card *card)
+ 	if (!mmc_card_sd_combo(card))
+ 		pm_runtime_disable(&card->dev);
+ 	pm_runtime_put_noidle(&card->dev);
+-	mmc_blk_remove_req(md);
++	mmc_blk_remove_req(card, md);
+ 	destroy_workqueue(card->complete_wq);
+ }
+ 
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index b7ce3137d..2625d9180 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -22,6 +22,7 @@
+ #include <linux/mmc/card.h>
+ #include <linux/mmc/slot-gpio.h>
+ 
++#include "card.h"
+ #include "core.h"
+ #include "crypto.h"
+ #include "host.h"
+@@ -703,3 +704,17 @@ void mmc_free_host(struct mmc_host *host)
+ }
+ 
+ EXPORT_SYMBOL(mmc_free_host);
++
++/**
++ *	mmc_host_set_removed - declare host removed
++ *	@host: mmc host
++ *
++ *	Declare the host (and any inserted card) removed and inaccessible.
++ */
++void mmc_host_set_removed(struct mmc_host *host)
++{
++	if (host->card)
++		mmc_card_set_removed(host->card);
++}
++
++EXPORT_SYMBOL(mmc_host_set_removed);
+diff --git a/drivers/mmc/host/rtsx_pci_sdmmc.c b/drivers/mmc/host/rtsx_pci_sdmmc.c
+index f870a76cf..a1502e7ab 100644
+--- a/drivers/mmc/host/rtsx_pci_sdmmc.c
++++ b/drivers/mmc/host/rtsx_pci_sdmmc.c
+@@ -1648,6 +1648,9 @@ static void rtsx_pci_sdmmc_drv_remove(struct platform_device *pdev)
+ 	pcr->slots[RTSX_SD_CARD].card_event = NULL;
+ 	mmc = host->mmc;
+ 
++	if (pci_dev_is_disconnected(pcr->pci))
++		mmc_host_set_removed(mmc);
++
+ 	cancel_work_sync(&host->work);
+ 
+ 	mutex_lock(&host->host_mutex);
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index ba84f02c2..a2403062d 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -588,6 +588,7 @@ struct mmc_host *devm_mmc_alloc_host(struct device *dev, int extra);
+ int mmc_add_host(struct mmc_host *);
+ void mmc_remove_host(struct mmc_host *);
+ void mmc_free_host(struct mmc_host *);
++void mmc_host_set_removed(struct mmc_host *host);
+ void mmc_of_parse_clk_phase(struct device *dev,
+ 			    struct mmc_clk_phase_map *map);
+ int mmc_of_parse(struct mmc_host *host);
+-- 
+2.55.0
+
