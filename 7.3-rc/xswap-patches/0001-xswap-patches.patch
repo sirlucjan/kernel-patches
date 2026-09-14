@@ -1,0 +1,2396 @@
+From b6b14356e8ba52ae0723ccf8bf4d4a29f956272d Mon Sep 17 00:00:00 2001
+From: Chris Li <chrisl@kernel.org>
+Date: Sun, 13 Sep 2026 15:50:03 +0800
+Subject: [PATCH 01/12] mm: xswap support for zswap
+
+Introduce extendable swap device support - xswap.
+
+An xswap device has no backing storage and no swap data section, so
+it wastes no disk space. Creation is via a sysfs interface added in a
+later patch.
+
+Zswap writeback is gated on whether a real (non-xswap) swap device is
+active. nr_real_swapfiles counts such devices and is maintained at
+swapon/swapoff only, so the gate reflects "a device exists to write
+back to" rather than "a device currently has free slots". This keeps
+writeback working even when the real swap device is full, and avoids
+a double decrement when a full device is swapped off.
+
+Co-developed-by: Baoquan He <hebaoquan@kylinos.cn>
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+Signed-off-by: Chris Li <chrisl@kernel.org>
+---
+ include/linux/swap.h |  2 ++
+ mm/page_io.c         | 16 ++++++++++++++++
+ mm/swap_state.c      |  7 +++++++
+ mm/swapfile.c        | 38 +++++++++++++++++++++++++++++++++++---
+ mm/zswap.c           |  7 ++++++-
+ 5 files changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 5658a1634..787fe463d 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -207,6 +207,7 @@ enum {
+ 	SWP_STABLE_WRITES = (1 << 11),	/* no overwrite PG_writeback pages */
+ 	SWP_SYNCHRONOUS_IO = (1 << 12),	/* synchronous IO is efficient */
+ 	SWP_HIBERNATION = (1 << 13),	/* pinned for hibernation */
++	SWP_XSWAP	= (1 << 14),	/* extendable swap device */
+ 					/* add others here before... */
+ };
+ 
+@@ -356,6 +357,7 @@ void free_folio_and_swap_cache(struct folio *folio);
+ void free_pages_and_swap_cache(struct encoded_page **, int);
+ /* linux/mm/swapfile.c */
+ extern atomic_long_t nr_swap_pages;
++extern atomic_t nr_real_swapfiles;
+ extern long total_swap_pages;
+ extern atomic_t nr_rotate_swap;
+ 
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 88962571c..5483c943e 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -248,6 +248,17 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+ 	}
+ 	rcu_read_unlock();
+ 
++	/*
++	 * ctx->sis is set by swap_add_folio() which is called from
++	 * __swap_writepage() below.  Since we must avoid the writepage
++	 * path for xswap devices, use the swap_info from the folio's
++	 * swap entry directly instead of going through ctx.
++	 */
++	if (unlikely(__swap_entry_to_info(folio->swap)->flags & SWP_XSWAP)) {
++		folio_mark_dirty(folio);
++		return AOP_WRITEPAGE_ACTIVATE;
++	}
++
+ 	__swap_writepage(ctx, folio);
+ 	return 0;
+ out_unlock:
+@@ -480,6 +491,11 @@ void swap_read_folio(struct swap_io_ctx *ctx, struct folio *folio)
+ 	if (zswap_load(folio) != -ENOENT)
+ 		goto finish;
+ 
++	if (unlikely(sis->flags & SWP_XSWAP)) {
++		folio_unlock(folio);
++		goto finish;
++	}
++
+ 	/* We have to read from slower devices. Increase zswap protection. */
+ 	zswap_folio_swapin(folio);
+ 	swap_add_folio(ctx, folio, READ);
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index f3961fdd8..03b633dce 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -830,6 +830,13 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 	struct blk_plug plug;
+ 	swp_entry_t ra_entry;
+ 
++	/*
++	 * The entry may have been freed by another task. Avoid swap_info_get()
++	 * which will print error message if the race happens.
++	 */
++	if (si->flags & SWP_XSWAP)
++		goto skip;
++
+ 	mask = swapin_nr_pages(offset) - 1;
+ 	if (!mask)
+ 		goto skip;
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 53bf01d5f..193b08a54 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -66,6 +66,7 @@ static void move_cluster(struct swap_info_struct *si,
+ static DEFINE_SPINLOCK(swap_lock);
+ static unsigned int nr_swapfiles;
+ atomic_long_t nr_swap_pages;
++atomic_t nr_real_swapfiles;
+ /*
+  * Some modules use swappable objects and may try to swap them out under
+  * memory pressure (via the shrinker). Before doing so, they may wish to
+@@ -1208,6 +1209,9 @@ static void del_from_avail_list(struct swap_info_struct *si, bool swapoff)
+ 		 */
+ 		lockdep_assert_held(&si->lock);
+ 		si->flags &= ~SWP_WRITEOK;
++		/* Count active devices, not merely those on the avail list. */
++		if (!(si->flags & SWP_XSWAP))
++			atomic_sub(1, &nr_real_swapfiles);
+ 		atomic_long_or(SWAP_USAGE_OFFLIST_BIT, &si->inuse_pages);
+ 	} else {
+ 		/*
+@@ -1265,6 +1269,8 @@ static void add_to_avail_list(struct swap_info_struct *si, bool swapon)
+ 	}
+ 
+ 	plist_add(&si->avail_list, &swap_avail_head);
++	if (swapon && !(si->flags & SWP_XSWAP))
++		atomic_add(1, &nr_real_swapfiles);
+ 
+ skip:
+ 	spin_unlock(&swap_avail_lock);
+@@ -2959,6 +2965,19 @@ static int setup_swap_extents(struct swap_info_struct *sis,
+ 	struct inode *inode = mapping->host;
+ 	int ret;
+ 
++	if (sis->flags & SWP_XSWAP) {
++		*span = 0;
++		/*
++		 * xswap devices have no backing block device and
++		 * physical writeout is skipped in swap_writeout(),
++		 * but sis->ops must still be set so that callers
++		 * like shrink_folio_list() can safely dereference
++		 * ops->flags.
++		 */
++		sis->ops = &swap_bdev_ops;
++		return 0;
++	}
++
+ 	ret = sio_pool_init();
+ 	if (ret)
+ 		return ret;
+@@ -3167,7 +3186,8 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 
+ 	destroy_swap_extents(p, p->swap_file);
+ 
+-	if (!(p->flags & SWP_SOLIDSTATE))
++	if (!(p->flags & SWP_XSWAP) &&
++	    !(p->flags & SWP_SOLIDSTATE))
+ 		atomic_dec(&nr_rotate_swap);
+ 
+ 	mutex_lock(&swapon_mutex);
+@@ -3277,6 +3297,19 @@ static void swap_stop(struct seq_file *swap, void *v)
+ 	mutex_unlock(&swapon_mutex);
+ }
+ 
++static const char *swap_type_str(struct swap_info_struct *si)
++{
++	struct file *file = si->swap_file;
++
++	if (si->flags & SWP_XSWAP)
++		return "xswap\t";
++
++	if (S_ISBLK(file_inode(file)->i_mode))
++		return "partition";
++
++	return "file\t";
++}
++
+ static int swap_show(struct seq_file *swap, void *v)
+ {
+ 	struct swap_info_struct *si = v;
+@@ -3296,8 +3329,7 @@ static int swap_show(struct seq_file *swap, void *v)
+ 	len = seq_file_path(swap, file, " \t\n\\");
+ 	seq_printf(swap, "%*s%s\t%lu\t%s%lu\t%s%d\n",
+ 			len < 40 ? 40 - len : 1, " ",
+-			S_ISBLK(file_inode(file)->i_mode) ?
+-				"partition" : "file\t",
++			swap_type_str(si),
+ 			bytes, bytes < 10000000 ? "\t" : "",
+ 			inuse, inuse < 10000000 ? "\t" : "",
+ 			si->prio);
+diff --git a/mm/zswap.c b/mm/zswap.c
+index 37f34e406..835f2b0b7 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -1000,6 +1000,11 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 	if (!si)
+ 		return -EEXIST;
+ 
++	if (si->flags & SWP_XSWAP) {
++		put_swap_device(si);
++		return -EINVAL;
++	}
++
+ 	mpol = get_task_policy(current);
+ 	folio = swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,
+ 				       NO_INTERLEAVE_INDEX);
+@@ -1545,7 +1550,7 @@ bool zswap_store(struct folio *folio)
+ 	zswap_pool_put(pool);
+ put_objcg:
+ 	obj_cgroup_put(objcg);
+-	if (!ret && zswap_pool_reached_full)
++	if (!ret && zswap_pool_reached_full && atomic_read(&nr_real_swapfiles))
+ 		queue_work(shrink_wq, &zswap_shrink_work);
+ check_old:
+ 	/*
+-- 
+2.55.0
+
+
+From 9b11d6689e2bee720c5a024e62d80d020e41aef7 Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:04 +0800
+Subject: [PATCH 02/12] mm, swap: add CONFIG_XSWAP and xswap fields to
+ swap_info_struct
+
+Add CONFIG_XSWAP Kconfig option for extendable swap device support.
+It depends on SWAP && 64BIT && ZSWAP, since xswap devices are backed by
+zswap, and on SYSFS, which is currently the only way to create one.
+
+Add three fields to struct swap_info_struct under CONFIG_XSWAP:
+- cluster_vm: the VM_SPARSE vm_struct backing the cluster_info array
+- nr_clusters_max: total number of clusters in the xswap address space
+- nr_clusters_mapped: number of clusters currently mapped (lazy grow)
+These fields enable lazy vmalloc-based dynamic cluster management.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ include/linux/swap.h | 5 +++++
+ mm/Kconfig           | 9 +++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 787fe463d..09ecef1b5 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -248,6 +248,11 @@ struct swap_info_struct {
+ 	signed char	type;		/* strange name for an index */
+ 	unsigned int	max;		/* size of this swap device */
+ 	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
++#ifdef CONFIG_XSWAP
++	struct vm_struct	*cluster_vm;	/* VM_SPARSE area for cluster_info */
++	unsigned long		nr_clusters_max;/* total clusters in the xswap address space */
++	unsigned long		nr_clusters_mapped; /* currently mapped cluster count */
++#endif
+ 	struct list_head free_clusters; /* free clusters list */
+ 	struct list_head full_clusters; /* full clusters list */
+ 	struct list_head nonfull_clusters[SWAP_NR_ORDERS];
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 604c58199..e9837c0f5 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -122,6 +122,15 @@ config ZSWAP_COMPRESSOR_DEFAULT
+        default "zstd" if ZSWAP_COMPRESSOR_DEFAULT_ZSTD
+        default ""
+ 
++config XSWAP
++	bool "Extendable (virtual) swap device"
++	depends on SWAP && 64BIT && ZSWAP && SYSFS
++	help
++	  Adds support for extendable swap devices (xswap) that decouple
++	  PTE swap entries from physical backing storage. The cluster_info
++	  array is backed by a sparse vmalloc area that grows and shrinks
++	  on demand, avoiding static pre-allocation overhead.
++
+ config ZSMALLOC
+ 	tristate
+ 
+-- 
+2.55.0
+
+
+From 85d1f83a368ec393426ead5a976ac782c47a9b34 Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:05 +0800
+Subject: [PATCH 03/12] mm, swap: refactor free_swap_cluster_info to take
+ swap_info_struct
+
+Change free_swap_cluster_info() to accept struct swap_info_struct*
+instead of (cluster_info, maxpages) directly. Extract cluster_info
+and maxpages from si inside the function, and clear si->cluster_info
+after freeing so a caller's error path cannot free it again (a
+double free on the swapon() error path). Also clean up swapoff:
+remove the snapshot locals (maxpages/cluster_info) and move the
+p->max/p->cluster_info clearing after free_swap_cluster_info().
+
+The new signature will allow the xswap path (added in the next patch)
+to access si->flags and call xswap_unmap_clusters() from within
+free_swap_cluster_info().
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 26 ++++++++++++++------------
+ 1 file changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 193b08a54..25bdb2f2f 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -3055,14 +3055,17 @@ static void wait_for_allocation(struct swap_info_struct *si)
+ 	}
+ }
+ 
+-static void free_swap_cluster_info(struct swap_cluster_info *cluster_info,
+-				   unsigned long maxpages)
++static void free_swap_cluster_info(struct swap_info_struct *si)
+ {
++	struct swap_cluster_info *cluster_info = si->cluster_info;
++	unsigned long maxpages = si->max;
+ 	struct swap_cluster_info *ci;
+-	int i, nr_clusters = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
++	int i, nr_clusters;
+ 
+ 	if (!cluster_info)
+ 		return;
++
++	nr_clusters = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
+ 	for (i = 0; i < nr_clusters; i++) {
+ 		ci = cluster_info + i;
+ 		/* Cluster with bad marks count will have a remaining table */
+@@ -3074,6 +3077,7 @@ static void free_swap_cluster_info(struct swap_cluster_info *cluster_info,
+ 		spin_unlock(&ci->lock);
+ 	}
+ 	kvfree(cluster_info);
++	si->cluster_info = NULL;
+ }
+ 
+ /*
+@@ -3101,11 +3105,9 @@ static void flush_percpu_swap_cluster(struct swap_info_struct *si)
+ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ {
+ 	struct swap_info_struct *p = NULL;
+-	struct swap_cluster_info *cluster_info;
+ 	struct file *swap_file, *victim;
+ 	struct address_space *mapping;
+ 	struct inode *inode;
+-	unsigned int maxpages;
+ 	int err, found = 0;
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+@@ -3197,10 +3199,6 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 
+ 	swap_file = p->swap_file;
+ 	p->swap_file = NULL;
+-	maxpages = p->max;
+-	cluster_info = p->cluster_info;
+-	p->max = 0;
+-	p->cluster_info = NULL;
+ 	spin_unlock(&p->lock);
+ 	spin_unlock(&swap_lock);
+ 	arch_swap_invalidate_area(p->type);
+@@ -3208,7 +3206,9 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 	mutex_unlock(&swapon_mutex);
+ 	kfree(p->global_cluster);
+ 	p->global_cluster = NULL;
+-	free_swap_cluster_info(cluster_info, maxpages);
++	free_swap_cluster_info(p);
++	p->max = 0;
++	p->cluster_info = NULL;
+ 
+ 	inode = mapping->host;
+ 
+@@ -3575,6 +3575,8 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 	if (!cluster_info)
+ 		goto err;
+ 
++	si->cluster_info = cluster_info;
++
+ 	for (i = 0; i < nr_clusters; i++)
+ 		spin_lock_init(&cluster_info[i].lock);
+ 
+@@ -3638,7 +3640,7 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 	si->cluster_info = cluster_info;
+ 	return 0;
+ err:
+-	free_swap_cluster_info(cluster_info, maxpages);
++	free_swap_cluster_info(si);
+ 	return err;
+ }
+ 
+@@ -3857,7 +3859,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 	si->global_cluster = NULL;
+ 	inode = NULL;
+ 	destroy_swap_extents(si, swap_file);
+-	free_swap_cluster_info(si->cluster_info, si->max);
++	free_swap_cluster_info(si);
+ 	si->cluster_info = NULL;
+ 	/*
+ 	 * Clear the SWP_USED flag after all resources are freed so
+-- 
+2.55.0
+
+
+From 07afd1b11ed6232378ce42dcecf0cb4b11ba8ff6 Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:06 +0800
+Subject: [PATCH 04/12] mm, swap: add xswap cluster grow via VM_SPARSE vmalloc
+
+Implement dynamic cluster_info array growth for xswap devices using a
+VM_SPARSE vmalloc area. The cluster_info array is backed by a sparse
+vmalloc region that is populated lazily in chunks: physical pages are
+allocated and mapped on demand as swap usage grows, and the mapped
+tail is unmapped again on the error/teardown paths. Only an initial
+chunk is mapped at device setup, and every access is bounded to the
+currently mapped range.
+
+The mapping is hardened against concurrency and failure: partial map
+failures clear their PTEs before freeing, stale grow ranges are rejected.
+The grow path avoids emergency reserves via __GFP_HIGH|__GFP_NOMEMALLOC
+and wraps allocations with memalloc_noreclaim_save(). A per-device
+mutex (xswap_lock) serializes concurrent map/unmap page table modifications.
+find_next_to_unuse() bounds its scan by the mapped range and wraps with >=
+so a shrunk bound cannot spin forever.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ include/linux/swap.h |   1 +
+ mm/swapfile.c        | 286 ++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 285 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 09ecef1b5..ad2311310 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -252,6 +252,7 @@ struct swap_info_struct {
+ 	struct vm_struct	*cluster_vm;	/* VM_SPARSE area for cluster_info */
+ 	unsigned long		nr_clusters_max;/* total clusters in the xswap address space */
+ 	unsigned long		nr_clusters_mapped; /* currently mapped cluster count */
++	struct mutex		xswap_lock;	/* serialize map/unmap operations */
+ #endif
+ 	struct list_head free_clusters; /* free clusters list */
+ 	struct list_head full_clusters; /* full clusters list */
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 25bdb2f2f..5140b3f84 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -49,6 +49,25 @@
+ #include "internal.h"
+ #include "swap.h"
+ 
++#ifdef CONFIG_XSWAP
++/*
++ * xswap: dynamically grow the cluster_info array via a VM_SPARSE area.
++ *
++ * XSWAP_GROW_CLUSTERS is the number of clusters to map in one grow
++ * operation.  It is set to the number of cluster_info structs that
++ * fit in a single page (at least 16), so that the vmalloc page table
++ * overhead is proportional to the number of clusters mapped.
++ */
++#define XSWAP_GROW_CLUSTERS \
++	max_t(unsigned long, PAGE_SIZE / sizeof(struct swap_cluster_info), 16)
++
++static int xswap_map_clusters(struct swap_info_struct *si,
++			      unsigned long start_idx, unsigned long nr);
++static void xswap_unmap_clusters(struct swap_info_struct *si,
++				 unsigned long start_idx, unsigned long nr);
++static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data);
++#endif
++
+ static void swap_range_alloc(struct swap_info_struct *si,
+ 			     unsigned int nr_entries);
+ static bool folio_swapcache_freeable(struct folio *folio);
+@@ -2716,15 +2735,27 @@ static unsigned int find_next_to_unuse(struct swap_info_struct *si,
+ 					unsigned int prev)
+ {
+ 	unsigned int i;
++	unsigned int end = si->max;
+ 	unsigned long swp_tb;
+ 
++#ifdef CONFIG_XSWAP
++	/* xswap may have shrunk and unmapped the cluster_info tail. */
++	if (si->flags & SWP_XSWAP) {
++		unsigned long mapped_end;
++
++		mapped_end = READ_ONCE(si->nr_clusters_mapped) * SWAPFILE_CLUSTER;
++		if (mapped_end < end)
++			end = mapped_end;
++	}
++#endif
++
+ 	/*
+ 	 * No need for swap_lock here: we're just looking
+ 	 * for whether an entry is in use, not modifying it; false
+ 	 * hits are okay, and sys_swapoff() has already prevented new
+ 	 * allocations from this area (while holding swap_lock).
+ 	 */
+-	for (i = prev + 1; i < si->max; i++) {
++	for (i = prev + 1; i < end; i++) {
+ 		swp_tb = swap_table_get(__swap_offset_to_cluster(si, i),
+ 					i % SWAPFILE_CLUSTER);
+ 		if (!swp_tb_is_null(swp_tb) && !swp_tb_is_bad(swp_tb))
+@@ -2733,7 +2764,7 @@ static unsigned int find_next_to_unuse(struct swap_info_struct *si,
+ 			cond_resched();
+ 	}
+ 
+-	if (i == si->max)
++	if (i >= end)
+ 		i = 0;
+ 
+ 	return i;
+@@ -3049,6 +3080,13 @@ static void wait_for_allocation(struct swap_info_struct *si)
+ 
+ 	BUG_ON(si->flags & SWP_WRITEOK);
+ 
++#ifdef CONFIG_XSWAP
++	/* Skip shrinker-unmapped cluster tail. */
++	if (si->flags & SWP_XSWAP)
++		end = min(end, READ_ONCE(si->nr_clusters_mapped) *
++			  SWAPFILE_CLUSTER);
++#endif
++
+ 	for (offset = 0; offset < end; offset += SWAPFILE_CLUSTER) {
+ 		ci = swap_cluster_lock(si, offset);
+ 		swap_cluster_unlock(ci);
+@@ -3065,6 +3103,18 @@ static void free_swap_cluster_info(struct swap_info_struct *si)
+ 	if (!cluster_info)
+ 		return;
+ 
++#ifdef CONFIG_XSWAP
++	if (si->flags & SWP_XSWAP) {
++		/* Unmap all mapped clusters and free the VM_SPARSE area */
++		if (si->nr_clusters_mapped > 0)
++			xswap_unmap_clusters(si, 0, si->nr_clusters_mapped);
++		free_vm_area(si->cluster_vm);
++		si->cluster_vm = NULL;
++		si->nr_clusters_mapped = 0;
++		return;
++	}
++#endif
++
+ 	nr_clusters = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
+ 	for (i = 0; i < nr_clusters; i++) {
+ 		ci = cluster_info + i;
+@@ -3562,6 +3612,174 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
+ 	return maxpages;
+ }
+ 
++#ifdef CONFIG_XSWAP
++static int xswap_map_clusters(struct swap_info_struct *si,
++			      unsigned long start_idx, unsigned long nr)
++{
++	unsigned long start_addr = (unsigned long)si->cluster_info +
++				   (size_t)start_idx * sizeof(struct swap_cluster_info);
++	unsigned long end_addr = start_addr + (size_t)nr * sizeof(struct swap_cluster_info);
++	/* Round to page boundaries for vm_area_map_pages(). */
++	unsigned long vm_start = PAGE_ALIGN(start_addr);
++	unsigned long vm_end = PAGE_ALIGN(end_addr);
++	unsigned int noreclaim_flags;
++	unsigned long mapped_end;
++	unsigned long npages;
++	struct page **pages;
++	unsigned long i;
++	int err;
++
++	mutex_lock(&si->xswap_lock);
++
++	/* Refuse a stale range: the boundary moved since the caller read it. */
++	if (start_idx != READ_ONCE(si->nr_clusters_mapped)) {
++		mutex_unlock(&si->xswap_lock);
++		return -EAGAIN;
++	}
++	if (start_idx + nr > si->nr_clusters_max) {
++		mutex_unlock(&si->xswap_lock);
++		return -EAGAIN;
++	}
++
++	/*
++	 * Mapping is page granular, so an earlier chunk can have mapped
++	 * past its own clusters up to the end of a page.  Find how much
++	 * of this range is already there and map only the rest; a range
++	 * that is covered entirely was mapped by a concurrent grower.
++	 */
++	mapped_end = vm_start;
++	if (vm_start < vm_end)
++		apply_to_existing_page_range(&init_mm, vm_start,
++					     vm_end - vm_start,
++					     xswap_mapped_end, &mapped_end);
++	if (vm_start >= vm_end || mapped_end == vm_end)
++		goto mapped;
++	vm_start = mapped_end;
++
++	npages = (vm_end - vm_start) >> PAGE_SHIFT;
++
++	/* Prevent recursive reclaim during vmap page table allocation. */
++	noreclaim_flags = memalloc_noreclaim_save();
++
++	pages = kmalloc_array(npages, sizeof(*pages),
++			      __GFP_HIGH | __GFP_NOMEMALLOC | GFP_KERNEL);
++	if (!pages) {
++		memalloc_noreclaim_restore(noreclaim_flags);
++		mutex_unlock(&si->xswap_lock);
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < npages; i++) {
++		/* __GFP_ZERO: cluster_info pointer fields must start NULL. */
++		pages[i] = alloc_page(__GFP_HIGH | __GFP_NOMEMALLOC |
++				      GFP_KERNEL | __GFP_ZERO);
++		if (!pages[i])
++			goto fail;
++	}
++
++	err = vm_area_map_pages(si->cluster_vm, vm_start, vm_end, pages);
++	if (err) {
++		/* -EBUSY: defensive, a concurrent grower got there first. */
++		if (err == -EBUSY) {
++			i = npages;
++			goto fail_nounmap;
++		}
++		i = npages;
++		goto fail;
++	}
++
++	/* Initialize spinlocks for newly mapped clusters */
++	for (i = start_idx; i < start_idx + nr; i++)
++		spin_lock_init(&si->cluster_info[i].lock);
++
++	kfree(pages);
++	memalloc_noreclaim_restore(noreclaim_flags);
++
++	/*
++	 * Pairs with READ_ONCE() in shrink/grow paths.
++	 */
++	smp_store_release(&si->nr_clusters_mapped, start_idx + nr);
++	mutex_unlock(&si->xswap_lock);
++	return 0;
++
++mapped:
++	/* Every page of the range is already mapped; account for it. */
++	for (i = start_idx; i < start_idx + nr; i++)
++		spin_lock_init(&si->cluster_info[i].lock);
++
++	/* Pairs with READ_ONCE() in shrink/grow paths. */
++	smp_store_release(&si->nr_clusters_mapped, start_idx + nr);
++	mutex_unlock(&si->xswap_lock);
++	return 0;
++
++fail_nounmap:
++	/*
++	 * The concurrent grower already mapped the range, initialized the
++	 * cluster spinlocks and advanced nr_clusters_mapped.  It may still
++	 * be holding those locks while adding clusters to the free list, so
++	 * do not touch them here; just free our unused pages.
++	 */
++	while (i > 0) {
++		i--;
++		if (pages[i])
++			__free_page(pages[i]);
++	}
++	kfree(pages);
++	memalloc_noreclaim_restore(noreclaim_flags);
++	mutex_unlock(&si->xswap_lock);
++	return 0;
++
++fail:
++	/* Clear PTEs vm_area_map_pages() may have left before freeing pages. */
++	vm_area_unmap_pages(si->cluster_vm, vm_start, vm_end);
++	while (i > 0) {
++		i--;
++		if (pages[i])
++			__free_page(pages[i]);
++	}
++	memalloc_noreclaim_restore(noreclaim_flags);
++	kfree(pages);
++	mutex_unlock(&si->xswap_lock);
++	return -ENOMEM;
++}
++
++static void xswap_unmap_clusters(struct swap_info_struct *si,
++				 unsigned long start_idx, unsigned long nr)
++{
++	unsigned long start_addr = (unsigned long)si->cluster_info +
++				   (size_t)start_idx * sizeof(struct swap_cluster_info);
++	unsigned long end_addr = start_addr + (size_t)nr * sizeof(struct swap_cluster_info);
++	/* Round to page boundaries for vm_area_unmap_pages(). */
++	unsigned long vm_start = PAGE_ALIGN(start_addr);
++	unsigned long vm_end = PAGE_ALIGN(end_addr);
++
++	mutex_lock(&si->xswap_lock);
++
++	if (vm_start >= vm_end) {
++		WRITE_ONCE(si->nr_clusters_mapped, start_idx);
++		mutex_unlock(&si->xswap_lock);
++		return;
++	}
++
++	vm_area_unmap_pages(si->cluster_vm, vm_start, vm_end);
++	/* vm_area_unmap_pages() clears PTEs but does not free pages. */
++	/* TODO: free backing pages via page table walk or tracking bitmap */
++
++	/* Pairs with READ_ONCE() in shrink/grow paths. */
++	WRITE_ONCE(si->nr_clusters_mapped, start_idx);
++	mutex_unlock(&si->xswap_lock);
++}
++
++/* Track the end of the run of pages that is already mapped. */
++static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data)
++{
++	unsigned long *mapped_end = data;
++
++	*mapped_end = addr + PAGE_SIZE;
++	return 0;
++}
++#endif /* CONFIG_XSWAP */
++
+ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 				    union swap_header *swap_header,
+ 				    unsigned long maxpages)
+@@ -3571,6 +3789,70 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 	int err = -ENOMEM;
+ 	unsigned long i;
+ 
++#ifdef CONFIG_XSWAP
++	if (si->flags & SWP_XSWAP) {
++		unsigned long size = PAGE_ALIGN(nr_clusters * sizeof(*cluster_info));
++		struct vm_struct *vm;
++
++		vm = get_vm_area(size, VM_SPARSE);
++		if (!vm)
++			goto err;
++
++		cluster_info = vm->addr;
++		si->cluster_vm = vm;
++		si->nr_clusters_max = nr_clusters;
++		si->cluster_info = cluster_info;
++
++		/* Must be initialized before xswap_map_clusters() locks it. */
++		mutex_init(&si->xswap_lock);
++
++		/* Map the initial chunk (at least cluster 0) */
++		if (xswap_map_clusters(si, 0, min_t(unsigned long,
++					XSWAP_GROW_CLUSTERS, nr_clusters)))
++			goto err_free_vm;
++
++		/* xswap: only cluster 0 slot 0 is bad */
++		err = swap_cluster_setup_bad_slot(si, cluster_info, 0, false);
++		if (err)
++			goto err_unmap;
++
++		INIT_LIST_HEAD(&si->free_clusters);
++		INIT_LIST_HEAD(&si->full_clusters);
++		INIT_LIST_HEAD(&si->discard_clusters);
++		for (i = 0; i < SWAP_NR_ORDERS; i++) {
++			INIT_LIST_HEAD(&si->nonfull_clusters[i]);
++			INIT_LIST_HEAD(&si->frag_clusters[i]);
++		}
++
++		/*
++		 * Cluster 0 holds the header slot and the last one holds the
++		 * holes past si->max; both have slots marked bad, so they are
++		 * not entirely free.  The clusters in between are.
++		 */
++		for (i = 0; i < si->nr_clusters_mapped; i++) {
++			struct swap_cluster_info *ci = &cluster_info[i];
++
++			if (ci->count) {
++				ci->flags = CLUSTER_FLAG_NONFULL;
++				list_add_tail(&ci->list, &si->nonfull_clusters[0]);
++			} else {
++				ci->flags = CLUSTER_FLAG_FREE;
++				list_add_tail(&ci->list, &si->free_clusters);
++			}
++		}
++
++		return 0;
++
++err_unmap:
++		xswap_unmap_clusters(si, 0, si->nr_clusters_mapped);
++err_free_vm:
++		free_vm_area(si->cluster_vm);
++		si->cluster_vm = NULL;
++		si->cluster_info = NULL;
++		return err;
++	}
++#endif /* CONFIG_XSWAP */
++
+ 	cluster_info = kvzalloc_objs(*cluster_info, nr_clusters);
+ 	if (!cluster_info)
+ 		goto err;
+-- 
+2.55.0
+
+
+From 74dd263975d4a838fe319aad5a6a62d13178756d Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:07 +0800
+Subject: [PATCH 05/12] mm, swap: add sysfs create interface for xswap
+
+xswap devices have no backing storage, so there is no file to swapon.
+Add a sysfs interface to create them directly:
+  /sys/kernel/mm/xswap/create    write an optional priority to create
+                                 a device (empty = DEF_SWAP_PRIO)
+
+A new device is created with si->max and nr_clusters_max both equal to
+full RAM: the cluster_info array is a sparse VM_SPARSE area mapped
+lazily, so an idle device costs nothing. The runtime size can be
+lowered per device afterwards via
+/sys/kernel/mm/xswap/type<N>/limit (added later in this series).
+The optional priority follows swapon(2)'s -p semantics (default
+DEF_SWAP_PRIO, valid range -1..SWAP_FLAG_PRIO_MASK). The device shows
+up in /proc/swaps as "xswap<N>".
+
+Hibernation device discovery skips xswap devices: they have no bdev
+to carry a resume image.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 165 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 160 insertions(+), 5 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 5140b3f84..4861e2d49 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -16,6 +16,8 @@
+ #include <linux/kernel_stat.h>
+ #include <linux/swap.h>
+ #include <linux/vmalloc.h>
++#include <linux/kobject.h>
++#include <linux/sysfs.h>
+ #include <linux/pagemap.h>
+ #include <linux/namei.h>
+ #include <linux/shmem_fs.h>
+@@ -48,6 +50,7 @@
+ #include "swap_table.h"
+ #include "internal.h"
+ #include "swap.h"
++#define DEF_SWAP_PRIO  -1
+ 
+ #ifdef CONFIG_XSWAP
+ /*
+@@ -66,7 +69,70 @@ static int xswap_map_clusters(struct swap_info_struct *si,
+ static void xswap_unmap_clusters(struct swap_info_struct *si,
+ 				 unsigned long start_idx, unsigned long nr);
+ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data);
+-#endif
++
++#ifdef CONFIG_SYSFS
++static int xswap_create(int prio);
++
++static ssize_t xswap_create_store(struct kobject *kobj,
++				  struct kobj_attribute *attr,
++				  const char *buf, size_t count)
++{
++	int prio = DEF_SWAP_PRIO;
++	int err;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	/* "[<prio>]" is optional; empty means DEF_SWAP_PRIO, i.e. the same
++	 * default as swapon(2) without SWAP_FLAG_PREFER.
++	 */
++	if (*skip_spaces(buf)) {
++		err = kstrtoint(buf, 10, &prio);
++		if (err)
++			return err;
++	}
++
++	err = xswap_create(prio);
++	if (err < 0)
++		return err;
++
++	return count;
++}
++
++static struct kobj_attribute xswap_create_attr = __ATTR(create, 0200, NULL,
++							xswap_create_store);
++
++static struct attribute *xswap_attrs[] = {
++	&xswap_create_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group xswap_attr_group = {
++	.attrs = xswap_attrs,
++};
++
++static struct kobject *xswap_kobj;
++
++static void xswap_sysfs_init(void)
++{
++	xswap_kobj = kobject_create_and_add("xswap", mm_kobj);
++	if (!xswap_kobj) {
++		pr_err("xswap: failed to create sysfs kobject\n");
++		return;
++	}
++	if (sysfs_create_group(xswap_kobj, &xswap_attr_group))
++		pr_err("xswap: failed to create sysfs group\n");
++}
++#else
++static inline void xswap_sysfs_init(void)
++{
++}
++#endif /* CONFIG_SYSFS */
++#else /* !CONFIG_XSWAP */
++static inline void xswap_sysfs_init(void)
++{
++}
++#endif /* CONFIG_XSWAP */
+ 
+ static void swap_range_alloc(struct swap_info_struct *si,
+ 			     unsigned int nr_entries);
+@@ -94,7 +160,6 @@ atomic_t nr_real_swapfiles;
+ EXPORT_SYMBOL_GPL(nr_swap_pages);
+ /* protected with swap_lock. reading in vm_swap_full() doesn't need lock */
+ long total_swap_pages;
+-#define DEF_SWAP_PRIO  -1
+ unsigned long swapfile_maximum_size;
+ #ifdef CONFIG_MIGRATION
+ bool swap_migration_ad_supported;
+@@ -2255,6 +2320,9 @@ static int __find_hibernation_swap_type(dev_t device, sector_t offset)
+ 
+ 		if (!(sis->flags & SWP_WRITEOK))
+ 			continue;
++		/* xswap has no bdev to match a resume device */
++		if (sis->flags & SWP_XSWAP)
++			continue;
+ 
+ 		if (device == sis->bdev->bd_dev) {
+ 			struct swap_extent *se = first_se(sis);
+@@ -2381,6 +2449,8 @@ int find_first_swap(dev_t *device)
+ 
+ 		if (!(sis->flags & SWP_WRITEOK))
+ 			continue;
++		if (sis->flags & SWP_XSWAP)
++			continue;
+ 		*device = sis->bdev->bd_dev;
+ 		spin_unlock(&swap_lock);
+ 		return type;
+@@ -3313,7 +3383,7 @@ static void *swap_start(struct seq_file *swap, loff_t *pos)
+ 		return SEQ_START_TOKEN;
+ 
+ 	for (type = 0; (si = swap_type_to_info(type)); type++) {
+-		if (!(si->swap_file))
++		if (!(si->swap_file) && !(si->flags & SWP_XSWAP))
+ 			continue;
+ 		if (!--l)
+ 			return si;
+@@ -3334,7 +3404,7 @@ static void *swap_next(struct seq_file *swap, void *v, loff_t *pos)
+ 
+ 	++(*pos);
+ 	for (; (si = swap_type_to_info(type)); type++) {
+-		if (!(si->swap_file))
++		if (!(si->swap_file) && !(si->flags & SWP_XSWAP))
+ 			continue;
+ 		return si;
+ 	}
+@@ -3376,7 +3446,14 @@ static int swap_show(struct seq_file *swap, void *v)
+ 	inuse = K(swap_usage_in_pages(si));
+ 
+ 	file = si->swap_file;
+-	len = seq_file_path(swap, file, " \t\n\\");
++	if (file)
++		len = seq_file_path(swap, file, " \t\n\\");
++	else {
++		char name[16];
++
++		len = scnprintf(name, sizeof(name), "xswap%d", si->type);
++		seq_puts(swap, name);
++	}
+ 	seq_printf(swap, "%*s%s\t%lu\t%s%lu\t%s%d\n",
+ 			len < 40 ? 40 - len : 1, " ",
+ 			swap_type_str(si),
+@@ -3926,6 +4003,82 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 	return err;
+ }
+ 
++#ifdef CONFIG_XSWAP
++#ifdef CONFIG_SYSFS
++/* Create a file-less xswap device.  si->max and the initial nr_clusters
++ * ceiling both equal full RAM; the runtime size can be lowered afterwards
++ * via /sys/kernel/mm/xswap/type<N>/limit.
++ */
++static int xswap_create(int prio)
++{
++	struct swap_info_struct *si;
++	unsigned long ram, maxpages;
++	int error;
++
++	if (prio != DEF_SWAP_PRIO && (prio < 0 || prio > SWAP_FLAG_PRIO_MASK))
++		return -EINVAL;
++
++	si = alloc_swap_info();
++	if (IS_ERR(si))
++		return PTR_ERR(si);
++
++	INIT_WORK(&si->discard_work, swap_discard_work);
++	INIT_WORK(&si->reclaim_work, swap_reclaim_work);
++
++	ram = totalram_pages();
++	maxpages = min_t(unsigned long, ram, swapfile_maximum_size);
++	if ((unsigned int)maxpages == 0)
++		maxpages = UINT_MAX;
++	/* Cluster-aligned, so no cluster holds a slot past si->max. */
++	if (maxpages > SWAPFILE_CLUSTER)
++		maxpages = rounddown(maxpages, SWAPFILE_CLUSTER);
++	if (maxpages < 2)
++		maxpages = 2;
++
++	si->bdev = NULL;
++	si->flags |= SWP_XSWAP | SWP_SOLIDSTATE;
++	si->max = maxpages;
++	si->pages = maxpages - 1;
++	/* no backing file: mirror the xswap branch of setup_swap_extents() */
++	si->ops = &swap_bdev_ops;
++
++	error = setup_swap_clusters_info(si, NULL, maxpages);
++	if (error)
++		goto bad_swap;
++
++	error = zswap_swapon(si->type, si->max);
++	if (error)
++		goto bad_swap;
++
++	mutex_lock(&swapon_mutex);
++	si->prio = prio;
++	si->list.prio = -si->prio;
++	si->avail_list.prio = -si->prio;
++	/* si->swap_file stays NULL: this is a file-less device */
++	enable_swap_info(si);
++	mutex_unlock(&swapon_mutex);
++
++	pr_info("xswap: adding extendable swap type %d (prio %d, %u pages, max %lu)\n",
++		si->type, prio, si->pages, maxpages);
++	atomic_inc(&proc_poll_event);
++	wake_up_interruptible(&proc_poll_wait);
++
++	return si->type;
++
++bad_swap:
++	kfree(si->global_cluster);
++	si->global_cluster = NULL;
++	destroy_swap_extents(si, NULL);	/* safe: xswap never sets SWP_ACTIVATED */
++	free_swap_cluster_info(si);
++	si->cluster_info = NULL;
++	spin_lock(&swap_lock);
++	si->flags = 0;
++	spin_unlock(&swap_lock);
++	return error;
++}
++#endif /* CONFIG_SYSFS */
++#endif /* CONFIG_XSWAP */
++
+ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ {
+ 	struct swap_info_struct *si;
+@@ -4269,6 +4422,8 @@ static int __init swapfile_init(void)
+ 		swap_migration_ad_supported = true;
+ #endif	/* CONFIG_MIGRATION */
+ 
++	xswap_sysfs_init();
++
+ 	return 0;
+ }
+ subsys_initcall(swapfile_init);
+-- 
+2.55.0
+
+
+From 125ed6d1ad0749373212ed66039ffc876432214c Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:08 +0800
+Subject: [PATCH 06/12] mm, swap: add xswap grow trigger on cluster allocation
+
+When cluster_alloc_swap_entry() fails to find a free cluster and
+the xswap device still has room to grow, expand the mapped range
+by XSWAP_GROW_CLUSTERS clusters.
+
+Since xswap is always SWP_SOLIDSTATE, global_cluster_lock is never
+held on this path.
+
+This makes the xswap cluster space grow transparently as swap usage
+increases, without any userspace intervention.
+
+Growing maps pages into the VM_SPARSE area, which can sleep. The caller
+holds local_lock(&percpu_swap_cluster.lock) across the whole slow path,
+so drop it around xswap_map_clusters() and take it again afterwards; it
+only protects the per-cpu cluster cache, which this path does not touch.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 50 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 4861e2d49..f603f8c4b 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -1270,6 +1270,56 @@ static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
+ 		if (found)
+ 			goto done;
+ 	}
++
++#ifdef CONFIG_XSWAP
++	/*
++	 * For xswap: if no free cluster was found and more clusters
++	 * can be mapped, grow the cluster_info array and retry.
++	 */
++	if (!found && (si->flags & SWP_XSWAP) &&
++	    READ_ONCE(si->nr_clusters_mapped) < READ_ONCE(si->nr_clusters_max) &&
++	    list_empty(&si->free_clusters)) {
++		unsigned long nr_new = min(READ_ONCE(si->nr_clusters_max) -
++					  READ_ONCE(si->nr_clusters_mapped),
++					  XSWAP_GROW_CLUSTERS);
++		unsigned long start = READ_ONCE(si->nr_clusters_mapped);
++		unsigned long i;
++		int ret;
++
++		/*
++		 * Mapping pages into the VM_SPARSE area can sleep, which is
++		 * not allowed under local_lock.  The lock only protects the
++		 * per-cpu cluster cache, which this path does not touch, so
++		 * it can be dropped across the call.
++		 */
++		local_unlock(&percpu_swap_cluster.lock);
++		ret = xswap_map_clusters(si, start, nr_new);
++		local_lock(&percpu_swap_cluster.lock);
++
++		if (!ret) {
++			for (i = start; i < start + nr_new; i++) {
++				struct swap_cluster_info *ci = &si->cluster_info[i];
++
++				/*
++				 * A concurrent grower may have already added
++				 * these clusters to the free list.  Only add
++				 * clusters that are still off-list (NONE).
++				 * Lock ci->lock first: move_cluster() takes
++				 * si->lock internally.
++				 */
++				spin_lock(&ci->lock);
++				if (ci->flags == CLUSTER_FLAG_NONE)
++					move_cluster(si, ci, &si->free_clusters,
++						     CLUSTER_FLAG_FREE);
++				spin_unlock(&ci->lock);
++			}
++
++			/* Retry allocation from the free list */
++			found = alloc_swap_scan_list(si, &si->free_clusters,
++						    folio, false);
++		}
++	}
++#endif
+ done:
+ 	if (!(si->flags & SWP_SOLIDSTATE))
+ 		spin_unlock(&si->global_cluster_lock);
+-- 
+2.55.0
+
+
+From 91bf4f0e82373480edd50dc2ec4272a9613eb30a Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:09 +0800
+Subject: [PATCH 07/12] mm, swap: add xswap_try_shrink and shrink trigger on
+ cluster free
+
+Add xswap_try_shrink(). It scans backwards from the end of the mapped
+range and counts the contiguous free clusters at the tail. It then
+unmaps one or more chunks of that tail, in units of XSWAP_GROW_CLUSTERS.
+
+The function only reclaims when the mapped range is at most half in use.
+Growth is demand driven. Reclaiming on a smaller dip would only map the
+same clusters again, and every unmap costs an RCU grace period. So it
+leaves one chunk of free tail mapped as slack for the next allocation,
+and waits until several chunks can go before it unmaps anything.
+
+Wire the trigger in __free_cluster(). After a cluster is released to
+the free list, call xswap_try_shrink() to attempt the tail shrink.
+
+Also update the XSWAP_GROW_CLUSTERS comment. The constant is now used
+for shrink as well as grow.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 95 +++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 89 insertions(+), 6 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index f603f8c4b..abe3d0ee5 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -54,12 +54,13 @@
+ 
+ #ifdef CONFIG_XSWAP
+ /*
+- * xswap: dynamically grow the cluster_info array via a VM_SPARSE area.
++ * xswap: dynamically grow and shrink the cluster_info array via a
++ * VM_SPARSE area.
+  *
+- * XSWAP_GROW_CLUSTERS is the number of clusters to map in one grow
+- * operation.  It is set to the number of cluster_info structs that
+- * fit in a single page (at least 16), so that the vmalloc page table
+- * overhead is proportional to the number of clusters mapped.
++ * XSWAP_GROW_CLUSTERS is the number of clusters to map/unmap in one
++ * grow/shrink operation: the number of cluster_info structs that fit in
++ * a single page (at least 16), so that the vmalloc page table overhead
++ * is proportional to the number of clusters mapped.
+  */
+ #define XSWAP_GROW_CLUSTERS \
+ 	max_t(unsigned long, PAGE_SIZE / sizeof(struct swap_cluster_info), 16)
+@@ -69,6 +70,7 @@ static int xswap_map_clusters(struct swap_info_struct *si,
+ static void xswap_unmap_clusters(struct swap_info_struct *si,
+ 				 unsigned long start_idx, unsigned long nr);
+ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data);
++static void xswap_try_shrink(struct swap_info_struct *si);
+ 
+ #ifdef CONFIG_SYSFS
+ static int xswap_create(int prio);
+@@ -694,6 +696,9 @@ static void __free_cluster(struct swap_info_struct *si, struct swap_cluster_info
+ 	swap_cluster_free_table(ci);
+ 	move_cluster(si, ci, &si->free_clusters, CLUSTER_FLAG_FREE);
+ 	ci->order = 0;
++#ifdef CONFIG_XSWAP
++	xswap_try_shrink(si);
++#endif
+ }
+ 
+ /*
+@@ -1514,11 +1519,19 @@ static bool swap_alloc_fast(struct folio *folio)
+ 	/*
+ 	 * Once allocated, swap_info_struct will never be completely freed,
+ 	 * so checking it's liveness by get_swap_device_info is enough.
++	 *
++	 * The cached cluster points into si->cluster_info, which xswap
++	 * maps and unmaps at runtime.  The RCU section has to cover both
++	 * reading the cached offset and dereferencing it, so that an
++	 * unmap can wait for the readers already in flight.
+ 	 */
++	rcu_read_lock();
+ 	si = this_cpu_read(percpu_swap_cluster.si[order]);
+ 	offset = this_cpu_read(percpu_swap_cluster.offset[order]);
+-	if (!si || !offset || !get_swap_device_info(si))
++	if (!si || !offset || !get_swap_device_info(si)) {
++		rcu_read_unlock();
+ 		return false;
++	}
+ 
+ 	ci = swap_cluster_lock(si, offset);
+ 	if (cluster_is_usable(ci, order)) {
+@@ -1530,6 +1543,7 @@ static bool swap_alloc_fast(struct folio *folio)
+ 	}
+ 
+ 	put_swap_device(si);
++	rcu_read_unlock();
+ 	return folio_test_swapcache(folio);
+ }
+ 
+@@ -2307,8 +2321,12 @@ swp_entry_t swap_alloc_hibernation_slot(int type)
+ 	/*
+ 	 * Try the local cluster first if it matches the device. If
+ 	 * not, try grab a new cluster and override local cluster.
++	 *
++	 * Same RCU requirement as swap_alloc_fast(): the cached offset
++	 * indexes si->cluster_info, which xswap can unmap.
+ 	 */
+ 	local_lock(&percpu_swap_cluster.lock);
++	rcu_read_lock();
+ 	pcp_si = this_cpu_read(percpu_swap_cluster.si[0]);
+ 	pcp_offset = this_cpu_read(percpu_swap_cluster.offset[0]);
+ 	if (pcp_si == si && pcp_offset) {
+@@ -2318,6 +2336,7 @@ swp_entry_t swap_alloc_hibernation_slot(int type)
+ 		else
+ 			swap_cluster_unlock(ci);
+ 	}
++	rcu_read_unlock();
+ 	if (!offset)
+ 		offset = cluster_alloc_swap_entry(si, NULL);
+ 	local_unlock(&percpu_swap_cluster.lock);
+@@ -3888,6 +3907,15 @@ static void xswap_unmap_clusters(struct swap_info_struct *si,
+ 		return;
+ 	}
+ 
++	/*
++	 * A per-cpu cluster cache can still hold an offset in this range.
++	 * Invalidate those references, then wait out the readers that have
++	 * already loaded one, so that nobody can dereference cluster_info
++	 * past this point.  swapoff() needs the same before it releases.
++	 */
++	flush_percpu_swap_cluster(si);
++	synchronize_rcu();
++
+ 	vm_area_unmap_pages(si->cluster_vm, vm_start, vm_end);
+ 	/* vm_area_unmap_pages() clears PTEs but does not free pages. */
+ 	/* TODO: free backing pages via page table walk or tracking bitmap */
+@@ -3905,6 +3933,61 @@ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data)
+ 	*mapped_end = addr + PAGE_SIZE;
+ 	return 0;
+ }
++
++/*
++ * Automatic reclaim: leave one chunk of the free tail mapped as slack, so
++ * that the next allocation does not grow the range straight back, and only
++ * unmap once several chunks can go, so the unmap is worth the RCU grace
++ * period it costs.
++ */
++#define XSWAP_SHRINK_SLACK	XSWAP_GROW_CLUSTERS
++#define XSWAP_SHRINK_MIN	(XSWAP_GROW_CLUSTERS * 4)
++
++/*
++ * Try to shrink the cluster_info tail: unmap contiguous free clusters
++ * at the end of the mapped range.
++ */
++static void xswap_try_shrink(struct swap_info_struct *si)
++{
++	struct swap_cluster_info *ci;
++	unsigned long nr_mapped, last, idx;
++
++	if (!(si->flags & SWP_XSWAP))
++		return;
++
++	nr_mapped = READ_ONCE(si->nr_clusters_mapped);
++	if (nr_mapped <= 1) /* keep cluster 0 */
++		return;
++
++	/*
++	 * Reclaim on our own, but only once the mapped range is at most
++	 * half in use: growth is demand driven, so reclaiming on a smaller
++	 * dip would only map the same clusters again, and every unmap costs
++	 * an RCU grace period.
++	 */
++	if (atomic_long_read(&si->inuse_pages) * 2 > nr_mapped * SWAPFILE_CLUSTER)
++		return;
++
++	/* Find the last non-free cluster from the tail */
++	last = nr_mapped;
++	while (last > 1) {
++		idx = last - 1;
++		ci = &si->cluster_info[idx];
++		if (ci->count || ci->flags != CLUSTER_FLAG_FREE)
++			break;
++		last = idx;
++	}
++
++	if (last == nr_mapped)
++		return; /* nothing to shrink */
++
++	if (nr_mapped - last < XSWAP_SHRINK_SLACK + XSWAP_SHRINK_MIN)
++		return;
++
++	last += XSWAP_SHRINK_SLACK;
++
++	xswap_unmap_clusters(si, last, nr_mapped - last);
++}
+ #endif /* CONFIG_XSWAP */
+ 
+ static int setup_swap_clusters_info(struct swap_info_struct *si,
+-- 
+2.55.0
+
+
+From 067caa1bb2d58068abe1edbf3e8f2ff7942e10bc Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:10 +0800
+Subject: [PATCH 08/12] mm, swap: free backing pages in xswap_unmap_clusters
+
+vm_area_unmap_pages() clears PTEs and frees intermediate page table
+pages. It does not free the backing physical pages that
+xswap_map_clusters() allocated. Those pages were leaked on every
+unmap.
+
+Collect the backing pages before the unmap. Walk the page table with
+apply_to_existing_page_range() and a small callback that stores
+pte_page() of every present PTE into a dynamically allocated array.
+After vm_area_unmap_pages() clears the PTEs, free the collected pages
+with __free_page().
+
+The array allocation runs under memalloc_noreclaim_save(). Reclaim
+must not recurse into the caller, which holds xswap_lock. If the
+allocation fails, return -ENOMEM without unmapping, so that no backing
+page is leaked.
+
+xswap_unmap_clusters() now returns an error code.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 57 ++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 50 insertions(+), 7 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index abe3d0ee5..e10bb6d24 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -67,8 +67,8 @@
+ 
+ static int xswap_map_clusters(struct swap_info_struct *si,
+ 			      unsigned long start_idx, unsigned long nr);
+-static void xswap_unmap_clusters(struct swap_info_struct *si,
+-				 unsigned long start_idx, unsigned long nr);
++static int xswap_unmap_clusters(struct swap_info_struct *si,
++				unsigned long start_idx, unsigned long nr);
+ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data);
+ static void xswap_try_shrink(struct swap_info_struct *si);
+ 
+@@ -3889,8 +3889,26 @@ static int xswap_map_clusters(struct swap_info_struct *si,
+ 	return -ENOMEM;
+ }
+ 
+-static void xswap_unmap_clusters(struct swap_info_struct *si,
+-				 unsigned long start_idx, unsigned long nr)
++struct xswap_page_data {
++	struct page **pages;
++	int nr;
++	int max;
++};
++
++static int xswap_collect_page(pte_t *pte, unsigned long addr, void *data)
++{
++	struct xswap_page_data *xpd = data;
++	pte_t pteval = ptep_get(pte);
++
++	if (!pte_present(pteval))
++		return 0;
++	if (xpd->nr < xpd->max)
++		xpd->pages[xpd->nr++] = pte_page(pteval);
++	return 0;
++}
++
++static int xswap_unmap_clusters(struct swap_info_struct *si,
++				unsigned long start_idx, unsigned long nr)
+ {
+ 	unsigned long start_addr = (unsigned long)si->cluster_info +
+ 				   (size_t)start_idx * sizeof(struct swap_cluster_info);
+@@ -3898,13 +3916,18 @@ static void xswap_unmap_clusters(struct swap_info_struct *si,
+ 	/* Round to page boundaries for vm_area_unmap_pages(). */
+ 	unsigned long vm_start = PAGE_ALIGN(start_addr);
+ 	unsigned long vm_end = PAGE_ALIGN(end_addr);
++	unsigned long size;
++	unsigned long npages;
++	struct xswap_page_data xpd;
++	unsigned int noreclaim_flags;
++	int i;
+ 
+ 	mutex_lock(&si->xswap_lock);
+ 
+ 	if (vm_start >= vm_end) {
+ 		WRITE_ONCE(si->nr_clusters_mapped, start_idx);
+ 		mutex_unlock(&si->xswap_lock);
+-		return;
++		return 0;
+ 	}
+ 
+ 	/*
+@@ -3916,13 +3939,33 @@ static void xswap_unmap_clusters(struct swap_info_struct *si,
+ 	flush_percpu_swap_cluster(si);
+ 	synchronize_rcu();
+ 
++	size = vm_end - vm_start;
++	npages = size >> PAGE_SHIFT;
++
++	noreclaim_flags = memalloc_noreclaim_save();
++	xpd.pages = kmalloc_array(npages, sizeof(*xpd.pages),
++				  __GFP_HIGH | __GFP_NOMEMALLOC | GFP_KERNEL);
++	memalloc_noreclaim_restore(noreclaim_flags);
++	if (!xpd.pages) {
++		mutex_unlock(&si->xswap_lock);
++		return -ENOMEM;
++	}
++
++	xpd.nr = 0;
++	xpd.max = npages;
++	apply_to_existing_page_range(&init_mm, vm_start, size,
++				     xswap_collect_page, &xpd);
++
+ 	vm_area_unmap_pages(si->cluster_vm, vm_start, vm_end);
+-	/* vm_area_unmap_pages() clears PTEs but does not free pages. */
+-	/* TODO: free backing pages via page table walk or tracking bitmap */
++
++	for (i = 0; i < xpd.nr; i++)
++		__free_page(xpd.pages[i]);
++	kfree(xpd.pages);
+ 
+ 	/* Pairs with READ_ONCE() in shrink/grow paths. */
+ 	WRITE_ONCE(si->nr_clusters_mapped, start_idx);
+ 	mutex_unlock(&si->xswap_lock);
++	return 0;
+ }
+ 
+ /* Track the end of the run of pages that is already mapped. */
+-- 
+2.55.0
+
+
+From fc08a59cde2954087710b9af34e0b6ce17528e15 Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:11 +0800
+Subject: [PATCH 09/12] mm, swap: defer xswap shrink to workqueue to avoid lock
+ recursion
+
+__free_cluster() called xswap_try_shrink() directly, with ci->lock
+held. The shrink path calls xswap_unmap_clusters(), which unmaps the
+vmalloc pages backing cluster_info. On return, swap_cache_del_folio()
+calls swap_cluster_unlock(ci) on that address. The address is no
+longer mapped, so it faults on a not-present page.
+
+Replace the direct call with schedule_work(). The shrink then runs in
+an independent workqueue context, where no cluster lock is held.
+
+__free_cluster() schedules the work only for xswap devices, and only
+while SWP_WRITEOK is set. The work function bails out once swapoff has
+begun. __swapoff() also cancels any pending work before it walks the
+clusters.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ include/linux/swap.h |   1 +
+ mm/swapfile.c        | 126 +++++++++++++++++++++++++++++++++----------
+ 2 files changed, 99 insertions(+), 28 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index ad2311310..6307d8e8f 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -252,6 +252,7 @@ struct swap_info_struct {
+ 	struct vm_struct	*cluster_vm;	/* VM_SPARSE area for cluster_info */
+ 	unsigned long		nr_clusters_max;/* total clusters in the xswap address space */
+ 	unsigned long		nr_clusters_mapped; /* currently mapped cluster count */
++	struct work_struct	xswap_shrink_work; /* deferred shrink trigger */
+ 	struct mutex		xswap_lock;	/* serialize map/unmap operations */
+ #endif
+ 	struct list_head free_clusters; /* free clusters list */
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index e10bb6d24..d2a3303b0 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -697,7 +697,9 @@ static void __free_cluster(struct swap_info_struct *si, struct swap_cluster_info
+ 	move_cluster(si, ci, &si->free_clusters, CLUSTER_FLAG_FREE);
+ 	ci->order = 0;
+ #ifdef CONFIG_XSWAP
+-	xswap_try_shrink(si);
++	/* Only xswap devices, and not while the device is being torn down. */
++	if ((si->flags & SWP_XSWAP) && (si->flags & SWP_WRITEOK))
++		schedule_work(&si->xswap_shrink_work);
+ #endif
+ }
+ 
+@@ -3244,6 +3246,7 @@ static void free_swap_cluster_info(struct swap_info_struct *si)
+ 
+ #ifdef CONFIG_XSWAP
+ 	if (si->flags & SWP_XSWAP) {
++		cancel_work_sync(&si->xswap_shrink_work);
+ 		/* Unmap all mapped clusters and free the VM_SPARSE area */
+ 		if (si->nr_clusters_mapped > 0)
+ 			xswap_unmap_clusters(si, 0, si->nr_clusters_mapped);
+@@ -3347,6 +3350,11 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 	spin_unlock(&p->lock);
+ 	spin_unlock(&swap_lock);
+ 
++#ifdef CONFIG_XSWAP
++	if (p->flags & SWP_XSWAP)
++		cancel_work_sync(&p->xswap_shrink_work);
++#endif
++
+ 	wait_for_allocation(p);
+ 
+ 	set_current_oom_origin();
+@@ -3907,8 +3915,9 @@ static int xswap_collect_page(pte_t *pte, unsigned long addr, void *data)
+ 	return 0;
+ }
+ 
+-static int xswap_unmap_clusters(struct swap_info_struct *si,
+-				unsigned long start_idx, unsigned long nr)
++/* Caller must hold si->xswap_lock; -ENOMEM leaves the mapping intact. */
++static int xswap_unmap_clusters_locked(struct swap_info_struct *si,
++				       unsigned long start_idx, unsigned long nr)
+ {
+ 	unsigned long start_addr = (unsigned long)si->cluster_info +
+ 				   (size_t)start_idx * sizeof(struct swap_cluster_info);
+@@ -3922,11 +3931,8 @@ static int xswap_unmap_clusters(struct swap_info_struct *si,
+ 	unsigned int noreclaim_flags;
+ 	int i;
+ 
+-	mutex_lock(&si->xswap_lock);
+-
+ 	if (vm_start >= vm_end) {
+ 		WRITE_ONCE(si->nr_clusters_mapped, start_idx);
+-		mutex_unlock(&si->xswap_lock);
+ 		return 0;
+ 	}
+ 
+@@ -3946,10 +3952,8 @@ static int xswap_unmap_clusters(struct swap_info_struct *si,
+ 	xpd.pages = kmalloc_array(npages, sizeof(*xpd.pages),
+ 				  __GFP_HIGH | __GFP_NOMEMALLOC | GFP_KERNEL);
+ 	memalloc_noreclaim_restore(noreclaim_flags);
+-	if (!xpd.pages) {
+-		mutex_unlock(&si->xswap_lock);
++	if (!xpd.pages)
+ 		return -ENOMEM;
+-	}
+ 
+ 	xpd.nr = 0;
+ 	xpd.max = npages;
+@@ -3964,10 +3968,20 @@ static int xswap_unmap_clusters(struct swap_info_struct *si,
+ 
+ 	/* Pairs with READ_ONCE() in shrink/grow paths. */
+ 	WRITE_ONCE(si->nr_clusters_mapped, start_idx);
+-	mutex_unlock(&si->xswap_lock);
+ 	return 0;
+ }
+ 
++static int xswap_unmap_clusters(struct swap_info_struct *si,
++				unsigned long start_idx, unsigned long nr)
++{
++	int ret;
++
++	mutex_lock(&si->xswap_lock);
++	ret = xswap_unmap_clusters_locked(si, start_idx, nr);
++	mutex_unlock(&si->xswap_lock);
++	return ret;
++}
++
+ /* Track the end of the run of pages that is already mapped. */
+ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data)
+ {
+@@ -3986,6 +4000,16 @@ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data)
+ #define XSWAP_SHRINK_SLACK	XSWAP_GROW_CLUSTERS
+ #define XSWAP_SHRINK_MIN	(XSWAP_GROW_CLUSTERS * 4)
+ 
++static void xswap_shrink_work_fn(struct work_struct *work)
++{
++	struct swap_info_struct *si = container_of(work,
++			struct swap_info_struct, xswap_shrink_work);
++
++	if (!(READ_ONCE(si->flags) & SWP_WRITEOK))
++		return;
++	xswap_try_shrink(si);
++}
++
+ /*
+  * Try to shrink the cluster_info tail: unmap contiguous free clusters
+  * at the end of the mapped range.
+@@ -3993,14 +4017,16 @@ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data)
+ static void xswap_try_shrink(struct swap_info_struct *si)
+ {
+ 	struct swap_cluster_info *ci;
+-	unsigned long nr_mapped, last, idx;
++	unsigned long nr_mapped, nr_tail, nr_unmap, start_idx, i;
+ 
+ 	if (!(si->flags & SWP_XSWAP))
+ 		return;
+ 
++	mutex_lock(&si->xswap_lock);
++
+ 	nr_mapped = READ_ONCE(si->nr_clusters_mapped);
+-	if (nr_mapped <= 1) /* keep cluster 0 */
+-		return;
++	if (nr_mapped <= 1)	/* keep cluster 0 */
++		goto out_unlock;
+ 
+ 	/*
+ 	 * Reclaim on our own, but only once the mapped range is at most
+@@ -4009,27 +4035,70 @@ static void xswap_try_shrink(struct swap_info_struct *si)
+ 	 * an RCU grace period.
+ 	 */
+ 	if (atomic_long_read(&si->inuse_pages) * 2 > nr_mapped * SWAPFILE_CLUSTER)
+-		return;
++		goto out_unlock;
+ 
+-	/* Find the last non-free cluster from the tail */
+-	last = nr_mapped;
+-	while (last > 1) {
+-		idx = last - 1;
+-		ci = &si->cluster_info[idx];
+-		if (ci->count || ci->flags != CLUSTER_FLAG_FREE)
++	/*
++	 * Count the free clusters at the tail of the mapped range.  Scanned,
++	 * not tracked: the count must be exact to size the unmap, and an
++	 * incremental count falls behind on out-of-order frees.
++	 */
++	nr_tail = 0;
++	while (nr_mapped - nr_tail > 1) {
++		ci = &si->cluster_info[nr_mapped - nr_tail - 1];
++		if (READ_ONCE(ci->count) ||
++		    READ_ONCE(ci->flags) != CLUSTER_FLAG_FREE)
+ 			break;
+-		last = idx;
++		nr_tail++;
++	}
++	if (nr_tail < XSWAP_SHRINK_SLACK + XSWAP_SHRINK_MIN)
++		goto out_unlock;
++
++	nr_unmap = rounddown(nr_tail - XSWAP_SHRINK_SLACK, XSWAP_GROW_CLUSTERS);
++	if (!nr_unmap)
++		goto out_unlock;
++	start_idx = nr_mapped - nr_unmap;
++
++	/*
++	 * Only shrink a run that reaches the mapped end; otherwise
++	 * truncating nr_clusters_mapped would orphan the active tail.
++	 */
++	spin_lock(&si->lock);
++	for (i = start_idx; i < nr_mapped; i++) {
++		ci = &si->cluster_info[i];
++		if (READ_ONCE(ci->flags) != CLUSTER_FLAG_FREE)
++			break;
++		/* Skip clusters whose lock is currently held. */
++		if (!spin_trylock(&ci->lock)) {
++			spin_unlock(&si->lock);
++			goto out_unlock;
++		}
++		spin_unlock(&ci->lock);
++	}
++	if (i != nr_mapped) {
++		spin_unlock(&si->lock);
++		goto out_unlock;
+ 	}
+ 
+-	if (last == nr_mapped)
+-		return; /* nothing to shrink */
++	for (i = start_idx; i < nr_mapped; i++) {
++		ci = &si->cluster_info[i];
++		list_del_init(&ci->list);
++		WRITE_ONCE(ci->flags, CLUSTER_FLAG_NONE);
++	}
++	spin_unlock(&si->lock);
+ 
+-	if (nr_mapped - last < XSWAP_SHRINK_SLACK + XSWAP_SHRINK_MIN)
+-		return;
++	if (xswap_unmap_clusters_locked(si, start_idx, nr_unmap)) {
++		spin_lock(&si->lock);
++		for (i = start_idx; i < nr_mapped; i++) {
++			ci = &si->cluster_info[i];
++			WRITE_ONCE(ci->flags, CLUSTER_FLAG_FREE);
++			list_add_tail(&ci->list, &si->free_clusters);
++		}
++		spin_unlock(&si->lock);
++		goto out_unlock;
++	}
+ 
+-	last += XSWAP_SHRINK_SLACK;
+-
+-	xswap_unmap_clusters(si, last, nr_mapped - last);
++out_unlock:
++	mutex_unlock(&si->xswap_lock);
+ }
+ #endif /* CONFIG_XSWAP */
+ 
+@@ -4094,6 +4163,7 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 			}
+ 		}
+ 
++		INIT_WORK(&si->xswap_shrink_work, xswap_shrink_work_fn);
+ 		return 0;
+ 
+ err_unmap:
+-- 
+2.55.0
+
+
+From 31b8d4b6e014c62b42b57e63b814f64f20dc0bb2 Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:12 +0800
+Subject: [PATCH 10/12] mm, swap: refactor swapoff + add xswap_destroy
+
+1. Extract __swapoff() from sys_swapoff(): the core teardown logic
+   now lives in __swapoff(), shared by sys_swapoff() and the new
+   xswap_destroy(). swap_file operations are guarded with NULL check
+   so __swapoff() works for file-less devices too. sys_swapoff()
+   retains file-matching; a NULL guard on p->swap_file ensures xswap
+   devices are never matched by the file path.
+2. Add xswap_destroy(int type): tears down a file-less xswap device
+   by its swap type. Validates SWP_XSWAP | SWP_WRITEOK, removes
+   from lists, delegates to __swapoff().
+3. Add /sys/kernel/mm/xswap/destroy: write a swap type to tear down
+   that xswap device. Requires CAP_SYS_ADMIN. Out-of-range types
+   are rejected before the implicit int truncation.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 199 ++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 138 insertions(+), 61 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index d2a3303b0..0321b6b0d 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -74,6 +74,7 @@ static void xswap_try_shrink(struct swap_info_struct *si);
+ 
+ #ifdef CONFIG_SYSFS
+ static int xswap_create(int prio);
++static int xswap_destroy(int type);
+ 
+ static ssize_t xswap_create_store(struct kobject *kobj,
+ 				  struct kobj_attribute *attr,
+@@ -104,8 +105,35 @@ static ssize_t xswap_create_store(struct kobject *kobj,
+ static struct kobj_attribute xswap_create_attr = __ATTR(create, 0200, NULL,
+ 							xswap_create_store);
+ 
++static ssize_t xswap_destroy_store(struct kobject *kobj,
++				   struct kobj_attribute *attr,
++				   const char *buf, size_t count)
++{
++	unsigned long type;
++	int err;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	err = kstrtoul(buf, 0, &type);
++	if (err)
++		return err;
++	if (type >= MAX_SWAPFILES)
++		return -EINVAL;
++
++	err = xswap_destroy(type);
++	if (err)
++		return err;
++
++	return count;
++}
++
++static struct kobj_attribute xswap_destroy_attr = __ATTR(destroy, 0200, NULL,
++							 xswap_destroy_store);
++
+ static struct attribute *xswap_attrs[] = {
+ 	&xswap_create_attr.attr,
++	&xswap_destroy_attr.attr,
+ 	NULL,
+ };
+ 
+@@ -3294,61 +3322,13 @@ static void flush_percpu_swap_cluster(struct swap_info_struct *si)
+ }
+ 
+ 
+-SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
++/* Common swap teardown after list removal; shared by sys_swapoff() and
++ * xswap_destroy().
++ */
++static int __swapoff(struct swap_info_struct *p)
+ {
+-	struct swap_info_struct *p = NULL;
+-	struct file *swap_file, *victim;
+-	struct address_space *mapping;
+-	struct inode *inode;
+-	int err, found = 0;
+-
+-	if (!capable(CAP_SYS_ADMIN))
+-		return -EPERM;
+-
+-	BUG_ON(!current->mm);
+-
+-	CLASS(filename, pathname)(specialfile);
+-	victim = file_open_name(pathname, O_RDWR|O_LARGEFILE, 0);
+-	if (IS_ERR(victim))
+-		return PTR_ERR(victim);
+-
+-	mapping = victim->f_mapping;
+-	spin_lock(&swap_lock);
+-	plist_for_each_entry(p, &swap_active_head, list) {
+-		if (p->flags & SWP_WRITEOK) {
+-			if (p->swap_file->f_mapping == mapping) {
+-				found = 1;
+-				break;
+-			}
+-		}
+-	}
+-	if (!found) {
+-		err = -EINVAL;
+-		spin_unlock(&swap_lock);
+-		goto out_dput;
+-	}
+-
+-	/* Refuse swapoff while the device is pinned for hibernation */
+-	if (p->flags & SWP_HIBERNATION) {
+-		err = -EBUSY;
+-		spin_unlock(&swap_lock);
+-		goto out_dput;
+-	}
+-
+-	if (!security_vm_enough_memory_mm(current->mm, p->pages))
+-		vm_unacct_memory(p->pages);
+-	else {
+-		err = -ENOMEM;
+-		spin_unlock(&swap_lock);
+-		goto out_dput;
+-	}
+-	spin_lock(&p->lock);
+-	del_from_avail_list(p, true);
+-	plist_del(&p->list, &swap_active_head);
+-	atomic_long_sub(p->pages, &nr_swap_pages);
+-	total_swap_pages -= p->pages;
+-	spin_unlock(&p->lock);
+-	spin_unlock(&swap_lock);
++	struct file *swap_file = NULL;
++	int err;
+ 
+ #ifdef CONFIG_XSWAP
+ 	if (p->flags & SWP_XSWAP)
+@@ -3364,7 +3344,7 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 	if (err) {
+ 		/* re-insert swap space back into swap_list */
+ 		reinsert_swap_info(p);
+-		goto out_dput;
++		return err;
+ 	}
+ 
+ 	/*
+@@ -3407,12 +3387,14 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 	p->max = 0;
+ 	p->cluster_info = NULL;
+ 
+-	inode = mapping->host;
++	if (swap_file) {
++		struct inode *inode = swap_file->f_mapping->host;
+ 
+-	inode_lock(inode);
+-	inode->i_flags &= ~S_SWAPFILE;
+-	inode_unlock(inode);
+-	filp_close(swap_file, NULL);
++		inode_lock(inode);
++		inode->i_flags &= ~S_SWAPFILE;
++		inode_unlock(inode);
++		filp_close(swap_file, NULL);
++	}
+ 
+ 	/*
+ 	 * Clear the SWP_USED flag after all resources are freed so that swapon
+@@ -3423,10 +3405,69 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 	p->flags = 0;
+ 	spin_unlock(&swap_lock);
+ 
+-	err = 0;
+ 	atomic_inc(&proc_poll_event);
+ 	wake_up_interruptible(&proc_poll_wait);
+ 
++	return 0;
++}
++
++SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
++{
++	struct swap_info_struct *p = NULL;
++	struct file *victim;
++	struct address_space *mapping;
++	int err, found = 0;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	BUG_ON(!current->mm);
++
++	CLASS(filename, pathname)(specialfile);
++	victim = file_open_name(pathname, O_RDWR|O_LARGEFILE, 0);
++	if (IS_ERR(victim))
++		return PTR_ERR(victim);
++
++	mapping = victim->f_mapping;
++	spin_lock(&swap_lock);
++	plist_for_each_entry(p, &swap_active_head, list) {
++		if (p->flags & SWP_WRITEOK) {
++			if (p->swap_file && p->swap_file->f_mapping == mapping) {
++				found = 1;
++				break;
++			}
++		}
++	}
++	if (!found) {
++		err = -EINVAL;
++		spin_unlock(&swap_lock);
++		goto out_dput;
++	}
++
++	/* Refuse swapoff while the device is pinned for hibernation */
++	if (p->flags & SWP_HIBERNATION) {
++		err = -EBUSY;
++		spin_unlock(&swap_lock);
++		goto out_dput;
++	}
++
++	if (!security_vm_enough_memory_mm(current->mm, p->pages))
++		vm_unacct_memory(p->pages);
++	else {
++		err = -ENOMEM;
++		spin_unlock(&swap_lock);
++		goto out_dput;
++	}
++	spin_lock(&p->lock);
++	del_from_avail_list(p, true);
++	plist_del(&p->list, &swap_active_head);
++	atomic_long_sub(p->pages, &nr_swap_pages);
++	total_swap_pages -= p->pages;
++	spin_unlock(&p->lock);
++	spin_unlock(&swap_lock);
++
++	err = __swapoff(p);
++
+ out_dput:
+ 	filp_close(victim, NULL);
+ 	return err;
+@@ -4322,6 +4363,42 @@ static int xswap_create(int prio)
+ 	spin_unlock(&swap_lock);
+ 	return error;
+ }
++
++/* Tear down a file-less xswap device by its swap type. */
++static int xswap_destroy(int type)
++{
++	struct swap_info_struct *p;
++
++	p = swap_type_to_info(type);
++	if (!p)
++		return -EINVAL;
++
++	spin_lock(&swap_lock);
++	if (!(p->flags & SWP_WRITEOK) || !(p->flags & SWP_XSWAP)) {
++		spin_unlock(&swap_lock);
++		return -EINVAL;
++	}
++	/* Refuse swapoff while the device is pinned for hibernation */
++	if (p->flags & SWP_HIBERNATION) {
++		spin_unlock(&swap_lock);
++		return -EBUSY;
++	}
++	if (!security_vm_enough_memory_mm(current->mm, p->pages))
++		vm_unacct_memory(p->pages);
++	else {
++		spin_unlock(&swap_lock);
++		return -ENOMEM;
++	}
++	spin_lock(&p->lock);
++	del_from_avail_list(p, true);
++	plist_del(&p->list, &swap_active_head);
++	atomic_long_sub(p->pages, &nr_swap_pages);
++	total_swap_pages -= p->pages;
++	spin_unlock(&p->lock);
++	spin_unlock(&swap_lock);
++
++	return __swapoff(p);
++}
+ #endif /* CONFIG_SYSFS */
+ #endif /* CONFIG_XSWAP */
+ 
+-- 
+2.55.0
+
+
+From 1631c1205bfef70d2fc08fa2edad3f7ccf1d1b60 Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:13 +0800
+Subject: [PATCH 11/12] mm, swap: require zswap for xswap devices
+
+xswap has no backing storage: swapped-out pages live only in zswap.
+Without zswap, swapout always bounces back, so the device would
+consume swap entry space without ever freeing memory. Refuse to
+create a device when zswap is unavailable.
+
+Runtime disabling of zswap after creation is safe: existing entries
+stay loadable (zswap_load() gates on zswap_never_enabled(), not the
+runtime zswap_enabled flag) and new swapouts merely bounce back to
+memory without freeing it.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 0321b6b0d..c2ca0a9ac 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -4305,6 +4305,10 @@ static int xswap_create(int prio)
+ 	if (prio != DEF_SWAP_PRIO && (prio < 0 || prio > SWAP_FLAG_PRIO_MASK))
+ 		return -EINVAL;
+ 
++	/* xswap has no backing store, it relies on zswap. */
++	if (!zswap_is_enabled())
++		return -EOPNOTSUPP;
++
+ 	si = alloc_swap_info();
+ 	if (IS_ERR(si))
+ 		return PTR_ERR(si);
+-- 
+2.55.0
+
+
+From ced6d1f47b23cc15151472c02d1fa112c4fc216e Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:14 +0800
+Subject: [PATCH 12/12] mm, swap: add sysfs per-device size limit for xswap
+
+Add a per-device knob for the xswap size ceiling, si->nr_clusters.
+Grow and shrink both work without it; a cap below the mapped range
+only makes shrink target the cap directly.
+
+  /sys/kernel/mm/xswap/type<N>/limit    read/write, in pages
+
+Reading reports the usable size, si->pages, in 4 KiB pages. Writing
+sets a new ceiling, rounded up to SWAPFILE_CLUSTER (the device's growth
+granularity).
+
+Each device gets its own kobject directory under /sys/kernel/mm/xswap/.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ include/linux/swap.h |   4 +
+ mm/swapfile.c        | 184 ++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 179 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 6307d8e8f..c76c801c3 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -16,6 +16,8 @@
+ #include <uapi/linux/mempolicy.h>
+ #include <asm/page.h>
+ 
++struct kobject;
++
+ #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
+ #define SWAP_FLAG_PRIO_MASK	0x7fff
+ #define SWAP_FLAG_DISCARD	0x10000 /* enable discard for swap */
+@@ -251,7 +253,9 @@ struct swap_info_struct {
+ #ifdef CONFIG_XSWAP
+ 	struct vm_struct	*cluster_vm;	/* VM_SPARSE area for cluster_info */
+ 	unsigned long		nr_clusters_max;/* total clusters in the xswap address space */
++	unsigned long		nr_clusters;	/* growth ceiling, set by type<N>/limit */
+ 	unsigned long		nr_clusters_mapped; /* currently mapped cluster count */
++	struct kobject		*xswap_dev_kobj; /* sysfs: /sys/kernel/mm/xswap/type<N>/ */
+ 	struct work_struct	xswap_shrink_work; /* deferred shrink trigger */
+ 	struct mutex		xswap_lock;	/* serialize map/unmap operations */
+ #endif
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index c2ca0a9ac..fd3bc83f6 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -50,8 +50,13 @@
+ #include "swap_table.h"
+ #include "internal.h"
+ #include "swap.h"
++
+ #define DEF_SWAP_PRIO  -1
+ 
++static DEFINE_SPINLOCK(swap_lock);
++
++static long swap_usage_in_pages(struct swap_info_struct *si);
++
+ #ifdef CONFIG_XSWAP
+ /*
+  * xswap: dynamically grow and shrink the cluster_info array via a
+@@ -158,6 +163,142 @@ static inline void xswap_sysfs_init(void)
+ {
+ }
+ #endif /* CONFIG_SYSFS */
++
++#ifdef CONFIG_SYSFS
++/*
++ * Per-device directory: /sys/kernel/mm/xswap/type<N>/limit (rw).
++ * It is the runtime size ceiling of the device, in pages (rounded up to
++ * SWAPFILE_CLUSTER, the device's growth granularity).  Lowering it below
++ * the current usage only stops further growth down to the used size and
++ * triggers shrink of the free tail.
++ */
++struct xswap_sysfs_dev {
++	struct kobject kobj;
++	struct swap_info_struct *si;
++};
++
++static ssize_t xswap_limit_show(struct kobject *kobj,
++				struct kobj_attribute *attr, char *buf)
++{
++	struct swap_info_struct *si =
++		container_of(kobj, struct xswap_sysfs_dev, kobj)->si;
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(si->pages));
++}
++
++static ssize_t xswap_limit_store(struct kobject *kobj,
++				 struct kobj_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct swap_info_struct *si =
++		container_of(kobj, struct xswap_sysfs_dev, kobj)->si;
++	unsigned long val, clusters, new_pages;
++	int err;
++
++	err = kstrtoul(buf, 0, &val);
++	if (err)
++		return err;
++
++	spin_lock(&swap_lock);
++	/* Reject writes once swapoff has cleared SWP_WRITEOK. */
++	if (!(si->flags & SWP_WRITEOK)) {
++		spin_unlock(&swap_lock);
++		return -ENODEV;
++	}
++
++	clusters = DIV_ROUND_UP(val, SWAPFILE_CLUSTER);
++	if (clusters > si->nr_clusters_max)
++		clusters = si->nr_clusters_max;
++
++	spin_lock(&si->lock);
++	si->nr_clusters = clusters;
++	spin_unlock(&si->lock);
++
++	new_pages = min_t(unsigned long, clusters * SWAPFILE_CLUSTER, si->max);
++	if (new_pages)
++		new_pages--;
++
++	if (new_pages < swap_usage_in_pages(si))
++		new_pages = swap_usage_in_pages(si);
++	if (new_pages != si->pages) {
++		long delta = (long)new_pages - (long)si->pages;
++
++		si->pages = new_pages;
++		atomic_long_add(delta, &nr_swap_pages);
++		total_swap_pages += delta;
++	}
++	spin_unlock(&swap_lock);
++
++	/* Lowering the ceiling may free tail clusters. */
++	xswap_try_shrink(si);
++
++	return count;
++}
++
++static struct kobj_attribute xswap_limit_attr =
++	__ATTR(limit, 0644, xswap_limit_show, xswap_limit_store);
++
++static void xswap_dev_release(struct kobject *kobj)
++{
++	kfree(container_of(kobj, struct xswap_sysfs_dev, kobj));
++}
++
++static const struct kobj_type xswap_dev_ktype = {
++	.sysfs_ops = &kobj_sysfs_ops,
++	.release = xswap_dev_release,
++};
++
++static int xswap_dev_kobj_add(struct swap_info_struct *si)
++{
++	struct xswap_sysfs_dev *dev;
++	int err;
++
++	if (!xswap_kobj)
++		return 0;
++
++	dev = kzalloc_obj(*dev, GFP_KERNEL);
++	if (!dev)
++		return -ENOMEM;
++	dev->si = si;
++
++	err = kobject_init_and_add(&dev->kobj, &xswap_dev_ktype, xswap_kobj,
++				   "type%d", si->type);
++	if (err) {
++		kobject_put(&dev->kobj);
++		return err;
++	}
++
++	err = sysfs_create_file(&dev->kobj, &xswap_limit_attr.attr);
++	if (err) {
++		kobject_del(&dev->kobj);
++		kobject_put(&dev->kobj);
++		return err;
++	}
++	si->xswap_dev_kobj = &dev->kobj;
++	return 0;
++}
++
++static void xswap_dev_kobj_del(struct swap_info_struct *si)
++{
++	struct kobject *kobj = si->xswap_dev_kobj;
++
++	if (!kobj)
++		return;
++	si->xswap_dev_kobj = NULL;
++	sysfs_remove_file(kobj, &xswap_limit_attr.attr);
++	kobject_del(kobj);
++	kobject_put(kobj);
++}
++#else /* !CONFIG_SYSFS */
++static inline int xswap_dev_kobj_add(struct swap_info_struct *si)
++{
++	return 0;
++}
++
++static inline void xswap_dev_kobj_del(struct swap_info_struct *si)
++{
++}
++#endif /* CONFIG_SYSFS */
+ #else /* !CONFIG_XSWAP */
+ static inline void xswap_sysfs_init(void)
+ {
+@@ -178,7 +319,6 @@ static void move_cluster(struct swap_info_struct *si,
+  *
+  * Also protects swap_active_head total_swap_pages, and the SWP_WRITEOK flag.
+  */
+-static DEFINE_SPINLOCK(swap_lock);
+ static unsigned int nr_swapfiles;
+ atomic_long_t nr_swap_pages;
+ atomic_t nr_real_swapfiles;
+@@ -3274,6 +3414,7 @@ static void free_swap_cluster_info(struct swap_info_struct *si)
+ 
+ #ifdef CONFIG_XSWAP
+ 	if (si->flags & SWP_XSWAP) {
++		xswap_dev_kobj_del(si);
+ 		cancel_work_sync(&si->xswap_shrink_work);
+ 		/* Unmap all mapped clusters and free the VM_SPARSE area */
+ 		if (si->nr_clusters_mapped > 0)
+@@ -4057,8 +4198,9 @@ static void xswap_shrink_work_fn(struct work_struct *work)
+  */
+ static void xswap_try_shrink(struct swap_info_struct *si)
+ {
++	unsigned long nr_mapped, nr_ceiling, nr_tail, nr_unmap;
++	unsigned long start_idx, slack, min, i;
+ 	struct swap_cluster_info *ci;
+-	unsigned long nr_mapped, nr_tail, nr_unmap, start_idx, i;
+ 
+ 	if (!(si->flags & SWP_XSWAP))
+ 		return;
+@@ -4066,18 +4208,34 @@ static void xswap_try_shrink(struct swap_info_struct *si)
+ 	mutex_lock(&si->xswap_lock);
+ 
+ 	nr_mapped = READ_ONCE(si->nr_clusters_mapped);
++	nr_ceiling = READ_ONCE(si->nr_clusters);
++
+ 	if (nr_mapped <= 1)	/* keep cluster 0 */
+ 		goto out_unlock;
+ 
+ 	/*
+-	 * Reclaim on our own, but only once the mapped range is at most
+-	 * half in use: growth is demand driven, so reclaiming on a smaller
+-	 * dip would only map the same clusters again, and every unmap costs
+-	 * an RCU grace period.
++	 * A cap below the mapped range is reason enough to reclaim on its
++	 * own; otherwise only once the mapped range is at most half in use,
++	 * because growth is demand driven and reclaiming on a smaller dip
++	 * would only map the same clusters again, at the price of an RCU
++	 * grace period per unmap.
+ 	 */
+-	if (atomic_long_read(&si->inuse_pages) * 2 > nr_mapped * SWAPFILE_CLUSTER)
++	if (nr_ceiling >= nr_mapped &&
++	    atomic_long_read(&si->inuse_pages) * 2 > nr_mapped * SWAPFILE_CLUSTER)
+ 		goto out_unlock;
+ 
++	/*
++	 * Keep one chunk of free tail as slack so that the next allocation
++	 * does not grow the range back immediately - unless a cap asks for
++	 * the whole tail.
++	 */
++	slack = XSWAP_SHRINK_SLACK;
++	min = XSWAP_SHRINK_MIN;
++	if (nr_ceiling < nr_mapped) {
++		slack = 0;
++		min = XSWAP_GROW_CLUSTERS;
++	}
++
+ 	/*
+ 	 * Count the free clusters at the tail of the mapped range.  Scanned,
+ 	 * not tracked: the count must be exact to size the unmap, and an
+@@ -4091,10 +4249,13 @@ static void xswap_try_shrink(struct swap_info_struct *si)
+ 			break;
+ 		nr_tail++;
+ 	}
+-	if (nr_tail < XSWAP_SHRINK_SLACK + XSWAP_SHRINK_MIN)
++	if (nr_tail < slack + min)
+ 		goto out_unlock;
+ 
+-	nr_unmap = rounddown(nr_tail - XSWAP_SHRINK_SLACK, XSWAP_GROW_CLUSTERS);
++	nr_unmap = rounddown(nr_tail - slack, XSWAP_GROW_CLUSTERS);
++	if (nr_ceiling < nr_mapped)
++		nr_unmap = min(nr_unmap, rounddown(nr_mapped - nr_ceiling,
++						   XSWAP_GROW_CLUSTERS));
+ 	if (!nr_unmap)
+ 		goto out_unlock;
+ 	start_idx = nr_mapped - nr_unmap;
+@@ -4164,6 +4325,8 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 		cluster_info = vm->addr;
+ 		si->cluster_vm = vm;
+ 		si->nr_clusters_max = nr_clusters;
++		/* No cap unless type<N>/limit is written. */
++		si->nr_clusters = nr_clusters;
+ 		si->cluster_info = cluster_info;
+ 
+ 		/* Must be initialized before xswap_map_clusters() locks it. */
+@@ -4205,6 +4368,9 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 		}
+ 
+ 		INIT_WORK(&si->xswap_shrink_work, xswap_shrink_work_fn);
++		if (xswap_dev_kobj_add(si))
++			pr_warn("xswap: failed to add sysfs interface for type %d\n",
++				si->type);
+ 		return 0;
+ 
+ err_unmap:
+-- 
+2.55.0
+

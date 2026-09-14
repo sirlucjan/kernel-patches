@@ -1,0 +1,199 @@
+From 91bf4f0e82373480edd50dc2ec4272a9613eb30a Mon Sep 17 00:00:00 2001
+From: Baoquan He <hebaoquan@kylinos.cn>
+Date: Sun, 13 Sep 2026 15:50:09 +0800
+Subject: [PATCH 07/12] mm, swap: add xswap_try_shrink and shrink trigger on
+ cluster free
+
+Add xswap_try_shrink(). It scans backwards from the end of the mapped
+range and counts the contiguous free clusters at the tail. It then
+unmaps one or more chunks of that tail, in units of XSWAP_GROW_CLUSTERS.
+
+The function only reclaims when the mapped range is at most half in use.
+Growth is demand driven. Reclaiming on a smaller dip would only map the
+same clusters again, and every unmap costs an RCU grace period. So it
+leaves one chunk of free tail mapped as slack for the next allocation,
+and waits until several chunks can go before it unmaps anything.
+
+Wire the trigger in __free_cluster(). After a cluster is released to
+the free list, call xswap_try_shrink() to attempt the tail shrink.
+
+Also update the XSWAP_GROW_CLUSTERS comment. The constant is now used
+for shrink as well as grow.
+
+Signed-off-by: Baoquan He <hebaoquan@kylinos.cn>
+---
+ mm/swapfile.c | 95 +++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 89 insertions(+), 6 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index f603f8c4b..abe3d0ee5 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -54,12 +54,13 @@
+ 
+ #ifdef CONFIG_XSWAP
+ /*
+- * xswap: dynamically grow the cluster_info array via a VM_SPARSE area.
++ * xswap: dynamically grow and shrink the cluster_info array via a
++ * VM_SPARSE area.
+  *
+- * XSWAP_GROW_CLUSTERS is the number of clusters to map in one grow
+- * operation.  It is set to the number of cluster_info structs that
+- * fit in a single page (at least 16), so that the vmalloc page table
+- * overhead is proportional to the number of clusters mapped.
++ * XSWAP_GROW_CLUSTERS is the number of clusters to map/unmap in one
++ * grow/shrink operation: the number of cluster_info structs that fit in
++ * a single page (at least 16), so that the vmalloc page table overhead
++ * is proportional to the number of clusters mapped.
+  */
+ #define XSWAP_GROW_CLUSTERS \
+ 	max_t(unsigned long, PAGE_SIZE / sizeof(struct swap_cluster_info), 16)
+@@ -69,6 +70,7 @@ static int xswap_map_clusters(struct swap_info_struct *si,
+ static void xswap_unmap_clusters(struct swap_info_struct *si,
+ 				 unsigned long start_idx, unsigned long nr);
+ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data);
++static void xswap_try_shrink(struct swap_info_struct *si);
+ 
+ #ifdef CONFIG_SYSFS
+ static int xswap_create(int prio);
+@@ -694,6 +696,9 @@ static void __free_cluster(struct swap_info_struct *si, struct swap_cluster_info
+ 	swap_cluster_free_table(ci);
+ 	move_cluster(si, ci, &si->free_clusters, CLUSTER_FLAG_FREE);
+ 	ci->order = 0;
++#ifdef CONFIG_XSWAP
++	xswap_try_shrink(si);
++#endif
+ }
+ 
+ /*
+@@ -1514,11 +1519,19 @@ static bool swap_alloc_fast(struct folio *folio)
+ 	/*
+ 	 * Once allocated, swap_info_struct will never be completely freed,
+ 	 * so checking it's liveness by get_swap_device_info is enough.
++	 *
++	 * The cached cluster points into si->cluster_info, which xswap
++	 * maps and unmaps at runtime.  The RCU section has to cover both
++	 * reading the cached offset and dereferencing it, so that an
++	 * unmap can wait for the readers already in flight.
+ 	 */
++	rcu_read_lock();
+ 	si = this_cpu_read(percpu_swap_cluster.si[order]);
+ 	offset = this_cpu_read(percpu_swap_cluster.offset[order]);
+-	if (!si || !offset || !get_swap_device_info(si))
++	if (!si || !offset || !get_swap_device_info(si)) {
++		rcu_read_unlock();
+ 		return false;
++	}
+ 
+ 	ci = swap_cluster_lock(si, offset);
+ 	if (cluster_is_usable(ci, order)) {
+@@ -1530,6 +1543,7 @@ static bool swap_alloc_fast(struct folio *folio)
+ 	}
+ 
+ 	put_swap_device(si);
++	rcu_read_unlock();
+ 	return folio_test_swapcache(folio);
+ }
+ 
+@@ -2307,8 +2321,12 @@ swp_entry_t swap_alloc_hibernation_slot(int type)
+ 	/*
+ 	 * Try the local cluster first if it matches the device. If
+ 	 * not, try grab a new cluster and override local cluster.
++	 *
++	 * Same RCU requirement as swap_alloc_fast(): the cached offset
++	 * indexes si->cluster_info, which xswap can unmap.
+ 	 */
+ 	local_lock(&percpu_swap_cluster.lock);
++	rcu_read_lock();
+ 	pcp_si = this_cpu_read(percpu_swap_cluster.si[0]);
+ 	pcp_offset = this_cpu_read(percpu_swap_cluster.offset[0]);
+ 	if (pcp_si == si && pcp_offset) {
+@@ -2318,6 +2336,7 @@ swp_entry_t swap_alloc_hibernation_slot(int type)
+ 		else
+ 			swap_cluster_unlock(ci);
+ 	}
++	rcu_read_unlock();
+ 	if (!offset)
+ 		offset = cluster_alloc_swap_entry(si, NULL);
+ 	local_unlock(&percpu_swap_cluster.lock);
+@@ -3888,6 +3907,15 @@ static void xswap_unmap_clusters(struct swap_info_struct *si,
+ 		return;
+ 	}
+ 
++	/*
++	 * A per-cpu cluster cache can still hold an offset in this range.
++	 * Invalidate those references, then wait out the readers that have
++	 * already loaded one, so that nobody can dereference cluster_info
++	 * past this point.  swapoff() needs the same before it releases.
++	 */
++	flush_percpu_swap_cluster(si);
++	synchronize_rcu();
++
+ 	vm_area_unmap_pages(si->cluster_vm, vm_start, vm_end);
+ 	/* vm_area_unmap_pages() clears PTEs but does not free pages. */
+ 	/* TODO: free backing pages via page table walk or tracking bitmap */
+@@ -3905,6 +3933,61 @@ static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data)
+ 	*mapped_end = addr + PAGE_SIZE;
+ 	return 0;
+ }
++
++/*
++ * Automatic reclaim: leave one chunk of the free tail mapped as slack, so
++ * that the next allocation does not grow the range straight back, and only
++ * unmap once several chunks can go, so the unmap is worth the RCU grace
++ * period it costs.
++ */
++#define XSWAP_SHRINK_SLACK	XSWAP_GROW_CLUSTERS
++#define XSWAP_SHRINK_MIN	(XSWAP_GROW_CLUSTERS * 4)
++
++/*
++ * Try to shrink the cluster_info tail: unmap contiguous free clusters
++ * at the end of the mapped range.
++ */
++static void xswap_try_shrink(struct swap_info_struct *si)
++{
++	struct swap_cluster_info *ci;
++	unsigned long nr_mapped, last, idx;
++
++	if (!(si->flags & SWP_XSWAP))
++		return;
++
++	nr_mapped = READ_ONCE(si->nr_clusters_mapped);
++	if (nr_mapped <= 1) /* keep cluster 0 */
++		return;
++
++	/*
++	 * Reclaim on our own, but only once the mapped range is at most
++	 * half in use: growth is demand driven, so reclaiming on a smaller
++	 * dip would only map the same clusters again, and every unmap costs
++	 * an RCU grace period.
++	 */
++	if (atomic_long_read(&si->inuse_pages) * 2 > nr_mapped * SWAPFILE_CLUSTER)
++		return;
++
++	/* Find the last non-free cluster from the tail */
++	last = nr_mapped;
++	while (last > 1) {
++		idx = last - 1;
++		ci = &si->cluster_info[idx];
++		if (ci->count || ci->flags != CLUSTER_FLAG_FREE)
++			break;
++		last = idx;
++	}
++
++	if (last == nr_mapped)
++		return; /* nothing to shrink */
++
++	if (nr_mapped - last < XSWAP_SHRINK_SLACK + XSWAP_SHRINK_MIN)
++		return;
++
++	last += XSWAP_SHRINK_SLACK;
++
++	xswap_unmap_clusters(si, last, nr_mapped - last);
++}
+ #endif /* CONFIG_XSWAP */
+ 
+ static int setup_swap_clusters_info(struct swap_info_struct *si,
+-- 
+2.55.0
+
