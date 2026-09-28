@@ -1,0 +1,279 @@
+From 1dc2fddbfd2a4cb2e71a59a28760d72061329410 Mon Sep 17 00:00:00 2001
+From: Nhat Pham <nphamcs@gmail.com>
+Date: Fri, 18 Sep 2026 11:02:37 -0700
+Subject: [PATCH 08/12] mm, swap: reclaim physical slots backing cache-only
+ vswap entries
+
+When a vswap entry's swap_count drops to 0 while its folio is still in
+the swap cache, the entry is cache-only and its physical slot is
+redundant. swap_put_entries_direct() tries to reclaim it at put time, but
+folio_put_swap() does not, and even the direct route can come back empty:
+the folio may be under the writeback that allocated the slot, its trylock
+may be lost, it may still be mapped, or swap_only_has_cache() may be false
+on a partial run. Nothing retried afterwards, so the slot stayed pinned.
+
+Reclaim such slots from the physical reclaim scanner, once swap is more
+than half used (vm_swap_full()), to free physical capacity for new
+allocations. Reclaim goes through folio_free_swap(), which ends in
+folio_set_dirty(), so a reclaimed slot costs a re-swapout if the folio is
+dropped again.
+
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Tested-by: Klara Modin <klarasmodin@gmail.com>
+Tested-by: syzbot@syzkaller.appspotmail.com
+---
+ mm/swap_table.h |  12 +++--
+ mm/swapfile.c   | 117 ++++++++++++++++++++++++++++++++++++++++++++++++
+ mm/vswap.h      |  31 +++++++++++++
+ 3 files changed, 156 insertions(+), 4 deletions(-)
+
+diff --git a/mm/swap_table.h b/mm/swap_table.h
+index 7d094694e..79f06642a 100644
+--- a/mm/swap_table.h
++++ b/mm/swap_table.h
+@@ -31,7 +31,7 @@ struct swap_memcg_table {
+  * NULL:     |---------------- 0 ---------------| - Free slot
+  * Shadow:   |SWAP_COUNT|Z|---- SHADOW_VAL ---|1| - Swapped out slot
+  * PFN:      |SWAP_COUNT|Z|------ PFN -------|10| - Cached slot
+- * Pointer:  |-------- vswap offset --------|100| - vswap rmap
++ * Pointer:  |C|------- vswap offset -------|100| - vswap rmap
+  * Bad:      |------------- 1 -------------|1000| - Bad slot
+  *
+  * COUNT is `SWP_TB_COUNT_BITS` long, Z is the `SWP_TB_ZERO_FLAG` bit,
+@@ -399,14 +399,18 @@ static inline unsigned short __swap_cgroup_clear(struct swap_cluster_info *ci,
+  * On physical clusters, a Pointer-tagged entry stores the offset of the
+  * vswap entry that owns this physical slot (the reverse map). Only the
+  * offset is stored; the swap type is implicit (always vswap_si->type,
+- * since there is exactly one vswap device).
++ * since there is exactly one vswap device). The top bit is reserved as
++ * a cache-only flag, set when vswap swap_count drops to 0 but the folio
++ * is still in swap cache.
+  *
+- *   Pointer:  |---- vswap offset ----|100|
++ *   Pointer:  |C|---- vswap offset ----|100|
++ *              C = SWP_RMAP_CACHE_ONLY (the top bit)
+  */
+ #define SWP_TB_PTR_MARK_BITS	3
+ #define SWP_TB_PTR_MARK		0b100UL
+ #define SWP_TB_PTR_MARK_MASK	((1UL << SWP_TB_PTR_MARK_BITS) - 1)
+-#define SWP_RMAP_ENTRY_MASK	(~SWP_TB_PTR_MARK_MASK)
++#define SWP_RMAP_CACHE_ONLY	(1UL << (BITS_PER_LONG - 1))
++#define SWP_RMAP_ENTRY_MASK	(~(SWP_RMAP_CACHE_ONLY | SWP_TB_PTR_MARK_MASK))
+ 
+ static inline bool swp_tb_is_pointer(unsigned long swp_tb)
+ {
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index d95d83b38..bac64f510 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -142,6 +142,11 @@ static DEFINE_PER_CPU(struct percpu_vswap_cluster, percpu_vswap_cluster) = {
+ 	.lock = INIT_LOCAL_LOCK(),
+ };
+ 
++static void vswap_mark_cache_only(struct swap_cluster_info *ci,
++				  unsigned int ci_off);
++static void vswap_clear_cache_only(struct swap_cluster_info *ci,
++				   unsigned int ci_start, int nr);
++
+ /* May return NULL on invalid type, caller must check for NULL return */
+ static struct swap_info_struct *swap_type_to_info(int type)
+ {
+@@ -874,6 +879,55 @@ static int swap_cluster_setup_bad_slot(struct swap_info_struct *si,
+ 	return ret;
+ }
+ 
++/*
++ * Try to reclaim a Pointer-tagged physical slot backing a vswap entry.
++ * The physical cluster lock must NOT be held. Returns the backing folio's
++ * page count, negated if the slots could not be reclaimed, or 0 if the
++ * folio could not be shown to own @offset (i.e. there is a race).
++ */
++static int try_to_reclaim_vswap_backing(struct swap_info_struct *si,
++					unsigned long offset,
++					swp_entry_t vswap_entry)
++{
++	swp_entry_t phys_base;
++	struct folio *folio;
++	unsigned int i;
++	int ret;
++
++	folio = swap_cache_get_folio(vswap_entry);
++	if (!folio)
++		return 0;
++
++	if (!folio_trylock(folio)) {
++		/* Unvalidated: the folio may not even own @offset. */
++		folio_put(folio);
++		return 0;
++	}
++
++	if (!folio_matches_swap_entry(folio, vswap_entry)) {
++		folio_unlock(folio);
++		folio_put(folio);
++		return 0;
++	}
++
++	i = vswap_entry.val - folio->swap.val;
++	phys_base = vswap_to_phys(folio->swap);
++	if (!phys_base.val || swp_type(phys_base) != si->type ||
++	    swp_offset(phys_base) + i != offset) {
++		folio_unlock(folio);
++		folio_put(folio);
++		return 0;
++	}
++
++	/* The run is ours: skip it all, whether or not the free succeeds. */
++	ret = folio_nr_pages(folio);
++	if (!folio_free_swap(folio))
++		ret = -ret;
++	folio_unlock(folio);
++	folio_put(folio);
++	return ret;
++}
++
+ /*
+  * Reclaim drops the ci lock, so the cluster may become unusable (freed or
+  * stolen by a lower order). @usable will be set to false if that happens.
+@@ -1155,6 +1209,7 @@ static void swap_reclaim_full_clusters(struct swap_info_struct *si, bool force)
+ 	long to_scan = 1;
+ 	unsigned long offset, end;
+ 	struct swap_cluster_info *ci;
++	swp_entry_t vswap_entry;
+ 	unsigned long swp_tb;
+ 	int nr_reclaim;
+ 
+@@ -1179,6 +1234,19 @@ static void swap_reclaim_full_clusters(struct swap_info_struct *si, bool force)
+ 					offset += abs(nr_reclaim);
+ 					continue;
+ 				}
++			} else if (swp_tb_is_pointer(swp_tb) &&
++				   (swp_tb & SWP_RMAP_CACHE_ONLY)) {
++				vswap_entry = swp_tb_ptr_to_swp_entry(swp_tb);
++				spin_unlock(&ci->lock);
++				nr_reclaim = try_to_reclaim_vswap_backing(si, offset,
++									  vswap_entry);
++				ci = swap_cluster_lock(si, offset);
++				if (!ci)
++					goto next;
++				if (nr_reclaim) {
++					offset += abs(nr_reclaim);
++					continue;
++				}
+ 			}
+ 			offset++;
+ 		}
+@@ -1755,6 +1823,8 @@ static void swap_put_entries_cluster(struct swap_info_struct *si,
+ 			}
+ 			/* count will be 0 after put, slot can be reclaimed */
+ 			need_reclaim = true;
++			if (swap_is_vswap(si))
++				vswap_mark_cache_only(ci, ci_off);
+ 		}
+ 		/*
+ 		 * A count != 1 or cached slot can't be freed. Put its swap
+@@ -1861,6 +1931,8 @@ static int swap_dup_entries_cluster(struct swap_info_struct *si,
+ 			goto failed;
+ 		}
+ 	} while (++ci_off < ci_end);
++	if (swap_is_vswap(si))
++		vswap_clear_cache_only(ci, ci_start, nr);
+ 	swap_cluster_unlock(ci);
+ 	return 0;
+ failed:
+@@ -1999,6 +2071,51 @@ int folio_alloc_swap(struct folio *folio)
+ 	return 0;
+ }
+ 
++static void vswap_mark_cache_only(struct swap_cluster_info *ci,
++				  unsigned int ci_off)
++{
++	struct swap_cluster_info_dynamic *ci_dyn;
++	struct swap_cluster_info *pci;
++	swp_entry_t phys;
++	unsigned long vt;
++
++	ci_dyn = container_of(ci, struct swap_cluster_info_dynamic, ci);
++	vt = __vtable_get(ci_dyn, ci_off);
++
++	if (vtable_type(vt) == VSWAP_SWAPFILE) {
++		phys = vtable_to_phys(vt);
++		pci = __swap_entry_to_cluster(phys);
++		swap_rmap_mark_cache_only(pci, swp_cluster_offset(phys));
++	}
++}
++
++/*
++ * Clear the cache-only rmap hint for entries re-referenced from count 0 to 1
++ * (no longer reclaimable), so the physical reclaim scanner skips them.
++ */
++static void vswap_clear_cache_only(struct swap_cluster_info *ci,
++				   unsigned int ci_start, int nr)
++{
++	struct swap_cluster_info_dynamic *ci_dyn;
++	struct swap_cluster_info *pci;
++	unsigned long swp_tb, vt;
++	swp_entry_t phys;
++	unsigned int off;
++
++	ci_dyn = container_of(ci, struct swap_cluster_info_dynamic, ci);
++	for (off = ci_start; off < ci_start + nr; off++) {
++		swp_tb = __swap_table_get(ci, off);
++		if (!swp_tb_is_folio(swp_tb) || swp_tb_get_count(swp_tb) != 1)
++			continue;
++		vt = __vtable_get(ci_dyn, off);
++		if (vtable_type(vt) != VSWAP_SWAPFILE)
++			continue;
++		phys = vtable_to_phys(vt);
++		pci = __swap_entry_to_cluster(phys);
++		swap_rmap_clear_cache_only(pci, swp_cluster_offset(phys));
++	}
++}
++
+ static void __swap_cluster_free_phys_backing(struct swap_info_struct *psi,
+ 					     struct swap_cluster_info *pci,
+ 					     unsigned int ci_start,
+diff --git a/mm/vswap.h b/mm/vswap.h
+index 6f952b259..b79866d59 100644
+--- a/mm/vswap.h
++++ b/mm/vswap.h
+@@ -44,6 +44,37 @@ static inline bool is_vswap_entry(swp_entry_t entry)
+ 	return swap_is_vswap(__swap_entry_to_info(entry));
+ }
+ 
++/*
++ * Rmap cache-only helpers for physical cluster Pointer-tagged entries.
++ * SWP_RMAP_CACHE_ONLY records, inline on the physical swap_table entry,
++ * that the backing vswap entry has swap_count == 0 (swap-cache-only, so
++ * reclaimable). The physical reclaim scanner reads it directly instead of
++ * chasing the rmap into the vswap layer and paying the cluster-lookup
++ * indirection.
++ *
++ * Callers hold the vswap cluster lock, not the physical one. The rmap is
++ * only touched while the vtable holds the slot as SWAPFILE, and that
++ * window is opened and closed under the vswap cluster lock, so the
++ * allocator has finished writing the entry by then.
++ */
++static inline void swap_rmap_mark_cache_only(struct swap_cluster_info *ci,
++					     unsigned int off)
++{
++	atomic_long_t *table;
++
++	table = rcu_dereference_protected(ci->table, true);
++	atomic_long_or(SWP_RMAP_CACHE_ONLY, &table[off]);
++}
++
++static inline void swap_rmap_clear_cache_only(struct swap_cluster_info *ci,
++					      unsigned int off)
++{
++	atomic_long_t *table;
++
++	table = rcu_dereference_protected(ci->table, true);
++	atomic_long_and(~SWP_RMAP_CACHE_ONLY, &table[off]);
++}
++
+ /*
+  * Virtual table entry encoding for vswap clusters.
+  *
+-- 
+2.55.0
+

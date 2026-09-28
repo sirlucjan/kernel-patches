@@ -1,0 +1,184 @@
+From b23edb84b28480fb74e8c75b85aa4b229019a713 Mon Sep 17 00:00:00 2001
+From: Nhat Pham <nphamcs@gmail.com>
+Date: Fri, 18 Sep 2026 11:02:36 -0700
+Subject: [PATCH 07/12] mm, swap: write back vswap zswap entries to physical
+ swap
+
+Add support for writing back zswap-backed vswap entries to physical
+swap. The mechanism mirrors the existing zswap writeback path, except
+the backing physical slot is allocated on demand at writeback time
+rather than already being pinned by the PTE.
+
+The zswap shrinker no longer skips vswap entries, unless we are out of
+physical swap space.
+
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Tested-by: Klara Modin <klarasmodin@gmail.com>
+Tested-by: syzbot@syzkaller.appspotmail.com
+---
+ mm/zswap.c | 67 +++++++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 46 insertions(+), 21 deletions(-)
+
+diff --git a/mm/zswap.c b/mm/zswap.c
+index d304f8266..82a84c0ed 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -1007,12 +1007,13 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
+ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 				 swp_entry_t swpentry)
+ {
+-	struct xarray *tree;
+ 	pgoff_t offset = swp_offset(swpentry);
+ 	struct folio *folio;
+ 	struct mempolicy *mpol;
+ 	struct swap_info_struct *si;
+ 	struct swap_io_ctx ctx = {};
++	swp_entry_t phys = {};
++	bool is_vswap;
+ 	int ret = 0;
+ 
+ 	/* try to allocate swap cache folio */
+@@ -1020,12 +1021,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 	if (!si)
+ 		return -EEXIST;
+ 
+-	/* Vswap entries have no physical backing to write to. */
+-	if (swap_is_vswap(si)) {
+-		put_swap_device(si);
+-		return -EINVAL;
+-	}
+-
++	is_vswap = swap_is_vswap(si);
+ 	mpol = get_task_policy(current);
+ 	folio = swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,
+ 				       NO_INTERLEAVE_INDEX);
+@@ -1044,24 +1040,44 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 	/*
+ 	 * folio is locked, and the swapcache is now secured against
+ 	 * concurrent swapping to and from the slot, and concurrent
+-	 * swapoff so we can safely dereference the zswap tree here.
++	 * swapoff so we can safely dereference the zswap tree (or vswap
++	 * vtable) here.
+ 	 * Verify that the swap entry hasn't been invalidated and recycled
+ 	 * behind our backs, to avoid overwriting a new swap folio with
+ 	 * old compressed data. Only when this is successful can the entry
+ 	 * be dereferenced.
+ 	 */
+-	tree = swap_zswap_tree(swpentry);
+-	if (entry != xa_load(tree, offset)) {
++	if (entry != zswap_entry_load(swpentry)) {
+ 		ret = -ENOMEM;
+ 		goto out;
+ 	}
+ 
++	if (is_vswap) {
++		/*
++		 * Allocate physical backing before decompress so a failure
++		 * wastes no work.
++		 */
++		phys = folio_realloc_swap(folio);
++		if (!phys.val) {
++			ret = -ENOMEM;
++			goto out;
++		}
++	}
++
+ 	if (!zswap_decompress(entry, folio)) {
+ 		ret = -EIO;
++		/*
++		 * The phys allocation above took the entry out of the vtable.
++		 * Restore the zswap entry to the vtable, which also frees the
++		 * allocated physical swap space.
++		 */
++		if (is_vswap)
++			vswap_zswap_store(swpentry, entry);
+ 		goto out;
+ 	}
+ 
+-	xa_erase(tree, offset);
++	if (!is_vswap)
++		xa_erase(swap_zswap_tree(swpentry), offset);
+ 
+ 	count_vm_event(ZSWPWB);
+ 	if (entry->objcg)
+@@ -1076,7 +1092,10 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 	folio_set_reclaim(folio);
+ 
+ 	/* start writeback */
+-	__swap_writepage(&ctx, folio, folio->swap);
++	if (is_vswap)
++		__swap_writepage(&ctx, folio, phys);
++	else
++		__swap_writepage(&ctx, folio, folio->swap);
+ 	swap_write_submit(&ctx);
+ 
+ out:
+@@ -1091,6 +1110,15 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+ /*********************************
+ * shrinker functions
+ **********************************/
++/*
++ * vswap zswap entries get a physical slot allocated on demand at writeback
++ * time. Skip the shrinker when none is available.
++ */
++static bool zswap_writeback_possible(void)
++{
++	return !vswap_is_enabled() || get_nr_swap_pages() > 0;
++}
++
+ /*
+  * The dynamic shrinker is modulated by the following factors:
+  *
+@@ -1228,7 +1256,7 @@ static unsigned long zswap_shrinker_count(struct shrinker *shrinker,
+ 	if (!zswap_shrinker_enabled || !mem_cgroup_zswap_writeback_enabled(memcg))
+ 		return 0;
+ 
+-	if (vswap_is_enabled())
++	if (!zswap_writeback_possible())
+ 		return 0;
+ 
+ 	/*
+@@ -1314,7 +1342,8 @@ static struct shrinker *zswap_alloc_shrinker(void)
+  * were scanned but none could be written back, or -ENOENT if @memcg has
+  * writeback disabled, is a zombie cgroup, or has empty zswap LRUs.
+  *
+- * Also returns -ENOENT when vswap is enabled.
++ * Also returns -ENOENT when vswap is enabled and there is no physical
++ * swap to write back to.
+  */
+ static int shrink_memcg(struct mem_cgroup *memcg)
+ {
+@@ -1323,7 +1352,7 @@ static int shrink_memcg(struct mem_cgroup *memcg)
+ 	if (!mem_cgroup_zswap_writeback_enabled(memcg))
+ 		return -ENOENT;
+ 
+-	if (vswap_is_enabled())
++	if (!zswap_writeback_possible())
+ 		return -ENOENT;
+ 
+ 	/*
+@@ -1354,11 +1383,7 @@ static void shrink_worker(struct work_struct *w)
+ 	int ret, failures = 0, attempts = 0;
+ 	unsigned long thr;
+ 
+-	/*
+-	 * When vswap is enabled, zswap entries are almost all vswap backed,
+-	 * with no slot to write back to.
+-	 */
+-	if (vswap_is_enabled())
++	if (!zswap_writeback_possible())
+ 		return;
+ 
+ 	/* Reclaim down to the accept threshold */
+@@ -1439,7 +1464,7 @@ static void shrink_worker(struct work_struct *w)
+ 			break;
+ resched:
+ 		cond_resched();
+-	} while (zswap_total_pages() > thr);
++	} while (zswap_total_pages() > thr && zswap_writeback_possible());
+ }
+ 
+ /*********************************
+-- 
+2.55.0
+

@@ -1,0 +1,250 @@
+From 33d2399c470fe4f2f8f7ee505742af58ff4e42dd Mon Sep 17 00:00:00 2001
+From: Nhat Pham <nphamcs@gmail.com>
+Date: Fri, 18 Sep 2026 11:02:40 -0700
+Subject: [PATCH 11/12] mm, swap: defer memcg_table allocation for physical
+ swap clusters
+
+Stop allocating a memcg table for every physical swap cluster that only
+ever holds vswap backings. The table costs SWAPFILE_CLUSTER *
+sizeof(unsigned short) per cluster, 1 KB per 2 MB of swap on a 64-bit
+kernel with 4 KB pages. On a vswap-heavy workload, where zswap writeback
+is the only consumer of physical swap, that is the common case.
+
+Such clusters never have their memcg_table read or written: vswap-layer
+charging records on the vswap cluster's table, not the physical one.
+
+Allocate eagerly only where the table is known to be needed: every vswap
+cluster, and, when vswap is off, every physical cluster, since none of its
+slots is then a vswap backing. A physical cluster otherwise allocates on
+its first direct-use slot, and skips entirely if it only holds vswap
+backings. Hibernation slots have no folio and record no cgroup, so they do
+not trigger it. That deferred allocation is on the allocator's fast path
+and can fail; the allocation it serves then fails too, and the caller falls
+back to another cluster.
+
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Tested-by: Klara Modin <klarasmodin@gmail.com>
+Tested-by: syzbot@syzkaller.appspotmail.com
+---
+ mm/swapfile.c | 83 +++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 64 insertions(+), 19 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 47d009a81..2f1fa427e 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -469,7 +469,8 @@ static void swap_cluster_free_table(struct swap_cluster_info *ci)
+ 		 swap_cluster_free_table_folio_rcu_cb);
+ }
+ 
+-static int swap_cluster_alloc_table(struct swap_cluster_info *ci, gfp_t gfp)
++static int swap_cluster_alloc_table(struct swap_info_struct *si,
++				    struct swap_cluster_info *ci, gfp_t gfp)
+ {
+ 	struct swap_table *table = NULL;
+ 	struct folio *folio;
+@@ -480,7 +481,14 @@ static int swap_cluster_alloc_table(struct swap_cluster_info *ci, gfp_t gfp)
+ 		return 0;
+ 
+ #ifdef CONFIG_MEMCG
+-	if (!mem_cgroup_disabled()) {
++	/*
++	 * A physical cluster under vswap may hold only vswap backings, which
++	 * record their memcg on the vswap cluster's table, not this one. Such
++	 * clusters defer memcg_table allocation until they hand out a slot
++	 * that maps directly into the PTEs.
++	 */
++	if ((!vswap_is_enabled() || swap_is_vswap(si)) &&
++	    !mem_cgroup_disabled()) {
+ 		VM_WARN_ON_ONCE(ci->memcg_table);
+ 		ci->memcg_table = kzalloc_obj(*ci->memcg_table, gfp);
+ 		if (!ci->memcg_table)
+@@ -571,8 +579,8 @@ swap_cluster_populate(struct swap_info_struct *si,
+ 		lockdep_assert_held(&si->global_cluster_lock);
+ 	lockdep_assert_held(&ci->lock);
+ 
+-	if (!swap_cluster_alloc_table(ci, __GFP_HIGH | __GFP_NOMEMALLOC |
+-					  __GFP_NOWARN))
++	if (!swap_cluster_alloc_table(si, ci, __GFP_HIGH | __GFP_NOMEMALLOC |
++					      __GFP_NOWARN))
+ 		return ci;
+ 
+ 	/*
+@@ -585,8 +593,8 @@ swap_cluster_populate(struct swap_info_struct *si,
+ 		spin_unlock(&si->global_cluster_lock);
+ 	local_unlock(&percpu_swap_cluster.lock);
+ 
+-	ret = swap_cluster_alloc_table(ci, __GFP_HIGH | __GFP_NOMEMALLOC |
+-					   GFP_KERNEL);
++	ret = swap_cluster_alloc_table(si, ci, __GFP_HIGH | __GFP_NOMEMALLOC |
++					       GFP_KERNEL);
+ 
+ 	/*
+ 	 * Back to atomic context. We might have migrated to a new CPU with a
+@@ -863,7 +871,7 @@ static int swap_cluster_setup_bad_slot(struct swap_info_struct *si,
+ 
+ 	ci = cluster_info + idx;
+ 	/* Need to allocate swap table first for initial bad slot marking. */
+-	if (!ci->count && swap_cluster_alloc_table(ci, GFP_KERNEL))
++	if (!ci->count && swap_cluster_alloc_table(si, ci, GFP_KERNEL))
+ 		return -ENOMEM;
+ 	spin_lock(&ci->lock);
+ 	/* Check for duplicated bad swap slots. */
+@@ -1086,7 +1094,9 @@ static bool __swap_cluster_alloc_entries(struct swap_info_struct *si,
+ /* Try use a new cluster for current CPU and allocate from it. */
+ static unsigned int alloc_swap_scan_cluster(struct swap_info_struct *si,
+ 					    struct swap_cluster_info *ci,
+-					    struct folio *folio, unsigned long offset)
++					    struct folio *folio,
++					    unsigned long offset,
++					    bool *nomem)
+ {
+ 	unsigned int next = SWAP_ENTRY_INVALID, found = SWAP_ENTRY_INVALID;
+ 	unsigned long start = ALIGN_DOWN(offset, SWAPFILE_CLUSTER);
+@@ -1115,6 +1125,23 @@ static unsigned int alloc_swap_scan_cluster(struct swap_info_struct *si,
+ 			if (!ret)
+ 				continue;
+ 		}
++#ifdef CONFIG_MEMCG
++		/*
++		 * Lazy-allocate memcg_table on the first direct-use slot of a
++		 * physical cluster.
++		 */
++		if (vswap_is_enabled() && folio &&
++		    !folio_test_swapcache(folio) && !mem_cgroup_disabled() &&
++		    !ci->memcg_table) {
++			ci->memcg_table = kzalloc_obj(*ci->memcg_table,
++						      GFP_ATOMIC | __GFP_NOWARN);
++			if (!ci->memcg_table) {
++				if (nomem)
++					*nomem = true;
++				goto out;
++			}
++		}
++#endif
+ 		if (!__swap_cluster_alloc_entries(si, ci, folio, offset % SWAPFILE_CLUSTER))
+ 			break;
+ 		found = offset;
+@@ -1124,7 +1151,15 @@ static unsigned int alloc_swap_scan_cluster(struct swap_info_struct *si,
+ 		break;
+ 	}
+ out:
+-	relocate_cluster(si, ci);
++	/*
++	 * On a discard-capable device, relocating a cluster whose memcg_table
++	 * allocation failed queues a discard for slots that were never used,
++	 * which folio_alloc_phys_swap() reads as progress and retries on.
++	 */
++	if (nomem && *nomem && !ci->count)
++		__free_cluster(si, ci);
++	else
++		relocate_cluster(si, ci);
+ 	swap_cluster_unlock(ci);
+ 	if (swap_is_vswap(si)) {
+ 		this_cpu_write(percpu_vswap_cluster.offset[order], next);
+@@ -1145,7 +1180,13 @@ static unsigned int alloc_swap_scan_list(struct swap_info_struct *si,
+ 					 bool scan_all)
+ {
+ 	unsigned int found = SWAP_ENTRY_INVALID;
++	bool nomem = false;
+ 
++	/*
++	 * In rare cases alloc_swap_scan_cluster() can fail due to
++	 * memcg_table allocation failure. Short-circuit to avoid looping
++	 * over the list indefinitely.
++	 */
+ 	do {
+ 		struct swap_cluster_info *ci = isolate_lock_cluster(si, list);
+ 		unsigned long offset;
+@@ -1153,10 +1194,10 @@ static unsigned int alloc_swap_scan_list(struct swap_info_struct *si,
+ 		if (!ci)
+ 			break;
+ 		offset = cluster_offset(si, ci);
+-		found = alloc_swap_scan_cluster(si, ci, folio, offset);
++		found = alloc_swap_scan_cluster(si, ci, folio, offset, &nomem);
+ 		if (found)
+ 			break;
+-	} while (scan_all);
++	} while (scan_all && !nomem);
+ 
+ 	return found;
+ }
+@@ -1177,7 +1218,8 @@ static unsigned int vswap_alloc_cluster(struct swap_info_struct *si,
+ 	spin_lock_init(&ci_dyn->ci.lock);
+ 	INIT_LIST_HEAD(&ci_dyn->ci.list);
+ 
+-	if (swap_cluster_alloc_table(&ci_dyn->ci, GFP_ATOMIC | __GFP_NOWARN)) {
++	if (swap_cluster_alloc_table(si, &ci_dyn->ci,
++				     GFP_ATOMIC | __GFP_NOWARN)) {
+ 		kfree(ci_dyn);
+ 		return SWAP_ENTRY_INVALID;
+ 	}
+@@ -1203,7 +1245,7 @@ static unsigned int vswap_alloc_cluster(struct swap_info_struct *si,
+ 	}
+ 
+ 	offset = cluster_offset(si, ci);
+-	return alloc_swap_scan_cluster(si, ci, folio, offset);
++	return alloc_swap_scan_cluster(si, ci, folio, offset, NULL);
+ }
+ 
+ static void swap_reclaim_full_clusters(struct swap_info_struct *si, bool force)
+@@ -1310,7 +1352,8 @@ static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
+ 		if (cluster_is_usable(ci, order)) {
+ 			if (cluster_is_empty(ci))
+ 				offset = cluster_offset(si, ci);
+-			found = alloc_swap_scan_cluster(si, ci, folio, offset);
++			found = alloc_swap_scan_cluster(si, ci, folio, offset,
++							NULL);
+ 		} else {
+ 			swap_cluster_unlock(ci);
+ 		}
+@@ -1354,7 +1397,7 @@ static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
+ 	if (order < PMD_ORDER) {
+ 		/*
+ 		 * Scan only one fragment cluster is good enough. Order 0
+-		 * allocation will surely success, and large allocation
++		 * allocation rarely fails, and large allocation
+ 		 * failure is not critical. Scanning one cluster still
+ 		 * keeps the list rotated and reclaimed (for clean swap cache).
+ 		 */
+@@ -1369,7 +1412,7 @@ static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
+ 	/* Order 0 stealing from higher order */
+ 	for (int o = 1; o < SWAP_NR_ORDERS; o++) {
+ 		/*
+-		 * Clusters here have at least one usable slots and can't fail order 0
++		 * Clusters here have at least one usable slots and rarely fail order 0
+ 		 * allocation, but reclaim may drop si->lock and race with another user.
+ 		 */
+ 		found = alloc_swap_scan_list(si, &si->frag_clusters[o], folio, true);
+@@ -1593,7 +1636,7 @@ static swp_entry_t swap_alloc_fast(struct folio *folio)
+ 	if (ci && cluster_is_usable(ci, order)) {
+ 		if (cluster_is_empty(ci))
+ 			offset = cluster_offset(si, ci);
+-		found = alloc_swap_scan_cluster(si, ci, folio, offset);
++		found = alloc_swap_scan_cluster(si, ci, folio, offset, NULL);
+ 	} else if (ci) {
+ 		swap_cluster_unlock(ci);
+ 	}
+@@ -1988,7 +2031,8 @@ static bool vswap_alloc(struct folio *folio)
+ 		if (ci && cluster_is_usable(ci, order)) {
+ 			if (cluster_is_empty(ci))
+ 				offset = cluster_offset(vswap_si, ci);
+-			alloc_swap_scan_cluster(vswap_si, ci, folio, offset);
++			alloc_swap_scan_cluster(vswap_si, ci, folio, offset,
++						NULL);
+ 		} else if (ci) {
+ 			swap_cluster_unlock(ci);
+ 		}
+@@ -2852,7 +2896,8 @@ swp_entry_t swap_alloc_hibernation_slot(int type)
+ 	if (pcp_si == si && pcp_offset) {
+ 		ci = swap_cluster_lock(si, pcp_offset);
+ 		if (cluster_is_usable(ci, 0))
+-			offset = alloc_swap_scan_cluster(si, ci, NULL, pcp_offset);
++			offset = alloc_swap_scan_cluster(si, ci, NULL,
++							 pcp_offset, NULL);
+ 		else
+ 			swap_cluster_unlock(ci);
+ 	}
+-- 
+2.55.0
+
