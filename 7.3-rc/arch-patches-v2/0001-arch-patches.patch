@@ -1,0 +1,154 @@
+From c4f047c710e9552576440cf95e8a6b130a676902 Mon Sep 17 00:00:00 2001
+From: Serge Hallyn <serge.hallyn@canonical.com>
+Date: Fri, 31 May 2013 19:12:12 +0100
+Subject: [PATCH 1/2] add sysctl to allow disabling unprivileged CLONE_NEWUSER
+
+This is a short-term patch.  Unprivileged use of CLONE_NEWUSER
+is certainly an intended feature of user namespaces.  However
+for at least saucy we want to make sure that, if any security
+issues are found, we have a fail-safe.
+
+[bwh: Remove unneeded binary sysctl bits]
+[bwh: Keep this sysctl, but change the default to enabled]
+[heftig: correct commit subject to reduce confusion]
+[heftig: for 6.17, move all code into kernel/fork.c]
+---
+ kernel/fork.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 10f2d05d8..ee5b64005 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -127,6 +127,12 @@
+ 
+ #include <kunit/visibility.h>
+ 
++#ifdef CONFIG_USER_NS
++static int unprivileged_userns_clone = 1;
++#else
++#define unprivileged_userns_clone 1
++#endif
++
+ /*
+  * Minimum number of threads to boot the kernel
+  */
+@@ -2112,6 +2118,11 @@ __latent_entropy struct task_struct *copy_process(
+ 			return ERR_PTR(-EPERM);
+ 	}
+ 
++	if ((clone_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
++		if (!capable(CAP_SYS_ADMIN))
++			return ERR_PTR(-EPERM);
++	}
++
+ 	/*
+ 	 * Force any signals received before this point to be delivered
+ 	 * before the fork happens.  Collect up signals sent to multiple
+@@ -3187,6 +3198,10 @@ static int check_unshare_flags(unsigned long unshare_flags)
+ 		if (!current_is_single_threaded())
+ 			return -EINVAL;
+ 	}
++	if ((unshare_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++	}
+ 
+ 	return 0;
+ }
+@@ -3416,6 +3431,15 @@ static const struct ctl_table fork_sysctl_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= sysctl_max_threads,
+ 	},
++#ifdef CONFIG_USER_NS
++	{
++		.procname	= "unprivileged_userns_clone",
++		.data		= &unprivileged_userns_clone,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++#endif
+ };
+ 
+ static int __init init_fork_sysctl(void)
+-- 
+2.55.0
+
+
+From c7b0e3cd80ee933173efc433dcb3dfcbea134028 Mon Sep 17 00:00:00 2001
+From: Ramses de Norre <ramses@well-founded.dev>
+Date: Thu, 27 Aug 2026 13:52:56 +0200
+Subject: [PATCH 2/2] wireguard: queueing: preserve tstamp_type when
+ encapsulating packet
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sending traffic through a wireguard tunnel on a host using the fq
+qdisc fills the log with:
+
+  fq: likely mono tstamp with tstamp_type 0
+
+An skb carries a timestamp in skb->tstamp and, separately, a
+skb->tstamp_type field recording which clock that timestamp came from.
+The two have to agree.
+
+When wireguard encapsulates a packet it calls wg_reset_packet(), which
+clears the fields that must not leak from the inner packet into the
+tunnel packet. It does so in two steps:
+
+  skb_scrub_packet(skb, true);
+  memset(&skb->headers, 0, sizeof(skb->headers));
+
+skb_scrub_packet() deliberately keeps skb->tstamp when it holds a
+monotonic timestamp: that value is the time the packet is scheduled to
+be sent, and the qdisc still needs it. The memset then zeroes
+skb->tstamp_type, because that field sits inside the headers group
+while skb->tstamp does not. The packet therefore leaves wireguard
+carrying a monotonic timestamp labelled as a realtime one.
+
+Nothing noticed until commit c4f796c4f16b ("net_sched: sch_fq: convert
+skb->tstamp if not monotonic"): fq used to assume every timestamp was
+monotonic. It now consults tstamp_type, spots the mismatch, warns, and
+falls back to treating the value as monotonic. Pacing still ends up
+correct, so the log spam is the actual problem.
+
+Save tstamp_type before the memset and restore it when encapsulating,
+next to the hash fields that are already carried over this way. When
+decapsulating it stays zeroed, which is right: an incoming packet's
+timestamp is a realtime receive timestamp.
+
+Fixes: de799101519a ("net: Add skb_clear_tstamp() to keep the mono delivery_time")
+Signed-off-by: Ramses de Norre <ramses@well-founded.dev>
+Reviewed-by: Toke Høiland-Jørgensen <toke@kernel.org>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Cherry-picked-for: https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/work_items/212
+---
+ drivers/net/wireguard/queueing.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/net/wireguard/queueing.h b/drivers/net/wireguard/queueing.h
+index 79b6d70de..663b19b78 100644
+--- a/drivers/net/wireguard/queueing.h
++++ b/drivers/net/wireguard/queueing.h
+@@ -78,12 +78,14 @@ static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)
+ 	u8 l4_hash = skb->l4_hash;
+ 	u8 sw_hash = skb->sw_hash;
+ 	u32 hash = skb->hash;
++	u8 tstamp_type = skb->tstamp_type;
+ 	skb_scrub_packet(skb, true);
+ 	memset(&skb->headers, 0, sizeof(skb->headers));
+ 	if (encapsulating) {
+ 		skb->l4_hash = l4_hash;
+ 		skb->sw_hash = sw_hash;
+ 		skb->hash = hash;
++		skb->tstamp_type = tstamp_type;
+ 	}
+ 	skb->queue_mapping = 0;
+ 	skb->nohdr = 0;
+-- 
+2.55.0
+
