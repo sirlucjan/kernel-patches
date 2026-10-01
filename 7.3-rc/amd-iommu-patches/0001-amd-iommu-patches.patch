@@ -1,0 +1,1718 @@
+From 2bb1b3c45b92714654046545d5bc62e8f5775fef Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Sun, 23 Aug 2026 06:20:15 +0800
+Subject: [PATCH 01/11] iommu/amd: Do not request ACS when IOMMU is not going
+ to be initialized
+
+The AMD IOMMU Initialization State Machine has the following state
+transition diagram (only the very first states are showed, and the
+`IOMMU_' prefix is omitted):
+
+   START_STATE
+        |
+        v
+[0] detect_ivrs() --> NOT_FOUND
+        | ok
+        v
+  IVRS_DETECTED
+        |
+        v
+[1] amd_iommu_disabled? (amd_iommu=off) --> IOMMU_CMDLINE_DISABLED
+        | no
+        v
+[2] early_amd_iommu_init()
+        |
+        +-- [3] amd_iommu_detected? (!iommu=off && ...) -+
+        | yes                                            |
+        +-- ... --> IOMMU_INIT_ERROR <-------------------+
+        | ok
+        v
+IOMMU_ACPI_FINISHED
+        |
+        v
+       ...
+
+[0] always calls pci_request_acs() as long as there's a valid IVRS table
+and no Stoney Ridge graphics. This is not optimal as ACS is not required
+in an [amd_]iommu=off boot.
+
+In a normal boot, ACS is requested due to amd_iommu_detect() requesting
+IVRS_DETECTED.
+
+    pci_request_acs+0x9/0x18
+    iommu_go_to_state+0x106/0x1a20
+    amd_iommu_detect+0x1c/0x50
+    pci_iommu_alloc+0x26/0x40
+    mm_core_init+0xa/0x120
+    start_kernel+0x527/0x7a0
+    x86_64_start_reservations+0x24/0x30
+    x86_64_start_kernel+0xd1/0xe0
+    common_startup_64+0x13e/0x158
+
+This is intended to ensure ACS is requested before the PCI core
+initialization, or else a !CONFIG_IRQ_REMAP, nointremap or intremap=off
+boot would be broken.
+
+However, in an amd_iommu=off boot, the state machine still requests ACS
+at the exact same time, as amd_iommu_detect() has nothing to do with
+amd_iommu_disabled.
+
+Even worse, in an iommu=off boot, though amd_iommu_detect() bails out
+early, ACS is still requested due to amd_iommu_prepare() requesting
+IOMMU_ACPI_FINISHED, which is called by irq_remapping_prepare() thanks
+to CONFIG_X86_LOCAL_APIC (always set on X86_64) and CONFIG_IRQ_REMAP
+(enabled by defconfig), unless nointremap or intremap=off is also passed
+to cmdline.
+
+    pci_request_acs+0x9/0x18
+    iommu_go_to_state+0x106/0x1a20
+    amd_iommu_prepare+0x15/0x40
+    irq_remapping_prepare+0x43/0x60
+    enable_IR_x2apic+0x22/0x190
+    x86_64_probe_apic+0xa/0x50
+    apic_intr_mode_init+0x70/0xd0
+    x86_late_time_init+0x28/0x40
+    start_kernel+0x6f9/0x7a0
+    ...
+
+In both cases, [2] is still gated due to the [1] or [3] check, so that
+IOMMU can be disabled per cmdline.
+
+Technically, it makes no sense to detect IVRS at all in an
+[amd_]iommu=off boot or if IOMMU is not supported due to platform
+settings. This is probably why amd_iommu_detect() bails out before
+requesting IVRS_DETECTED. Apparently only bailing out there is not
+sufficient, and the bailing-out paths should really have been parts of
+the state machine.
+
+Clean up the initialization routines by moving the bailing-out paths and
+[1] to the right place in the state machine (i.e., before [0]), and
+always requesting IVRS_DETECTED in amd_iommu_detect() to initialize the
+state machine early and properly.
+
+Note that the condition (iommu_detected && !gart_iommu_aperture) is
+dropped as it's dead code since the relevant code being removed. It
+meant to detect what commit 6631ee9d0099 ("x86, AMD IOMMU: add
+dma_ops initialization function") had introduced, but commit
+d7f077697533 ("x86/amd-iommu: Fall back to GART if initialization
+fails") has removed it. Later, commit 78013eaadf69 ("x86: remove the
+IOMMU table infrastructure") ensured AMD IOMMU being detected before
+Intel's and led to iommu_detected == gart_iommu_aperture in any case.
+
+Signed-off-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Ankit Soni <Ankit.Soni@amd.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/init.c | 25 +++++++++++--------------
+ 1 file changed, 11 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index 8a410d4aa..975d77b50 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -3476,6 +3476,8 @@ static void amd_iommu_apply_erratum_snp(void)
+ #endif
+ }
+ 
++static bool amd_iommu_sme_check(void);
++
+ /****************************************************************************
+  *
+  * AMD IOMMU Initialization State Machine
+@@ -3488,7 +3490,13 @@ static int __init state_next(void)
+ 
+ 	switch (init_state) {
+ 	case IOMMU_START_STATE:
+-		if (!detect_ivrs()) {
++		if (no_iommu || amd_iommu_disabled) {
++			init_state	= IOMMU_CMDLINE_DISABLED;
++			ret		= -EINVAL;
++		} else if (!amd_iommu_sme_check()) {
++			init_state	= IOMMU_INIT_ERROR;
++			ret		= -EINVAL;
++		} else if (!detect_ivrs()) {
+ 			init_state	= IOMMU_NOT_FOUND;
+ 			ret		= -ENODEV;
+ 		} else {
+@@ -3496,13 +3504,8 @@ static int __init state_next(void)
+ 		}
+ 		break;
+ 	case IOMMU_IVRS_DETECTED:
+-		if (amd_iommu_disabled) {
+-			init_state = IOMMU_CMDLINE_DISABLED;
+-			ret = -EINVAL;
+-		} else {
+-			ret = early_amd_iommu_init();
+-			init_state = ret ? IOMMU_INIT_ERROR : IOMMU_ACPI_FINISHED;
+-		}
++		ret = early_amd_iommu_init();
++		init_state = ret ? IOMMU_INIT_ERROR : IOMMU_ACPI_FINISHED;
+ 		break;
+ 	case IOMMU_ACPI_FINISHED:
+ 		early_enable_iommus();
+@@ -3701,12 +3704,6 @@ void __init amd_iommu_detect(void)
+ {
+ 	int ret;
+ 
+-	if (no_iommu || (iommu_detected && !gart_iommu_aperture))
+-		goto disable_snp;
+-
+-	if (!amd_iommu_sme_check())
+-		goto disable_snp;
+-
+ 	ret = iommu_go_to_state(IOMMU_IVRS_DETECTED);
+ 	if (ret)
+ 		goto disable_snp;
+-- 
+2.55.0
+
+
+From 443951a7080c3752648802d280aad6d03131dce0 Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Sun, 23 Aug 2026 06:20:16 +0800
+Subject: [PATCH 02/11] iommu/amd: Disallow implicit START_STATE =>
+ IVRS_DETECTED transition
+
+Xen PV intentionally skips calling amd_iommu_detect() in order to gate
+IOMMU initialization, as the Xen hypervisor has taken over the hardware.
+However, due to amd_iommu_prepare() requesting ACPI_FINISHED while
+setting up APIC, the state machine is still progressed, only to be
+stopped midway due to the `!amd_iommu_detected' check in
+early_amd_iommu_init(). This is worthless and fragile. It unnecessarily
+calls detect_ivrs(), which leads to extra overhead, i.e., getting the
+IVRS table and accessing the PCI config space.
+
+Disallow implicit START_STATE => IVRS_DETECTED transition, so that
+amd_iommu_prepare() and other paths no longer progress the state machine
+accidentally. This should also help prevent potential bugs if more
+housekeeping work is added to amd_iommu_detect() in the future.
+
+Signed-off-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Ankit Soni <Ankit.Soni@amd.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/init.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index 975d77b50..e6dee2c78 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -3577,6 +3577,19 @@ static int __init iommu_go_to_state(enum iommu_init_state state)
+ {
+ 	int ret = -EINVAL;
+ 
++	/*
++	 * Some essential housekeeping work is done by amd_iommu_detect().
++	 * Skipping calling it implies that the platform (e.g., Xen hypervisor)
++	 * has taken over the hardware. Progressing the state machine in this
++	 * case is worthless and fragile.
++	 *
++	 * There are several paths requesting later states, so disallow implicit
++	 * START_STATE => IVRS_DETECTED transition to prevent these paths from
++	 * accidentally progressing the state machine.
++	 */
++	if (init_state == IOMMU_START_STATE && state != IOMMU_IVRS_DETECTED)
++		goto out;
++
+ 	while (init_state != state) {
+ 		if (init_state == IOMMU_NOT_FOUND         ||
+ 		    init_state == IOMMU_INIT_ERROR        ||
+@@ -3585,6 +3598,7 @@ static int __init iommu_go_to_state(enum iommu_init_state state)
+ 		ret = state_next();
+ 	}
+ 
++out:
+ 	/*
+ 	 * SNP platform initilazation requires IOMMUs to be fully configured.
+ 	 * If the SNP support on IOMMUs has NOT been checked, simply mark SNP
+-- 
+2.55.0
+
+
+From 2a684ef7d9c71d531044a85892628e365f60d2bd Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Sun, 23 Aug 2026 06:20:17 +0800
+Subject: [PATCH 03/11] iommu/amd: Remove ad-hoc checks that are never true
+
+The state transitions of the AMD IOMMU Initialization State Machine
+imply that some ad-hoc checks will never be true. In detail, they are
+only reachable if the previous state transitions have succeeded, but the
+conditions are only true if the previous state transitions have failed.
+
+Therefore, remove the redundant ad-hoc checks.
+
+Signed-off-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Ankit Soni <Ankit.Soni@amd.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/init.c | 13 +------------
+ 1 file changed, 1 insertion(+), 12 deletions(-)
+
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index e6dee2c78..5b1a443f3 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -163,7 +163,6 @@ int amd_iommu_gpt_level = PAGE_MODE_4_LEVEL;
+ int amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_VAPIC;
+ static int amd_iommu_xt_mode = IRQ_REMAP_XAPIC_MODE;
+ 
+-static bool amd_iommu_detected;
+ static bool amd_iommu_disabled __initdata;
+ static bool amd_iommu_force_enable __initdata;
+ static bool amd_iommu_irtcachedis;
+@@ -3228,9 +3227,6 @@ static int __init early_amd_iommu_init(void)
+ 	acpi_status status;
+ 	u8 efr_hats, max_vasize;
+ 
+-	if (!amd_iommu_detected)
+-		return -ENODEV;
+-
+ 	status = acpi_get_table("IVRS", 0, &ivrs_base);
+ 	if (status == AE_NOT_FOUND)
+ 		return -ENODEV;
+@@ -3309,7 +3305,7 @@ static int __init early_amd_iommu_init(void)
+ 	}
+ 
+ 	/* Disable any previously enabled IOMMUs */
+-	if (!is_kdump_kernel() || amd_iommu_disabled)
++	if (!is_kdump_kernel())
+ 		disable_iommus();
+ 
+ 	if (amd_iommu_irq_remap)
+@@ -3404,12 +3400,6 @@ static __init void iommu_snp_enable(void)
+ 	if (!cc_platform_has(CC_ATTR_HOST_SEV_SNP))
+ 		return;
+ 
+-	/* SNP support required IOMMU to be ON */
+-	if (no_iommu) {
+-		pr_warn("SNP: IOMMU disabled, SNP cannot be supported.\n");
+-		goto disable_snp;
+-	}
+-
+ 	amd_iommu_snp_mode0_sup = check_feature2(FEATURE_SNP_PAGE_MODE0_SUP);
+ 	/*
+ 	 * If SNP page mode 0 is not enabled, then SNP support requires that IOMMU
+@@ -3722,7 +3712,6 @@ void __init amd_iommu_detect(void)
+ 	if (ret)
+ 		goto disable_snp;
+ 
+-	amd_iommu_detected = true;
+ 	iommu_detected = 1;
+ 	x86_init.iommu.iommu_init = amd_iommu_init;
+ 	return;
+-- 
+2.55.0
+
+
+From 593b006d973d98bc1aadae571162eede594c091e Mon Sep 17 00:00:00 2001
+From: Vasant Hegde <vasant.hegde@amd.com>
+Date: Mon, 24 Aug 2026 08:58:21 +0000
+Subject: [PATCH 04/11] iommu/amd: Force identity mode for selected GPUs only
+
+Certain AMD GPUs must always operate in IOMMU identity mode. This was
+previously enforced using a PASID check, which happened to work because
+these specific GPUs are PASID-capable. However, this approach incorrectly
+applies identity mode enforcement to all PASID-capable devices, not just
+the GPUs that require it.
+
+This made sense in the past because the domain allocation API
+(iommu_ops->domain_alloc()) only received the domain type, so the
+driver had no way to inspect device capabilities and pick the most
+suitable page table format (v1 or v2). With the recent driver
+enhancement to use domain_alloc_paging_flags() for all paging
+domain allocations, the driver can now inspect the device and flags
+directly and choose the appropriate page table type per device.
+
+Update amd_iommu_def_domain_type() to force identity mapping only for
+the specific GPUs that require it, via a new quirks_force_identity_mapping().
+
+With this change, a system booting in DMA translation mode will now
+select:
+ * Guest (v2) page table for PASID-capable devices
+ * Host (v1) page table for non-PASID-capable devices
+
+Also drop the amd_iommu_snp_en check, as SNP enforces paging domain,
+which doesn't work with the identity requirement of these GPUs.
+
+Link: https://lore.kernel.org/all/20200824105415.21000-1-joro@8bytes.org/
+Link: https://lore.kernel.org/linux-iommu/20260723061548.10187-1-vasant.hegde@amd.com/
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Vasant Hegde <vasant.hegde@amd.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Mario Limonciello (AMD) <superm1@kernel.org>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/iommu.c | 45 +++++++++++++++++++++++++++++----------
+ 1 file changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 56262f6b1..24ad9c796 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -3162,6 +3162,26 @@ static bool amd_iommu_is_attach_deferred(struct device *dev)
+ 	return dev_data->defer_attach;
+ }
+ 
++static bool quirks_force_identity_mapping(struct pci_dev *pdev)
++{
++	int class = pdev->class >> 8;
++
++	/* AMD GPU vendor ID */
++	if (pdev->vendor != PCI_VENDOR_ID_ATI)
++		return false;
++
++	/* GPU class */
++	if (class != PCI_CLASS_DISPLAY_VGA &&
++	    class != PCI_CLASS_DISPLAY_OTHER)
++		return false;
++
++	if (pci_upstream_bridge(pdev)->vendor == PCI_VENDOR_ID_ATI)
++		return false;
++
++	/* It is the GPU in an APU, force identity domain */
++	return true;
++}
++
+ static int amd_iommu_def_domain_type(struct device *dev)
+ {
+ 	struct iommu_dev_data *dev_data;
+@@ -3170,20 +3190,23 @@ static int amd_iommu_def_domain_type(struct device *dev)
+ 	if (!dev_data)
+ 		return 0;
+ 
++	if (!dev_is_pci(dev))
++		return 0;
++
+ 	/* Always use DMA domain for untrusted device */
+-	if (dev_is_pci(dev) && to_pci_dev(dev)->untrusted)
++	if (to_pci_dev(dev)->untrusted)
+ 		return IOMMU_DOMAIN_DMA;
+ 
+-	/*
+-	 * Do not identity map IOMMUv2 capable devices when:
+-	 *  - memory encryption is active, because some of those devices
+-	 *    (AMD GPUs) don't have the encryption bit in their DMA-mask
+-	 *    and require remapping.
+-	 *  - SNP is enabled, because it prohibits DTE[Mode]=0.
+-	 */
+-	if (pdev_pasid_supported(dev_data) &&
+-	    !cc_platform_has(CC_ATTR_MEM_ENCRYPT) &&
+-	    !amd_iommu_snp_en) {
++	/* Apply device specific quirks */
++	if (quirks_force_identity_mapping(to_pci_dev(dev))) {
++		/*
++		 * When memory encryption is active, some of these devices
++		 * don't have the encryption bit in their DMA-mask and
++		 * require remapping.
++		 */
++		if (cc_platform_has(CC_ATTR_MEM_ENCRYPT))
++			return 0;
++
+ 		return IOMMU_DOMAIN_IDENTITY;
+ 	}
+ 
+-- 
+2.55.0
+
+
+From 76498c401f594985784d74d51552040adb5803b8 Mon Sep 17 00:00:00 2001
+From: Pranjal Shrivastava <praan@google.com>
+Date: Thu, 10 Sep 2026 14:26:52 +0000
+Subject: [PATCH 05/11] iommu/amd: Refactor device probe and capability
+ initialization
+
+Restructure the device probe path to improve readability and prepare for
+cleaner error handling. Refactor check_device() into lookup_device to
+explicitly validate and return the amd_iommu ptr & devid. Refactor
+iommu_init_device() to return the allocated dev_data. Consolidate all
+PCI cap inits (MSI domains, PASID, ATS) into a new helper:
+iommu_init_device_caps().
+
+Suggested-by: Vasant Hegde <vasant.hegde@amd.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Vasant Hegde <vasant.hegde@amd.com>
+Signed-off-by: Pranjal Shrivastava <praan@google.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/iommu.c | 131 +++++++++++++++++++-------------------
+ 1 file changed, 66 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 24ad9c796..fb98f909c 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -675,7 +675,8 @@ static void pdev_disable_caps(struct pci_dev *pdev)
+  * This function checks if the driver got a valid device from the caller to
+  * avoid dereferencing invalid pointers.
+  */
+-static bool check_device(struct device *dev)
++static bool lookup_device(struct device *dev,
++				struct amd_iommu **iommu_out, u16 *devid_out)
+ {
+ 	struct amd_iommu_pci_seg *pci_seg;
+ 	struct amd_iommu *iommu;
+@@ -690,7 +691,7 @@ static bool check_device(struct device *dev)
+ 	devid = PCI_SBDF_TO_DEVID(sbdf);
+ 
+ 	iommu = rlookup_amd_iommu(dev);
+-	if (!iommu)
++	if (!iommu || !iommu->iommu.ops)
+ 		return false;
+ 
+ 	/* Out of our scope? */
+@@ -698,47 +699,33 @@ static bool check_device(struct device *dev)
+ 	if (devid > pci_seg->last_bdf)
+ 		return false;
+ 
++	*iommu_out = iommu;
++	*devid_out = devid;
+ 	return true;
+ }
+ 
+-static int iommu_init_device(struct amd_iommu *iommu, struct device *dev)
++static struct iommu_dev_data *iommu_init_device(struct amd_iommu *iommu,
++						struct device *dev, u16 devid)
+ {
+ 	struct iommu_dev_data *dev_data;
+-	int devid, sbdf;
+ 
+-	if (dev_iommu_priv_get(dev))
+-		return 0;
+-
+-	sbdf = get_device_sbdf_id(dev);
+-	if (sbdf < 0)
+-		return sbdf;
+-
+-	devid = PCI_SBDF_TO_DEVID(sbdf);
+ 	dev_data = find_dev_data(iommu, devid);
+ 	if (!dev_data)
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	dev_data->dev = dev;
+ 
+ 	/*
+-	 * The dev_iommu_priv_set() needes to be called before setup_aliases.
++	 * The dev_iommu_priv_set() needs to be called before setup_aliases.
+ 	 * Otherwise, subsequent call to dev_iommu_priv_get() will fail.
+ 	 */
+ 	dev_iommu_priv_set(dev, dev_data);
+ 	setup_aliases(iommu, dev);
+ 
+-	/*
+-	 * By default we use passthrough mode for IOMMUv2 capable device.
+-	 * But if amd_iommu=force_isolation is set (e.g. to debug DMA to
+-	 * invalid address), we ignore the capability for the device so
+-	 * it'll be forced to go into translation mode.
+-	 */
+-	if ((iommu_default_passthrough() || !amd_iommu_force_isolation) &&
+-	    dev_is_pci(dev) && amd_iommu_gt_ppr_supported()) {
+-		dev_data->flags = pdev_get_caps(to_pci_dev(dev));
+-	}
++	/* Wait for DTE updates to go through */
++	iommu_completion_wait(iommu);
+ 
+-	return 0;
++	return dev_data;
+ }
+ 
+ static void iommu_ignore_device(struct amd_iommu *iommu, struct device *dev)
+@@ -2484,49 +2471,73 @@ static void detach_device(struct device *dev)
+ 	mutex_unlock(&dev_data->mutex);
+ }
+ 
+-static struct iommu_device *amd_iommu_probe_device(struct device *dev)
++static void iommu_init_device_caps(struct iommu_dev_data *dev_data,
++				   struct device *dev,
++				   struct amd_iommu *iommu)
+ {
+-	struct iommu_device *iommu_dev;
+-	struct amd_iommu *iommu;
+-	struct iommu_dev_data *dev_data;
+-	int ret;
+-
+-	if (!check_device(dev))
+-		return ERR_PTR(-ENODEV);
+-
+-	iommu = rlookup_amd_iommu(dev);
+-	if (!iommu)
+-		return ERR_PTR(-ENODEV);
+-
+-	/* Not registered yet? */
+-	if (!iommu->iommu.ops)
+-		return ERR_PTR(-ENODEV);
+-
+-	if (dev_iommu_priv_get(dev))
+-		return &iommu->iommu;
+-
+-	ret = iommu_init_device(iommu, dev);
+-	if (ret) {
+-		dev_err(dev, "Failed to initialize - trying to proceed anyway\n");
+-		iommu_dev = ERR_PTR(ret);
+-		iommu_ignore_device(iommu, dev);
+-		goto out_err;
+-	}
++	if (FEATURE_NUM_INT_REMAP_SUP_2K(amd_iommu_efr2))
++		dev_data->max_irqs = MAX_IRQS_PER_TABLE_2K;
++	else
++		dev_data->max_irqs = MAX_IRQS_PER_TABLE_512;
+ 
+ 	amd_iommu_set_pci_msi_domain(dev, iommu);
+-	iommu_dev = &iommu->iommu;
++
++	if (!dev_is_pci(dev))
++		return;
++
++	/*
++	 * By default we use passthrough mode for IOMMUv2 capable device.
++	 * But if amd_iommu=force_isolation is set (e.g. to debug DMA to
++	 * invalid address), we ignore the capability for the device so
++	 * it'll be forced to go into translation mode.
++	 */
++	if ((iommu_default_passthrough() || !amd_iommu_force_isolation) &&
++	    amd_iommu_gt_ppr_supported()) {
++		dev_data->flags = pdev_get_caps(to_pci_dev(dev));
++	}
+ 
+ 	/*
+ 	 * If IOMMU and device supports PASID then it will contain max
+ 	 * supported PASIDs, else it will be zero.
+ 	 */
+-	dev_data = dev_iommu_priv_get(dev);
+-	if (amd_iommu_pasid_supported() && dev_is_pci(dev) &&
++	if (amd_iommu_pasid_supported() &&
+ 	    pdev_pasid_supported(dev_data)) {
+ 		dev_data->max_pasids = min_t(u32, iommu->iommu.max_pasids,
+ 					     pci_max_pasids(to_pci_dev(dev)));
+ 	}
+ 
++	pci_prepare_ats(to_pci_dev(dev), PAGE_SHIFT);
++}
++
++static struct iommu_device *amd_iommu_probe_device(struct device *dev)
++{
++	struct iommu_device *iommu_dev;
++	struct amd_iommu *iommu;
++	struct iommu_dev_data *dev_data;
++	u16 devid;
++
++	if (!lookup_device(dev, &iommu, &devid))
++		return ERR_PTR(-ENODEV);
++
++	if (dev_iommu_priv_get(dev))
++		return &iommu->iommu;
++
++	dev_data = iommu_init_device(iommu, dev, devid);
++	if (IS_ERR(dev_data)) {
++		dev_err(dev, "Failed to initialize - trying to proceed anyway\n");
++		iommu_dev = ERR_CAST(dev_data);
++		iommu_ignore_device(iommu, dev);
++		goto out_err;
++	}
++
++	iommu_init_device_caps(dev_data, dev, iommu);
++	iommu_dev = &iommu->iommu;
++
++	/*
++	 * When DMA translation is unavailable return error so the iommu core
++	 * won't attempt domain attach for this device, while preserving its
++	 * rlookup entry for interrupt remapping.
++	 */
+ 	if (amd_iommu_pgtable == PD_MODE_NONE) {
+ 		pr_warn_once("%s: DMA translation not supported by iommu.\n",
+ 			     __func__);
+@@ -2534,16 +2545,6 @@ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+ 		goto out_err;
+ 	}
+ 
+-	iommu_completion_wait(iommu);
+-
+-	if (FEATURE_NUM_INT_REMAP_SUP_2K(amd_iommu_efr2))
+-		dev_data->max_irqs = MAX_IRQS_PER_TABLE_2K;
+-	else
+-		dev_data->max_irqs = MAX_IRQS_PER_TABLE_512;
+-
+-	if (dev_is_pci(dev))
+-		pci_prepare_ats(to_pci_dev(dev), PAGE_SHIFT);
+-
+ out_err:
+ 	return iommu_dev;
+ }
+-- 
+2.55.0
+
+
+From bdf05393fb1839c9a82f080e50453bce71a36e42 Mon Sep 17 00:00:00 2001
+From: Pranjal Shrivastava <praan@google.com>
+Date: Thu, 10 Sep 2026 14:26:53 +0000
+Subject: [PATCH 06/11] iommu/amd: Remove iommu_ignore_device()
+
+The iommu_ignore_device() helper was historically called on device
+initialization failure to clear the primary Device Table Entry (DTE) via
+memset() and nullify the rlookup_table entry.
+
+However, clearing the DTE on probe failure is problematic:
+1. During normal boot, DTEs start out unconfigured (blocking DMA), making
+   clearing redundant.
+2. During kdump boot, pre-existing translations should be kept running
+   until deferred attach rather than abruptly clearing them, which risks
+   breaking in-flight transfers.
+3. Writing to the DTE table via memset without flushing the hardware DTE
+   cache risks aliasing & torn writes.
+4. Clearing the rlookup_table entry breaks interrupt remapping for
+   devices that fail probe or operate in translation-less modes.
+
+Remove iommu_ignore_device() entirely and simplify the error return
+paths in amd_iommu_probe_device().
+
+Suggested-by: Jason Gunthorpe <jgg@nvidia.com>
+Suggested-by: Vasant Hegde <vasant.hegde@amd.com>
+Reported-by: sashiko-bot@kernel.org
+Closes: https://lore.kernel.org/all/20260529153216.2AD1E1F00899@smtp.kernel.org/
+Signed-off-by: Pranjal Shrivastava <praan@google.com>
+Reviewed-by: Vasant Hegde <vasant.hegde@amd.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/iommu.c | 24 ++----------------------
+ 1 file changed, 2 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index fb98f909c..3a3cac6f6 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -728,22 +728,6 @@ static struct iommu_dev_data *iommu_init_device(struct amd_iommu *iommu,
+ 	return dev_data;
+ }
+ 
+-static void iommu_ignore_device(struct amd_iommu *iommu, struct device *dev)
+-{
+-	struct amd_iommu_pci_seg *pci_seg = iommu->pci_seg;
+-	struct dev_table_entry *dev_table = get_dev_table(iommu);
+-	int devid, sbdf;
+-
+-	sbdf = get_device_sbdf_id(dev);
+-	if (sbdf < 0)
+-		return;
+-
+-	devid = PCI_SBDF_TO_DEVID(sbdf);
+-	pci_seg->rlookup_table[devid] = NULL;
+-	memset(&dev_table[devid], 0, sizeof(struct dev_table_entry));
+-
+-	setup_aliases(iommu, dev);
+-}
+ 
+ 
+ /****************************************************************************
+@@ -2525,9 +2509,7 @@ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+ 	dev_data = iommu_init_device(iommu, dev, devid);
+ 	if (IS_ERR(dev_data)) {
+ 		dev_err(dev, "Failed to initialize - trying to proceed anyway\n");
+-		iommu_dev = ERR_CAST(dev_data);
+-		iommu_ignore_device(iommu, dev);
+-		goto out_err;
++		return ERR_CAST(dev_data);
+ 	}
+ 
+ 	iommu_init_device_caps(dev_data, dev, iommu);
+@@ -2541,11 +2523,9 @@ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+ 	if (amd_iommu_pgtable == PD_MODE_NONE) {
+ 		pr_warn_once("%s: DMA translation not supported by iommu.\n",
+ 			     __func__);
+-		iommu_dev = ERR_PTR(-ENODEV);
+-		goto out_err;
++		return ERR_PTR(-ENODEV);
+ 	}
+ 
+-out_err:
+ 	return iommu_dev;
+ }
+ 
+-- 
+2.55.0
+
+
+From e67809f638f1fc913687302d813e60b3d5ec3e87 Mon Sep 17 00:00:00 2001
+From: Pranjal Shrivastava <praan@google.com>
+Date: Thu, 10 Sep 2026 14:26:54 +0000
+Subject: [PATCH 07/11] iommu/amd: Fail probe on ATS configuration failure
+
+Update the driver to call pci_prepare_ats() after checking if
+pci_ats_supported() and fail the probe_device if pci_prepare_ats()
+returns an error. Additionally, update pdev_enable_cap_ats() to WARN_ON()
+a failure in pci_enable_ats().
+
+Reviewed-by: Vasant Hegde <vasant.hegde@amd.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Samiullah Khawaja <skhawaja@google.com>
+Signed-off-by: Pranjal Shrivastava <praan@google.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/iommu.c | 39 +++++++++++++++++++++++++++++----------
+ 1 file changed, 29 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 3a3cac6f6..b6838fe6e 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -573,10 +573,17 @@ static inline int pdev_enable_cap_ats(struct pci_dev *pdev)
+ 	if (amd_iommu_iotlb_sup &&
+ 	    (dev_data->flags & AMD_IOMMU_DEVICE_FLAG_ATS_SUP)) {
+ 		ret = pci_enable_ats(pdev, PAGE_SHIFT);
+-		if (!ret) {
+-			dev_data->ats_enabled = 1;
+-			dev_data->ats_qdep    = pci_ats_queue_depth(pdev);
+-		}
++
++		/*
++		 * pci_enable_ats() should not fail here because earlier
++		 * checks have already verified support & config.
++		 */
++		if (WARN_ON(ret))
++			return ret;
++
++		dev_data->ats_enabled = 1;
++		dev_data->ats_qdep    = pci_ats_queue_depth(pdev);
++		ret = 0;
+ 	}
+ 
+ 	return ret;
+@@ -2455,10 +2462,12 @@ static void detach_device(struct device *dev)
+ 	mutex_unlock(&dev_data->mutex);
+ }
+ 
+-static void iommu_init_device_caps(struct iommu_dev_data *dev_data,
+-				   struct device *dev,
+-				   struct amd_iommu *iommu)
++static int iommu_init_device_caps(struct iommu_dev_data *dev_data,
++				  struct device *dev,
++				  struct amd_iommu *iommu)
+ {
++	int ret;
++
+ 	if (FEATURE_NUM_INT_REMAP_SUP_2K(amd_iommu_efr2))
+ 		dev_data->max_irqs = MAX_IRQS_PER_TABLE_2K;
+ 	else
+@@ -2467,7 +2476,7 @@ static void iommu_init_device_caps(struct iommu_dev_data *dev_data,
+ 	amd_iommu_set_pci_msi_domain(dev, iommu);
+ 
+ 	if (!dev_is_pci(dev))
+-		return;
++		return 0;
+ 
+ 	/*
+ 	 * By default we use passthrough mode for IOMMUv2 capable device.
+@@ -2490,7 +2499,13 @@ static void iommu_init_device_caps(struct iommu_dev_data *dev_data,
+ 					     pci_max_pasids(to_pci_dev(dev)));
+ 	}
+ 
+-	pci_prepare_ats(to_pci_dev(dev), PAGE_SHIFT);
++	if (pci_ats_supported(to_pci_dev(dev))) {
++		ret = pci_prepare_ats(to_pci_dev(dev), PAGE_SHIFT);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
+ }
+ 
+ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+@@ -2499,6 +2514,7 @@ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+ 	struct amd_iommu *iommu;
+ 	struct iommu_dev_data *dev_data;
+ 	u16 devid;
++	int ret;
+ 
+ 	if (!lookup_device(dev, &iommu, &devid))
+ 		return ERR_PTR(-ENODEV);
+@@ -2512,7 +2528,10 @@ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+ 		return ERR_CAST(dev_data);
+ 	}
+ 
+-	iommu_init_device_caps(dev_data, dev, iommu);
++	ret = iommu_init_device_caps(dev_data, dev, iommu);
++	if (ret)
++		return ERR_PTR(ret);
++
+ 	iommu_dev = &iommu->iommu;
+ 
+ 	/*
+-- 
+2.55.0
+
+
+From d44d0787d834dd5a78cb8b7f0242ce8748c3896a Mon Sep 17 00:00:00 2001
+From: Vasant Hegde <vasant.hegde@amd.com>
+Date: Fri, 11 Sep 2026 10:43:17 +0000
+Subject: [PATCH 08/11] iommu/amd: Move GA log allocation to init
+
+Currently GA log buffer allocation is done at the time of enabling ga
+log. This mixes capability checking, resource allocation, and hardware
+enablement into a single late stage code path.
+
+Move capability checking and buffer allocation to init path:
+  - check_vapic_support(): Checks AVIC support
+
+  - alloc_ga_log(): Rename iommu_init_ga_log() as alloc_ga_log(). It will
+    allocate the GA log and GA log tail buffers for a given IOMMU. Remove
+    redundant checks inside alloc_ga_log().
+
+  - enable_iommus_vapic() is simplified - it handles enabling GA log and
+    GAM/SNPAVIC support for IOMMUs.
+
+Finally update iommu_ga_log_enable() return value from int to bool as
+return value is used in boolean context only.
+
+Signed-off-by: Vasant Hegde <vasant.hegde@amd.com>
+Reviewed-by: Ankit Soni <Ankit.Soni@amd.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/init.c | 74 +++++++++++++++++++++++-----------------
+ 1 file changed, 42 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index 5b1a443f3..3c02ebd4e 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -915,13 +915,13 @@ static void free_ga_log(struct amd_iommu *iommu)
+ }
+ 
+ #ifdef CONFIG_IRQ_REMAP
+-static int iommu_ga_log_enable(struct amd_iommu *iommu)
++static bool iommu_ga_log_enable(struct amd_iommu *iommu)
+ {
+ 	u32 status, i;
+ 	u64 entry;
+ 
+ 	if (!iommu->ga_log)
+-		return -EINVAL;
++		return false;
+ 
+ 	entry = iommu_virt_to_phys(iommu->ga_log) | GA_LOG_SIZE_512;
+ 	memcpy_toio(iommu->mmio_base + MMIO_GA_LOG_BASE_OFFSET,
+@@ -945,35 +945,31 @@ static int iommu_ga_log_enable(struct amd_iommu *iommu)
+ 	}
+ 
+ 	if (WARN_ON(i >= MMIO_STATUS_TIMEOUT))
+-		return -EINVAL;
++		return false;
+ 
+-	return 0;
++	return true;
+ }
++#endif /* CONFIG_IRQ_REMAP */
+ 
+-static int iommu_init_ga_log(struct amd_iommu *iommu)
++static int alloc_ga_log(struct amd_iommu *iommu)
+ {
++#ifdef CONFIG_IRQ_REMAP
+ 	int nid = iommu->dev ? dev_to_node(&iommu->dev->dev) : NUMA_NO_NODE;
+ 
+-	if (WARN_ON_ONCE(!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir)))
+-		return -EINVAL;
+-
+-	if (iommu->ga_log && iommu->ga_log_tail)
+-		return 0;
+-
+ 	iommu->ga_log = iommu_alloc_pages_node_sz(nid, GFP_KERNEL, GA_LOG_SIZE);
+ 	if (!iommu->ga_log)
+-		goto err_out;
++		return -ENOMEM;
+ 
+ 	iommu->ga_log_tail = iommu_alloc_pages_node_sz(nid, GFP_KERNEL, 8);
+-	if (!iommu->ga_log_tail)
+-		goto err_out;
++	if (!iommu->ga_log_tail) {
++		iommu_free_pages(iommu->ga_log);
++		iommu->ga_log = NULL;
++		return -ENOMEM;
++	}
++#endif
+ 
+ 	return 0;
+-err_out:
+-	free_ga_log(iommu);
+-	return -EINVAL;
+ }
+-#endif /* CONFIG_IRQ_REMAP */
+ 
+ static int __init alloc_cwwb_sem(struct amd_iommu *iommu)
+ {
+@@ -2151,6 +2147,27 @@ static void __init late_iommu_features_init(struct amd_iommu *iommu)
+ 	}
+ }
+ 
++/* Must be called after SNP support check is complete (iommu_snp_enable()) */
++static bool check_vapic_support(void)
++{
++	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir))
++		return false;
++
++	if (!check_feature(FEATURE_GAM_VAPIC)) {
++		amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY_GA;
++		return false;
++	}
++
++	if (amd_iommu_snp_en &&
++	    !FEATURE_SNPAVICSUP_GAM(amd_iommu_efr2)) {
++		pr_warn("Force to disable Virtual APIC due to SNP\n");
++		amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY_GA;
++		return false;
++	}
++
++	return true;
++}
++
+ static int __init iommu_init_pci(struct amd_iommu *iommu)
+ {
+ 	int cap_ptr = iommu->cap_ptr;
+@@ -2195,6 +2212,12 @@ static int __init iommu_init_pci(struct amd_iommu *iommu)
+ 	if (check_feature(FEATURE_PPR) && amd_iommu_alloc_ppr_log(iommu))
+ 		return -ENOMEM;
+ 
++	if (check_vapic_support()) {
++		ret = alloc_ga_log(iommu);
++		if (ret)
++			return ret;
++	}
++
+ 	if (iommu->cap & (1UL << IOMMU_CAP_NPCACHE)) {
+ 		pr_info("Using strict mode due to virtualization\n");
+ 		iommu_set_dma_strict();
+@@ -3009,22 +3032,9 @@ static void enable_iommus_vapic(void)
+ 	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir))
+ 		return;
+ 
+-	if (!check_feature(FEATURE_GAM_VAPIC)) {
+-		amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY_GA;
+-		return;
+-	}
+-
+-	if (amd_iommu_snp_en &&
+-	    !FEATURE_SNPAVICSUP_GAM(amd_iommu_efr2)) {
+-		pr_warn("Force to disable Virtual APIC due to SNP\n");
+-		amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY_GA;
+-		return;
+-	}
+-
+ 	/* Enabling GAM and SNPAVIC support */
+ 	for_each_iommu(iommu) {
+-		if (iommu_init_ga_log(iommu) ||
+-		    iommu_ga_log_enable(iommu))
++		if (!iommu_ga_log_enable(iommu))
+ 			return;
+ 
+ 		iommu_feature_enable(iommu, CONTROL_GAM_EN);
+-- 
+2.55.0
+
+
+From c20d258a0af92eff414bec84f469079dc4f06049 Mon Sep 17 00:00:00 2001
+From: Li RongQing <lirongqing@baidu.com>
+Date: Tue, 22 Sep 2026 17:00:35 +0800
+Subject: [PATCH 09/11] iommu/amd: Fix leak of data->entry in
+ irq_remapping_alloc() error path
+
+In irq_remapping_alloc() each per-IRQ iteration allocates two objects:
+the amd_ir_data (chip_data) and its data->entry (union irte / struct
+irte_ga). The out_free_data error path only freed chip_data via
+kfree(irq_data->chip_data), leaking data->entry for every already
+initialized IRQ.
+
+Free data->entry alongside data on the error path.
+
+Signed-off-by: Li RongQing <lirongqing@baidu.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/iommu.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index b6838fe6e..c679b621c 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -3925,8 +3925,11 @@ static int irq_remapping_alloc(struct irq_domain *domain, unsigned int virq,
+ out_free_data:
+ 	for (i--; i >= 0; i--) {
+ 		irq_data = irq_domain_get_irq_data(domain, virq + i);
+-		if (irq_data)
+-			kfree(irq_data->chip_data);
++		if (irq_data && irq_data->chip_data) {
++			data = irq_data->chip_data;
++			kfree(data->entry);
++			kfree(data);
++		}
+ 	}
+ 	for (i = 0; i < nr_irqs; i++)
+ 		free_irte(iommu, devid, index + i);
+-- 
+2.55.0
+
+
+From 5d2e6992e469f0429d9b21a02304473f4065cb9f Mon Sep 17 00:00:00 2001
+From: Mario Limonciello <mario.limonciello@amd.com>
+Date: Mon, 7 Sep 2026 23:12:06 -0500
+Subject: [PATCH 10/11] iommu/amd: Add PerfOpt IOMMU performance optimization
+ support
+
+Add support for the AMD IOMMU Performance Optimization (PerfOpt)
+feature as defined in the AMD I/O Virtualization Technology (IOMMU)
+Specification, Section 3.4.9 (MMIO Offset 016Ch).
+
+This feature allows privileged integrated I/O devices (GPUs) to bypass
+the IOMMU when directly accessing system memory.  The IOMMU only
+enforces the IR/IW permission bits without GPA->SPA translations.
+
+amd_iommu_enable_perfopt() performs a detach/reattach cycle to rehome
+devices already on the identity domain with ATS/PRI/PASID/GCR3
+disabled (skip_caps path).  amd_iommu_disable_perfopt() restores those
+capabilities.  The per-device dev_data->perfopt flag tracks state.
+
+PERF_OPT_EN is a single control bit per IOMMU, shared by every device
+behind that IOMMU, while enablement is requested per device.  It is
+therefore reference counted (amd_iommu->perfopt_refcount): armed on the
+first requesting device and cleared on the last, so one device's
+teardown never clears the bit while a peer behind the same IOMMU still
+needs it.
+
+The per-device flag is cleared on every teardown path
+(blocked_domain_attach, release_device, and amd_iommu_disable_perfopt),
+dropping the reference with it, so a reused dev_data never carries stale
+PerfOpt state onto its next bind.
+
+On suspend/resume the hardware is reprogrammed from scratch:
+amd_iommu_perfopt_clear() forces the bit off without touching the
+reference count, and amd_iommu_perfopt_restore() re-asserts it from the
+count after early_enable_iommu(), so armed devices keep the optimization
+across resume without relying on each consumer driver to re-arm.
+
+The exported amd_iommu_enable_perfopt()/amd_iommu_disable_perfopt() run
+only from a consumer driver's bind/unbind path.  group->mutex is not
+exposed to drivers, but a device bound to its native driver cannot have
+its IOMMU domain changed concurrently by the core, which serializes the
+detach/attach pair against core-driven attach.
+
+PerfOpt is opt-in -- only enabled when explicitly requested by a driver.
+
+Tested-by: Derek J. Clark <derekjohn.clark@gmail.com>
+Co-developed-by: Jatin Kataria <jkataria@netflix.com>
+Signed-off-by: Jatin Kataria <jkataria@netflix.com>
+Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+Tested-by: Boqun Feng (Netflix) <boqun@kernel.org>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+[joerg.roedel@amd.com: Fixed build failure on i386]
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/amd_iommu.h       |   3 +
+ drivers/iommu/amd/amd_iommu_types.h |   7 +
+ drivers/iommu/amd/init.c            |  43 ++++++
+ drivers/iommu/amd/iommu.c           | 214 ++++++++++++++++++++++++++++
+ include/linux/amd-iommu.h           |  13 +-
+ 5 files changed, 279 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iommu/amd/amd_iommu.h b/drivers/iommu/amd/amd_iommu.h
+index 71113e860..93845b3c3 100644
+--- a/drivers/iommu/amd/amd_iommu.h
++++ b/drivers/iommu/amd/amd_iommu.h
+@@ -48,6 +48,9 @@ extern u8 amd_iommu_hpt_vasize;
+ extern unsigned long amd_iommu_pgsize_bitmap;
+ extern bool amd_iommu_hatdis;
+ 
++int amd_iommu_perfopt_clear(struct amd_iommu *iommu);
++int amd_iommu_perfopt_restore(struct amd_iommu *iommu);
++
+ /* Protection domain ops */
+ void amd_iommu_init_identity_domain(void);
+ struct protection_domain *protection_domain_alloc(void);
+diff --git a/drivers/iommu/amd/amd_iommu_types.h b/drivers/iommu/amd/amd_iommu_types.h
+index 8241ef922..1c1624b7c 100644
+--- a/drivers/iommu/amd/amd_iommu_types.h
++++ b/drivers/iommu/amd/amd_iommu_types.h
+@@ -53,6 +53,7 @@
+ #define MMIO_MSI_ADDR_LO_OFFSET	0x015C
+ #define MMIO_MSI_ADDR_HI_OFFSET	0x0160
+ #define MMIO_MSI_DATA_OFFSET	0x0164
++#define MMIO_PERF_OPT_OFFSET	0x016C
+ #define MMIO_INTCAPXT_EVT_OFFSET	0x0170
+ #define MMIO_INTCAPXT_PPR_OFFSET	0x0178
+ #define MMIO_INTCAPXT_GALOG_OFFSET	0x0180
+@@ -87,6 +88,8 @@
+ #define FEATURE_GLX		GENMASK_ULL(15, 14)
+ #define FEATURE_GAM_VAPIC	BIT_ULL(21)
+ #define FEATURE_PASMAX		GENMASK_ULL(36, 32)
++#define FEATURE_PERF_OPT	BIT_ULL(45)
++#define PERF_OPT_EN		BIT(13)
+ #define FEATURE_GIOSUP		BIT_ULL(48)
+ #define FEATURE_HASUP		BIT_ULL(49)
+ #define FEATURE_EPHSUP		BIT_ULL(50)
+@@ -654,6 +657,9 @@ struct amd_iommu {
+ 	/* Extended features 2 */
+ 	u64 features2;
+ 
++	/* Devices requesting PerfOpt; the shared PERF_OPT_EN bit is on while >0. Protected by @lock. */
++	int perfopt_refcount;
++
+ 	/* PCI device id of the IOMMU device */
+ 	u16 devid;
+ 
+@@ -815,6 +821,7 @@ struct iommu_dev_data {
+ 	u8 ppr          :1;		  /* Enable device PPR support */
+ 	bool use_vapic;			  /* Enable device to use vapic mode */
+ 	bool defer_attach;
++	bool perfopt;
+ 
+ 	struct ratelimit_state rs;        /* Ratelimit IOPF messages */
+ };
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index 3c02ebd4e..8ec8a6fcc 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -1943,6 +1943,9 @@ static int __init init_iommu_one(struct amd_iommu *iommu, struct ivhd_header *h,
+ 	if (!iommu->mmio_base)
+ 		return -ENOMEM;
+ 
++	if (amd_iommu_perfopt_clear(iommu))
++		pr_err("IOMMU%d: failed to clear PerfOpt\n", iommu->index);
++
+ 	return init_iommu_from_acpi(iommu, h);
+ }
+ 
+@@ -3047,10 +3050,46 @@ static void enable_iommus_vapic(void)
+ #endif
+ }
+ 
++static int clear_perfopt_all(void)
++{
++	struct amd_iommu *iommu;
++	int err, ret = 0;
++
++	for_each_iommu(iommu) {
++		err = amd_iommu_perfopt_clear(iommu);
++		if (err)
++			ret = err;
++	}
++
++	return ret;
++}
++
++static int restore_perfopt_all(void)
++{
++	struct amd_iommu *iommu;
++	int err, ret = 0;
++
++	for_each_iommu(iommu) {
++		err = amd_iommu_perfopt_restore(iommu);
++		if (err)
++			ret = err;
++	}
++
++	return ret;
++}
++
+ static void disable_iommus(void)
+ {
+ 	struct amd_iommu *iommu;
+ 
++	/*
++	 * PerfOpt is an optional performance bit, so a failure to clear it must
++	 * not skip the mandatory disable below. This also runs from the void
++	 * amd_iommu_disable() shutdown/kexec path, which cannot report an error.
++	 */
++	if (clear_perfopt_all())
++		pr_err("Failed to clear PerfOpt while disabling IOMMUs\n");
++
+ 	for_each_iommu(iommu)
+ 		iommu_disable(iommu);
+ 
+@@ -3076,6 +3115,10 @@ static void amd_iommu_resume(void *data)
+ 	for_each_iommu(iommu)
+ 		early_enable_iommu(iommu);
+ 
++	/* early_enable_iommu() cleared PERF_OPT_EN; re-assert it from the refcount. */
++	if (restore_perfopt_all())
++		pr_err("Failed to restore PerfOpt after IOMMU resume\n");
++
+ 	iommu_enable_event_buffer();
+ 	amd_iommu_enable_interrupts();
+ }
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index c679b621c..c9b28e5e5 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -2370,6 +2370,9 @@ static int attach_device(struct device *dev,
+ 	if (ret)
+ 		goto out;
+ 
++	if (dev_data->perfopt)
++		goto skip_caps;
++
+ 	/* Setup GCR3 table */
+ 	if (pdom_is_sva_capable(domain)) {
+ 		ret = init_gcr3_table(dev_data, domain);
+@@ -2394,6 +2397,7 @@ static int attach_device(struct device *dev,
+ 		pdev_enable_cap_ats(pdev);
+ 	}
+ 
++skip_caps:
+ 	/* Update data structures */
+ 	dev_data->domain = domain;
+ 	spin_lock_irqsave(&domain->lock, flags);
+@@ -2508,6 +2512,192 @@ static int iommu_init_device_caps(struct iommu_dev_data *dev_data,
+ 	return 0;
+ }
+ 
++/* Program the per-IOMMU PerfOpt enable bit. Caller must hold iommu->lock. */
++static int __perfopt_write(struct amd_iommu *iommu, bool enable)
++{
++	u32 old, val, readback;
++
++	if (!(readq(iommu->mmio_base + MMIO_EXT_FEATURES) & FEATURE_PERF_OPT))
++		return enable ? -ENODEV : 0;
++
++	old = readl(iommu->mmio_base + MMIO_PERF_OPT_OFFSET);
++	if (old == U32_MAX)
++		return -EIO;
++
++	val = enable ? old | PERF_OPT_EN : old & ~PERF_OPT_EN;
++	if (val != old)
++		writel(val, iommu->mmio_base + MMIO_PERF_OPT_OFFSET);
++	readback = readl(iommu->mmio_base + MMIO_PERF_OPT_OFFSET);
++	if (readback == U32_MAX ||
++	    (readback & PERF_OPT_EN) != (val & PERF_OPT_EN))
++		return -EIO;
++	return 0;
++}
++
++/*
++ * PERF_OPT_EN is a single bit shared by every device behind @iommu, so it is
++ * reference counted: armed on the first requesting device, cleared on the last.
++ */
++static int perfopt_get(struct amd_iommu *iommu)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (!iommu->mmio_base)
++		return 0;
++
++	raw_spin_lock_irqsave(&iommu->lock, flags);
++	if (iommu->perfopt_refcount == 0) {
++		ret = __perfopt_write(iommu, true);
++		if (ret)
++			goto out;
++	}
++	iommu->perfopt_refcount++;
++out:
++	raw_spin_unlock_irqrestore(&iommu->lock, flags);
++	return ret;
++}
++
++static int perfopt_put(struct amd_iommu *iommu)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (!iommu->mmio_base)
++		return 0;
++
++	raw_spin_lock_irqsave(&iommu->lock, flags);
++	if (iommu->perfopt_refcount > 0 && --iommu->perfopt_refcount == 0)
++		ret = __perfopt_write(iommu, false);
++	raw_spin_unlock_irqrestore(&iommu->lock, flags);
++	return ret;
++}
++
++/*
++ * Force PERF_OPT_EN off without touching the refcount (used on init, shutdown,
++ * and suspend). The count is preserved so amd_iommu_perfopt_restore() can
++ * re-arm on resume.
++ */
++int amd_iommu_perfopt_clear(struct amd_iommu *iommu)
++{
++	unsigned long flags;
++	int ret;
++
++	if (!iommu->mmio_base)
++		return 0;
++
++	raw_spin_lock_irqsave(&iommu->lock, flags);
++	ret = __perfopt_write(iommu, false);
++	raw_spin_unlock_irqrestore(&iommu->lock, flags);
++	return ret;
++}
++
++/*
++ * Re-assert PERF_OPT_EN from the refcount after the hardware was reprogrammed on
++ * resume, so devices armed before suspend keep the optimization without each
++ * consumer driver re-arming.
++ */
++int amd_iommu_perfopt_restore(struct amd_iommu *iommu)
++{
++	unsigned long flags;
++	int ret;
++
++	if (!iommu->mmio_base)
++		return 0;
++
++	raw_spin_lock_irqsave(&iommu->lock, flags);
++	ret = __perfopt_write(iommu, iommu->perfopt_refcount > 0);
++	raw_spin_unlock_irqrestore(&iommu->lock, flags);
++	return ret;
++}
++
++int amd_iommu_enable_perfopt(struct pci_dev *pdev)
++{
++	struct iommu_dev_data *dev_data = dev_iommu_priv_get(&pdev->dev);
++	struct amd_iommu *iommu = rlookup_amd_iommu(&pdev->dev);
++	struct protection_domain *domain;
++	int ret;
++
++	if (!iommu || !dev_data)
++		return -ENODEV;
++
++	if (!(iommu->features & FEATURE_PERF_OPT))
++		return -ENODEV;
++
++	domain = dev_data->domain;
++	if (!domain)
++		return -ENODEV;
++
++	/* Already armed for this device (e.g. re-entry on resume). */
++	if (dev_data->perfopt)
++		return 0;
++
++	/*
++	 * The bit is only architecturally valid while the device is untranslated:
++	 * identity domain with ATS/PRI/PASID off. The identity domain is
++	 * SVA-capable so attach_device() enabled ATS/PRI/PASID and built a GCR3
++	 * table. Re-home the device onto the same identity domain with
++	 * perfopt set, so the attach_device() skip_caps path leaves
++	 * ATS/PRI/PASID off and no GCR3 table. This follows the detach/attach
++	 * pattern used by amd_iommu_attach_device().
++	 *
++	 * Locking: this and amd_iommu_disable_perfopt() run only from the
++	 * consumer driver's bind/unbind path. group->mutex is not exposed to
++	 * drivers, but a device bound to its native driver cannot have its domain
++	 * changed concurrently by the core (VFIO ownership is mutually exclusive;
++	 * sysfs domain changes require an unused group), so the detach/attach pair
++	 * is serialized without it.
++	 */
++	dev_data->perfopt = true;
++	detach_device(&pdev->dev);
++	ret = attach_device(&pdev->dev, domain);
++	if (ret)
++		goto err_restore;
++
++	ret = perfopt_get(iommu);
++	if (ret)
++		goto err_rearm;
++
++	dev_info_once(&pdev->dev, "PerfOpt armed on IOMMU%d\n", iommu->index);
++	return 0;
++
++err_rearm:
++	detach_device(&pdev->dev);
++err_restore:
++	dev_data->perfopt = false;
++	if (attach_device(&pdev->dev, domain))
++		pci_err(pdev, "failed to restore state after PerfOpt setup; device left detached\n");
++	dev_err_once(&pdev->dev, "PerfOpt failed to arm on IOMMU%d (%d)\n",
++		     iommu->index, ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(amd_iommu_enable_perfopt);
++
++void amd_iommu_disable_perfopt(struct pci_dev *pdev)
++{
++	struct iommu_dev_data *dev_data = dev_iommu_priv_get(&pdev->dev);
++	struct amd_iommu *iommu = rlookup_amd_iommu(&pdev->dev);
++	struct protection_domain *domain;
++
++	if (!iommu || !dev_data || !dev_data->perfopt || !dev_data->domain)
++		return;
++
++	if (WARN_ON(perfopt_put(iommu)))
++		pci_err(pdev, "failed to clear PerfOpt\n");
++
++	/*
++	 * Restore ATS/PRI/PASID (and thus SVA) by re-homing the device onto its
++	 * identity domain with the flag cleared, so a later bind without PerfOpt
++	 * sees a normally-capable device. See the locking note in
++	 * amd_iommu_enable_perfopt().
++	 */
++	domain = dev_data->domain;
++	dev_data->perfopt = false;
++	detach_device(&pdev->dev);
++	if (attach_device(&pdev->dev, domain))
++		pci_err(pdev, "failed to restore caps after PerfOpt disable\n");
++}
++EXPORT_SYMBOL_GPL(amd_iommu_disable_perfopt);
+ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+ {
+ 	struct iommu_device *iommu_dev;
+@@ -2551,6 +2741,14 @@ static struct iommu_device *amd_iommu_probe_device(struct device *dev)
+ static void amd_iommu_release_device(struct device *dev)
+ {
+ 	struct iommu_dev_data *dev_data = dev_iommu_priv_get(dev);
++	struct amd_iommu *iommu = get_amd_iommu_from_dev_data(dev_data);
++
++	if (dev_data->perfopt) {
++		if (WARN_ON(perfopt_put(iommu)))
++			dev_err(dev, "IOMMU%d: failed to clear PerfOpt on release\n",
++				iommu->index);
++		dev_data->perfopt = false;
++	}
+ 
+ 	WARN_ON(dev_data->domain);
+ 
+@@ -2925,6 +3123,19 @@ static int blocked_domain_attach_device(struct iommu_domain *domain,
+ 					struct iommu_domain *old)
+ {
+ 	struct iommu_dev_data *dev_data = dev_iommu_priv_get(dev);
++	struct amd_iommu *iommu = get_amd_iommu_from_dev_data(dev_data);
++
++	/*
++	 * blocked_domain is also the .release_domain, so this is the normal
++	 * teardown path: drop the reference and clear the flag here too, and
++	 * don't fail teardown if the WARN-guarded write doesn't stick.
++	 */
++	if (dev_data->perfopt) {
++		if (WARN_ON(perfopt_put(iommu)))
++			dev_err(dev, "IOMMU%d: failed to clear PerfOpt for blocked domain\n",
++				iommu->index);
++		dev_data->perfopt = false;
++	}
+ 
+ 	if (dev_data->domain)
+ 		detach_device(dev);
+@@ -2993,6 +3204,9 @@ static int amd_iommu_attach_device(struct iommu_domain *dom, struct device *dev,
+ 	struct amd_iommu *iommu = get_amd_iommu_from_dev(dev);
+ 	int ret;
+ 
++	if (dev_data->perfopt && !pdom_is_in_pt_mode(domain))
++		return -EBUSY;
++
+ 	/*
+ 	 * Skip attach device to domain if new domain is same as
+ 	 * devices current domain
+diff --git a/include/linux/amd-iommu.h b/include/linux/amd-iommu.h
+index edcee9f53..104817e8d 100644
+--- a/include/linux/amd-iommu.h
++++ b/include/linux/amd-iommu.h
+@@ -11,11 +11,11 @@
+ #include <linux/types.h>
+ 
+ struct amd_iommu;
++struct pci_dev;
+ 
+ #ifdef CONFIG_AMD_IOMMU
+ 
+ struct task_struct;
+-struct pci_dev;
+ 
+ extern void amd_iommu_detect(void);
+ 
+@@ -76,4 +76,15 @@ static inline int amd_iommu_snp_disable(void) { return 0; }
+ static inline bool amd_iommu_sev_tio_supported(void) { return false; }
+ #endif
+ 
++#ifdef CONFIG_AMD_IOMMU
++int amd_iommu_enable_perfopt(struct pci_dev *pdev);
++void amd_iommu_disable_perfopt(struct pci_dev *pdev);
++#else
++static inline int amd_iommu_enable_perfopt(struct pci_dev *pdev)
++{
++	return 0;
++}
++static inline void amd_iommu_disable_perfopt(struct pci_dev *pdev) { }
++#endif
++
+ #endif /* _ASM_X86_AMD_IOMMU_H */
+-- 
+2.55.0
+
+
+From ee299100d79e17d3eb8b4a3c6c1034332c95e779 Mon Sep 17 00:00:00 2001
+From: Mario Limonciello <mario.limonciello@amd.com>
+Date: Mon, 7 Sep 2026 23:12:07 -0500
+Subject: [PATCH 11/11] drm/amdgpu: Enable PerfOpt IOMMU perf optimization when
+ GPU in identity domain
+
+Enable PerfOpt via amd_iommu_enable_perfopt() when the GPU's
+iommu_perfopt module parameter is enabled (default 1) and the GPU
+resides in the identity domain. The identity domain means the GPU is
+already performing direct DMA with the IOMMU only enforcing IR/IW
+permission bits -- no GPA->SPA translations.
+
+amd_iommu_enable_perfopt() clears ATS, PRI, PASID and SVA for the
+device. This is safe in identity domain because DTE[I]=0 means the
+IOMMU already returns target abort for ATS requests from this
+peripheral and the GPU manages its own TLB.
+
+PerfOpt is a soft, optional latency optimization: failing to arm it (for
+example on an IOMMU that does not implement the feature, which returns
+-ENODEV) must not be fatal, so probe and resume warn and continue rather
+than aborting.
+
+PERF_OPT_EN is a per-IOMMU control shared by all devices behind that
+IOMMU; the IOMMU driver reference counts it so that on systems where
+multiple devices share one IOMMU, one GPU's teardown does not clear the
+bit while a peer still requires it.
+
+Arming PerfOpt trades IOMMU DMA containment for lower DMA latency. This
+is enabled by default for GPUs in the identity domain as a deliberate,
+documented policy and can be disabled with iommu_perfopt=0.
+
+The AMD IOMMU spec indicates this is only supported on integrated GPUs
+so check explicitly for AMD_IS_APU (which is set by
+amdgpu_device_ip_early_init()).
+
+PerfOpt is disabled during GPU init teardown and restored on resume.
+
+Tested-by: Derek J. Clark <derekjohn.clark@gmail.com>
+Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+Tested-by: Boqun Feng (Netflix) <boqun@kernel.org>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 50 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c    | 12 ++++++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index a9c6f5d4a..0e53a02ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -156,6 +156,7 @@ struct amdgpu_watchdog_timer {
+  * Modules parameters.
+  */
+ extern int amdgpu_modeset;
++extern int amdgpu_iommu_perfopt;
+ extern unsigned int amdgpu_vram_limit;
+ extern int amdgpu_vis_vram_limit;
+ extern int amdgpu_gart_size;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 9269e780f..bfe4d9034 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -33,6 +33,7 @@
+ #include <linux/console.h>
+ #include <linux/slab.h>
+ #include <linux/iommu.h>
++#include <linux/amd-iommu.h>
+ #include <linux/pci.h>
+ #include <linux/pci-p2pdma.h>
+ #include <linux/apple-gmux.h>
+@@ -3752,6 +3753,28 @@ amdgpu_device_should_register_switcheroo(struct amdgpu_device *adev, bool px)
+ 		       apple_gmux_detect(NULL, NULL)));
+ }
+ 
++static inline bool amdgpu_device_identity(struct amdgpu_device *adev)
++{
++	struct pci_dev *pdev = adev->pdev;
++	struct iommu_domain *domain = iommu_get_domain_for_dev(&pdev->dev);
++
++	if (!domain)
++		return false;
++
++	return domain->type == IOMMU_DOMAIN_IDENTITY;
++}
++
++static bool amdgpu_device_use_perfopt(struct amdgpu_device *adev)
++{
++	if (amdgpu_iommu_perfopt == 0)
++		return false;
++
++	if (!(adev->flags & AMD_IS_APU))
++		return false;
++
++	return amdgpu_device_identity(adev);
++}
++
+ /**
+  * amdgpu_device_init - initialize the driver
+  *
+@@ -3959,6 +3982,16 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	if (r)
+ 		return r;
+ 
++	if (amdgpu_device_use_perfopt(adev)) {
++		int perfopt_ret = amd_iommu_enable_perfopt(pdev);
++
++		/* Optional optimization; a failure to arm it must not abort probe. */
++		if (perfopt_ret)
++			dev_warn(adev->dev,
++				 "Failed to enable IOMMU PerfOpt (%d); continuing without it\n",
++				 perfopt_ret);
++	}
++
+ 	/*
+ 	 * No need to remove conflicting FBs for non-display class devices.
+ 	 * This prevents the sysfb from being freed accidently.
+@@ -4328,6 +4361,9 @@ void amdgpu_device_fini_hw(struct amdgpu_device *adev)
+ 
+ 	amdgpu_gart_dummy_page_fini(adev);
+ 
++	if (amdgpu_device_use_perfopt(adev))
++		amd_iommu_disable_perfopt(adev->pdev);
++
+ 	if (pci_dev_is_disconnected(adev->pdev))
+ 		amdgpu_device_unmap_mmio(adev);
+ 
+@@ -4691,6 +4727,20 @@ int amdgpu_device_resume(struct drm_device *dev, bool notify_clients)
+ 	if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 		return 0;
+ 
++	if (amdgpu_device_use_perfopt(adev)) {
++		int perfopt_ret = amd_iommu_enable_perfopt(adev->pdev);
++
++		/*
++		 * Must not return on failure: a bare return would leak the
++		 * SR-IOV VF exclusive-mode acquisition taken above (released
++		 * via the exit: path).
++		 */
++		if (perfopt_ret)
++			dev_warn(adev->dev,
++				 "Failed to enable IOMMU PerfOpt (%d); continuing without it\n",
++				 perfopt_ret);
++	}
++
+ 	if (adev->in_s0ix)
+ 		amdgpu_dpm_gfx_state_change(adev, sGpuChangeState_D0Entry);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 5c33c19fd..3ca98091c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -185,6 +185,7 @@ char *amdgpu_disable_cu;
+ char *amdgpu_virtual_display;
+ int amdgpu_enforce_isolation = -1;
+ int amdgpu_modeset = -1;
++int amdgpu_iommu_perfopt = -1;
+ 
+ /* Specifies the default granularity for SVM, used in buffer
+  * migration and restoration of backing memory when handling
+@@ -392,6 +393,17 @@ module_param_named(fw_load_type, amdgpu_fw_load_type, int, 0444);
+ MODULE_PARM_DESC(aspm, "ASPM support (1 = enable, 0 = disable, -1 = auto)");
+ module_param_named(aspm, amdgpu_aspm, int, 0444);
+ 
++/**
++ * DOC: iommu_perfopt (int)
++ * Control the AMD IOMMU PerfOpt DMA-latency optimization
++ * (0 = disable; -1 = enable on supported devices).
++ * This arms the IOMMU PerfOpt control (IOMMU spec, MMIO Offset 016Ch, EFR PerfOptSup / PerfOptEn)
++ * Arming it disables ATS, PRI, PASID and SVA for the GPU and removes IOMMU DMA containment for it,
++ * trading isolation for lower DMA latency.
++ */
++MODULE_PARM_DESC(iommu_perfopt, "Control IOMMU PerfOpt DMA-latency optimization (-1 = enable on supported devices, 0 = disable)");
++module_param_named(iommu_perfopt, amdgpu_iommu_perfopt, int, 0444);
++
+ /**
+  * DOC: runpm (int)
+  * Override for runtime power management control for dGPUs. The amdgpu driver can dynamically power down
+-- 
+2.55.0
+

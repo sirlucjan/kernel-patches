@@ -1,0 +1,168 @@
+From 2bb1b3c45b92714654046545d5bc62e8f5775fef Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Sun, 23 Aug 2026 06:20:15 +0800
+Subject: [PATCH 01/11] iommu/amd: Do not request ACS when IOMMU is not going
+ to be initialized
+
+The AMD IOMMU Initialization State Machine has the following state
+transition diagram (only the very first states are showed, and the
+`IOMMU_' prefix is omitted):
+
+   START_STATE
+        |
+        v
+[0] detect_ivrs() --> NOT_FOUND
+        | ok
+        v
+  IVRS_DETECTED
+        |
+        v
+[1] amd_iommu_disabled? (amd_iommu=off) --> IOMMU_CMDLINE_DISABLED
+        | no
+        v
+[2] early_amd_iommu_init()
+        |
+        +-- [3] amd_iommu_detected? (!iommu=off && ...) -+
+        | yes                                            |
+        +-- ... --> IOMMU_INIT_ERROR <-------------------+
+        | ok
+        v
+IOMMU_ACPI_FINISHED
+        |
+        v
+       ...
+
+[0] always calls pci_request_acs() as long as there's a valid IVRS table
+and no Stoney Ridge graphics. This is not optimal as ACS is not required
+in an [amd_]iommu=off boot.
+
+In a normal boot, ACS is requested due to amd_iommu_detect() requesting
+IVRS_DETECTED.
+
+    pci_request_acs+0x9/0x18
+    iommu_go_to_state+0x106/0x1a20
+    amd_iommu_detect+0x1c/0x50
+    pci_iommu_alloc+0x26/0x40
+    mm_core_init+0xa/0x120
+    start_kernel+0x527/0x7a0
+    x86_64_start_reservations+0x24/0x30
+    x86_64_start_kernel+0xd1/0xe0
+    common_startup_64+0x13e/0x158
+
+This is intended to ensure ACS is requested before the PCI core
+initialization, or else a !CONFIG_IRQ_REMAP, nointremap or intremap=off
+boot would be broken.
+
+However, in an amd_iommu=off boot, the state machine still requests ACS
+at the exact same time, as amd_iommu_detect() has nothing to do with
+amd_iommu_disabled.
+
+Even worse, in an iommu=off boot, though amd_iommu_detect() bails out
+early, ACS is still requested due to amd_iommu_prepare() requesting
+IOMMU_ACPI_FINISHED, which is called by irq_remapping_prepare() thanks
+to CONFIG_X86_LOCAL_APIC (always set on X86_64) and CONFIG_IRQ_REMAP
+(enabled by defconfig), unless nointremap or intremap=off is also passed
+to cmdline.
+
+    pci_request_acs+0x9/0x18
+    iommu_go_to_state+0x106/0x1a20
+    amd_iommu_prepare+0x15/0x40
+    irq_remapping_prepare+0x43/0x60
+    enable_IR_x2apic+0x22/0x190
+    x86_64_probe_apic+0xa/0x50
+    apic_intr_mode_init+0x70/0xd0
+    x86_late_time_init+0x28/0x40
+    start_kernel+0x6f9/0x7a0
+    ...
+
+In both cases, [2] is still gated due to the [1] or [3] check, so that
+IOMMU can be disabled per cmdline.
+
+Technically, it makes no sense to detect IVRS at all in an
+[amd_]iommu=off boot or if IOMMU is not supported due to platform
+settings. This is probably why amd_iommu_detect() bails out before
+requesting IVRS_DETECTED. Apparently only bailing out there is not
+sufficient, and the bailing-out paths should really have been parts of
+the state machine.
+
+Clean up the initialization routines by moving the bailing-out paths and
+[1] to the right place in the state machine (i.e., before [0]), and
+always requesting IVRS_DETECTED in amd_iommu_detect() to initialize the
+state machine early and properly.
+
+Note that the condition (iommu_detected && !gart_iommu_aperture) is
+dropped as it's dead code since the relevant code being removed. It
+meant to detect what commit 6631ee9d0099 ("x86, AMD IOMMU: add
+dma_ops initialization function") had introduced, but commit
+d7f077697533 ("x86/amd-iommu: Fall back to GART if initialization
+fails") has removed it. Later, commit 78013eaadf69 ("x86: remove the
+IOMMU table infrastructure") ensured AMD IOMMU being detected before
+Intel's and led to iommu_detected == gart_iommu_aperture in any case.
+
+Signed-off-by: Rong Zhang <i@rong.moe>
+Reviewed-by: Ankit Soni <Ankit.Soni@amd.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/amd/init.c | 25 +++++++++++--------------
+ 1 file changed, 11 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index 8a410d4aa..975d77b50 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -3476,6 +3476,8 @@ static void amd_iommu_apply_erratum_snp(void)
+ #endif
+ }
+ 
++static bool amd_iommu_sme_check(void);
++
+ /****************************************************************************
+  *
+  * AMD IOMMU Initialization State Machine
+@@ -3488,7 +3490,13 @@ static int __init state_next(void)
+ 
+ 	switch (init_state) {
+ 	case IOMMU_START_STATE:
+-		if (!detect_ivrs()) {
++		if (no_iommu || amd_iommu_disabled) {
++			init_state	= IOMMU_CMDLINE_DISABLED;
++			ret		= -EINVAL;
++		} else if (!amd_iommu_sme_check()) {
++			init_state	= IOMMU_INIT_ERROR;
++			ret		= -EINVAL;
++		} else if (!detect_ivrs()) {
+ 			init_state	= IOMMU_NOT_FOUND;
+ 			ret		= -ENODEV;
+ 		} else {
+@@ -3496,13 +3504,8 @@ static int __init state_next(void)
+ 		}
+ 		break;
+ 	case IOMMU_IVRS_DETECTED:
+-		if (amd_iommu_disabled) {
+-			init_state = IOMMU_CMDLINE_DISABLED;
+-			ret = -EINVAL;
+-		} else {
+-			ret = early_amd_iommu_init();
+-			init_state = ret ? IOMMU_INIT_ERROR : IOMMU_ACPI_FINISHED;
+-		}
++		ret = early_amd_iommu_init();
++		init_state = ret ? IOMMU_INIT_ERROR : IOMMU_ACPI_FINISHED;
+ 		break;
+ 	case IOMMU_ACPI_FINISHED:
+ 		early_enable_iommus();
+@@ -3701,12 +3704,6 @@ void __init amd_iommu_detect(void)
+ {
+ 	int ret;
+ 
+-	if (no_iommu || (iommu_detected && !gart_iommu_aperture))
+-		goto disable_snp;
+-
+-	if (!amd_iommu_sme_check())
+-		goto disable_snp;
+-
+ 	ret = iommu_go_to_state(IOMMU_IVRS_DETECTED);
+ 	if (ret)
+ 		goto disable_snp;
+-- 
+2.55.0
+

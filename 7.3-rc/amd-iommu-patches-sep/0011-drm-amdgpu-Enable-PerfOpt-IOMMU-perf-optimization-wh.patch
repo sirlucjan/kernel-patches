@@ -1,0 +1,182 @@
+From ee299100d79e17d3eb8b4a3c6c1034332c95e779 Mon Sep 17 00:00:00 2001
+From: Mario Limonciello <mario.limonciello@amd.com>
+Date: Mon, 7 Sep 2026 23:12:07 -0500
+Subject: [PATCH 11/11] drm/amdgpu: Enable PerfOpt IOMMU perf optimization when
+ GPU in identity domain
+
+Enable PerfOpt via amd_iommu_enable_perfopt() when the GPU's
+iommu_perfopt module parameter is enabled (default 1) and the GPU
+resides in the identity domain. The identity domain means the GPU is
+already performing direct DMA with the IOMMU only enforcing IR/IW
+permission bits -- no GPA->SPA translations.
+
+amd_iommu_enable_perfopt() clears ATS, PRI, PASID and SVA for the
+device. This is safe in identity domain because DTE[I]=0 means the
+IOMMU already returns target abort for ATS requests from this
+peripheral and the GPU manages its own TLB.
+
+PerfOpt is a soft, optional latency optimization: failing to arm it (for
+example on an IOMMU that does not implement the feature, which returns
+-ENODEV) must not be fatal, so probe and resume warn and continue rather
+than aborting.
+
+PERF_OPT_EN is a per-IOMMU control shared by all devices behind that
+IOMMU; the IOMMU driver reference counts it so that on systems where
+multiple devices share one IOMMU, one GPU's teardown does not clear the
+bit while a peer still requires it.
+
+Arming PerfOpt trades IOMMU DMA containment for lower DMA latency. This
+is enabled by default for GPUs in the identity domain as a deliberate,
+documented policy and can be disabled with iommu_perfopt=0.
+
+The AMD IOMMU spec indicates this is only supported on integrated GPUs
+so check explicitly for AMD_IS_APU (which is set by
+amdgpu_device_ip_early_init()).
+
+PerfOpt is disabled during GPU init teardown and restored on resume.
+
+Tested-by: Derek J. Clark <derekjohn.clark@gmail.com>
+Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+Tested-by: Boqun Feng (Netflix) <boqun@kernel.org>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 50 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c    | 12 ++++++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index a9c6f5d4a..0e53a02ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -156,6 +156,7 @@ struct amdgpu_watchdog_timer {
+  * Modules parameters.
+  */
+ extern int amdgpu_modeset;
++extern int amdgpu_iommu_perfopt;
+ extern unsigned int amdgpu_vram_limit;
+ extern int amdgpu_vis_vram_limit;
+ extern int amdgpu_gart_size;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 9269e780f..bfe4d9034 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -33,6 +33,7 @@
+ #include <linux/console.h>
+ #include <linux/slab.h>
+ #include <linux/iommu.h>
++#include <linux/amd-iommu.h>
+ #include <linux/pci.h>
+ #include <linux/pci-p2pdma.h>
+ #include <linux/apple-gmux.h>
+@@ -3752,6 +3753,28 @@ amdgpu_device_should_register_switcheroo(struct amdgpu_device *adev, bool px)
+ 		       apple_gmux_detect(NULL, NULL)));
+ }
+ 
++static inline bool amdgpu_device_identity(struct amdgpu_device *adev)
++{
++	struct pci_dev *pdev = adev->pdev;
++	struct iommu_domain *domain = iommu_get_domain_for_dev(&pdev->dev);
++
++	if (!domain)
++		return false;
++
++	return domain->type == IOMMU_DOMAIN_IDENTITY;
++}
++
++static bool amdgpu_device_use_perfopt(struct amdgpu_device *adev)
++{
++	if (amdgpu_iommu_perfopt == 0)
++		return false;
++
++	if (!(adev->flags & AMD_IS_APU))
++		return false;
++
++	return amdgpu_device_identity(adev);
++}
++
+ /**
+  * amdgpu_device_init - initialize the driver
+  *
+@@ -3959,6 +3982,16 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	if (r)
+ 		return r;
+ 
++	if (amdgpu_device_use_perfopt(adev)) {
++		int perfopt_ret = amd_iommu_enable_perfopt(pdev);
++
++		/* Optional optimization; a failure to arm it must not abort probe. */
++		if (perfopt_ret)
++			dev_warn(adev->dev,
++				 "Failed to enable IOMMU PerfOpt (%d); continuing without it\n",
++				 perfopt_ret);
++	}
++
+ 	/*
+ 	 * No need to remove conflicting FBs for non-display class devices.
+ 	 * This prevents the sysfb from being freed accidently.
+@@ -4328,6 +4361,9 @@ void amdgpu_device_fini_hw(struct amdgpu_device *adev)
+ 
+ 	amdgpu_gart_dummy_page_fini(adev);
+ 
++	if (amdgpu_device_use_perfopt(adev))
++		amd_iommu_disable_perfopt(adev->pdev);
++
+ 	if (pci_dev_is_disconnected(adev->pdev))
+ 		amdgpu_device_unmap_mmio(adev);
+ 
+@@ -4691,6 +4727,20 @@ int amdgpu_device_resume(struct drm_device *dev, bool notify_clients)
+ 	if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 		return 0;
+ 
++	if (amdgpu_device_use_perfopt(adev)) {
++		int perfopt_ret = amd_iommu_enable_perfopt(adev->pdev);
++
++		/*
++		 * Must not return on failure: a bare return would leak the
++		 * SR-IOV VF exclusive-mode acquisition taken above (released
++		 * via the exit: path).
++		 */
++		if (perfopt_ret)
++			dev_warn(adev->dev,
++				 "Failed to enable IOMMU PerfOpt (%d); continuing without it\n",
++				 perfopt_ret);
++	}
++
+ 	if (adev->in_s0ix)
+ 		amdgpu_dpm_gfx_state_change(adev, sGpuChangeState_D0Entry);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 5c33c19fd..3ca98091c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -185,6 +185,7 @@ char *amdgpu_disable_cu;
+ char *amdgpu_virtual_display;
+ int amdgpu_enforce_isolation = -1;
+ int amdgpu_modeset = -1;
++int amdgpu_iommu_perfopt = -1;
+ 
+ /* Specifies the default granularity for SVM, used in buffer
+  * migration and restoration of backing memory when handling
+@@ -392,6 +393,17 @@ module_param_named(fw_load_type, amdgpu_fw_load_type, int, 0444);
+ MODULE_PARM_DESC(aspm, "ASPM support (1 = enable, 0 = disable, -1 = auto)");
+ module_param_named(aspm, amdgpu_aspm, int, 0444);
+ 
++/**
++ * DOC: iommu_perfopt (int)
++ * Control the AMD IOMMU PerfOpt DMA-latency optimization
++ * (0 = disable; -1 = enable on supported devices).
++ * This arms the IOMMU PerfOpt control (IOMMU spec, MMIO Offset 016Ch, EFR PerfOptSup / PerfOptEn)
++ * Arming it disables ATS, PRI, PASID and SVA for the GPU and removes IOMMU DMA containment for it,
++ * trading isolation for lower DMA latency.
++ */
++MODULE_PARM_DESC(iommu_perfopt, "Control IOMMU PerfOpt DMA-latency optimization (-1 = enable on supported devices, 0 = disable)");
++module_param_named(iommu_perfopt, amdgpu_iommu_perfopt, int, 0444);
++
+ /**
+  * DOC: runpm (int)
+  * Override for runtime power management control for dGPUs. The amdgpu driver can dynamically power down
+-- 
+2.55.0
+
