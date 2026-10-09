@@ -1,0 +1,254 @@
+From 735f744b51f7500e788669e77aa81baaf7735115 Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Fri, 9 Oct 2026 16:11:33 +0900
+Subject: [PATCH 14/15] zram: use a singleton compression context for
+ recompression
+
+Secondary compressors are only used by recompress_store(), which is
+serialized under zram->dev_lock, so we only ever use one secondary
+compressor at a time, yet we still allocate them on each CPU, which is
+just a plain memory wastage.  However, we do need per-CPU decompressors
+in order to support concurrent reads.
+
+Now that Read and Write contexts are split, we can allocate just a
+single compression stream (recomp_cstream) for secondary algorithms
+instead of per-CPU streams, which saves N - 1 compression contexts
+and 2 * PAGE_SIZE buffers.
+
+For example, on an 8-CPU x86_64 system (4K PAGE_SIZE), this saves:
+- zstd (level 3, default):        ~700 KB (~100 KB/CPU)
+- zstd (levels 12-22, no dict):   ~1.91 MB (~280 KB/CPU)
+- zstd (levels 14-22, 110K dict): ~5.33 MB (~780 KB/CPU, lazy)
+- deflate (winbits=-11, default): ~1.04 MB (~152 KB/CPU)
+- deflate (winbits=15):           ~1.86 MB (~272 KB/CPU)
+- lz4hc:                          ~1.84 MB (~269 KB/CPU)
+
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+---
+ drivers/block/zram/zcomp.c    | 78 +++++++++++++++++++++++++----------
+ drivers/block/zram/zcomp.h    |  9 ++--
+ drivers/block/zram/zram_drv.c |  5 ++-
+ 3 files changed, 66 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/block/zram/zcomp.c b/drivers/block/zram/zcomp.c
+index 1c9f6d5c8..20c487baf 100644
+--- a/drivers/block/zram/zcomp.c
++++ b/drivers/block/zram/zcomp.c
+@@ -151,6 +151,11 @@ ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
+ 
+ struct zcomp_cstrm *zcomp_cstrm_get(struct zcomp *comp)
+ {
++	if (comp->recomp_cstream) {
++		mutex_lock(&comp->recomp_cstream->lock);
++		return comp->recomp_cstream;
++	}
++
+ 	for (;;) {
+ 		struct zcomp_cstrm *zstrm = raw_cpu_ptr(comp->cstream);
+ 
+@@ -243,22 +248,25 @@ int zcomp_decompress(struct zcomp *comp, struct zcomp_dstrm *zstrm,
+ int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
+ {
+ 	struct zcomp *comp = hlist_entry(node, struct zcomp, node);
+-	struct zcomp_cstrm *cstrm;
++	struct zcomp_cstrm *cstrm = NULL;
+ 	struct zcomp_dstrm *dstrm;
+ 	int ret;
+ 
+-	cstrm = per_cpu_ptr(comp->cstream, cpu);
+-	ret = zcomp_cstrm_init(comp, cstrm);
+-	if (ret) {
+-		pr_err("Can't allocate a compression stream\n");
+-		return ret;
++	if (comp->cstream) {
++		cstrm = per_cpu_ptr(comp->cstream, cpu);
++		ret = zcomp_cstrm_init(comp, cstrm);
++		if (ret) {
++			pr_err("Can't allocate a compression stream\n");
++			return ret;
++		}
+ 	}
+ 
+ 	dstrm = per_cpu_ptr(comp->dstream, cpu);
+ 	ret = zcomp_dstrm_init(comp, dstrm);
+ 	if (ret) {
+ 		pr_err("Can't allocate a decompression stream\n");
+-		zcomp_cstrm_free(comp, cstrm);
++		if (cstrm)
++			zcomp_cstrm_free(comp, cstrm);
+ 		return ret;
+ 	}
+ 
+@@ -271,10 +279,12 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
+ 	struct zcomp_cstrm *cstrm;
+ 	struct zcomp_dstrm *dstrm;
+ 
+-	cstrm = per_cpu_ptr(comp->cstream, cpu);
+-	mutex_lock(&cstrm->lock);
+-	zcomp_cstrm_free(comp, cstrm);
+-	mutex_unlock(&cstrm->lock);
++	if (comp->cstream) {
++		cstrm = per_cpu_ptr(comp->cstream, cpu);
++		mutex_lock(&cstrm->lock);
++		zcomp_cstrm_free(comp, cstrm);
++		mutex_unlock(&cstrm->lock);
++	}
+ 
+ 	dstrm = per_cpu_ptr(comp->dstream, cpu);
+ 	mutex_lock(&dstrm->lock);
+@@ -284,7 +294,8 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
+ 	return 0;
+ }
+ 
+-static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
++static int zcomp_init(struct zcomp *comp, struct zcomp_params *params,
++		      bool recomp)
+ {
+ 	int ret, cpu;
+ 
+@@ -293,10 +304,28 @@ static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
+ 	if (ret)
+ 		goto cleanup;
+ 
+-	comp->cstream = alloc_percpu(struct zcomp_cstrm);
+-	if (!comp->cstream) {
+-		ret = -ENOMEM;
+-		goto cleanup;
++	if (recomp) {
++		comp->recomp_cstream = kzalloc_obj(*comp->recomp_cstream);
++		if (!comp->recomp_cstream) {
++			ret = -ENOMEM;
++			goto cleanup;
++		}
++		mutex_init(&comp->recomp_cstream->lock);
++		ret = zcomp_cstrm_init(comp, comp->recomp_cstream);
++		if (ret) {
++			/* zcomp_cstrm_init() cleans up after itself */
++			kfree(comp->recomp_cstream);
++			comp->recomp_cstream = NULL;
++			goto cleanup;
++		}
++	} else {
++		comp->cstream = alloc_percpu(struct zcomp_cstrm);
++		if (!comp->cstream) {
++			ret = -ENOMEM;
++			goto cleanup;
++		}
++		for_each_possible_cpu(cpu)
++			mutex_init(&per_cpu_ptr(comp->cstream, cpu)->lock);
+ 	}
+ 
+ 	comp->dstream = alloc_percpu(struct zcomp_dstrm);
+@@ -305,10 +334,8 @@ static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
+ 		goto cleanup;
+ 	}
+ 
+-	for_each_possible_cpu(cpu) {
+-		mutex_init(&per_cpu_ptr(comp->cstream, cpu)->lock);
++	for_each_possible_cpu(cpu)
+ 		mutex_init(&per_cpu_ptr(comp->dstream, cpu)->lock);
+-	}
+ 
+ 	ret = cpuhp_state_add_instance(CPUHP_ZCOMP_PREPARE, &comp->node);
+ 	if (ret < 0)
+@@ -317,6 +344,10 @@ static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
+ 	return 0;
+ 
+ cleanup:
++	if (comp->recomp_cstream) {
++		zcomp_cstrm_free(comp, comp->recomp_cstream);
++		kfree(comp->recomp_cstream);
++	}
+ 	comp->ops->release_params(comp->params);
+ 	free_percpu(comp->dstream);
+ 	free_percpu(comp->cstream);
+@@ -326,13 +357,18 @@ static int zcomp_init(struct zcomp *comp, struct zcomp_params *params)
+ void zcomp_destroy(struct zcomp *comp)
+ {
+ 	cpuhp_state_remove_instance(CPUHP_ZCOMP_PREPARE, &comp->node);
++	if (comp->recomp_cstream) {
++		zcomp_cstrm_free(comp, comp->recomp_cstream);
++		kfree(comp->recomp_cstream);
++	}
+ 	comp->ops->release_params(comp->params);
+ 	free_percpu(comp->dstream);
+ 	free_percpu(comp->cstream);
+ 	kfree(comp);
+ }
+ 
+-struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
++struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params,
++			   bool recomp)
+ {
+ 	struct zcomp *comp;
+ 	int error;
+@@ -355,7 +391,7 @@ struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	error = zcomp_init(comp, params);
++	error = zcomp_init(comp, params, recomp);
+ 	if (error) {
+ 		kfree(comp);
+ 		return ERR_PTR(error);
+diff --git a/drivers/block/zram/zcomp.h b/drivers/block/zram/zcomp.h
+index 22be50dc5..e48e3f075 100644
+--- a/drivers/block/zram/zcomp.h
++++ b/drivers/block/zram/zcomp.h
+@@ -33,7 +33,8 @@ struct zcomp_params {
+ /*
+  * Run-time driver context - scratch buffers, etc. It is modified during
+  * request execution (compression/decompression), cannot be shared, so
+- * it's in per-CPU area.
++ * it's in per-CPU area (except for recompression, which uses a single
++ * per-device compression stream).
+  */
+ struct zcomp_ctx {
+ 	void *context;
+@@ -81,8 +82,9 @@ struct zcomp_ops {
+ 
+ /* dynamic per-device compression frontend */
+ struct zcomp {
+-	struct zcomp_cstrm __percpu *cstream;
+ 	struct zcomp_dstrm __percpu *dstream;
++	struct zcomp_cstrm __percpu *cstream;
++	struct zcomp_cstrm *recomp_cstream;
+ 	const struct zcomp_ops *ops;
+ 	struct zcomp_params *params;
+ 	struct hlist_node node;
+@@ -93,7 +95,8 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node);
+ ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at);
+ const char *zcomp_lookup_backend_name(const char *comp);
+ 
+-struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params);
++struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params,
++			   bool recomp);
+ void zcomp_destroy(struct zcomp *comp);
+ 
+ struct zcomp_cstrm *zcomp_cstrm_get(struct zcomp *comp);
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index def526667..70d3f0ed9 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -2522,7 +2522,7 @@ static int recompress_slot(struct zram *zram, unsigned long index,
+ 	}
+ 
+ 	/*
+-	 * We are holding per-CPU stream mutex and entry lock so better
++	 * We are holding compression stream mutex and entry lock so better
+ 	 * avoid direct reclaim.  Allocation error is not fatal since
+ 	 * we still have the old object in the mem_pool.
+ 	 *
+@@ -2924,7 +2924,8 @@ static ssize_t disksize_store(struct device *dev, struct device_attribute *attr,
+ 			continue;
+ 
+ 		comp = zcomp_create(zram->comp_algs[prio],
+-				    &zram->params[prio]);
++				    &zram->params[prio],
++				    prio != ZRAM_PRIMARY_COMP);
+ 		if (IS_ERR(comp)) {
+ 			pr_err("Cannot initialise %s compressing backend\n",
+ 			       zram->comp_algs[prio]);
+-- 
+2.56.0
+

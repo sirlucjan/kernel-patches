@@ -1,0 +1,213 @@
+From 590b5ee79b3f9ca7733a6d6cf5a18ee5b25f021a Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Fri, 9 Oct 2026 16:11:34 +0900
+Subject: [PATCH 15/15] zram: use rw_semaphore for decompression streams
+
+Currently, per-CPU decompression streams use a mutex, so there is
+a chance for priority inversion - a low priority Reader can get
+preempted by a higher priority Reader, which simply will get
+blocked on the stream mutex.
+
+Switch zcomp_dstrm lock from mutex to rw_semaphore to permit parallel
+usage.  However, things are not completely straightforward.  Many
+backends have stateless decompression and don't modify decompression
+context, so those can be used concurrently.  But then there are backends
+that do modify decompression context.  We also can have compressed
+object span across physical pages, which zcomp linearises using stream's
+->local_copy buffer before decompression.  That buffer, clearly, cannot
+be used concurrently.
+
+When the backend has no per-stream decompression context (stateless)
+and zsmalloc object fits in a single page (ZCOMP_DECOMP_INPLACE), take
+the stream lock in shared mode (read).  Otherwise, when ->local_copy
+is needed (ZCOMP_DECOMP_BOUNCE) or the backend has a decompression
+context (zstd, deflate), take the lock in exclusive mode (write).
+
+A quick synthetic fio test on 24 CPUs (preempt=full, lz4, 48 low
+priority (nice 19) readers, 24 normal priority (nice 0) CPU hogs
+and 24 high priority (nice -19) readers):
+
+  Metric           Base               Patched
+  ----------------------------------------------------------
+  Read IOPS        473k               680k          (+43.8%)
+  Read clat avg    35.98 us           21.28 us      (-40.9%)
+  Read clat p99.95 55.55 us           20.86 us      (-2.7x)
+  Read clat p99.99 6,717 us           2,834 us      (-2.4x)
+  Read clat max    2,005,100 us       1,614,300 us  (-19.5%)
+
+Suggested-by: Brian Geffon <bgeffon@google.com>
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+---
+ drivers/block/zram/zcomp.c    | 41 +++++++++++++++++++++++++++--------
+ drivers/block/zram/zcomp.h    | 12 ++++++++--
+ drivers/block/zram/zram_drv.c | 10 ++++++---
+ 3 files changed, 49 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/block/zram/zcomp.c b/drivers/block/zram/zcomp.c
+index 20c487baf..79ed957fe 100644
+--- a/drivers/block/zram/zcomp.c
++++ b/drivers/block/zram/zcomp.c
+@@ -181,21 +181,43 @@ void zcomp_cstrm_put(struct zcomp_cstrm *zstrm)
+ 	mutex_unlock(&zstrm->lock);
+ }
+ 
+-struct zcomp_dstrm *zcomp_dstrm_get(struct zcomp *comp)
++struct zcomp_dstrm *zcomp_dstrm_get(struct zcomp *comp,
++				    enum zcomp_decomp_mode mode)
+ {
++	/*
++	 * Backends with a per-stream decompression context modify ->ctx
++	 * during decompression and cannot share the stream concurrently.
++	 */
++	if (comp->ops->create_dctx)
++		mode = ZCOMP_DECOMP_BOUNCE;
++
+ 	for (;;) {
+ 		struct zcomp_dstrm *zstrm = raw_cpu_ptr(comp->dstream);
+ 
+-		mutex_lock(&zstrm->lock);
+-		if (likely(zstrm->local_copy))
+-			return zstrm;
+-		mutex_unlock(&zstrm->lock);
++		if (mode == ZCOMP_DECOMP_INPLACE) {
++			down_read(&zstrm->lock);
++			if (likely(zstrm->local_copy))
++				return zstrm;
++			up_read(&zstrm->lock);
++		} else {
++			down_write(&zstrm->lock);
++			if (likely(zstrm->local_copy)) {
++				zstrm->excl_locked = true;
++				return zstrm;
++			}
++			up_write(&zstrm->lock);
++		}
+ 	}
+ }
+ 
+ void zcomp_dstrm_put(struct zcomp_dstrm *zstrm)
+ {
+-	mutex_unlock(&zstrm->lock);
++	if (zstrm->excl_locked) {
++		zstrm->excl_locked = false;
++		up_write(&zstrm->lock);
++	} else {
++		up_read(&zstrm->lock);
++	}
+ }
+ 
+ int zcomp_compress(struct zcomp *comp, struct zcomp_cstrm *zstrm,
+@@ -235,6 +257,7 @@ int zcomp_decompress(struct zcomp *comp, struct zcomp_dstrm *zstrm,
+ 		req.src = src + sg->offset;
+ 	} else {
+ 		/* the object spans two pages, linearize it into local copy */
++		lockdep_assert_held_write(&zstrm->lock);
+ 		sg_copy_to_buffer(sg, 2, zstrm->local_copy, src_len);
+ 		req.src = zstrm->local_copy;
+ 	}
+@@ -287,9 +310,9 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
+ 	}
+ 
+ 	dstrm = per_cpu_ptr(comp->dstream, cpu);
+-	mutex_lock(&dstrm->lock);
++	down_write(&dstrm->lock);
+ 	zcomp_dstrm_free(comp, dstrm);
+-	mutex_unlock(&dstrm->lock);
++	up_write(&dstrm->lock);
+ 
+ 	return 0;
+ }
+@@ -335,7 +358,7 @@ static int zcomp_init(struct zcomp *comp, struct zcomp_params *params,
+ 	}
+ 
+ 	for_each_possible_cpu(cpu)
+-		mutex_init(&per_cpu_ptr(comp->dstream, cpu)->lock);
++		init_rwsem(&per_cpu_ptr(comp->dstream, cpu)->lock);
+ 
+ 	ret = cpuhp_state_add_instance(CPUHP_ZCOMP_PREPARE, &comp->node);
+ 	if (ret < 0)
+diff --git a/drivers/block/zram/zcomp.h b/drivers/block/zram/zcomp.h
+index e48e3f075..db9fc7aa5 100644
+--- a/drivers/block/zram/zcomp.h
++++ b/drivers/block/zram/zcomp.h
+@@ -4,11 +4,17 @@
+ #define _ZCOMP_H_
+ 
+ #include <linux/mutex.h>
++#include <linux/rwsem.h>
+ 
+ struct scatterlist;
+ 
+ #define ZCOMP_PARAM_NOT_SET	INT_MIN
+ 
++enum zcomp_decomp_mode {
++	ZCOMP_DECOMP_INPLACE,
++	ZCOMP_DECOMP_BOUNCE,
++};
++
+ struct deflate_params {
+ 	s32 winbits;
+ };
+@@ -48,7 +54,8 @@ struct zcomp_cstrm {
+ };
+ 
+ struct zcomp_dstrm {
+-	struct mutex lock;
++	struct rw_semaphore lock;
++	bool excl_locked;
+ 	/* local copy of handle memory */
+ 	void *local_copy;
+ 	struct zcomp_ctx ctx;
+@@ -102,7 +109,8 @@ void zcomp_destroy(struct zcomp *comp);
+ struct zcomp_cstrm *zcomp_cstrm_get(struct zcomp *comp);
+ void zcomp_cstrm_put(struct zcomp_cstrm *zstrm);
+ 
+-struct zcomp_dstrm *zcomp_dstrm_get(struct zcomp *comp);
++struct zcomp_dstrm *zcomp_dstrm_get(struct zcomp *comp,
++				    enum zcomp_decomp_mode mode);
+ void zcomp_dstrm_put(struct zcomp_dstrm *zstrm);
+ 
+ int zcomp_compress(struct zcomp *comp, struct zcomp_cstrm *zstrm,
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 70d3f0ed9..d47d1e412 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1373,7 +1373,7 @@ static int decompress_bdev_page(struct zram *zram, struct page *page,
+ 	sg_init_table(sg, 1);
+ 	sg_set_page(sg, page, size, 0);
+ 
+-	zstrm = zcomp_dstrm_get(zram->comps[prio]);
++	zstrm = zcomp_dstrm_get(zram->comps[prio], ZCOMP_DECOMP_BOUNCE);
+ 	ret = zcomp_decompress(zram->comps[prio], zstrm, sg, size,
+ 			       zstrm->local_copy);
+ 	if (!ret) {
+@@ -2115,6 +2115,7 @@ static int read_incompressible_page(struct zram *zram, struct page *page,
+ static int read_compressed_page(struct zram *zram, struct page *page,
+ 				unsigned long index)
+ {
++	enum zcomp_decomp_mode mode = ZCOMP_DECOMP_BOUNCE;
+ 	struct zcomp_dstrm *zstrm;
+ 	struct scatterlist sg[2];
+ 	unsigned long handle;
+@@ -2126,13 +2127,16 @@ static int read_compressed_page(struct zram *zram, struct page *page,
+ 	size = get_slot_size(zram, index);
+ 	prio = get_slot_comp_priority(zram, index);
+ 
+-	zstrm = zcomp_dstrm_get(zram->comps[prio]);
+ 	zs_obj_read_sg_begin(zram->mem_pool, handle, sg, size);
++	if (sg_is_last(sg))
++		mode = ZCOMP_DECOMP_INPLACE;
++
++	zstrm = zcomp_dstrm_get(zram->comps[prio], mode);
+ 	dst = kmap_local_page(page);
+ 	ret = zcomp_decompress(zram->comps[prio], zstrm, sg, size, dst);
+ 	kunmap_local(dst);
+-	zs_obj_read_sg_end(zram->mem_pool, handle);
+ 	zcomp_dstrm_put(zstrm);
++	zs_obj_read_sg_end(zram->mem_pool, handle);
+ 
+ 	return ret;
+ }
+-- 
+2.56.0
+
