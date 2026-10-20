@@ -1,0 +1,169 @@
+From 8b6263edc3eb8f0d2c6a9b2258e35e57a2bc77e9 Mon Sep 17 00:00:00 2001
+From: Matthew Schwartz <matthew.schwartz@linux.dev>
+Date: Sat, 4 Jul 2026 12:05:36 -0700
+Subject: [PATCH 118/161] ACPI: battery: derive present rate from capacity
+ change on MSI Claw 8 EX AI+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The EC on the MSI Claw 8 EX AI+ (board MS-1T91, BIOS E1T91IMS.105) reports
+a bogus _BST present rate that does not track load. Measured live, current_now
+held at ~-63 A across a 60s window in which charge_now actually moved from
+2037 mAh to 1996 mAh, a real discharge of 2.46 A (~37.6 W). The EC value is
+off by ~25x here and by a different factor under other loads, so no constant
+scale corrects it; the reported rate simply never moves.
+
+Everything that reads current_now/power_now (MangoHUD, the Steam UI) then
+reports a nonsensical draw. Add a DMI-gated quirk that derives the rate from
+the change in remaining capacity over time, recomputed when the capacity
+counter ticks and held steady in between. Report 0 while the pack is neither
+charging nor discharging, so it does not show a stale draw when full and
+plugged in.
+
+Holo: Drop this quirk when MSI fixes the EC firmware.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+Signed-off-by: Nícolas F. R. A. Prado <nfraprado@collabora.com>
+---
+ drivers/acpi/battery.c | 81 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/drivers/acpi/battery.c b/drivers/acpi/battery.c
+index 670853ec3..73335c444 100644
+--- a/drivers/acpi/battery.c
++++ b/drivers/acpi/battery.c
+@@ -18,6 +18,7 @@
+ #include <linux/kfifo.h>
+ #include <linux/list.h>
+ #include <linux/lockdep.h>
++#include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/platform_device.h>
+@@ -94,6 +95,11 @@ enum {
+ 	 * on a full charge, but showing degradation in full charge cap.
+ 	 */
+ 	ACPI_BATTERY_QUIRK_DEGRADED_FULL_CHARGE,
++	/* Some ECs report a _BST present rate that never tracks load
++	 * (seen on the MSI Claw 8 EX AI+). Derive current/power from
++	 * capacity change over time instead.
++	 */
++	ACPI_BATTERY_QUIRK_DERIVE_RATE,
+ };
+ 
+ struct acpi_battery {
+@@ -113,6 +119,9 @@ struct acpi_battery {
+ 	int revision;
+ 	int rate_now;
+ 	int capacity_now;
++	int derived_rate;
++	int derive_cap_prev;
++	unsigned long derive_time_prev;
+ 	int voltage_now;
+ 	int design_capacity;
+ 	int full_charge_capacity;
+@@ -160,6 +169,7 @@ static int acpi_battery_technology(struct acpi_battery *battery)
+ }
+ 
+ static int acpi_battery_get_state(struct acpi_battery *battery);
++static void acpi_battery_derive_rate(struct acpi_battery *battery);
+ 
+ static bool acpi_battery_is_full(struct acpi_battery *battery)
+ {
+@@ -213,6 +223,10 @@ static int acpi_battery_get_property(struct power_supply *psy,
+ 	mutex_lock(&battery->property_lock);
+ 
+ 	acpi_battery_get_state(battery);
++	if (test_bit(ACPI_BATTERY_QUIRK_DERIVE_RATE, &battery->flags)) {
++		acpi_battery_derive_rate(battery);
++		battery->rate_now = battery->derived_rate;
++	}
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+@@ -994,6 +1008,67 @@ static void find_battery(const struct dmi_header *dm, void *private)
+ 	}
+ }
+ 
++static const struct dmi_system_id acpi_battery_derive_rate_dmi[] = {
++	{
++		/* MSI Claw 8 EX AI+: EC _BST present rate is bogus */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR,
++				  "Micro-Star International Co., Ltd."),
++			DMI_MATCH(DMI_BOARD_NAME, "MS-1T91"),
++		},
++	},
++	{}
++};
++
++/*
++ * Recomputes battery->derived_rate; the caller mirrors it into rate_now.
++ * Kept as a separate field rather than writing rate_now directly here,
++ * since extract_package() (called from acpi_battery_get_state(), before
++ * this runs) overwrites rate_now with the raw EC value on every real
++ * refresh, and derived_rate must survive that to be held steady between
++ * capacity ticks.
++ */
++static void acpi_battery_derive_rate(struct acpi_battery *battery)
++{
++	unsigned long now = jiffies;
++	unsigned long dt;
++	u64 dcap;
++
++	/*
++	 * When neither charging nor discharging (full/on AC), the true rate
++	 * is ~0 but capacity_now stops ticking, so the hold-steady logic
++	 * below would freeze the last discharge value. Report 0 and re-seed.
++	 */
++	if (!(battery->state & (ACPI_BATTERY_STATE_DISCHARGING |
++				ACPI_BATTERY_STATE_CHARGING))) {
++		battery->derived_rate = 0;
++		battery->derive_cap_prev = ACPI_BATTERY_VALUE_UNKNOWN;
++		return;
++	}
++
++	if (!ACPI_BATTERY_CAPACITY_VALID(battery->capacity_now)) {
++		battery->derived_rate = ACPI_BATTERY_VALUE_UNKNOWN;
++		return;
++	}
++
++	if (battery->derive_cap_prev == ACPI_BATTERY_VALUE_UNKNOWN) {
++		battery->derive_cap_prev = battery->capacity_now;
++		battery->derive_time_prev = now;
++		return;
++	}
++
++	if (battery->capacity_now == battery->derive_cap_prev)
++		return;
++
++	dcap = abs(battery->derive_cap_prev - battery->capacity_now);
++	dt = now - battery->derive_time_prev;
++	battery->derive_cap_prev = battery->capacity_now;
++	battery->derive_time_prev = now;
++
++	if (dt)
++		battery->derived_rate = div64_u64(dcap * 3600 * HZ, dt);
++}
++
+ /*
+  * According to the ACPI spec, some kinds of primary batteries can
+  * report percentage battery remaining capacity directly to OS.
+@@ -1403,6 +1478,12 @@ static int acpi_battery_probe(struct platform_device *pdev)
+ 	if (acpi_has_method(battery->device->handle, "_BIX"))
+ 		set_bit(ACPI_BATTERY_XINFO_PRESENT, &battery->flags);
+ 
++	if (dmi_check_system(acpi_battery_derive_rate_dmi)) {
++		battery->derived_rate = ACPI_BATTERY_VALUE_UNKNOWN;
++		battery->derive_cap_prev = ACPI_BATTERY_VALUE_UNKNOWN;
++		set_bit(ACPI_BATTERY_QUIRK_DERIVE_RATE, &battery->flags);
++	}
++
+ 	result = devm_acpi_battery_update_retry(dev, battery);
+ 	if (result)
+ 		return result;
+-- 
+2.56.0
+
